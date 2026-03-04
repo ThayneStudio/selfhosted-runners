@@ -20,6 +20,7 @@ packages:
   - wget
   - apt-transport-https
   - software-properties-common
+  - qemu-guest-agent
 
 write_files:
   - path: /etc/github-runner/config.env
