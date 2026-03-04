@@ -11,8 +11,11 @@ mkdir -p "$INSTALL_DIR"
 curl -fsSL "$REPO_URL" | tar xz --strip-components=1 -C "$INSTALL_DIR"
 chmod +x "$INSTALL_DIR/runner" "$INSTALL_DIR/lib/"*.sh
 
+# Symlink to /usr/local/bin
+ln -sf "$INSTALL_DIR/runner" /usr/local/bin/runner
+
 echo "Installed to $INSTALL_DIR"
 echo ""
 echo "Run the setup wizard:"
-echo "  $INSTALL_DIR/runner setup"
+echo "  runner setup"
 echo ""
