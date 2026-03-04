@@ -96,6 +96,9 @@ if ! qm destroy $VMID --purge; then
     exit 1
 fi
 
+# Clean up per-VM meta-data snippet
+rm -f "/var/lib/vz/snippets/runner-${VMID}-meta.yaml"
+
 echo ""
 log_info "Runner '$RUNNER_NAME' (VMID: $VMID) destroyed."
 echo ""

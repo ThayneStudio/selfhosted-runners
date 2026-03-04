@@ -113,8 +113,16 @@ if ! qm clone $TEMPLATE_ID $VMID --name "$RUNNER_NAME" --full; then
 fi
 
 log_info "Configuring cloud-init..."
-if ! qm set $VMID --cicustom "user=local:snippets/runner-user-data.yaml"; then
+
+# Create per-VM meta-data for hostname
+cat > /var/lib/vz/snippets/runner-${VMID}-meta.yaml << METAEOF
+instance-id: $RUNNER_NAME
+local-hostname: $RUNNER_NAME
+METAEOF
+
+if ! qm set $VMID --cicustom "user=local:snippets/runner-user-data.yaml,meta=local:snippets/runner-${VMID}-meta.yaml"; then
     log_error "Failed to set cloud-init config"
+    rm -f "/var/lib/vz/snippets/runner-${VMID}-meta.yaml"
     qm destroy $VMID --purge 2>/dev/null || true
     exit 1
 fi
