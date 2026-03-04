@@ -106,6 +106,15 @@ if ! ip link show "$NETWORK_BRIDGE" &> /dev/null; then
     exit 1
 fi
 
+# VLAN tag (optional)
+read -p "VLAN tag (leave empty for none): " VLAN_TAG
+if [[ -n "$VLAN_TAG" ]]; then
+    if [[ ! "$VLAN_TAG" =~ ^[0-9]+$ ]] || [[ "$VLAN_TAG" -lt 1 || "$VLAN_TAG" -gt 4094 ]]; then
+        log_error "VLAN tag must be a number between 1 and 4094"
+        exit 1
+    fi
+fi
+
 # Detect storage
 echo ""
 echo "Available storage pools:"
@@ -134,6 +143,7 @@ echo "Configuration:"
 echo "  GitHub Org:     $GITHUB_ORG"
 echo "  PAT:            ${GITHUB_PAT:0:10}... (validated)"
 echo "  Network Bridge: $NETWORK_BRIDGE"
+echo "  VLAN Tag:       ${VLAN_TAG:-none}"
 echo "  VM Storage:     $VM_STORAGE"
 echo "  Template ID:    $TEMPLATE_ID"
 echo ""
@@ -175,6 +185,7 @@ cat > /etc/github-runners.conf << EOF
 GITHUB_ORG="$GITHUB_ORG"
 GITHUB_PAT="$GITHUB_PAT"
 NETWORK_BRIDGE="$NETWORK_BRIDGE"
+VLAN_TAG="${VLAN_TAG}"
 VM_STORAGE="$VM_STORAGE"
 TEMPLATE_ID="$TEMPLATE_ID"
 EOF
@@ -224,8 +235,12 @@ else
     fi
 
     log_info "Creating VM template..."
+    NET_CONFIG="virtio,bridge=$NETWORK_BRIDGE"
+    if [[ -n "$VLAN_TAG" ]]; then
+        NET_CONFIG="${NET_CONFIG},tag=$VLAN_TAG"
+    fi
     if ! qm create $TEMPLATE_ID --name ubuntu-cloud-template \
-        --memory 8192 --cores 2 --net0 virtio,bridge=$NETWORK_BRIDGE; then
+        --memory 8192 --cores 2 --net0 "$NET_CONFIG"; then
         log_error "Failed to create VM"
         exit 1
     fi
