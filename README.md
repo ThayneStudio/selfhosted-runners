@@ -6,7 +6,7 @@ One-command setup for self-hosted GitHub Actions runners on Proxmox.
 
 ```bash
 # On your Proxmox host
-git clone https://github.com/youruser/selfhosted-runners.git
+git clone https://github.com/ThayneStudio/selfhosted-runners.git
 cd selfhosted-runners
 ./setup.sh
 ```
