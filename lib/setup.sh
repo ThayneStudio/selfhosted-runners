@@ -211,13 +211,13 @@ if qm status $TEMPLATE_ID &> /dev/null; then
 else
     # Download and create template
     log_info "[5/5] Creating Ubuntu cloud template..."
-    CLOUD_IMG="jammy-server-cloudimg-amd64.img"
-    CLOUD_IMG_URL="https://cloud-images.ubuntu.com/jammy/current/$CLOUD_IMG"
+    CLOUD_IMG="noble-server-cloudimg-amd64.img"
+    CLOUD_IMG_URL="https://cloud-images.ubuntu.com/noble/current/$CLOUD_IMG"
     # SHA256 checksum from Ubuntu (update periodically)
-    # Get latest from: https://cloud-images.ubuntu.com/jammy/current/SHA256SUMS
+    # Get latest from: https://cloud-images.ubuntu.com/noble/current/SHA256SUMS
 
     if [[ ! -f "/tmp/$CLOUD_IMG" ]]; then
-        log_info "Downloading Ubuntu 22.04 cloud image..."
+        log_info "Downloading Ubuntu 24.04 cloud image..."
         if ! wget -q --show-progress -O "/tmp/$CLOUD_IMG" "$CLOUD_IMG_URL"; then
             log_error "Failed to download cloud image"
             rm -f "/tmp/$CLOUD_IMG"

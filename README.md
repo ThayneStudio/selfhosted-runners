@@ -39,7 +39,7 @@ runner create runner-02
 │  /var/lib/vz/snippets/             ← Cloud-init config         │
 │                                                                 │
 │  ┌──────────────────┐                                          │
-│  │ Template (9000)  │  ← Ubuntu 22.04 cloud image              │
+│  │ Template (9000)  │  ← Ubuntu 24.04 cloud image              │
 │  └──────────────────┘                                          │
 │           │                                                     │
 │           │ clone                                               │
