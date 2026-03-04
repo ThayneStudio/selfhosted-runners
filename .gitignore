@@ -1,0 +1,23 @@
+# Sensitive files (never commit these)
+*.conf
+*.env
+*.pem
+*.key
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor files
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# Downloaded images
+*.img
+*.qcow2
+
+# Claude Code
+.claude/

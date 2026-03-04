@@ -1,0 +1,99 @@
+#cloud-config
+
+users:
+  - name: runner
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+    groups: docker
+
+package_update: true
+package_upgrade: true
+
+packages:
+  - ca-certificates
+  - curl
+  - gnupg
+  - jq
+  - unzip
+  - build-essential
+  - git
+
+write_files:
+  - path: /etc/github-runner/config.env
+    permissions: '0600'
+    content: |
+      GITHUB_PAT={{GITHUB_PAT}}
+      GITHUB_ORG={{GITHUB_ORG}}
+      RUNNER_LABELS=self-hosted,linux,x64
+
+  - path: /opt/setup-runner.sh
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      set -euo pipefail
+
+      echo "=== GitHub Actions Runner Setup ==="
+
+      source /etc/github-runner/config.env
+
+      RUNNER_HOME=/home/runner/actions-runner
+      RUNNER_USER=runner
+
+      echo "[1/6] Installing Docker..."
+      install -m 0755 -d /etc/apt/keyrings
+      curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+      chmod a+r /etc/apt/keyrings/docker.gpg
+      echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
+      apt-get update
+      apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+
+      echo "[2/6] Installing Node.js LTS..."
+      curl -fsSL https://deb.nodesource.com/setup_lts.x | bash -
+      apt-get install -y nodejs
+
+      echo "[3/6] Installing Playwright dependencies..."
+      npx playwright install-deps
+
+      echo "[4/6] Downloading GitHub Actions runner..."
+      mkdir -p $RUNNER_HOME
+      chown $RUNNER_USER:$RUNNER_USER $RUNNER_HOME
+      cd $RUNNER_HOME
+
+      RUNNER_VERSION=$(curl -s https://api.github.com/repos/actions/runner/releases/latest | jq -r .tag_name | sed 's/v//')
+      curl -o actions-runner.tar.gz -L "https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-linux-x64-${RUNNER_VERSION}.tar.gz"
+      tar xzf actions-runner.tar.gz
+      rm actions-runner.tar.gz
+      chown -R $RUNNER_USER:$RUNNER_USER $RUNNER_HOME
+
+      echo "[5/6] Registering runner with GitHub..."
+      REG_TOKEN=$(curl -s -X POST \
+        -H "Authorization: token ${GITHUB_PAT}" \
+        -H "Accept: application/vnd.github.v3+json" \
+        "https://api.github.com/orgs/${GITHUB_ORG}/actions/runners/registration-token" \
+        | jq -r .token)
+
+      if [[ "$REG_TOKEN" == "null" ]] || [[ -z "$REG_TOKEN" ]]; then
+        echo "Error: Failed to get registration token. Check your PAT permissions."
+        exit 1
+      fi
+
+      sudo -u $RUNNER_USER ./config.sh \
+        --url "https://github.com/${GITHUB_ORG}" \
+        --token "$REG_TOKEN" \
+        --name "$(hostname)" \
+        --labels "$RUNNER_LABELS" \
+        --unattended \
+        --replace
+
+      echo "[6/6] Starting runner service..."
+      ./svc.sh install $RUNNER_USER
+      ./svc.sh start
+
+      echo ""
+      echo "=== Runner setup complete! ==="
+      echo "Runner name: $(hostname)"
+      echo "Labels: $RUNNER_LABELS"
+      echo ""
+
+runcmd:
+  - /opt/setup-runner.sh
