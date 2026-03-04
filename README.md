@@ -6,9 +6,15 @@ Zero-touch setup for self-hosted GitHub Actions runners on Proxmox.
 
 ```bash
 # On your Proxmox host
+curl -fsSL https://raw.githubusercontent.com/ThayneStudio/selfhosted-runners/master/install.sh | bash
+runner setup
+```
+
+Or manually:
+```bash
 git clone https://github.com/ThayneStudio/selfhosted-runners.git
 cd selfhosted-runners
-./setup.sh
+./runner setup
 ```
 
 The wizard will:
