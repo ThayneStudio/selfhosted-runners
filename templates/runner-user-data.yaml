@@ -17,6 +17,9 @@ packages:
   - unzip
   - build-essential
   - git
+  - wget
+  - apt-transport-https
+  - software-properties-common
 
 write_files:
   - path: /etc/github-runner/config.env
@@ -32,68 +35,197 @@ write_files:
       #!/bin/bash
       set -euo pipefail
 
-      echo "=== GitHub Actions Runner Setup ==="
+      # Logging with timestamps
+      log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"; }
+      log_error() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: $1" >&2; }
+
+      # Retry wrapper for network operations
+      retry() {
+        local max_attempts=3
+        local delay=5
+        local attempt=1
+        local cmd="$@"
+
+        while [[ $attempt -le $max_attempts ]]; do
+          log "Attempt $attempt/$max_attempts: $cmd"
+          if eval "$cmd"; then
+            return 0
+          fi
+          log "Attempt $attempt failed, waiting ${delay}s..."
+          sleep $delay
+          ((attempt++))
+          delay=$((delay * 2))
+        done
+        log_error "All $max_attempts attempts failed for: $cmd"
+        return 1
+      }
+
+      log "=== GitHub Actions Runner Setup ==="
+
+      # Validate environment
+      if [[ ! -f /etc/github-runner/config.env ]]; then
+        log_error "Config file not found: /etc/github-runner/config.env"
+        exit 1
+      fi
 
       source /etc/github-runner/config.env
+
+      # Validate required variables
+      : ${GITHUB_PAT:?GITHUB_PAT not set}
+      : ${GITHUB_ORG:?GITHUB_ORG not set}
+      : ${RUNNER_LABELS:=self-hosted,linux,x64}
 
       RUNNER_HOME=/home/runner/actions-runner
       RUNNER_USER=runner
 
-      echo "[1/6] Installing Docker..."
+      # Check disk space (need at least 5GB free)
+      FREE_SPACE=$(df -BG /home | tail -1 | awk '{print $4}' | tr -d 'G')
+      if [[ "$FREE_SPACE" -lt 5 ]]; then
+        log_error "Insufficient disk space: ${FREE_SPACE}GB free, need at least 5GB"
+        exit 1
+      fi
+      log "Disk space check passed: ${FREE_SPACE}GB free"
+
+      # Wait for network connectivity
+      log "[1/7] Checking network connectivity..."
+      for i in {1..30}; do
+        if curl -sf --max-time 5 https://github.com > /dev/null 2>&1; then
+          log "Network connectivity confirmed"
+          break
+        fi
+        if [[ $i -eq 30 ]]; then
+          log_error "No network connectivity after 30 attempts"
+          exit 1
+        fi
+        log "Waiting for network... ($i/30)"
+        sleep 2
+      done
+
+      log "[2/7] Installing Docker..."
       install -m 0755 -d /etc/apt/keyrings
-      curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+
+      # Docker GPG key with retry
+      retry "curl -fsSL --retry 3 --retry-delay 2 https://download.docker.com/linux/ubuntu/gpg -o /tmp/docker.gpg"
+      gpg --dearmor -o /etc/apt/keyrings/docker.gpg < /tmp/docker.gpg
       chmod a+r /etc/apt/keyrings/docker.gpg
+      rm /tmp/docker.gpg
+
       echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
-      apt-get update
-      apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
 
-      echo "[2/6] Installing Node.js LTS..."
-      curl -fsSL https://deb.nodesource.com/setup_lts.x | bash -
-      apt-get install -y nodejs
+      retry "apt-get update"
+      retry "apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin"
 
-      echo "[3/6] Installing Playwright dependencies..."
-      npx playwright install-deps
+      # Verify Docker is running
+      if ! systemctl is-active --quiet docker; then
+        log "Starting Docker service..."
+        systemctl start docker
+        systemctl enable docker
+      fi
+      log "Docker installed and running"
 
-      echo "[4/6] Downloading GitHub Actions runner..."
+      log "[3/7] Installing Node.js LTS..."
+      # Use official NodeSource with retry
+      retry "curl -fsSL --retry 3 https://deb.nodesource.com/setup_lts.x -o /tmp/nodesource_setup.sh"
+      bash /tmp/nodesource_setup.sh
+      rm /tmp/nodesource_setup.sh
+      retry "apt-get install -y nodejs"
+      log "Node.js $(node --version) installed"
+
+      log "[4/7] Installing Playwright dependencies..."
+      # This can take a while, so we run with timeout
+      timeout 300 npx playwright install-deps || {
+        log_error "Playwright deps installation timed out or failed"
+        log "Continuing anyway - Playwright can be installed in workflows"
+      }
+
+      log "[5/7] Downloading GitHub Actions runner..."
       mkdir -p $RUNNER_HOME
       chown $RUNNER_USER:$RUNNER_USER $RUNNER_HOME
       cd $RUNNER_HOME
 
-      RUNNER_VERSION=$(curl -s https://api.github.com/repos/actions/runner/releases/latest | jq -r .tag_name | sed 's/v//')
-      curl -o actions-runner.tar.gz -L "https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-linux-x64-${RUNNER_VERSION}.tar.gz"
-      tar xzf actions-runner.tar.gz
-      rm actions-runner.tar.gz
-      chown -R $RUNNER_USER:$RUNNER_USER $RUNNER_HOME
+      # Get latest runner version with validation
+      RUNNER_VERSION=$(curl -sf --retry 3 https://api.github.com/repos/actions/runner/releases/latest | jq -r .tag_name | sed 's/v//')
+      if [[ -z "$RUNNER_VERSION" || "$RUNNER_VERSION" == "null" ]]; then
+        log_error "Failed to get runner version from GitHub API"
+        exit 1
+      fi
+      log "Latest runner version: $RUNNER_VERSION"
 
-      echo "[5/6] Registering runner with GitHub..."
-      REG_TOKEN=$(curl -s -X POST \
-        -H "Authorization: token ${GITHUB_PAT}" \
-        -H "Accept: application/vnd.github.v3+json" \
-        "https://api.github.com/orgs/${GITHUB_ORG}/actions/runners/registration-token" \
-        | jq -r .token)
+      RUNNER_URL="https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-linux-x64-${RUNNER_VERSION}.tar.gz"
+      retry "curl -fsSL --retry 3 -o actions-runner.tar.gz '$RUNNER_URL'"
 
-      if [[ "$REG_TOKEN" == "null" ]] || [[ -z "$REG_TOKEN" ]]; then
-        echo "Error: Failed to get registration token. Check your PAT permissions."
+      # Verify download
+      if [[ ! -s actions-runner.tar.gz ]]; then
+        log_error "Runner download is empty or missing"
         exit 1
       fi
 
+      tar xzf actions-runner.tar.gz || {
+        log_error "Failed to extract runner archive"
+        exit 1
+      }
+      rm actions-runner.tar.gz
+      chown -R $RUNNER_USER:$RUNNER_USER $RUNNER_HOME
+      log "Runner extracted successfully"
+
+      log "[6/7] Registering runner with GitHub..."
+      # Get registration token with error details
+      REG_RESPONSE=$(curl -sf --retry 3 -X POST \
+        -H "Authorization: token ${GITHUB_PAT}" \
+        -H "Accept: application/vnd.github.v3+json" \
+        "https://api.github.com/orgs/${GITHUB_ORG}/actions/runners/registration-token" 2>&1) || {
+        log_error "Failed to get registration token from GitHub API"
+        log_error "Response: $REG_RESPONSE"
+        exit 1
+      }
+
+      REG_TOKEN=$(echo "$REG_RESPONSE" | jq -r .token)
+      if [[ "$REG_TOKEN" == "null" || -z "$REG_TOKEN" ]]; then
+        log_error "Invalid registration token received"
+        log_error "Response: $REG_RESPONSE"
+        log_error "Check that your PAT has 'admin:org' scope"
+        exit 1
+      fi
+
+      # Configure runner
       sudo -u $RUNNER_USER ./config.sh \
         --url "https://github.com/${GITHUB_ORG}" \
         --token "$REG_TOKEN" \
         --name "$(hostname)" \
         --labels "$RUNNER_LABELS" \
         --unattended \
-        --replace
+        --replace || {
+        log_error "Runner configuration failed"
+        exit 1
+      }
+      log "Runner configured successfully"
 
-      echo "[6/6] Starting runner service..."
-      ./svc.sh install $RUNNER_USER
-      ./svc.sh start
+      log "[7/7] Starting runner service..."
+      ./svc.sh install $RUNNER_USER || {
+        log_error "Failed to install runner service"
+        exit 1
+      }
+      ./svc.sh start || {
+        log_error "Failed to start runner service"
+        exit 1
+      }
+
+      # Verify service is running
+      sleep 3
+      if systemctl is-active --quiet "actions.runner.*"; then
+        log "Runner service is running"
+      else
+        log_error "Runner service failed to start"
+        systemctl status "actions.runner.*" || true
+        exit 1
+      fi
 
       echo ""
-      echo "=== Runner setup complete! ==="
-      echo "Runner name: $(hostname)"
-      echo "Labels: $RUNNER_LABELS"
+      log "=== Runner setup complete! ==="
+      log "Runner name: $(hostname)"
+      log "Labels: $RUNNER_LABELS"
+      log "Organization: $GITHUB_ORG"
       echo ""
 
 runcmd:
-  - /opt/setup-runner.sh
+  - /opt/setup-runner.sh 2>&1 | tee /var/log/runner-setup.log
