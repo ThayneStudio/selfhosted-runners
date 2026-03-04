@@ -79,7 +79,21 @@ if ! flock -n 200; then
 fi
 
 # Get next available VM ID (inside lock to prevent race)
-VMID=$(pvesh get /cluster/nextid)
+NEXT_ID=$(pvesh get /cluster/nextid)
+read -p "VM ID [$NEXT_ID]: " VMID
+VMID=${VMID:-$NEXT_ID}
+
+# Validate VMID
+if [[ ! "$VMID" =~ ^[0-9]+$ ]]; then
+    log_error "VM ID must be a number"
+    exit 1
+fi
+
+# Check if VMID is already in use
+if qm status $VMID &> /dev/null; then
+    log_error "VM ID $VMID is already in use"
+    exit 1
+fi
 
 # Show confirmation
 echo ""
