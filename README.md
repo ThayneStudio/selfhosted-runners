@@ -13,14 +13,14 @@ cd selfhosted-runners
 
 The wizard will:
 1. Ask for GitHub org, PAT, network bridge, storage pool
-2. Install scripts to `/opt/selfhosted-runners`
-3. Create symlinks in `/usr/local/bin`
+2. Install to `/opt/selfhosted-runners`
+3. Add `runner` command to `/usr/local/bin`
 4. Download Ubuntu cloud image and create VM template
 
 Then create runners from anywhere:
 ```bash
-create-runner runner-01
-create-runner runner-02
+runner create runner-01
+runner create runner-02
 ```
 
 ## Architecture
@@ -100,14 +100,15 @@ The Proxmox host and runner VMs need outbound access to:
 
 ## Commands
 
-After setup, these commands are available globally:
+After setup, the `runner` command is available globally:
 
 | Command | Description |
 |---------|-------------|
-| `runner-setup` | Re-run the setup wizard |
-| `create-runner <name>` | Create a new runner VM |
-| `destroy-runner <name>` | Destroy a runner VM |
-| `list-runners` | List all runner VMs |
+| `runner setup` | Re-run the setup wizard |
+| `runner create <name>` | Create a new runner VM |
+| `runner destroy <name>` | Destroy a runner VM |
+| `runner list` | List all runner VMs |
+| `runner help` | Show available commands |
 
 ## Installed Software
 
@@ -137,12 +138,12 @@ To update runner configuration or installed software:
 1. Edit `/opt/selfhosted-runners/templates/runner-user-data.yaml`
 2. Re-run setup to regenerate the cloud-init snippet:
    ```bash
-   runner-setup
+   runner setup
    ```
 3. Destroy and recreate runners:
    ```bash
-   destroy-runner runner-01
-   create-runner runner-01
+   runner destroy runner-01
+   runner create runner-01
    ```
 
 ## Troubleshooting
@@ -218,12 +219,12 @@ The runner VM might not have network connectivity. Check:
 1. Generate a new PAT in GitHub
 2. Update the configuration:
    ```bash
-   runner-setup  # Re-run wizard with new PAT
+   runner setup  # Re-run wizard with new PAT
    ```
 3. Recreate runners:
    ```bash
-   destroy-runner runner-01
-   create-runner runner-01
+   runner destroy runner-01
+   runner create runner-01
    ```
 
 ## Files Created by Setup
@@ -231,10 +232,7 @@ The runner VM might not have network connectivity. Check:
 | Location | Purpose |
 |----------|---------|
 | `/opt/selfhosted-runners/` | Installed scripts and templates |
-| `/usr/local/bin/create-runner` | Symlink to create-runner.sh |
-| `/usr/local/bin/destroy-runner` | Symlink to destroy-runner.sh |
-| `/usr/local/bin/list-runners` | Symlink to list-runners.sh |
-| `/usr/local/bin/runner-setup` | Symlink to setup.sh |
+| `/usr/local/bin/runner` | Symlink to runner entrypoint |
 | `/etc/github-runners.conf` | Configuration (org, PAT, storage) |
 | `/var/lib/vz/snippets/runner-user-data.yaml` | Cloud-init config for VMs |
 | VM template (default ID 9000) | Ubuntu cloud image template |

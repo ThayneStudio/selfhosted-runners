@@ -29,18 +29,18 @@ if ! command -v pvesm &> /dev/null; then
     exit 1
 fi
 
-# Get the directory where this script is located (resolve symlinks)
+# Get the repo root directory (this script lives in lib/)
 SOURCE="${BASH_SOURCE[0]}"
 while [[ -L "$SOURCE" ]]; do
-    SCRIPT_DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
+    DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
     SOURCE="$(readlink "$SOURCE")"
-    [[ "$SOURCE" != /* ]] && SOURCE="$SCRIPT_DIR/$SOURCE"
+    [[ "$SOURCE" != /* ]] && SOURCE="$DIR/$SOURCE"
 done
-SCRIPT_DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
+REPO_DIR="$(cd "$(dirname "$SOURCE")/.." && pwd)"
 
 # Check if template file exists
-if [[ ! -f "$SCRIPT_DIR/templates/runner-user-data.yaml" ]]; then
-    log_error "templates/runner-user-data.yaml not found"
+if [[ ! -f "$REPO_DIR/templates/runner-user-data.yaml" ]]; then
+    log_error "templates/runner-user-data.yaml not found in $REPO_DIR"
     exit 1
 fi
 
@@ -140,26 +140,23 @@ echo ""
 read -p "Proceed? [Y/n]: " CONFIRM
 [[ "${CONFIRM:-Y}" =~ ^[Yy]$ ]] || exit 0
 
-# Install to /opt and create symlinks
+# Install to /opt and create symlink
 echo ""
 log_info "[1/5] Installing to $INSTALL_DIR..."
-if [[ "$SCRIPT_DIR" != "$INSTALL_DIR" ]]; then
+if [[ "$REPO_DIR" != "$INSTALL_DIR" ]]; then
     mkdir -p "$INSTALL_DIR"
-    cp -r "$SCRIPT_DIR"/* "$INSTALL_DIR/"
-    cp -r "$SCRIPT_DIR"/.gitignore "$INSTALL_DIR/" 2>/dev/null || true
-    chmod +x "$INSTALL_DIR"/*.sh
+    cp -r "$REPO_DIR"/* "$INSTALL_DIR/"
+    cp -r "$REPO_DIR"/.gitignore "$INSTALL_DIR/" 2>/dev/null || true
+    chmod +x "$INSTALL_DIR/runner" "$INSTALL_DIR/lib/"*.sh
     log_info "Copied files to $INSTALL_DIR"
 else
     log_info "Already running from $INSTALL_DIR"
 fi
 
-# Create symlinks in /usr/local/bin
-log_info "Creating symlinks in /usr/local/bin..."
-ln -sf "$INSTALL_DIR/create-runner.sh" /usr/local/bin/create-runner
-ln -sf "$INSTALL_DIR/destroy-runner.sh" /usr/local/bin/destroy-runner
-ln -sf "$INSTALL_DIR/list-runners.sh" /usr/local/bin/list-runners
-ln -sf "$INSTALL_DIR/setup.sh" /usr/local/bin/runner-setup
-log_info "Commands available: create-runner, destroy-runner, list-runners, runner-setup"
+# Create single symlink in /usr/local/bin
+log_info "Creating symlink in /usr/local/bin..."
+ln -sf "$INSTALL_DIR/runner" /usr/local/bin/runner
+log_info "Command available: runner"
 
 # Enable snippets on local storage
 log_info "[2/5] Enabling snippets storage..."
@@ -191,6 +188,7 @@ ESCAPED_ORG=$(printf '%s\n' "$GITHUB_ORG" | sed -e 's/[\/&]/\\&/g')
 sed -e "s|{{GITHUB_PAT}}|$ESCAPED_PAT|g" \
     -e "s|{{GITHUB_ORG}}|$ESCAPED_ORG|g" \
     "$INSTALL_DIR/templates/runner-user-data.yaml" > /var/lib/vz/snippets/runner-user-data.yaml || {
+
     log_error "Failed to generate cloud-init snippet"
     exit 1
 }
@@ -267,12 +265,13 @@ echo "========================================"
 echo ""
 echo "Installed to: $INSTALL_DIR"
 echo ""
-echo "Commands available anywhere:"
-echo "  create-runner runner-01"
-echo "  create-runner runner-02"
-echo "  list-runners"
-echo "  destroy-runner runner-01"
-echo "  runner-setup               (re-run this wizard)"
+echo "Usage:"
+echo "  runner create runner-01"
+echo "  runner create runner-02"
+echo "  runner list"
+echo "  runner destroy runner-01"
+echo "  runner setup               (re-run this wizard)"
+echo "  runner help"
 echo ""
 echo "View runners in GitHub:"
 echo "  https://github.com/organizations/$GITHUB_ORG/settings/actions/runners"

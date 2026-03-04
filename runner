@@ -1,0 +1,50 @@
+#!/bin/bash
+set -euo pipefail
+
+# Resolve symlinks to find real script location
+SOURCE="${BASH_SOURCE[0]}"
+while [[ -L "$SOURCE" ]]; do
+    DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
+    SOURCE="$(readlink "$SOURCE")"
+    [[ "$SOURCE" != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+SCRIPT_DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
+
+COMMAND=${1:-help}
+shift 2>/dev/null || true
+
+case "$COMMAND" in
+    create)
+        exec "$SCRIPT_DIR/lib/create.sh" "$@"
+        ;;
+    destroy)
+        exec "$SCRIPT_DIR/lib/destroy.sh" "$@"
+        ;;
+    list)
+        exec "$SCRIPT_DIR/lib/list.sh" "$@"
+        ;;
+    setup)
+        exec "$SCRIPT_DIR/lib/setup.sh" "$@"
+        ;;
+    help|--help|-h)
+        echo "Usage: runner <command> [args]"
+        echo ""
+        echo "Commands:"
+        echo "  setup              Run the setup wizard"
+        echo "  create <name>      Create a new runner VM"
+        echo "  destroy <name>     Destroy a runner VM"
+        echo "  list               List all runner VMs"
+        echo "  help               Show this help"
+        echo ""
+        echo "Examples:"
+        echo "  runner setup"
+        echo "  runner create runner-01"
+        echo "  runner destroy runner-01"
+        echo "  runner list"
+        ;;
+    *)
+        echo "Unknown command: $COMMAND"
+        echo "Run 'runner help' for usage."
+        exit 1
+        ;;
+esac
