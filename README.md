@@ -11,16 +11,16 @@ cd selfhosted-runners
 ./setup.sh
 ```
 
-The wizard will ask for:
-- GitHub organization name
-- GitHub PAT (with `admin:org` scope)
-- Network bridge (default: vmbr0)
-- Storage pool (default: local-zfs)
+The wizard will:
+1. Ask for GitHub org, PAT, network bridge, storage pool
+2. Install scripts to `/opt/selfhosted-runners`
+3. Create symlinks in `/usr/local/bin`
+4. Download Ubuntu cloud image and create VM template
 
-Then create runners:
+Then create runners from anywhere:
 ```bash
-./create-runner.sh runner-01
-./create-runner.sh runner-02
+create-runner runner-01
+create-runner runner-02
 ```
 
 ## Architecture
@@ -100,12 +100,14 @@ The Proxmox host and runner VMs need outbound access to:
 
 ## Commands
 
+After setup, these commands are available globally:
+
 | Command | Description |
 |---------|-------------|
-| `./setup.sh` | Initial setup wizard (run once) |
-| `./create-runner.sh <name>` | Create a new runner VM |
-| `./destroy-runner.sh <name>` | Destroy a runner VM |
-| `./list-runners.sh` | List all runner VMs |
+| `runner-setup` | Re-run the setup wizard |
+| `create-runner <name>` | Create a new runner VM |
+| `destroy-runner <name>` | Destroy a runner VM |
+| `list-runners` | List all runner VMs |
 
 ## Installed Software
 
@@ -132,15 +134,15 @@ jobs:
 
 To update runner configuration or installed software:
 
-1. Edit `templates/runner-user-data.yaml`
+1. Edit `/opt/selfhosted-runners/templates/runner-user-data.yaml`
 2. Re-run setup to regenerate the cloud-init snippet:
    ```bash
-   ./setup.sh
+   runner-setup
    ```
 3. Destroy and recreate runners:
    ```bash
-   ./destroy-runner.sh runner-01
-   ./create-runner.sh runner-01
+   destroy-runner runner-01
+   create-runner runner-01
    ```
 
 ## Troubleshooting
@@ -216,18 +218,23 @@ The runner VM might not have network connectivity. Check:
 1. Generate a new PAT in GitHub
 2. Update the configuration:
    ```bash
-   ./setup.sh  # Re-run wizard with new PAT
+   runner-setup  # Re-run wizard with new PAT
    ```
 3. Recreate runners:
    ```bash
-   ./destroy-runner.sh runner-01
-   ./create-runner.sh runner-01
+   destroy-runner runner-01
+   create-runner runner-01
    ```
 
 ## Files Created by Setup
 
 | Location | Purpose |
 |----------|---------|
+| `/opt/selfhosted-runners/` | Installed scripts and templates |
+| `/usr/local/bin/create-runner` | Symlink to create-runner.sh |
+| `/usr/local/bin/destroy-runner` | Symlink to destroy-runner.sh |
+| `/usr/local/bin/list-runners` | Symlink to list-runners.sh |
+| `/usr/local/bin/runner-setup` | Symlink to setup.sh |
 | `/etc/github-runners.conf` | Configuration (org, PAT, storage) |
 | `/var/lib/vz/snippets/runner-user-data.yaml` | Cloud-init config for VMs |
 | VM template (default ID 9000) | Ubuntu cloud image template |

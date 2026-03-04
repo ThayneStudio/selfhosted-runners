@@ -11,6 +11,8 @@ log_info() { echo -e "${GREEN}[INFO]${NC} $1"; }
 log_warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
 
+INSTALL_DIR="/opt/selfhosted-runners"
+
 echo "========================================"
 echo "  GitHub Actions Runner Setup Wizard"
 echo "========================================"
@@ -27,8 +29,14 @@ if ! command -v pvesm &> /dev/null; then
     exit 1
 fi
 
-# Get the directory where this script is located
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Get the directory where this script is located (resolve symlinks)
+SOURCE="${BASH_SOURCE[0]}"
+while [[ -L "$SOURCE" ]]; do
+    SCRIPT_DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
+    SOURCE="$(readlink "$SOURCE")"
+    [[ "$SOURCE" != /* ]] && SOURCE="$SCRIPT_DIR/$SOURCE"
+done
+SCRIPT_DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
 
 # Check if template file exists
 if [[ ! -f "$SCRIPT_DIR/templates/runner-user-data.yaml" ]]; then
@@ -132,9 +140,29 @@ echo ""
 read -p "Proceed? [Y/n]: " CONFIRM
 [[ "${CONFIRM:-Y}" =~ ^[Yy]$ ]] || exit 0
 
-# Enable snippets on local storage
+# Install to /opt and create symlinks
 echo ""
-log_info "[1/4] Enabling snippets storage..."
+log_info "[1/5] Installing to $INSTALL_DIR..."
+if [[ "$SCRIPT_DIR" != "$INSTALL_DIR" ]]; then
+    mkdir -p "$INSTALL_DIR"
+    cp -r "$SCRIPT_DIR"/* "$INSTALL_DIR/"
+    cp -r "$SCRIPT_DIR"/.gitignore "$INSTALL_DIR/" 2>/dev/null || true
+    chmod +x "$INSTALL_DIR"/*.sh
+    log_info "Copied files to $INSTALL_DIR"
+else
+    log_info "Already running from $INSTALL_DIR"
+fi
+
+# Create symlinks in /usr/local/bin
+log_info "Creating symlinks in /usr/local/bin..."
+ln -sf "$INSTALL_DIR/create-runner.sh" /usr/local/bin/create-runner
+ln -sf "$INSTALL_DIR/destroy-runner.sh" /usr/local/bin/destroy-runner
+ln -sf "$INSTALL_DIR/list-runners.sh" /usr/local/bin/list-runners
+ln -sf "$INSTALL_DIR/setup.sh" /usr/local/bin/runner-setup
+log_info "Commands available: create-runner, destroy-runner, list-runners, runner-setup"
+
+# Enable snippets on local storage
+log_info "[2/5] Enabling snippets storage..."
 CURRENT_CONTENT=$(pvesm status --content snippets 2>/dev/null | grep -c "^local" || echo "0")
 if [[ "$CURRENT_CONTENT" -eq 0 ]]; then
     pvesm set local --content iso,backup,vztmpl,snippets || {
@@ -145,7 +173,7 @@ fi
 mkdir -p /var/lib/vz/snippets
 
 # Save config for other scripts
-log_info "[2/4] Saving configuration..."
+log_info "[3/5] Saving configuration..."
 cat > /etc/github-runners.conf << EOF
 GITHUB_ORG="$GITHUB_ORG"
 GITHUB_PAT="$GITHUB_PAT"
@@ -157,23 +185,23 @@ chmod 600 /etc/github-runners.conf
 
 # Generate cloud-init from template
 # Escape special characters in PAT for sed
-log_info "[3/4] Creating cloud-init snippet..."
+log_info "[4/5] Creating cloud-init snippet..."
 ESCAPED_PAT=$(printf '%s\n' "$GITHUB_PAT" | sed -e 's/[\/&]/\\&/g')
 ESCAPED_ORG=$(printf '%s\n' "$GITHUB_ORG" | sed -e 's/[\/&]/\\&/g')
 sed -e "s|{{GITHUB_PAT}}|$ESCAPED_PAT|g" \
     -e "s|{{GITHUB_ORG}}|$ESCAPED_ORG|g" \
-    "$SCRIPT_DIR/templates/runner-user-data.yaml" > /var/lib/vz/snippets/runner-user-data.yaml || {
+    "$INSTALL_DIR/templates/runner-user-data.yaml" > /var/lib/vz/snippets/runner-user-data.yaml || {
     log_error "Failed to generate cloud-init snippet"
     exit 1
 }
 
 # Check if template already exists
 if qm status $TEMPLATE_ID &> /dev/null; then
-    log_info "[4/4] Template VM $TEMPLATE_ID already exists. Skipping creation."
+    log_info "[5/5] Template VM $TEMPLATE_ID already exists. Skipping creation."
     log_warn "To recreate: qm destroy $TEMPLATE_ID && ./setup.sh"
 else
     # Download and create template
-    log_info "[4/4] Creating Ubuntu cloud template..."
+    log_info "[5/5] Creating Ubuntu cloud template..."
     CLOUD_IMG="jammy-server-cloudimg-amd64.img"
     CLOUD_IMG_URL="https://cloud-images.ubuntu.com/jammy/current/$CLOUD_IMG"
     # SHA256 checksum from Ubuntu (update periodically)
@@ -237,12 +265,14 @@ echo "========================================"
 echo "  Setup complete!"
 echo "========================================"
 echo ""
-echo "Create runners with:"
-echo "  ./create-runner.sh runner-01"
-echo "  ./create-runner.sh runner-02"
+echo "Installed to: $INSTALL_DIR"
 echo ""
-echo "List runners with:"
-echo "  ./list-runners.sh"
+echo "Commands available anywhere:"
+echo "  create-runner runner-01"
+echo "  create-runner runner-02"
+echo "  list-runners"
+echo "  destroy-runner runner-01"
+echo "  runner-setup               (re-run this wizard)"
 echo ""
 echo "View runners in GitHub:"
 echo "  https://github.com/organizations/$GITHUB_ORG/settings/actions/runners"
