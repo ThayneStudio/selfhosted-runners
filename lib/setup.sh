@@ -240,7 +240,7 @@ else
         NET_CONFIG="${NET_CONFIG},tag=$VLAN_TAG"
     fi
     if ! qm create $TEMPLATE_ID --name ubuntu-cloud-template \
-        --memory 8192 --cores 2 --net0 "$NET_CONFIG"; then
+        --memory 8192 --cores 2 --cpu host --net0 "$NET_CONFIG"; then
         log_error "Failed to create VM"
         exit 1
     fi
