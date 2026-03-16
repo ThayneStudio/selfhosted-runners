@@ -88,7 +88,7 @@ write_files:
       log "Disk space check passed: ${FREE_SPACE}GB free"
 
       # Wait for network connectivity
-      log "[1/7] Checking network connectivity..."
+      log "[1/8] Checking network connectivity..."
       for i in {1..30}; do
         if curl -sf --max-time 5 https://github.com > /dev/null 2>&1; then
           log "Network connectivity confirmed"
@@ -102,7 +102,7 @@ write_files:
         sleep 2
       done
 
-      log "[2/7] Installing Docker..."
+      log "[2/8] Installing Docker..."
       install -m 0755 -d /etc/apt/keyrings
 
       # Docker GPG key with retry
@@ -124,7 +124,7 @@ write_files:
       fi
       log "Docker installed and running"
 
-      log "[3/7] Installing Node.js LTS..."
+      log "[3/8] Installing Node.js LTS..."
       # Use official NodeSource with retry
       retry "curl -fsSL --retry 3 https://deb.nodesource.com/setup_lts.x -o /tmp/nodesource_setup.sh"
       bash /tmp/nodesource_setup.sh
@@ -132,14 +132,21 @@ write_files:
       retry "apt-get install -y nodejs"
       log "Node.js $(node --version) installed"
 
-      log "[4/7] Installing Playwright dependencies..."
+      log "[4/8] Installing GitHub CLI..."
+      retry "curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg -o /usr/share/keyrings/githubcli-archive-keyring.gpg"
+      echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+      retry "apt-get update"
+      retry "apt-get install -y gh"
+      log "GitHub CLI $(gh --version | head -1) installed"
+
+      log "[5/8] Installing Playwright dependencies..."
       # This can take a while, so we run with timeout
       timeout 300 npx playwright install-deps || {
         log_error "Playwright deps installation timed out or failed"
         log "Continuing anyway - Playwright can be installed in workflows"
       }
 
-      log "[5/7] Downloading GitHub Actions runner..."
+      log "[6/8] Downloading GitHub Actions runner..."
       mkdir -p $RUNNER_HOME
       chown $RUNNER_USER:$RUNNER_USER $RUNNER_HOME
       cd $RUNNER_HOME
@@ -169,7 +176,7 @@ write_files:
       chown -R $RUNNER_USER:$RUNNER_USER $RUNNER_HOME
       log "Runner extracted successfully"
 
-      log "[6/7] Registering runner with GitHub..."
+      log "[7/8] Registering runner with GitHub..."
       # Get registration token with error details
       REG_RESPONSE=$(curl -sf --retry 3 -X POST \
         -H "Authorization: token ${GITHUB_PAT}" \
@@ -201,7 +208,7 @@ write_files:
       }
       log "Runner configured successfully"
 
-      log "[7/7] Starting runner service..."
+      log "[8/8] Starting runner service..."
       ./svc.sh install $RUNNER_USER || {
         log_error "Failed to install runner service"
         exit 1
