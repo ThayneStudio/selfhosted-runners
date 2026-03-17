@@ -26,9 +26,9 @@ write_files:
   - path: /etc/github-runner/config.env
     permissions: '0600'
     content: |
-      GITHUB_PAT={{GITHUB_PAT}}
-      GITHUB_ORG={{GITHUB_ORG}}
-      RUNNER_LABELS=self-hosted,linux,x64
+      GITHUB_PAT="{{GITHUB_PAT}}"
+      GITHUB_ORG="{{GITHUB_ORG}}"
+      RUNNER_LABELS="self-hosted,linux,x64"
 
   - path: /opt/setup-runner.sh
     permissions: '0755'
@@ -124,20 +124,23 @@ write_files:
       fi
       log "Docker installed and running"
 
-      log "[3/8] Installing Node.js LTS..."
+      log "[3/8] Installing GitHub CLI..."
+      retry "curl -fsSL --retry 3 --retry-delay 2 https://cli.github.com/packages/githubcli-archive-keyring.gpg -o /tmp/gh.gpg"
+      gpg --dearmor -o /etc/apt/keyrings/githubcli-archive-keyring.gpg < /tmp/gh.gpg
+      chmod a+r /etc/apt/keyrings/githubcli-archive-keyring.gpg
+      rm /tmp/gh.gpg
+      echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+      retry "apt-get update"
+      retry "apt-get install -y gh"
+      log "GitHub CLI $(gh --version | head -1) installed"
+
+      log "[4/8] Installing Node.js LTS..."
       # Use official NodeSource with retry
       retry "curl -fsSL --retry 3 https://deb.nodesource.com/setup_lts.x -o /tmp/nodesource_setup.sh"
       bash /tmp/nodesource_setup.sh
       rm /tmp/nodesource_setup.sh
       retry "apt-get install -y nodejs"
       log "Node.js $(node --version) installed"
-
-      log "[4/8] Installing GitHub CLI..."
-      retry "curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg -o /usr/share/keyrings/githubcli-archive-keyring.gpg"
-      echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | tee /etc/apt/sources.list.d/github-cli.list > /dev/null
-      retry "apt-get update"
-      retry "apt-get install -y gh"
-      log "GitHub CLI $(gh --version | head -1) installed"
 
       log "[5/8] Installing Playwright dependencies..."
       # This can take a while, so we run with timeout
