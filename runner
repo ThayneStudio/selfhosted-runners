@@ -26,25 +26,41 @@ case "$COMMAND" in
     setup)
         exec "$SCRIPT_DIR/lib/setup.sh" "$@"
         ;;
+    add-org)
+        exec "$SCRIPT_DIR/lib/add-org.sh" "$@"
+        ;;
+    remove-org)
+        exec "$SCRIPT_DIR/lib/remove-org.sh" "$@"
+        ;;
+    list-orgs)
+        exec "$SCRIPT_DIR/lib/list-orgs.sh" "$@"
+        ;;
     help|--help|-h)
         echo "Usage: runner <command> [args]"
         echo ""
         echo "Commands:"
-        echo "  setup              Run the setup wizard"
-        echo "  create <name>      Create a new runner VM"
-        echo "  destroy <name>     Destroy a runner VM"
-        echo "  list               List all runner VMs"
-        echo "  help               Show this help"
+        echo "  setup                       Run the setup wizard"
+        echo "  create [--org <org>] <name> Create a new runner VM"
+        echo "  destroy <name>              Destroy a runner VM"
+        echo "  list                        List all runner VMs"
+        echo "  add-org                     Add a GitHub organization"
+        echo "  remove-org [<org>]          Remove a GitHub organization"
+        echo "  list-orgs                   List configured organizations"
+        echo "  help                        Show this help"
         echo ""
         echo "Examples:"
         echo "  runner setup"
         echo "  runner create runner-01"
+        echo "  runner create --org MyOrg runner-01"
         echo "  runner destroy runner-01"
         echo "  runner list"
+        echo "  runner add-org"
+        echo "  runner remove-org MyOrg"
+        echo "  runner list-orgs"
         ;;
     *)
-        echo "Unknown command: $COMMAND"
-        echo "Run 'runner help' for usage."
+        echo "Unknown command: $COMMAND" >&2
+        echo "Run 'runner help' for usage." >&2
         exit 1
         ;;
 esac

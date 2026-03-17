@@ -1,50 +1,30 @@
 #!/bin/bash
 set -euo pipefail
 
-# Colors for output
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-NC='\033[0m'
+source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/common.sh"
 
-log_info() { echo -e "${GREEN}[INFO]${NC} $1"; }
-log_warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
-log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
+require_root "create"
 
-# Resolve symlinks to find real script location
-SOURCE="${BASH_SOURCE[0]}"
-while [[ -L "$SOURCE" ]]; do
-    DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
-    SOURCE="$(readlink "$SOURCE")"
-    [[ "$SOURCE" != /* ]] && SOURCE="$DIR/$SOURCE"
+load_infra_config
+
+# Parse arguments: [--org <org>] <runner-name>
+ORG_FLAG=""
+RUNNER_NAME=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --org) [[ $# -ge 2 ]] || { log_error "--org requires a value"; exit 1; }; ORG_FLAG="$2"; shift 2 ;;
+        --org=*) ORG_FLAG="${1#--org=}"; [[ -n "$ORG_FLAG" ]] || { log_error "--org requires a value"; exit 1; }; shift ;;
+        -*) log_error "Unknown option: $1"; exit 1 ;;
+        *) [[ -z "$RUNNER_NAME" ]] || { log_error "Unexpected argument: $1"; exit 1; }; RUNNER_NAME="$1"; shift ;;
+    esac
 done
 
-# Load configuration
-CONFIG_FILE="/etc/github-runners.conf"
-if [[ ! -f "$CONFIG_FILE" ]]; then
-    log_error "Configuration not found at $CONFIG_FILE"
-    log_error "Run ./setup.sh first."
-    exit 1
-fi
-source "$CONFIG_FILE"
-
-# Validate required config variables
-for var in GITHUB_ORG GITHUB_PAT TEMPLATE_ID VM_STORAGE; do
-    if [[ -z "${!var:-}" ]]; then
-        log_error "Missing required config variable: $var"
-        log_error "Re-run ./setup.sh to fix configuration."
-        exit 1
-    fi
-done
-
-# Validate runner name argument
-RUNNER_NAME=${1:-}
 if [[ -z "$RUNNER_NAME" ]]; then
-    echo "Usage: ./create-runner.sh <runner-name>"
+    echo "Usage: runner create [--org <org>] <runner-name>"
     echo ""
     echo "Examples:"
-    echo "  ./create-runner.sh runner-01"
-    echo "  ./create-runner.sh build-worker-1"
+    echo "  runner create runner-01"
+    echo "  runner create --org MyOrg runner-01"
     exit 1
 fi
 
@@ -55,32 +35,56 @@ if [[ ! "$RUNNER_NAME" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]*$ ]]; then
     exit 1
 fi
 
-# Check if a VM with this name already exists
-EXISTING_VM=$(qm list | awk -v name="$RUNNER_NAME" '$2 == name {print $1}')
-if [[ -n "$EXISTING_VM" ]]; then
-    log_error "A VM named '$RUNNER_NAME' already exists (VMID: $EXISTING_VM)"
-    log_error "Choose a different name or destroy the existing VM first."
+# Select and load org
+SELECTED_ORG=$(select_org "$ORG_FLAG") || exit 1
+load_org_config "$SELECTED_ORG"
+
+# Validate required config variables
+for var in GITHUB_ORG GITHUB_PAT TEMPLATE_ID VM_STORAGE; do
+    if [[ -z "${!var:-}" ]]; then
+        log_error "Missing required config variable: $var"
+        log_error "Re-run 'runner setup' to fix configuration."
+        exit 1
+    fi
+done
+
+# Verify template exists
+if ! qm status "$TEMPLATE_ID" &> /dev/null; then
+    log_error "Template VM $TEMPLATE_ID does not exist"
+    log_error "Run 'runner setup' to create it."
     exit 1
 fi
 
-# Verify template exists
-if ! qm status $TEMPLATE_ID &> /dev/null; then
-    log_error "Template VM $TEMPLATE_ID does not exist"
-    log_error "Run ./setup.sh to create it."
+# Verify org cloud-init snippet exists
+if [[ ! -f "$SNIPPETS_DIR/runner-user-data-${SELECTED_ORG}.yaml" ]]; then
+    log_error "Cloud-init snippet for org '$SELECTED_ORG' not found"
+    log_error "Run 'runner add-org' to regenerate it."
     exit 1
 fi
 
 # Lock file to prevent race conditions
-LOCK_FILE="/tmp/github-runner-create.lock"
+LOCK_FILE="/var/lock/github-runner-create.lock"
 exec 200>"$LOCK_FILE"
 if ! flock -n 200; then
     log_error "Another runner creation is in progress. Please wait."
     exit 1
 fi
 
+# Check if a VM with this name already exists (inside lock to prevent race)
+QM_LIST=$(qm list) || { log_error "Failed to list VMs — is Proxmox running?"; exit 1; }
+EXISTING_VM=$(echo "$QM_LIST" | awk -v name="$RUNNER_NAME" '$2 == name {print $1}')
+if [[ -n "$EXISTING_VM" ]]; then
+    log_error "A VM named '$RUNNER_NAME' already exists (VMID: $EXISTING_VM)"
+    log_error "Choose a different name or destroy the existing VM first."
+    exit 1
+fi
+
 # Get next available VM ID (inside lock to prevent race)
-NEXT_ID=$(pvesh get /cluster/nextid)
-read -p "VM ID [$NEXT_ID]: " VMID
+if ! NEXT_ID=$(pvesh get /cluster/nextid 2>&1); then
+    log_error "Failed to get next VM ID from Proxmox: $NEXT_ID"
+    exit 1
+fi
+read -rp "VM ID [$NEXT_ID]: " VMID
 VMID=${VMID:-$NEXT_ID}
 
 # Validate VMID
@@ -88,9 +92,13 @@ if [[ ! "$VMID" =~ ^[0-9]+$ ]]; then
     log_error "VM ID must be a number"
     exit 1
 fi
+if [[ "$VMID" -lt 100 || "$VMID" -gt 999999999 ]]; then
+    log_error "VM ID must be between 100 and 999999999"
+    exit 1
+fi
 
 # Check if VMID is already in use
-if qm status $VMID &> /dev/null; then
+if qm status "$VMID" &> /dev/null; then
     log_error "VM ID $VMID is already in use"
     exit 1
 fi
@@ -103,58 +111,69 @@ echo "  VMID:     $VMID"
 echo "  Template: $TEMPLATE_ID"
 echo "  Org:      $GITHUB_ORG"
 echo ""
-read -p "Proceed? [Y/n]: " CONFIRM
-[[ "${CONFIRM:-Y}" =~ ^[Yy]$ ]] || exit 0
+read -rp "Proceed? [Y/n]: " CONFIRM
+[[ "${CONFIRM:-Y}" =~ ^[Yy]([Ee][Ss])?$ ]] || exit 0
+
+# Cleanup on failure after VM is cloned
+VM_CLONED=false
+cleanup_vm() {
+    if [[ "$VM_CLONED" == true ]]; then
+        log_warn "Cleaning up failed VM $VMID..."
+        rm -f "${SNIPPETS_DIR}/runner-${VMID}-meta.yaml"
+        qm stop "$VMID" --timeout 10 2>/dev/null || true
+        qm destroy "$VMID" --purge 2>/dev/null || true
+    fi
+}
+trap cleanup_vm EXIT
 
 log_info "Cloning template..."
-if ! qm clone $TEMPLATE_ID $VMID --name "$RUNNER_NAME" --full; then
+if ! qm clone "$TEMPLATE_ID" "$VMID" --name "$RUNNER_NAME" --full --storage "$VM_STORAGE"; then
     log_error "Failed to clone template"
     exit 1
 fi
+VM_CLONED=true
 
 log_info "Configuring cloud-init..."
 
 # Create per-VM meta-data for hostname
-cat > /var/lib/vz/snippets/runner-${VMID}-meta.yaml << METAEOF
-instance-id: $RUNNER_NAME
-local-hostname: $RUNNER_NAME
+cat > "${SNIPPETS_DIR}/runner-${VMID}-meta.yaml" << METAEOF
+instance-id: "$RUNNER_NAME"
+local-hostname: "$RUNNER_NAME"
 METAEOF
 
-if ! qm set $VMID --cicustom "user=local:snippets/runner-user-data.yaml,meta=local:snippets/runner-${VMID}-meta.yaml"; then
+if ! qm set "$VMID" --cicustom "user=local:snippets/runner-user-data-${SELECTED_ORG}.yaml,meta=local:snippets/runner-${VMID}-meta.yaml"; then
     log_error "Failed to set cloud-init config"
-    rm -f "/var/lib/vz/snippets/runner-${VMID}-meta.yaml"
-    qm destroy $VMID --purge 2>/dev/null || true
     exit 1
 fi
 
-if ! qm set $VMID --ipconfig0 ip=dhcp; then
+if ! qm set "$VMID" --ipconfig0 ip=dhcp; then
     log_error "Failed to set IP config"
-    qm destroy $VMID --purge 2>/dev/null || true
     exit 1
 fi
 
-if ! qm set $VMID --ciuser runner; then
+if ! qm set "$VMID" --ciuser runner; then
     log_error "Failed to set cloud-init user"
-    qm destroy $VMID --purge 2>/dev/null || true
     exit 1
 fi
 
 log_info "Starting VM..."
-if ! qm start $VMID; then
+if ! qm start "$VMID"; then
     log_error "Failed to start VM"
-    qm destroy $VMID --purge 2>/dev/null || true
     exit 1
 fi
 
-# Wait briefly and check if VM is running
+# VM start was accepted by Proxmox — disable destructive cleanup trap
+# from this point on. A transient status-check failure should not destroy
+# a VM that Proxmox already acknowledged starting.
+trap - EXIT
+
+# Wait briefly and verify VM is running (advisory check only)
 sleep 2
-VM_STATUS=$(qm status $VMID 2>/dev/null | awk '{print $2}')
+VM_STATUS=$(qm status "$VMID" 2>/dev/null | awk '{print $2}') || true
 if [[ "$VM_STATUS" != "running" ]]; then
-    log_error "VM failed to start (status: $VM_STATUS)"
-    exit 1
+    log_warn "VM may not be running yet (status: ${VM_STATUS:-unknown})"
+    log_warn "Check manually: qm status $VMID"
 fi
-
-# Release lock
 flock -u 200
 
 echo ""
