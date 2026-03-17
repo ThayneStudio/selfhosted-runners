@@ -215,12 +215,16 @@ else
         exit 1
     }
 
-    # Extract the disk volume from the "unused0:" line that importdisk reports
-    IMPORTED_DISK=$(echo "$IMPORT_OUTPUT" | sed -n 's/.*unused0:\s*\(\S\+\).*/\1/p' | head -1)
-    if [[ -z "$IMPORTED_DISK" ]]; then
+    # Extract the disk volume from importdisk output
+    # Typical output: "Successfully imported disk as 'unused0:storage:vm-9000-disk-0'"
+    if [[ "$IMPORT_OUTPUT" =~ unused0:([^\'\"[:space:]]+) ]]; then
+        IMPORTED_DISK="${BASH_REMATCH[1]}"
+    else
         # Fallback to conventional naming
         IMPORTED_DISK="${VM_STORAGE}:vm-${TEMPLATE_ID}-disk-0"
-        log_warn "Could not parse imported disk name from output, assuming: $IMPORTED_DISK"
+        log_warn "Could not parse imported disk name from importdisk output:"
+        log_warn "$IMPORT_OUTPUT"
+        log_warn "Assuming: $IMPORTED_DISK"
     fi
 
     if ! qm set "$TEMPLATE_ID" --scsihw virtio-scsi-pci \
