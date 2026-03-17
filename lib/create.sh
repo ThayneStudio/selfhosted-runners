@@ -7,24 +7,35 @@ require_root "create"
 
 load_infra_config
 
-# Parse arguments: [--org <org>] <runner-name>
+# Parse arguments: [--org <org>] [--labels <labels>] <runner-name>
 ORG_FLAG=""
+LABELS_FLAG=""
 RUNNER_NAME=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --org) [[ $# -ge 2 ]] || { log_error "--org requires a value"; exit 1; }; ORG_FLAG="$2"; shift 2 ;;
         --org=*) ORG_FLAG="${1#--org=}"; [[ -n "$ORG_FLAG" ]] || { log_error "--org requires a value"; exit 1; }; shift ;;
+        --labels) [[ $# -ge 2 ]] || { log_error "--labels requires a value"; exit 1; }; LABELS_FLAG="$2"; shift 2 ;;
+        --labels=*) LABELS_FLAG="${1#--labels=}"; [[ -n "$LABELS_FLAG" ]] || { log_error "--labels requires a value"; exit 1; }; shift ;;
         -*) log_error "Unknown option: $1"; exit 1 ;;
         *) [[ -z "$RUNNER_NAME" ]] || { log_error "Unexpected argument: $1"; exit 1; }; RUNNER_NAME="$1"; shift ;;
     esac
 done
 
 if [[ -z "$RUNNER_NAME" ]]; then
-    echo "Usage: runner create [--org <org>] <runner-name>"
+    echo "Usage: runner create [--org <org>] [--labels <labels>] <runner-name>"
     echo ""
     echo "Examples:"
     echo "  runner create runner-01"
     echo "  runner create --org MyOrg runner-01"
+    echo "  runner create --labels docker,gpu runner-01"
+    exit 1
+fi
+
+# Validate labels format (comma-separated alphanumeric with hyphens/underscores)
+if [[ -n "$LABELS_FLAG" && ! "$LABELS_FLAG" =~ ^[a-zA-Z0-9_-]+(,[a-zA-Z0-9_-]+)*$ ]]; then
+    log_error "Invalid labels format: $LABELS_FLAG"
+    log_error "Use comma-separated labels with letters, numbers, hyphens, underscores."
     exit 1
 fi
 
@@ -110,6 +121,11 @@ echo "  Name:     $RUNNER_NAME"
 echo "  VMID:     $VMID"
 echo "  Template: $TEMPLATE_ID"
 echo "  Org:      $GITHUB_ORG"
+if [[ -n "$LABELS_FLAG" ]]; then
+    echo "  Labels:   self-hosted,linux,x64,$LABELS_FLAG"
+else
+    echo "  Labels:   self-hosted,linux,x64 (default)"
+fi
 echo ""
 read -rp "Proceed? [Y/n]: " CONFIRM
 [[ "${CONFIRM:-Y}" =~ ^[Yy]([Ee][Ss])?$ ]] || exit 0
@@ -119,7 +135,7 @@ VM_CLONED=false
 cleanup_vm() {
     if [[ "$VM_CLONED" == true ]]; then
         log_warn "Cleaning up failed VM $VMID..."
-        rm -f "${SNIPPETS_DIR}/runner-${VMID}-meta.yaml"
+        rm -f "${SNIPPETS_DIR}/runner-${VMID}-meta.yaml" "${SNIPPETS_DIR}/runner-${VMID}-vendor.yaml"
         qm stop "$VMID" --timeout 10 2>/dev/null || true
         qm destroy "$VMID" --purge 2>/dev/null || true
     fi
@@ -141,7 +157,21 @@ instance-id: "$RUNNER_NAME"
 local-hostname: "$RUNNER_NAME"
 METAEOF
 
-if ! qm set "$VMID" --cicustom "user=local:snippets/runner-user-data-${SELECTED_ORG}.yaml,meta=local:snippets/runner-${VMID}-meta.yaml"; then
+# Create per-VM vendor-data to override labels if custom labels provided
+CICUSTOM="user=local:snippets/runner-user-data-${SELECTED_ORG}.yaml,meta=local:snippets/runner-${VMID}-meta.yaml"
+if [[ -n "$LABELS_FLAG" ]]; then
+    cat > "${SNIPPETS_DIR}/runner-${VMID}-vendor.yaml" << VENDOREOF
+#cloud-config
+write_files:
+  - path: /etc/github-runner/labels.env
+    permissions: '0600'
+    content: |
+      RUNNER_LABELS="self-hosted,linux,x64,$LABELS_FLAG"
+VENDOREOF
+    CICUSTOM="${CICUSTOM},vendor=local:snippets/runner-${VMID}-vendor.yaml"
+fi
+
+if ! qm set "$VMID" --cicustom "$CICUSTOM"; then
     log_error "Failed to set cloud-init config"
     exit 1
 fi

@@ -71,6 +71,11 @@ write_files:
 
       source /etc/github-runner/config.env
 
+      # Override labels if vendor-data provided a labels.env
+      if [[ -f /etc/github-runner/labels.env ]]; then
+        source /etc/github-runner/labels.env
+      fi
+
       # Validate required variables
       : ${GITHUB_PAT:?GITHUB_PAT not set}
       : ${GITHUB_ORG:?GITHUB_ORG not set}
