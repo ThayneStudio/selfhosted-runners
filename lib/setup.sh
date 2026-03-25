@@ -69,6 +69,14 @@ fi
 read -rp "Template VM ID [9000]: " TEMPLATE_ID
 TEMPLATE_ID=${TEMPLATE_ID:-9000}
 
+# Memory ballooning (0 = disabled)
+read -rp "Memory balloon, MB (0 = disabled) [0]: " BALLOON
+BALLOON=${BALLOON:-0}
+if [[ ! "$BALLOON" =~ ^[0-9]+$ ]]; then
+    log_error "Balloon must be a non-negative number"
+    exit 1
+fi
+
 # Validate template ID is a valid Proxmox VM ID (100-999999999)
 if [[ ! "$TEMPLATE_ID" =~ ^[0-9]+$ ]]; then
     log_error "Template ID must be a number"
@@ -86,6 +94,7 @@ echo "  Network Bridge: $NETWORK_BRIDGE"
 echo "  VLAN Tag:       ${VLAN_TAG:-none}"
 echo "  VM Storage:     $VM_STORAGE"
 echo "  Template ID:    $TEMPLATE_ID"
+echo "  Balloon:        ${BALLOON:-0} MB ($([ "${BALLOON:-0}" -eq 0 ] && echo "disabled" || echo "enabled"))"
 echo ""
 read -rp "Proceed? [Y/n]: " CONFIRM
 [[ "${CONFIRM:-Y}" =~ ^[Yy]([Ee][Ss])?$ ]] || exit 0
@@ -141,6 +150,7 @@ NETWORK_BRIDGE="$NETWORK_BRIDGE"
 VLAN_TAG="${VLAN_TAG}"
 VM_STORAGE="$VM_STORAGE"
 TEMPLATE_ID="$TEMPLATE_ID"
+BALLOON="$BALLOON"
 EOF
 chmod 600 "$CONF_TMP"
 mv "$CONF_TMP" "$CONFIG_FILE"
@@ -203,7 +213,7 @@ else
         NET_CONFIG="${NET_CONFIG},tag=$VLAN_TAG"
     fi
     if ! qm create "$TEMPLATE_ID" --name ubuntu-cloud-template \
-        --memory 8192 --cores 2 --cpu host --net0 "$NET_CONFIG"; then
+        --memory 8192 --balloon "$BALLOON" --cores 2 --cpu host --net0 "$NET_CONFIG"; then
         log_error "Failed to create VM"
         exit 1
     fi
