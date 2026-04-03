@@ -21,6 +21,14 @@ if ! command -v pvesm &> /dev/null; then
     exit 1
 fi
 
+if ! command -v jq &> /dev/null; then
+    log_info "Installing jq (required for runner recycling)..."
+    apt-get install -y jq > /dev/null 2>&1 || {
+        log_error "Failed to install jq. Install it manually: apt-get install jq"
+        exit 1
+    }
+fi
+
 # Check if template file exists
 if [[ ! -f "$REPO_DIR/templates/runner-user-data.yaml" ]]; then
     log_error "templates/runner-user-data.yaml not found in $REPO_DIR"
