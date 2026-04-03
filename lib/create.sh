@@ -212,8 +212,10 @@ if ! qm set "$VMID" --ciuser runner; then
     exit 1
 fi
 
-# Release lock — VMID is claimed in Proxmox, safe to let recycler proceed
+# Release lock and close fd — VMID is claimed in Proxmox, safe to let recycler proceed
+# Closing fd 200 prevents child processes (qm start → kvm) from inheriting the lock
 flock -u 200
+exec 200>&-
 
 # Show MAC and pause so user can configure DHCP static mapping
 echo ""
