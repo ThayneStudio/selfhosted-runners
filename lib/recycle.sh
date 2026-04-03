@@ -190,7 +190,11 @@ STATEEOF
         fi
 
         # Get next available VM ID
-        NEW_VMID=$(pvesh get /cluster/nextid 2>&1) || {
+        NEXTID_ARGS=""
+        if [[ "${MIN_VMID:-0}" -gt 0 ]]; then
+            NEXTID_ARGS="--vmid $MIN_VMID"
+        fi
+        NEW_VMID=$(pvesh get /cluster/nextid $NEXTID_ARGS 2>&1) || {
             log_recycle_err " $RUNNER_NAME — failed to get next VM ID: $NEW_VMID"
             exit 1
         }

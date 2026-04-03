@@ -77,6 +77,18 @@ fi
 read -rp "Template VM ID [9000]: " TEMPLATE_ID
 TEMPLATE_ID=${TEMPLATE_ID:-9000}
 
+# Minimum VM ID for runners (0 = use Proxmox default)
+read -rp "Minimum VM ID for runners (0 = auto) [0]: " MIN_VMID
+MIN_VMID=${MIN_VMID:-0}
+if [[ ! "$MIN_VMID" =~ ^[0-9]+$ ]]; then
+    log_error "Minimum VM ID must be a non-negative number"
+    exit 1
+fi
+if [[ "$MIN_VMID" -ne 0 && "$MIN_VMID" -lt 100 ]]; then
+    log_error "Minimum VM ID must be at least 100"
+    exit 1
+fi
+
 # Memory ballooning (0 = disabled)
 read -rp "Memory balloon, MB (0 = disabled) [0]: " BALLOON
 BALLOON=${BALLOON:-0}
@@ -102,6 +114,7 @@ echo "  Network Bridge: $NETWORK_BRIDGE"
 echo "  VLAN Tag:       ${VLAN_TAG:-none}"
 echo "  VM Storage:     $VM_STORAGE"
 echo "  Template ID:    $TEMPLATE_ID"
+echo "  Min VM ID:      $([ "${MIN_VMID:-0}" -eq 0 ] && echo "auto" || echo "$MIN_VMID")"
 echo "  Balloon:        ${BALLOON:-0} MB ($([ "${BALLOON:-0}" -eq 0 ] && echo "disabled" || echo "enabled"))"
 echo ""
 read -rp "Proceed? [Y/n]: " CONFIRM
@@ -158,6 +171,7 @@ NETWORK_BRIDGE="$NETWORK_BRIDGE"
 VLAN_TAG="${VLAN_TAG}"
 VM_STORAGE="$VM_STORAGE"
 TEMPLATE_ID="$TEMPLATE_ID"
+MIN_VMID="$MIN_VMID"
 BALLOON="$BALLOON"
 EOF
 chmod 600 "$CONF_TMP"

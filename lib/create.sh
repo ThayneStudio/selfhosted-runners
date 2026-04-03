@@ -90,7 +90,11 @@ if [[ -n "$EXISTING_VM" ]]; then
 fi
 
 # Get next available VM ID (inside lock to prevent race)
-if ! VMID=$(pvesh get /cluster/nextid 2>&1); then
+NEXTID_ARGS=""
+if [[ "${MIN_VMID:-0}" -gt 0 ]]; then
+    NEXTID_ARGS="--vmid $MIN_VMID"
+fi
+if ! VMID=$(pvesh get /cluster/nextid $NEXTID_ARGS 2>&1); then
     log_error "Failed to get next VM ID from Proxmox: $VMID"
     exit 1
 fi
@@ -139,7 +143,7 @@ if [[ -n "$EXISTING_VM" ]]; then
     log_error "A VM named '$RUNNER_NAME' was created while waiting (VMID: $EXISTING_VM)"
     exit 1
 fi
-if ! VMID=$(pvesh get /cluster/nextid 2>&1); then
+if ! VMID=$(pvesh get /cluster/nextid $NEXTID_ARGS 2>&1); then
     log_error "Failed to get next VM ID from Proxmox: $VMID"
     exit 1
 fi
