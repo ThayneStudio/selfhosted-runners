@@ -90,26 +90,8 @@ if [[ -n "$EXISTING_VM" ]]; then
 fi
 
 # Get next available VM ID (inside lock to prevent race)
-if ! NEXT_ID=$(pvesh get /cluster/nextid 2>&1); then
-    log_error "Failed to get next VM ID from Proxmox: $NEXT_ID"
-    exit 1
-fi
-read -rp "VM ID [$NEXT_ID]: " VMID
-VMID=${VMID:-$NEXT_ID}
-
-# Validate VMID
-if [[ ! "$VMID" =~ ^[0-9]+$ ]]; then
-    log_error "VM ID must be a number"
-    exit 1
-fi
-if [[ "$VMID" -lt 100 || "$VMID" -gt 999999999 ]]; then
-    log_error "VM ID must be between 100 and 999999999"
-    exit 1
-fi
-
-# Check if VMID is already in use
-if qm status "$VMID" &> /dev/null; then
-    log_error "VM ID $VMID is already in use"
+if ! VMID=$(pvesh get /cluster/nextid 2>&1); then
+    log_error "Failed to get next VM ID from Proxmox: $VMID"
     exit 1
 fi
 
@@ -151,14 +133,14 @@ flock -n 200 || {
     exit 1
 }
 
-# Re-validate VMID and name are still available
-if qm status "$VMID" &> /dev/null; then
-    log_error "VM ID $VMID was taken while waiting. Please try again."
-    exit 1
-fi
+# Re-validate name is still available and get fresh VMID
 EXISTING_VM=$(qm list | awk -v name="$RUNNER_NAME" '$2 == name {print $1}')
 if [[ -n "$EXISTING_VM" ]]; then
     log_error "A VM named '$RUNNER_NAME' was created while waiting (VMID: $EXISTING_VM)"
+    exit 1
+fi
+if ! VMID=$(pvesh get /cluster/nextid 2>&1); then
+    log_error "Failed to get next VM ID from Proxmox: $VMID"
     exit 1
 fi
 
