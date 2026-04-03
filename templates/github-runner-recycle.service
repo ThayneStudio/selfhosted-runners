@@ -1,0 +1,12 @@
+[Unit]
+Description=Recycle ephemeral GitHub Actions runners
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/runner recycle
+TimeoutStartSec=600
+MemoryMax=128M
+CPUQuota=25%
+SyslogIdentifier=github-runner-recycle

@@ -110,6 +110,18 @@ if [[ "$VM_STATUS" != "stopped" && "$VM_STATUS" != "unknown" ]]; then
     fi
 fi
 
+# Deregister runner from GitHub before destroying (best-effort)
+if [[ "$VM_ORG" != "unknown" ]]; then
+    log_info "Deregistering runner from GitHub..."
+    if deregister_runner "$VM_ORG" "$RUNNER_NAME"; then
+        log_info "Runner deregistered from GitHub."
+    else
+        log_warn "Could not deregister runner from GitHub."
+        echo "Remove it manually at:"
+        echo "  https://github.com/organizations/$VM_ORG/settings/actions/runners"
+    fi
+fi
+
 # Destroy VM
 log_info "Destroying VM..."
 if ! qm destroy "$VMID" --purge; then
@@ -118,18 +130,10 @@ if ! qm destroy "$VMID" --purge; then
     exit 1
 fi
 
-# Clean up per-VM snippets
+# Clean up per-VM snippets and runner state file
 rm -f "${SNIPPETS_DIR}/runner-${VMID}-meta.yaml" "${SNIPPETS_DIR}/runner-${VMID}-vendor.yaml"
+rm -f "${RUNNERS_DIR}/${RUNNER_NAME}.conf"
 
 echo ""
 log_info "Runner '$RUNNER_NAME' (VMID: $VMID) destroyed."
-echo ""
-if [[ "$VM_ORG" != "unknown" ]]; then
-    log_warn "The runner may still appear as 'Offline' in GitHub."
-    echo "Remove it manually at:"
-    echo "  https://github.com/organizations/$VM_ORG/settings/actions/runners"
-else
-    log_warn "The runner may still appear as 'Offline' in GitHub."
-    echo "Remove it manually from your organization's Actions settings."
-fi
 echo ""

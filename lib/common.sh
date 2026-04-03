@@ -31,8 +31,10 @@ REPO_DIR="$(cd "$LIB_DIR/.." && pwd)"
 # Path constants
 CONFIG_FILE="/etc/github-runners.conf"
 ORG_CONFIG_DIR="/etc/github-runners.d"
+RUNNERS_DIR="/etc/github-runners.d/runners"
 SNIPPETS_DIR="/var/lib/vz/snippets"
 INSTALL_DIR="/opt/selfhosted-runners"
+LOCK_FILE="/var/lock/github-runner.lock"
 
 # Check if running as root
 require_root() {
@@ -256,4 +258,37 @@ migrate_config_if_needed() {
     fi
 
     log_info "Migrated org '$old_org' to $ORG_CONFIG_DIR/${old_org}.conf"
+}
+
+# Deregister a runner from GitHub (best-effort, non-fatal)
+# Removes the runner registration so it doesn't linger as "Offline" in the GitHub UI.
+deregister_runner() {
+    local org="$1"
+    local runner_name="$2"
+
+    # Load org config to get PAT
+    local org_file="$ORG_CONFIG_DIR/${org}.conf"
+    [[ -f "$org_file" ]] || return 0
+
+    # Source org config in a subshell to avoid polluting caller's scope
+    local pat="" github_org=""
+    pat=$(source "$org_file" && echo "$GITHUB_PAT") || return 0
+    github_org=$(source "$org_file" && echo "$GITHUB_ORG") || return 0
+    [[ -n "$pat" && -n "$github_org" ]] || return 0
+
+    # Find runner ID by name (pass auth via file descriptor to avoid PAT in /proc/PID/cmdline)
+    local runner_id
+    runner_id=$(curl -sf --max-time 10 \
+        -H "Accept: application/vnd.github.v3+json" \
+        --config <(printf 'header = "Authorization: token %s"\n' "$pat") \
+        "https://api.github.com/orgs/${github_org}/actions/runners" 2>/dev/null \
+        | jq --arg name "$runner_name" -r '.runners[] | select(.name == $name) | .id' 2>/dev/null) || return 0
+
+    [[ -n "$runner_id" && "$runner_id" != "null" && "$runner_id" =~ ^[0-9]+$ ]] || return 0
+
+    # Delete the runner
+    curl -sf --max-time 10 -X DELETE \
+        -H "Accept: application/vnd.github.v3+json" \
+        --config <(printf 'header = "Authorization: token %s"\n' "$pat") \
+        "https://api.github.com/orgs/${github_org}/actions/runners/${runner_id}" 2>/dev/null || return 0
 }

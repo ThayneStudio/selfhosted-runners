@@ -101,7 +101,7 @@ read -rp "Proceed? [Y/n]: " CONFIRM
 
 # Install to /opt and create symlink
 echo ""
-log_info "[1/4] Installing to $INSTALL_DIR..."
+log_info "[1/6] Installing to $INSTALL_DIR..."
 if [[ "$REPO_DIR" != "$INSTALL_DIR" ]]; then
     mkdir -p "$INSTALL_DIR"
     cp -r "$REPO_DIR"/* "$INSTALL_DIR/"
@@ -118,7 +118,7 @@ ln -sf "$INSTALL_DIR/runner" /usr/local/bin/runner
 log_info "Command available: runner"
 
 # Enable snippets on local storage
-log_info "[2/4] Enabling snippets storage..."
+log_info "[2/6] Enabling snippets storage..."
 if ! pvesm status --content snippets 2>/dev/null | awk '{print $1}' | grep -qx "local"; then
     # Read current content types to avoid overwriting them
     EXISTING_CONTENT=$(awk '/^dir: local$/,/^[^[:space:]]/' /etc/pve/storage.cfg 2>/dev/null | awk '/^[[:space:]]+content/ {print $2}')
@@ -141,7 +141,7 @@ fi
 mkdir -p "$SNIPPETS_DIR"
 
 # Save infra config
-log_info "[3/4] Saving configuration..."
+log_info "[3/6] Saving configuration..."
 mkdir -p "$ORG_CONFIG_DIR"
 chmod 700 "$ORG_CONFIG_DIR"
 CONF_TMP=$(mktemp "${CONFIG_FILE}.XXXXXX")
@@ -157,11 +157,11 @@ mv "$CONF_TMP" "$CONFIG_FILE"
 
 # Check if template already exists
 if qm status "$TEMPLATE_ID" &> /dev/null; then
-    log_info "[4/4] Template VM $TEMPLATE_ID already exists. Skipping creation."
+    log_info "[4/6] Template VM $TEMPLATE_ID already exists. Skipping creation."
     log_warn "To recreate: qm destroy $TEMPLATE_ID && runner setup"
 else
     # Download and create template
-    log_info "[4/4] Creating Ubuntu cloud template..."
+    log_info "[4/6] Creating baked Ubuntu cloud template..."
     CLOUD_IMG="noble-server-cloudimg-amd64.img"
     CLOUD_IMG_URL="https://cloud-images.ubuntu.com/noble/current/$CLOUD_IMG"
 
@@ -254,10 +254,129 @@ else
     qm set "$TEMPLATE_ID" --serial0 socket --vga serial0 || { log_error "Failed to set serial"; qm destroy "$TEMPLATE_ID" --purge 2>/dev/null || true; exit 1; }
     qm set "$TEMPLATE_ID" --agent enabled=1 || { log_error "Failed to enable agent"; qm destroy "$TEMPLATE_ID" --purge 2>/dev/null || true; exit 1; }
     qm resize "$TEMPLATE_ID" scsi0 30G || { log_error "Failed to resize disk"; qm destroy "$TEMPLATE_ID" --purge 2>/dev/null || true; exit 1; }
-    qm template "$TEMPLATE_ID" || { log_error "Failed to convert to template"; qm destroy "$TEMPLATE_ID" --purge 2>/dev/null || true; exit 1; }
 
-    log_info "Template created successfully"
+    # Copy template-setup cloud-init to snippets and configure
+    log_info "Configuring template cloud-init..."
+    cp "$INSTALL_DIR/templates/template-setup.yaml" "$SNIPPETS_DIR/template-setup.yaml"
+    chmod 600 "$SNIPPETS_DIR/template-setup.yaml"
+
+    if ! qm set "$TEMPLATE_ID" --cicustom "user=local:snippets/template-setup.yaml"; then
+        log_error "Failed to set cloud-init config"
+        qm destroy "$TEMPLATE_ID" --purge 2>/dev/null || true
+        exit 1
+    fi
+    qm set "$TEMPLATE_ID" --ipconfig0 ip=dhcp || { log_error "Failed to set IP config"; qm destroy "$TEMPLATE_ID" --purge 2>/dev/null || true; exit 1; }
+    qm set "$TEMPLATE_ID" --ciuser runner || { log_error "Failed to set cloud-init user"; qm destroy "$TEMPLATE_ID" --purge 2>/dev/null || true; exit 1; }
+
+    # Cleanup trap for baking phase (set before start so interrupted starts are cleaned up)
+    cleanup_bake() {
+        log_warn "Baking failed, cleaning up template VM..."
+        qm stop "$TEMPLATE_ID" --timeout 30 2>/dev/null || true
+        qm destroy "$TEMPLATE_ID" --purge 2>/dev/null || true
+    }
+    trap cleanup_bake EXIT
+
+    # Boot VM to bake tools into the template
+    log_info "Starting VM to install tools (this takes 10-20 minutes)..."
+    if ! qm start "$TEMPLATE_ID"; then
+        log_error "Failed to start template VM"
+        exit 1
+    fi
+
+    # Poll for template setup completion (timeout: 20 minutes)
+    log_info "Waiting for tool installation to complete..."
+    log_info "  (Monitor progress: qm guest exec $TEMPLATE_ID -- cat /var/log/template-setup.log)"
+    BAKE_TIMEOUT=1200
+    BAKE_ELAPSED=0
+    BAKE_INTERVAL=15
+    BAKE_READY=false
+
+    while [[ $BAKE_ELAPSED -lt $BAKE_TIMEOUT ]]; do
+        sleep $BAKE_INTERVAL
+        BAKE_ELAPSED=$((BAKE_ELAPSED + BAKE_INTERVAL))
+
+        # Check if VM is still running (it will poweroff after setup completes)
+        VM_STATUS=$(qm status "$TEMPLATE_ID" 2>/dev/null | awk '{print $2}') || true
+        if [[ "$VM_STATUS" != "running" ]]; then
+            # VM powered off — setup succeeded (poweroff only runs if marker exists)
+            BAKE_READY=true
+            echo "" >&2
+            log_info "Template VM powered off (setup complete)"
+            break
+        fi
+
+        # Try to check for completion marker via guest agent
+        EXEC_RESULT=$(qm guest exec "$TEMPLATE_ID" -- test -f /opt/.template-setup-complete 2>&1) || {
+            # Guest agent not ready yet (still installing qemu-guest-agent)
+            MINUTES=$((BAKE_ELAPSED / 60))
+            SECONDS_REM=$((BAKE_ELAPSED % 60))
+            printf '\r  Elapsed: %dm%02ds / %dm (waiting for guest agent...)' "$MINUTES" "$SECONDS_REM" "$((BAKE_TIMEOUT / 60))" >&2
+            continue
+        }
+
+        # Parse exit code from guest exec JSON response
+        EXEC_EXIT=$(echo "$EXEC_RESULT" | jq -r '.exitcode // "1"' 2>/dev/null) || EXEC_EXIT="1"
+        if [[ "$EXEC_EXIT" == "0" ]]; then
+            BAKE_READY=true
+            echo "" >&2
+            log_info "Template setup complete!"
+            break
+        fi
+
+        MINUTES=$((BAKE_ELAPSED / 60))
+        SECONDS_REM=$((BAKE_ELAPSED % 60))
+        printf '\r  Elapsed: %dm%02ds / %dm (installing tools...)' "$MINUTES" "$SECONDS_REM" "$((BAKE_TIMEOUT / 60))" >&2
+    done
+    echo "" >&2
+
+    if [[ "$BAKE_READY" != true ]]; then
+        log_error "Template setup timed out after $((BAKE_TIMEOUT / 60)) minutes"
+        log_error "The VM is still running — setup may have failed."
+        log_error "Check logs: qm guest exec $TEMPLATE_ID -- cat /var/log/template-setup.log"
+        exit 1
+    fi
+
+    # Stop VM if still running
+    VM_STATUS=$(qm status "$TEMPLATE_ID" 2>/dev/null | awk '{print $2}') || true
+    if [[ "$VM_STATUS" == "running" ]]; then
+        log_info "Stopping template VM..."
+        qm stop "$TEMPLATE_ID" --timeout 60 || {
+            log_warn "Graceful stop failed, forcing..."
+            qm stop "$TEMPLATE_ID" --skiplock 2>/dev/null || true
+        }
+        # Wait for stopped state
+        for i in {1..30}; do
+            VM_STATUS=$(qm status "$TEMPLATE_ID" 2>/dev/null | awk '{print $2}') || true
+            [[ "$VM_STATUS" == "stopped" ]] && break
+            sleep 2
+        done
+    fi
+
+    # Clear bake-time cloud-init settings so clones start fresh
+    log_info "Preparing template for cloning..."
+    qm set "$TEMPLATE_ID" --delete cicustom 2>/dev/null || true
+    qm set "$TEMPLATE_ID" --delete ciuser 2>/dev/null || true
+    qm set "$TEMPLATE_ID" --delete ipconfig0 2>/dev/null || true
+
+    # Convert to template
+    qm template "$TEMPLATE_ID" || { log_error "Failed to convert to template"; exit 1; }
+
+    # Disable cleanup trap — template created successfully
+    trap - EXIT
+
+    log_info "Template created successfully (tools baked in)"
 fi
+
+log_info "[5/6] Installing recycle timer..."
+cp "$INSTALL_DIR/templates/github-runner-recycle.service" /etc/systemd/system/
+cp "$INSTALL_DIR/templates/github-runner-recycle.timer" /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now github-runner-recycle.timer 2>/dev/null || true
+log_info "Recycle timer installed (120s interval)"
+
+log_info "[6/6] Preparing runner state directory..."
+mkdir -p "$RUNNERS_DIR"
+chmod 700 "$RUNNERS_DIR"
 
 echo ""
 echo "========================================"

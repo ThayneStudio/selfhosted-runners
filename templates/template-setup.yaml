@@ -1,0 +1,181 @@
+#cloud-config
+
+users:
+  - name: runner
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+    groups: docker
+
+package_update: true
+package_upgrade: true
+
+packages:
+  - ca-certificates
+  - curl
+  - gnupg
+  - jq
+  - unzip
+  - build-essential
+  - git
+  - wget
+  - apt-transport-https
+  - software-properties-common
+  - qemu-guest-agent
+
+write_files:
+  - path: /opt/setup-template.sh
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      set -euo pipefail
+
+      # Logging with timestamps
+      log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"; }
+      log_error() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: $1" >&2; }
+
+      # Retry wrapper for network operations
+      retry() {
+        local max_attempts=3
+        local delay=5
+        local attempt=1
+        local cmd="$@"
+
+        while [[ $attempt -le $max_attempts ]]; do
+          log "Attempt $attempt/$max_attempts: $cmd"
+          if eval "$cmd"; then
+            return 0
+          fi
+          log "Attempt $attempt failed, waiting ${delay}s..."
+          sleep $delay
+          ((attempt++))
+          delay=$((delay * 2))
+        done
+        log_error "All $max_attempts attempts failed for: $cmd"
+        return 1
+      }
+
+      log "=== Template Setup: Installing Tools ==="
+
+      # Check disk space (need at least 5GB free)
+      FREE_SPACE=$(df -BG /home | tail -1 | awk '{print $4}' | tr -d 'G')
+      if [[ "$FREE_SPACE" -lt 5 ]]; then
+        log_error "Insufficient disk space: ${FREE_SPACE}GB free, need at least 5GB"
+        exit 1
+      fi
+      log "Disk space check passed: ${FREE_SPACE}GB free"
+
+      # Wait for network connectivity
+      log "[1/7] Checking network connectivity..."
+      for i in {1..30}; do
+        if curl -sf --max-time 5 https://github.com > /dev/null 2>&1; then
+          log "Network connectivity confirmed"
+          break
+        fi
+        if [[ $i -eq 30 ]]; then
+          log_error "No network connectivity after 30 attempts"
+          exit 1
+        fi
+        log "Waiting for network... ($i/30)"
+        sleep 2
+      done
+
+      log "[2/7] Installing Docker..."
+      install -m 0755 -d /etc/apt/keyrings
+
+      # Docker GPG key with retry
+      retry "curl -fsSL --retry 3 --retry-delay 2 https://download.docker.com/linux/ubuntu/gpg -o /tmp/docker.gpg"
+      gpg --dearmor -o /etc/apt/keyrings/docker.gpg < /tmp/docker.gpg
+      chmod a+r /etc/apt/keyrings/docker.gpg
+      rm /tmp/docker.gpg
+
+      echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
+
+      retry "apt-get update"
+      retry "apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin"
+
+      # Verify Docker is running
+      if ! systemctl is-active --quiet docker; then
+        log "Starting Docker service..."
+        systemctl start docker
+        systemctl enable docker
+      fi
+      # Ensure runner user is in docker group (cloud-init may have created
+      # the user before the docker group existed)
+      usermod -aG docker runner
+      log "Docker installed and running"
+
+      log "[3/7] Installing GitHub CLI..."
+      retry "curl -fsSL --retry 3 --retry-delay 2 https://cli.github.com/packages/githubcli-archive-keyring.gpg -o /tmp/gh.gpg"
+      gpg --dearmor -o /etc/apt/keyrings/githubcli-archive-keyring.gpg < /tmp/gh.gpg
+      chmod a+r /etc/apt/keyrings/githubcli-archive-keyring.gpg
+      rm /tmp/gh.gpg
+      echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+      retry "apt-get update"
+      retry "apt-get install -y gh"
+      log "GitHub CLI $(gh --version | head -1) installed"
+
+      log "[4/7] Installing Node.js LTS..."
+      retry "curl -fsSL --retry 3 https://deb.nodesource.com/setup_lts.x -o /tmp/nodesource_setup.sh"
+      bash /tmp/nodesource_setup.sh
+      rm /tmp/nodesource_setup.sh
+      retry "apt-get install -y nodejs"
+      log "Node.js $(node --version) installed"
+
+      log "[5/7] Installing Playwright dependencies..."
+      timeout 300 npx playwright install-deps || {
+        log_error "Playwright deps installation timed out or failed"
+        log "Continuing anyway - Playwright can be installed in workflows"
+      }
+
+      log "[6/7] Downloading GitHub Actions runner..."
+      RUNNER_HOME=/home/runner/actions-runner
+      RUNNER_USER=runner
+      mkdir -p $RUNNER_HOME
+      chown $RUNNER_USER:$RUNNER_USER $RUNNER_HOME
+      cd $RUNNER_HOME
+
+      # Get latest runner version with validation
+      RUNNER_VERSION=$(curl -sf --retry 3 https://api.github.com/repos/actions/runner/releases/latest | jq -r .tag_name | sed 's/v//')
+      if [[ -z "$RUNNER_VERSION" || "$RUNNER_VERSION" == "null" ]]; then
+        log_error "Failed to get runner version from GitHub API"
+        exit 1
+      fi
+      log "Latest runner version: $RUNNER_VERSION"
+
+      RUNNER_URL="https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-linux-x64-${RUNNER_VERSION}.tar.gz"
+      retry "curl -fsSL --retry 3 -o actions-runner.tar.gz '$RUNNER_URL'"
+
+      # Verify download
+      if [[ ! -s actions-runner.tar.gz ]]; then
+        log_error "Runner download is empty or missing"
+        exit 1
+      fi
+
+      tar xzf actions-runner.tar.gz || {
+        log_error "Failed to extract runner archive"
+        exit 1
+      }
+      rm actions-runner.tar.gz
+      chown -R $RUNNER_USER:$RUNNER_USER $RUNNER_HOME
+
+      # Install runner .NET/ICU runtime dependencies
+      ./bin/installdependencies.sh || {
+        log_error "Failed to install runner dependencies"
+        exit 1
+      }
+      log "Runner extracted and dependencies installed"
+
+      log "[7/7] Cleaning up for template conversion..."
+      apt-get clean
+      rm -rf /tmp/* /var/tmp/*
+      truncate -s 0 /var/log/*.log 2>/dev/null || true
+
+      # Mark template setup as complete
+      touch /opt/.template-setup-complete
+
+      log "=== Template setup complete! ==="
+      log "Installed: Docker, GitHub CLI, Node.js, Playwright deps, Actions runner"
+
+runcmd:
+  - /opt/setup-template.sh 2>&1 | tee /var/log/template-setup.log
+  - bash -c 'test -f /opt/.template-setup-complete && { cloud-init clean --logs; poweroff; }'

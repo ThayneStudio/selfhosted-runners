@@ -1,27 +1,5 @@
 #cloud-config
 
-users:
-  - name: runner
-    sudo: ALL=(ALL) NOPASSWD:ALL
-    shell: /bin/bash
-    groups: docker
-
-package_update: true
-package_upgrade: true
-
-packages:
-  - ca-certificates
-  - curl
-  - gnupg
-  - jq
-  - unzip
-  - build-essential
-  - git
-  - wget
-  - apt-transport-https
-  - software-properties-common
-  - qemu-guest-agent
-
 write_files:
   - path: /etc/github-runner/config.env
     permissions: '0600'
@@ -30,7 +8,7 @@ write_files:
       GITHUB_ORG="{{GITHUB_ORG}}"
       RUNNER_LABELS="self-hosted,linux,x64"
 
-  - path: /opt/setup-runner.sh
+  - path: /opt/register-runner.sh
     permissions: '0755'
     content: |
       #!/bin/bash
@@ -40,28 +18,7 @@ write_files:
       log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"; }
       log_error() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: $1" >&2; }
 
-      # Retry wrapper for network operations
-      retry() {
-        local max_attempts=3
-        local delay=5
-        local attempt=1
-        local cmd="$@"
-
-        while [[ $attempt -le $max_attempts ]]; do
-          log "Attempt $attempt/$max_attempts: $cmd"
-          if eval "$cmd"; then
-            return 0
-          fi
-          log "Attempt $attempt failed, waiting ${delay}s..."
-          sleep $delay
-          ((attempt++))
-          delay=$((delay * 2))
-        done
-        log_error "All $max_attempts attempts failed for: $cmd"
-        return 1
-      }
-
-      log "=== GitHub Actions Runner Setup ==="
+      log "=== GitHub Actions Runner Registration ==="
 
       # Validate environment
       if [[ ! -f /etc/github-runner/config.env ]]; then
@@ -84,16 +41,17 @@ write_files:
       RUNNER_HOME=/home/runner/actions-runner
       RUNNER_USER=runner
 
-      # Check disk space (need at least 5GB free)
-      FREE_SPACE=$(df -BG /home | tail -1 | awk '{print $4}' | tr -d 'G')
-      if [[ "$FREE_SPACE" -lt 5 ]]; then
-        log_error "Insufficient disk space: ${FREE_SPACE}GB free, need at least 5GB"
+      # Verify runner binary exists (should be baked into template)
+      if [[ ! -f "$RUNNER_HOME/config.sh" ]]; then
+        log_error "Runner binary not found at $RUNNER_HOME/config.sh"
+        log_error "The VM template may not have been baked correctly. Re-run 'runner setup'."
         exit 1
       fi
-      log "Disk space check passed: ${FREE_SPACE}GB free"
+
+      cd $RUNNER_HOME
 
       # Wait for network connectivity
-      log "[1/8] Checking network connectivity..."
+      log "[1/3] Checking network connectivity..."
       for i in {1..30}; do
         if curl -sf --max-time 5 https://github.com > /dev/null 2>&1; then
           log "Network connectivity confirmed"
@@ -107,88 +65,12 @@ write_files:
         sleep 2
       done
 
-      log "[2/8] Installing Docker..."
-      install -m 0755 -d /etc/apt/keyrings
-
-      # Docker GPG key with retry
-      retry "curl -fsSL --retry 3 --retry-delay 2 https://download.docker.com/linux/ubuntu/gpg -o /tmp/docker.gpg"
-      gpg --dearmor -o /etc/apt/keyrings/docker.gpg < /tmp/docker.gpg
-      chmod a+r /etc/apt/keyrings/docker.gpg
-      rm /tmp/docker.gpg
-
-      echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
-
-      retry "apt-get update"
-      retry "apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin"
-
-      # Verify Docker is running
-      if ! systemctl is-active --quiet docker; then
-        log "Starting Docker service..."
-        systemctl start docker
-        systemctl enable docker
-      fi
-      log "Docker installed and running"
-
-      log "[3/8] Installing GitHub CLI..."
-      retry "curl -fsSL --retry 3 --retry-delay 2 https://cli.github.com/packages/githubcli-archive-keyring.gpg -o /tmp/gh.gpg"
-      gpg --dearmor -o /etc/apt/keyrings/githubcli-archive-keyring.gpg < /tmp/gh.gpg
-      chmod a+r /etc/apt/keyrings/githubcli-archive-keyring.gpg
-      rm /tmp/gh.gpg
-      echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | tee /etc/apt/sources.list.d/github-cli.list > /dev/null
-      retry "apt-get update"
-      retry "apt-get install -y gh"
-      log "GitHub CLI $(gh --version | head -1) installed"
-
-      log "[4/8] Installing Node.js LTS..."
-      # Use official NodeSource with retry
-      retry "curl -fsSL --retry 3 https://deb.nodesource.com/setup_lts.x -o /tmp/nodesource_setup.sh"
-      bash /tmp/nodesource_setup.sh
-      rm /tmp/nodesource_setup.sh
-      retry "apt-get install -y nodejs"
-      log "Node.js $(node --version) installed"
-
-      log "[5/8] Installing Playwright dependencies..."
-      # This can take a while, so we run with timeout
-      timeout 300 npx playwright install-deps || {
-        log_error "Playwright deps installation timed out or failed"
-        log "Continuing anyway - Playwright can be installed in workflows"
-      }
-
-      log "[6/8] Downloading GitHub Actions runner..."
-      mkdir -p $RUNNER_HOME
-      chown $RUNNER_USER:$RUNNER_USER $RUNNER_HOME
-      cd $RUNNER_HOME
-
-      # Get latest runner version with validation
-      RUNNER_VERSION=$(curl -sf --retry 3 https://api.github.com/repos/actions/runner/releases/latest | jq -r .tag_name | sed 's/v//')
-      if [[ -z "$RUNNER_VERSION" || "$RUNNER_VERSION" == "null" ]]; then
-        log_error "Failed to get runner version from GitHub API"
-        exit 1
-      fi
-      log "Latest runner version: $RUNNER_VERSION"
-
-      RUNNER_URL="https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-linux-x64-${RUNNER_VERSION}.tar.gz"
-      retry "curl -fsSL --retry 3 -o actions-runner.tar.gz '$RUNNER_URL'"
-
-      # Verify download
-      if [[ ! -s actions-runner.tar.gz ]]; then
-        log_error "Runner download is empty or missing"
-        exit 1
-      fi
-
-      tar xzf actions-runner.tar.gz || {
-        log_error "Failed to extract runner archive"
-        exit 1
-      }
-      rm actions-runner.tar.gz
-      chown -R $RUNNER_USER:$RUNNER_USER $RUNNER_HOME
-      log "Runner extracted successfully"
-
-      log "[7/8] Registering runner with GitHub..."
+      log "[2/3] Registering runner with GitHub..."
       # Get registration token with error details
+      # Pass auth header via file descriptor to avoid leaking PAT in /proc/PID/cmdline
       REG_RESPONSE=$(curl -sf --retry 3 -X POST \
-        -H "Authorization: token ${GITHUB_PAT}" \
         -H "Accept: application/vnd.github.v3+json" \
+        --config <(printf 'header = "Authorization: token %s"\n' "$GITHUB_PAT") \
         "https://api.github.com/orgs/${GITHUB_ORG}/actions/runners/registration-token" 2>&1) || {
         log_error "Failed to get registration token from GitHub API"
         log_error "Response: $REG_RESPONSE"
@@ -203,20 +85,21 @@ write_files:
         exit 1
       fi
 
-      # Configure runner
+      # Configure runner as ephemeral
       sudo -u $RUNNER_USER ./config.sh \
         --url "https://github.com/${GITHUB_ORG}" \
         --token "$REG_TOKEN" \
         --name "$(hostname)" \
         --labels "$RUNNER_LABELS" \
         --unattended \
-        --replace || {
+        --replace \
+        --ephemeral || {
         log_error "Runner configuration failed"
         exit 1
       }
-      log "Runner configured successfully"
+      log "Runner configured successfully (ephemeral mode)"
 
-      log "[8/8] Starting runner service..."
+      log "[3/3] Starting runner service..."
       ./svc.sh install $RUNNER_USER || {
         log_error "Failed to install runner service"
         exit 1
@@ -236,12 +119,16 @@ write_files:
         exit 1
       fi
 
+      # Signal that the runner is ready (used by recycler to avoid false recycles)
+      touch /opt/.runner-ready
+
       echo ""
-      log "=== Runner setup complete! ==="
+      log "=== Runner registration complete! ==="
       log "Runner name: $(hostname)"
       log "Labels: $RUNNER_LABELS"
       log "Organization: $GITHUB_ORG"
+      log "Mode: ephemeral (single job, then exit)"
       echo ""
 
 runcmd:
-  - /opt/setup-runner.sh 2>&1 | tee /var/log/runner-setup.log
+  - /opt/register-runner.sh 2>&1 | tee /var/log/runner-setup.log

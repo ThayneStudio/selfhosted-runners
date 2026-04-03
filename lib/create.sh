@@ -73,8 +73,7 @@ if [[ ! -f "$SNIPPETS_DIR/runner-user-data-${SELECTED_ORG}.yaml" ]]; then
     exit 1
 fi
 
-# Lock file to prevent race conditions
-LOCK_FILE="/var/lock/github-runner-create.lock"
+# Lock file to prevent race conditions (shared with recycle.sh)
 exec 200>"$LOCK_FILE"
 if ! flock -n 200; then
     log_error "Another runner creation is in progress. Please wait."
@@ -114,6 +113,9 @@ if qm status "$VMID" &> /dev/null; then
     exit 1
 fi
 
+# Release lock during interactive prompts so recycler isn't blocked
+flock -u 200
+
 # Show confirmation
 echo ""
 echo "Creating runner:"
@@ -126,6 +128,7 @@ if [[ -n "$LABELS_FLAG" ]]; then
 else
     echo "  Labels:   self-hosted,linux,x64 (default)"
 fi
+echo "  Mode:     ephemeral"
 echo ""
 read -rp "Proceed? [Y/n]: " CONFIRM
 [[ "${CONFIRM:-Y}" =~ ^[Yy]([Ee][Ss])?$ ]] || exit 0
@@ -142,12 +145,33 @@ cleanup_vm() {
 }
 trap cleanup_vm EXIT
 
+# Re-acquire lock for clone (VMID may have been taken during prompts)
+flock -n 200 || {
+    log_error "Another operation is in progress. Please try again."
+    exit 1
+}
+
+# Re-validate VMID and name are still available
+if qm status "$VMID" &> /dev/null; then
+    log_error "VM ID $VMID was taken while waiting. Please try again."
+    exit 1
+fi
+EXISTING_VM=$(qm list | awk -v name="$RUNNER_NAME" '$2 == name {print $1}')
+if [[ -n "$EXISTING_VM" ]]; then
+    log_error "A VM named '$RUNNER_NAME' was created while waiting (VMID: $EXISTING_VM)"
+    exit 1
+fi
+
 log_info "Cloning template..."
 if ! qm clone "$TEMPLATE_ID" "$VMID" --name "$RUNNER_NAME" --full --storage "$VM_STORAGE"; then
     log_error "Failed to clone template"
     exit 1
 fi
 VM_CLONED=true
+
+# Capture MAC address for DHCP static mapping (e.g., pfSense)
+NET0_LINE=$(qm config "$VMID" | grep '^net0:' | sed 's/^net0: //') || true
+MAC_ADDRESS=$(echo "$NET0_LINE" | sed -n 's/.*virtio=\([^,]*\).*/\1/p') || true
 
 log_info "Configuring cloud-init..."
 
@@ -156,6 +180,7 @@ cat > "${SNIPPETS_DIR}/runner-${VMID}-meta.yaml" << METAEOF
 instance-id: "$RUNNER_NAME"
 local-hostname: "$RUNNER_NAME"
 METAEOF
+chmod 600 "${SNIPPETS_DIR}/runner-${VMID}-meta.yaml"
 
 # Create per-VM vendor-data to override labels if custom labels provided
 CICUSTOM="user=local:snippets/runner-user-data-${SELECTED_ORG}.yaml,meta=local:snippets/runner-${VMID}-meta.yaml"
@@ -168,6 +193,7 @@ write_files:
     content: |
       RUNNER_LABELS="self-hosted,linux,x64,$LABELS_FLAG"
 VENDOREOF
+    chmod 600 "${SNIPPETS_DIR}/runner-${VMID}-vendor.yaml"
     CICUSTOM="${CICUSTOM},vendor=local:snippets/runner-${VMID}-vendor.yaml"
 fi
 
@@ -184,6 +210,22 @@ fi
 if ! qm set "$VMID" --ciuser runner; then
     log_error "Failed to set cloud-init user"
     exit 1
+fi
+
+# Release lock — VMID is claimed in Proxmox, safe to let recycler proceed
+flock -u 200
+
+# Show MAC and pause so user can configure DHCP static mapping
+echo ""
+log_info "Runner '$RUNNER_NAME' cloned successfully (VMID: $VMID)"
+if [[ -n "$MAC_ADDRESS" ]]; then
+    echo "  MAC: $MAC_ADDRESS"
+    echo ""
+    echo "Configure a static DHCP lease for this MAC in your router,"
+    read -rp "then press Enter to start the VM. "
+else
+    log_warn "Could not detect MAC address"
+    read -rp "Press Enter to start the VM. "
 fi
 
 log_info "Starting VM..."
@@ -204,16 +246,31 @@ if [[ "$VM_STATUS" != "running" ]]; then
     log_warn "VM may not be running yet (status: ${VM_STATUS:-unknown})"
     log_warn "Check manually: qm status $VMID"
 fi
-flock -u 200
+
+# Write per-runner state file (used by recycler for MAC preservation + auto-recycle)
+mkdir -p "$RUNNERS_DIR"
+chmod 700 "$RUNNERS_DIR"
+STATE_TMP=$(mktemp "${RUNNERS_DIR}/.${RUNNER_NAME}.XXXXXX")
+cat > "$STATE_TMP" << STATEEOF
+RUNNER_NAME="$RUNNER_NAME"
+VMID="$VMID"
+ORG="$SELECTED_ORG"
+MAC_ADDRESS="$MAC_ADDRESS"
+LABELS="$LABELS_FLAG"
+CREATED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+LAST_RECYCLED_AT=""
+STATEEOF
+chmod 600 "$STATE_TMP"
+mv "$STATE_TMP" "${RUNNERS_DIR}/${RUNNER_NAME}.conf"
 
 echo ""
-log_info "Runner '$RUNNER_NAME' created successfully (VMID: $VMID)"
+log_info "Runner '$RUNNER_NAME' started (VMID: $VMID)"
 echo ""
-echo "The runner will appear in GitHub in ~2-3 minutes:"
+echo "The runner will appear in GitHub in ~30 seconds:"
 echo "  https://github.com/organizations/$GITHUB_ORG/settings/actions/runners"
 echo ""
-echo "To watch setup progress:"
-echo "  qm guest exec $VMID -- tail -f /var/log/cloud-init-output.log"
+echo "To watch registration progress:"
+echo "  qm guest exec $VMID -- cat /var/log/runner-setup.log"
 echo ""
 echo "To check runner service status:"
 echo "  qm guest exec $VMID -- systemctl status actions.runner.*"
