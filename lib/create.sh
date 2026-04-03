@@ -90,13 +90,17 @@ if [[ -n "$EXISTING_VM" ]]; then
 fi
 
 # Get next available VM ID (inside lock to prevent race)
-NEXTID_ARGS=""
 if [[ "${MIN_VMID:-0}" -gt 0 ]]; then
-    NEXTID_ARGS="--vmid $MIN_VMID"
-fi
-if ! VMID=$(pvesh get /cluster/nextid $NEXTID_ARGS 2>&1); then
-    log_error "Failed to get next VM ID from Proxmox: $VMID"
-    exit 1
+    # Find next free VMID starting from MIN_VMID
+    VMID="$MIN_VMID"
+    while qm status "$VMID" &>/dev/null 2>&1; do
+        VMID=$((VMID + 1))
+    done
+else
+    if ! VMID=$(pvesh get /cluster/nextid 2>&1); then
+        log_error "Failed to get next VM ID from Proxmox: $VMID"
+        exit 1
+    fi
 fi
 
 # Release lock and close fd during interactive prompts so recycler isn't blocked
@@ -146,9 +150,16 @@ if [[ -n "$EXISTING_VM" ]]; then
     log_error "A VM named '$RUNNER_NAME' was created while waiting (VMID: $EXISTING_VM)"
     exit 1
 fi
-if ! VMID=$(pvesh get /cluster/nextid $NEXTID_ARGS 2>&1); then
-    log_error "Failed to get next VM ID from Proxmox: $VMID"
-    exit 1
+if [[ "${MIN_VMID:-0}" -gt 0 ]]; then
+    VMID="$MIN_VMID"
+    while qm status "$VMID" &>/dev/null 2>&1; do
+        VMID=$((VMID + 1))
+    done
+else
+    if ! VMID=$(pvesh get /cluster/nextid 2>&1); then
+        log_error "Failed to get next VM ID from Proxmox: $VMID"
+        exit 1
+    fi
 fi
 
 log_info "Cloning template..."
