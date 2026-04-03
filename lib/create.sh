@@ -99,8 +99,10 @@ if ! VMID=$(pvesh get /cluster/nextid $NEXTID_ARGS 2>&1); then
     exit 1
 fi
 
-# Release lock during interactive prompts so recycler isn't blocked
+# Release lock and close fd during interactive prompts so recycler isn't blocked
+# and no child processes inherit the fd
 flock -u 200
+exec 200>&-
 
 # Show confirmation
 echo ""
@@ -132,6 +134,7 @@ cleanup_vm() {
 trap cleanup_vm EXIT
 
 # Re-acquire lock for clone (VMID may have been taken during prompts)
+exec 200>"$LOCK_FILE"
 flock -n 200 || {
     log_error "Another operation is in progress. Please try again."
     exit 1
