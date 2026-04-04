@@ -21,14 +21,22 @@ if [[ ${#STATE_FILES[@]} -eq 0 ]]; then
     exit 0
 fi
 
-RECYCLE_COUNT=0
-ERROR_COUNT=0
+# Concurrency limit for parallel recycles (default 3)
+MAX_CONCURRENT="${MAX_CONCURRENT_RECYCLES:-3}"
 
 log_recycle() { log_info "[recycle] $1"; }
 log_recycle_warn() { log_warn "[recycle] $1"; }
 log_recycle_err() { log_error "[recycle] $1"; }
 
+# Temp dir for collecting exit codes from background subshells
+RESULT_DIR=$(mktemp -d)
+trap 'rm -rf "$RESULT_DIR"' EXIT
+
+ACTIVE_JOBS=0
+
 for STATE_FILE in "${STATE_FILES[@]}"; do
+    RUNNER_BASE=$(basename "$STATE_FILE" .conf)
+
     (
         # Subshell for continue-on-error per runner
         RUNNER_NAME=""
@@ -276,10 +284,32 @@ STATEEOF
         log_recycle " Recycled $RUNNER_NAME (VMID: ${OLD_VMID:-none} → $NEW_VMID)"
         # Exit 2 = successfully recycled (distinguishes from exit 0 = no action needed)
         exit 2
-    ) && SUBSHELL_EXIT=0 || SUBSHELL_EXIT=$?
-    if [[ $SUBSHELL_EXIT -eq 2 ]]; then
+    ) &
+    # Write PID to result dir for tracking
+    echo $! > "$RESULT_DIR/$RUNNER_BASE.pid"
+
+    ACTIVE_JOBS=$((ACTIVE_JOBS + 1))
+    if [[ $ACTIVE_JOBS -ge $MAX_CONCURRENT ]]; then
+        # Wait for any one background job to finish
+        wait -n 2>/dev/null || true
+        ACTIVE_JOBS=$((ACTIVE_JOBS - 1))
+    fi
+done
+
+# Wait for all remaining background jobs
+wait 2>/dev/null || true
+
+# Collect results from background jobs
+RECYCLE_COUNT=0
+ERROR_COUNT=0
+for pidfile in "$RESULT_DIR"/*.pid; do
+    [[ -f "$pidfile" ]] || continue
+    pid=$(cat "$pidfile")
+    # wait for specific PID and capture exit code
+    wait "$pid" 2>/dev/null && EXIT_CODE=0 || EXIT_CODE=$?
+    if [[ $EXIT_CODE -eq 2 ]]; then
         RECYCLE_COUNT=$((RECYCLE_COUNT + 1))
-    elif [[ $SUBSHELL_EXIT -ne 0 ]]; then
+    elif [[ $EXIT_CODE -ne 0 ]]; then
         ERROR_COUNT=$((ERROR_COUNT + 1))
     fi
 done
