@@ -32,7 +32,7 @@ log_recycle_err() { log_error "[recycle] $1"; }
 RESULT_DIR=$(mktemp -d)
 trap 'rm -rf "$RESULT_DIR"' EXIT
 
-ACTIVE_JOBS=0
+PIDS=()
 
 for STATE_FILE in "${STATE_FILES[@]}"; do
     RUNNER_BASE=$(basename "$STATE_FILE" .conf)
@@ -285,27 +285,30 @@ STATEEOF
         # Exit 2 = successfully recycled (distinguishes from exit 0 = no action needed)
         exit 2
     ) &
-    # Write PID to result dir for tracking
+    PIDS+=($!)
     echo $! > "$RESULT_DIR/$RUNNER_BASE.pid"
 
-    ACTIVE_JOBS=$((ACTIVE_JOBS + 1))
-    if [[ $ACTIVE_JOBS -ge $MAX_CONCURRENT ]]; then
-        # Wait for any one background job to finish
-        wait -n 2>/dev/null || true
-        ACTIVE_JOBS=$((ACTIVE_JOBS - 1))
-    fi
+    # Throttle: if we've hit the concurrency limit, wait for one to finish
+    while [[ ${#PIDS[@]} -ge $MAX_CONCURRENT ]]; do
+        NEW_PIDS=()
+        for p in "${PIDS[@]}"; do
+            if kill -0 "$p" 2>/dev/null; then
+                NEW_PIDS+=("$p")
+            fi
+        done
+        PIDS=("${NEW_PIDS[@]}")
+        if [[ ${#PIDS[@]} -ge $MAX_CONCURRENT ]]; then
+            sleep 1
+        fi
+    done
 done
 
-# Wait for all remaining background jobs
-wait 2>/dev/null || true
-
-# Collect results from background jobs
+# Wait for all jobs and collect exit codes
 RECYCLE_COUNT=0
 ERROR_COUNT=0
 for pidfile in "$RESULT_DIR"/*.pid; do
     [[ -f "$pidfile" ]] || continue
     pid=$(cat "$pidfile")
-    # wait for specific PID and capture exit code
     wait "$pid" 2>/dev/null && EXIT_CODE=0 || EXIT_CODE=$?
     if [[ $EXIT_CODE -eq 2 ]]; then
         RECYCLE_COUNT=$((RECYCLE_COUNT + 1))
