@@ -212,6 +212,13 @@ if ! qm set "$VMID" --ipconfig0 ip=dhcp; then
     exit 1
 fi
 
+if [[ -n "${DNS_SERVERS:-}" ]]; then
+    if ! qm set "$VMID" --nameserver "$DNS_SERVERS"; then
+        log_error "Failed to set DNS servers"
+        exit 1
+    fi
+fi
+
 if ! qm set "$VMID" --ciuser runner; then
     log_error "Failed to set cloud-init user"
     exit 1

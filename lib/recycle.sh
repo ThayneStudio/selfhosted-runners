@@ -255,6 +255,13 @@ VENDOREOF
             qm destroy "$NEW_VMID" --purge 2>/dev/null || true
             exit 1
         }
+        if [[ -n "${DNS_SERVERS:-}" ]]; then
+            qm set "$NEW_VMID" --nameserver "$DNS_SERVERS" || {
+                log_recycle_err " $RUNNER_NAME — failed to set DNS servers"
+                qm destroy "$NEW_VMID" --purge 2>/dev/null || true
+                exit 1
+            }
+        fi
         qm set "$NEW_VMID" --ciuser runner || {
             log_recycle_err " $RUNNER_NAME — failed to set cloud-init user"
             qm destroy "$NEW_VMID" --purge 2>/dev/null || true

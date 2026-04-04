@@ -97,6 +97,16 @@ if [[ ! "$BALLOON" =~ ^[0-9]+$ ]]; then
     exit 1
 fi
 
+# DNS nameservers (space-separated, applied via cloud-init)
+read -rp "DNS nameservers, space-separated [1.1.1.1 8.8.8.8]: " DNS_SERVERS
+DNS_SERVERS=${DNS_SERVERS:-1.1.1.1 8.8.8.8}
+for ns in $DNS_SERVERS; do
+    if [[ ! "$ns" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && [[ ! "$ns" =~ ^[0-9a-fA-F:]+$ ]]; then
+        log_error "Invalid nameserver: $ns (must be an IPv4 or IPv6 address)"
+        exit 1
+    fi
+done
+
 # Validate template ID is a valid Proxmox VM ID (100-999999999)
 if [[ ! "$TEMPLATE_ID" =~ ^[0-9]+$ ]]; then
     log_error "Template ID must be a number"
@@ -116,6 +126,7 @@ echo "  VM Storage:     $VM_STORAGE"
 echo "  Template ID:    $TEMPLATE_ID"
 echo "  Min VM ID:      $([ "${MIN_VMID:-0}" -eq 0 ] && echo "auto" || echo "$MIN_VMID")"
 echo "  Balloon:        ${BALLOON:-0} MB ($([ "${BALLOON:-0}" -eq 0 ] && echo "disabled" || echo "enabled"))"
+echo "  DNS Servers:    ${DNS_SERVERS:-DHCP only}"
 echo ""
 read -rp "Proceed? [Y/n]: " CONFIRM
 [[ "${CONFIRM:-Y}" =~ ^[Yy]([Ee][Ss])?$ ]] || exit 0
@@ -173,6 +184,7 @@ VM_STORAGE="$VM_STORAGE"
 TEMPLATE_ID="$TEMPLATE_ID"
 MIN_VMID="$MIN_VMID"
 BALLOON="$BALLOON"
+DNS_SERVERS="$DNS_SERVERS"
 EOF
 chmod 600 "$CONF_TMP"
 mv "$CONF_TMP" "$CONFIG_FILE"
@@ -288,6 +300,9 @@ else
         exit 1
     fi
     qm set "$TEMPLATE_ID" --ipconfig0 ip=dhcp || { log_error "Failed to set IP config"; qm destroy "$TEMPLATE_ID" --purge 2>/dev/null || true; exit 1; }
+    if [[ -n "${DNS_SERVERS:-}" ]]; then
+        qm set "$TEMPLATE_ID" --nameserver "$DNS_SERVERS" || { log_error "Failed to set DNS servers"; qm destroy "$TEMPLATE_ID" --purge 2>/dev/null || true; exit 1; }
+    fi
     qm set "$TEMPLATE_ID" --ciuser runner || { log_error "Failed to set cloud-init user"; qm destroy "$TEMPLATE_ID" --purge 2>/dev/null || true; exit 1; }
 
     # Cleanup trap for baking phase (set before start so interrupted starts are cleaned up)
@@ -379,6 +394,7 @@ else
     qm set "$TEMPLATE_ID" --delete cicustom 2>/dev/null || true
     qm set "$TEMPLATE_ID" --delete ciuser 2>/dev/null || true
     qm set "$TEMPLATE_ID" --delete ipconfig0 2>/dev/null || true
+    qm set "$TEMPLATE_ID" --delete nameserver 2>/dev/null || true
 
     # Convert to template
     qm template "$TEMPLATE_ID" || { log_error "Failed to convert to template"; exit 1; }
