@@ -208,6 +208,9 @@ STATEEOF
             exit 1
         fi
 
+        # Close lock fd so child processes (qm set, qm start → kvm) don't inherit it
+        exec 200>&-
+
         # Configure cloud-init
         cat > "${SNIPPETS_DIR}/runner-${NEW_VMID}-meta.yaml" << METAEOF
 instance-id: "$RUNNER_NAME"
