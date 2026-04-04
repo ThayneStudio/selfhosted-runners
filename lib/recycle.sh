@@ -112,14 +112,6 @@ for STATE_FILE in "${STATE_FILES[@]}"; do
                     log_recycle " $RUNNER_NAME — service status: $SERVICE_STATUS — recycling"
                 fi
 
-                # --- Acquire lock for entire destroy+recreate cycle ---
-                exec 200>"$LOCK_FILE"
-                if ! flock -w 30 200; then
-                    log_recycle_err " $RUNNER_NAME — could not acquire lock, skipping"
-                    exit 1
-                fi
-                LOCK_HELD=true
-
                 # --- Destroy the old VM ---
 
                 # Deregister runner from GitHub before destroying VM (best-effort)
@@ -180,14 +172,12 @@ STATEEOF
             exit 1
         fi
 
-        # Acquire lock if not already held (empty VMID path skips destroy)
-        if [[ "${LOCK_HELD:-}" != true ]]; then
-            exec 200>"$LOCK_FILE"
-            flock -w 30 200 || {
-                log_recycle_err " $RUNNER_NAME — could not acquire lock, skipping"
-                exit 1
-            }
-        fi
+        # Acquire lock for VMID allocation only
+        exec 200>"$LOCK_FILE"
+        flock -w 30 200 || {
+            log_recycle_err " $RUNNER_NAME — could not acquire lock, skipping"
+            exit 1
+        }
 
         # Get next available VM ID
         if [[ "${MIN_VMID:-0}" -gt 0 ]]; then
@@ -202,14 +192,15 @@ STATEEOF
             }
         fi
 
+        # Release lock and close fd BEFORE any qm commands that spawn persistent processes.
+        # VMID is allocated — that's all the lock protects.
+        exec 200>&-
+
         # Clone template
         if ! qm clone "$TEMPLATE_ID" "$NEW_VMID" --name "$RUNNER_NAME" --full --storage "$VM_STORAGE"; then
             log_recycle_err " $RUNNER_NAME — failed to clone template"
             exit 1
         fi
-
-        # Close lock fd so child processes (qm set, qm start → kvm) don't inherit it
-        exec 200>&-
 
         # Configure cloud-init
         cat > "${SNIPPETS_DIR}/runner-${NEW_VMID}-meta.yaml" << METAEOF

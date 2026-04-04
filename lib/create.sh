@@ -162,6 +162,11 @@ else
     fi
 fi
 
+# Release lock and close fd BEFORE any qm commands that spawn persistent processes.
+# The VMID is allocated and name is validated — that's all the lock protects.
+flock -u 200
+exec 200>&-
+
 log_info "Cloning template..."
 if ! qm clone "$TEMPLATE_ID" "$VMID" --name "$RUNNER_NAME" --full --storage "$VM_STORAGE"; then
     log_error "Failed to clone template"
@@ -213,10 +218,6 @@ if ! qm set "$VMID" --ciuser runner; then
 fi
 
 # Release lock and close fd — VMID is claimed in Proxmox, safe to let recycler proceed
-# Closing fd 200 prevents child processes (qm start → kvm) from inheriting the lock
-flock -u 200
-exec 200>&-
-
 # Show MAC and pause so user can configure DHCP static mapping
 echo ""
 log_info "Runner '$RUNNER_NAME' cloned successfully (VMID: $VMID)"
