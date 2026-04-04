@@ -59,14 +59,23 @@ for STATE_FILE in "${STATE_FILES[@]}"; do
             log_recycle " $RUNNER_NAME has empty VMID (previous recycle failed) — recreating"
             # Fall through to recreate
         else
-            # Check VM exists
-            if ! qm status "$VMID" &>/dev/null; then
-                log_recycle " $RUNNER_NAME VM $VMID not found — recreating"
-                # Clean up orphaned snippets from the missing VM
-                rm -f "${SNIPPETS_DIR}/runner-${VMID}-meta.yaml" "${SNIPPETS_DIR}/runner-${VMID}-vendor.yaml" 2>/dev/null || true
-                # Deregister stale runner from GitHub (best-effort)
-                deregister_runner "$ORG" "$RUNNER_NAME" || true
-                # Fall through to recreate
+            # Check VM exists — distinguish "not found" from transient API errors
+            # to avoid creating duplicates when Proxmox is under load
+            VM_CHECK=$(qm status "$VMID" 2>&1)
+            VM_CHECK_RC=$?
+            if [[ $VM_CHECK_RC -ne 0 ]]; then
+                if [[ "$VM_CHECK" == *"does not exist"* ]]; then
+                    log_recycle " $RUNNER_NAME VM $VMID not found — recreating"
+                    # Clean up orphaned snippets from the missing VM
+                    rm -f "${SNIPPETS_DIR}/runner-${VMID}-meta.yaml" "${SNIPPETS_DIR}/runner-${VMID}-vendor.yaml" 2>/dev/null || true
+                    # Deregister stale runner from GitHub (best-effort)
+                    deregister_runner "$ORG" "$RUNNER_NAME" || true
+                    # Fall through to recreate
+                else
+                    # Proxmox API error — don't assume VM is gone, skip to avoid duplicates
+                    log_recycle_warn " $RUNNER_NAME — failed to query VM $VMID (${VM_CHECK%%$'\n'*}) — skipping"
+                    exit 0
+                fi
             else
                 # Check VM status
                 VM_STATUS=$(qm status "$VMID" 2>/dev/null | awk '{print $2}') || true
