@@ -63,12 +63,10 @@ for STATE_FILE in "${STATE_FILES[@]}"; do
             # to avoid creating duplicates when Proxmox is under load.
             # The assignment must be inside `if` to prevent set -e from killing the subshell.
             if VM_CHECK=$(qm status "$VMID" 2>&1); then
-                # Check VM status
-                VM_STATUS=$(qm status "$VMID" 2>/dev/null | awk '{print $2}') || true
+                # Parse status from the already-captured output (e.g. "status: running")
+                VM_STATUS=$(echo "$VM_CHECK" | awk '{print $2}')
                 if [[ "$VM_STATUS" == "stopped" || "$VM_STATUS" == "failed" ]]; then
                     log_recycle " $RUNNER_NAME VM $VMID is $VM_STATUS — recycling"
-                    # Deregister before destroy (best-effort)
-                    deregister_runner "$ORG" "$RUNNER_NAME" || true
                     # Fall through to destroy+recreate
                 elif [[ "$VM_STATUS" != "running" ]]; then
                     log_recycle " $RUNNER_NAME VM $VMID not running (status: ${VM_STATUS:-unknown}) — skipping"
@@ -310,7 +308,11 @@ STATEEOF
                 NEW_PIDS+=("$p")
             fi
         done
-        PIDS=("${NEW_PIDS[@]}")
+        if [[ ${#NEW_PIDS[@]} -gt 0 ]]; then
+            PIDS=("${NEW_PIDS[@]}")
+        else
+            PIDS=()
+        fi
         if [[ ${#PIDS[@]} -ge $MAX_CONCURRENT ]]; then
             sleep 1
         fi

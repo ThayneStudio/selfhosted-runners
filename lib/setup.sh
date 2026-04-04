@@ -101,7 +101,7 @@ fi
 read -rp "DNS nameservers, space-separated [1.1.1.1 8.8.8.8]: " DNS_SERVERS
 DNS_SERVERS=${DNS_SERVERS:-1.1.1.1 8.8.8.8}
 for ns in $DNS_SERVERS; do
-    if [[ ! "$ns" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && [[ ! "$ns" =~ ^[0-9a-fA-F:]+$ ]]; then
+    if [[ ! "$ns" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && [[ ! ("$ns" =~ ^[0-9a-fA-F:]+$ && "$ns" =~ :) ]]; then
         log_error "Invalid nameserver: $ns (must be an IPv4 or IPv6 address)"
         exit 1
     fi
