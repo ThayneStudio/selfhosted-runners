@@ -60,23 +60,9 @@ for STATE_FILE in "${STATE_FILES[@]}"; do
             # Fall through to recreate
         else
             # Check VM exists — distinguish "not found" from transient API errors
-            # to avoid creating duplicates when Proxmox is under load
-            VM_CHECK=$(qm status "$VMID" 2>&1)
-            VM_CHECK_RC=$?
-            if [[ $VM_CHECK_RC -ne 0 ]]; then
-                if [[ "$VM_CHECK" == *"does not exist"* ]]; then
-                    log_recycle " $RUNNER_NAME VM $VMID not found — recreating"
-                    # Clean up orphaned snippets from the missing VM
-                    rm -f "${SNIPPETS_DIR}/runner-${VMID}-meta.yaml" "${SNIPPETS_DIR}/runner-${VMID}-vendor.yaml" 2>/dev/null || true
-                    # Deregister stale runner from GitHub (best-effort)
-                    deregister_runner "$ORG" "$RUNNER_NAME" || true
-                    # Fall through to recreate
-                else
-                    # Proxmox API error — don't assume VM is gone, skip to avoid duplicates
-                    log_recycle_warn " $RUNNER_NAME — failed to query VM $VMID (${VM_CHECK%%$'\n'*}) — skipping"
-                    exit 0
-                fi
-            else
+            # to avoid creating duplicates when Proxmox is under load.
+            # The assignment must be inside `if` to prevent set -e from killing the subshell.
+            if VM_CHECK=$(qm status "$VMID" 2>&1); then
                 # Check VM status
                 VM_STATUS=$(qm status "$VMID" 2>/dev/null | awk '{print $2}') || true
                 if [[ "$VM_STATUS" == "stopped" || "$VM_STATUS" == "failed" ]]; then
@@ -159,6 +145,18 @@ for STATE_FILE in "${STATE_FILES[@]}"; do
 
                 # Clean up old snippets
                 rm -f "${SNIPPETS_DIR}/runner-${VMID}-meta.yaml" "${SNIPPETS_DIR}/runner-${VMID}-vendor.yaml"
+            else
+                # qm status failed — check if VM is genuinely gone or just an API error
+                if [[ "$VM_CHECK" == *"does not exist"* ]]; then
+                    log_recycle " $RUNNER_NAME VM $VMID not found — recreating"
+                    rm -f "${SNIPPETS_DIR}/runner-${VMID}-meta.yaml" "${SNIPPETS_DIR}/runner-${VMID}-vendor.yaml" 2>/dev/null || true
+                    deregister_runner "$ORG" "$RUNNER_NAME" || true
+                    # Fall through to recreate
+                else
+                    # Proxmox API error — don't assume VM is gone, skip to avoid duplicates
+                    log_recycle_warn " $RUNNER_NAME — failed to query VM $VMID (${VM_CHECK%%$'\n'*}) — skipping"
+                    exit 0
+                fi
             fi
         fi
 
