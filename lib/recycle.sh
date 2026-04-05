@@ -185,9 +185,9 @@ STATEEOF
             exit 1
         fi
 
-        # Acquire lock for VMID allocation only
+        # Acquire lock for VMID allocation + clone (clone takes ~60s, so allow 180s)
         exec 200>"$LOCK_FILE"
-        flock -w 30 200 || {
+        flock -w 180 200 || {
             log_recycle_err " $RUNNER_NAME — could not acquire lock, skipping"
             exit 1
         }
