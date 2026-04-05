@@ -24,9 +24,9 @@ generate_mac() {
     echo -n "$1" | md5sum | sed 's/\(..\)\(..\)\(..\)\(..\)\(..\).*/02:\1:\2:\3:\4:\5/'
 }
 
-# Get all runner VMs (matching prefix) as "VMID NAME" pairs
-get_runner_vms() {
-    qm list 2>/dev/null | awk -v prefix="${RUNNER_PREFIX}-" 'NR>1 && $2 ~ "^"prefix {print $1, $2}'
+# Get all VMs as "VMID NAME" pairs (excluding header)
+get_all_vms() {
+    qm list 2>/dev/null | awk 'NR>1 {print $1, $2}'
 }
 
 # Get the org for a VM from its cicustom config
@@ -126,21 +126,19 @@ EOF
 
 # --- Main ---
 
-# Snapshot current runner VMs
-RUNNER_VMS=$(get_runner_vms)
+# Snapshot all VMs (filtering happens per-org by prefix)
+ALL_VMS=$(get_all_vms)
 
 # Iterate each org and fill its pool
 mapfile -t ORGS < <(list_orgs)
 
 CREATED=0
 for org_name in "${ORGS[@]}"; do
-    # Load org config to get RUNNER_COUNT
-    ORG_RUNNER_COUNT=""
-    ORG_RUNNER_PREFIX=""
-    # Source in subshell to avoid polluting scope
-    eval "$(grep -E '^(RUNNER_COUNT|RUNNER_PREFIX)=' "$ORG_CONFIG_DIR/${org_name}.conf" 2>/dev/null || true)"
-    local_count="${ORG_RUNNER_COUNT:-${RUNNER_COUNT:-0}}"
-    local_prefix="${ORG_RUNNER_PREFIX:-${RUNNER_PREFIX}}"
+    # Load per-org RUNNER_COUNT and RUNNER_PREFIX
+    local_count=$(grep '^RUNNER_COUNT=' "$ORG_CONFIG_DIR/${org_name}.conf" 2>/dev/null | head -1 | sed 's/^RUNNER_COUNT=//' | tr -d '"') || true
+    local_prefix=$(grep '^RUNNER_PREFIX=' "$ORG_CONFIG_DIR/${org_name}.conf" 2>/dev/null | head -1 | sed 's/^RUNNER_PREFIX=//' | tr -d '"') || true
+    local_count="${local_count:-0}"
+    local_prefix="${local_prefix:-${RUNNER_PREFIX}}"
 
     if [[ "$local_count" -le 0 ]]; then
         continue
@@ -153,7 +151,7 @@ for org_name in "${ORGS[@]}"; do
         if [[ "$(vm_org "$vm_id")" == "$org_name" ]]; then
             existing=$((existing + 1))
         fi
-    done <<< "$RUNNER_VMS"
+    done <<< "$ALL_VMS"
 
     if [[ $existing -ge $local_count ]]; then
         continue
@@ -163,7 +161,7 @@ for org_name in "${ORGS[@]}"; do
     for n in $(seq 1 "$local_count"); do
         slot_name="${local_prefix}-${n}"
         # Check if this name exists in the VM list
-        if ! echo "$RUNNER_VMS" | awk '{print $2}' | grep -qxF "$slot_name"; then
+        if ! echo "$ALL_VMS" | awk '{print $2}' | grep -qxF "$slot_name"; then
             if clone_runner "$slot_name" "$org_name"; then
                 CREATED=$((CREATED + 1))
             fi
@@ -173,10 +171,12 @@ for org_name in "${ORGS[@]}"; do
 done
 
 # --- Stuck VM detection ---
-# Force-stop VMs running >30 min without the runner-ready sentinel.
+# Force-stop runner VMs running >30 min without the runner-ready sentinel.
 # The hookscript auto-destroys them on stop, and next tick fills the gap.
+# Only check VMs that have a runner cloud-init snippet (actual runners).
 while read -r vm_id vm_name; do
     [[ -z "$vm_id" ]] && continue
+    [[ -n "$(vm_org "$vm_id")" ]] || continue
     vm_status=$(qm status "$vm_id" 2>/dev/null | awk '{print $2}') || continue
     [[ "$vm_status" == "running" ]] || continue
 
@@ -194,7 +194,7 @@ while read -r vm_id vm_name; do
         qm stop "$vm_id" --timeout 10 2>/dev/null || qm stop "$vm_id" --skiplock 2>/dev/null || true
         # Hookscript will auto-destroy on post-stop, watcher fills the gap next tick
     fi
-done <<< "$RUNNER_VMS"
+done <<< "$ALL_VMS"
 
 if [[ $CREATED -gt 0 ]]; then
     log_watch "Created $CREATED runner(s)"
