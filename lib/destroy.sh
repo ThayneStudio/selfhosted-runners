@@ -18,8 +18,14 @@ if [[ ! "$RUNNER_NAME" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]*$ ]]; then
 fi
 
 # Find VM by exact name
-VMID=$(qm list | awk -v n="$RUNNER_NAME" '$2==n {print $1}')
+VMID=$(qm list | awk -v n="$RUNNER_NAME" '$2==n {print $1}' | head -1)
 [[ -n "$VMID" ]] || { log_error "'$RUNNER_NAME' not found"; exit 1; }
+
+# Check for duplicates
+MATCH_COUNT=$(qm list | awk -v n="$RUNNER_NAME" '$2==n' | wc -l)
+if [[ "$MATCH_COUNT" -gt 1 ]]; then
+    log_warn "Multiple VMs named '$RUNNER_NAME' found — destroying first (VMID $VMID)"
+fi
 
 VM_ORG=$(get_vm_org "$VMID")
 

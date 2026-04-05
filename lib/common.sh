@@ -6,6 +6,7 @@ set -euo pipefail
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
 NC='\033[0m'
 
 log_info() { printf '%b[INFO]%b %s\n' "$GREEN" "$NC" "$1" >&2; }
@@ -187,10 +188,16 @@ clone_runner() {
     local vmid
     vmid=$(next_vmid) || return 1
 
-    # Clone
-    if ! qm clone "$TEMPLATE_ID" "$vmid" --name "$name" --full --storage "$VM_STORAGE"; then
+    # Cleanup helper: destroy VM and remove snippet on any failure
+    _fail() {
+        rm -f "${SNIPPETS_DIR}/runner-${vmid}-meta.yaml"
         qm destroy "$vmid" --purge 2>/dev/null || true
         return 1
+    }
+
+    # Clone
+    if ! qm clone "$TEMPLATE_ID" "$vmid" --name "$name" --full --storage "$VM_STORAGE"; then
+        _fail; return 1
     fi
 
     # Deterministic MAC
@@ -199,7 +206,7 @@ clone_runner() {
     net0=$(qm config "$vmid" | grep '^net0:' | sed 's/^net0: //') || true
     if [[ -n "$net0" ]]; then
         net0=$(echo "$net0" | sed "s/virtio=[^,]*/virtio=$mac/")
-        qm set "$vmid" --net0 "$net0" || { qm destroy "$vmid" --purge 2>/dev/null || true; return 1; }
+        qm set "$vmid" --net0 "$net0" || { _fail; return 1; }
     fi
 
     # Cloud-init
@@ -210,21 +217,22 @@ EOF
     chmod 600 "${SNIPPETS_DIR}/runner-${vmid}-meta.yaml"
 
     qm set "$vmid" --cicustom "user=local:snippets/runner-user-data-${org}.yaml,meta=local:snippets/runner-${vmid}-meta.yaml" \
-        || { qm destroy "$vmid" --purge 2>/dev/null || true; return 1; }
+        || { _fail; return 1; }
     qm set "$vmid" --ipconfig0 ip=dhcp \
-        || { qm destroy "$vmid" --purge 2>/dev/null || true; return 1; }
+        || { _fail; return 1; }
     [[ -z "${DNS_SERVERS:-}" ]] || qm set "$vmid" --nameserver "$DNS_SERVERS" \
-        || { qm destroy "$vmid" --purge 2>/dev/null || true; return 1; }
+        || { _fail; return 1; }
     qm set "$vmid" --ciuser runner \
-        || { qm destroy "$vmid" --purge 2>/dev/null || true; return 1; }
+        || { _fail; return 1; }
 
     # Hookscript for auto-destroy on shutdown
-    [[ ! -f "$SNIPPETS_DIR/runner-hookscript.sh" ]] || \
+    if [[ -f "$SNIPPETS_DIR/runner-hookscript.sh" ]]; then
         qm set "$vmid" --hookscript "local:snippets/runner-hookscript.sh" || true
+    fi
 
     # Start
     if ! qm start "$vmid"; then
-        return 1
+        _fail; return 1
     fi
 
     echo "$vmid"

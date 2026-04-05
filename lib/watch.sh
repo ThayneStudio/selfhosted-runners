@@ -13,8 +13,10 @@ load_infra_config
 # Template must exist and be a template (not still baking)
 qm config "$TEMPLATE_ID" 2>/dev/null | grep -q "^template: 1" || exit 0
 
-# Snapshot all VM names once
-ALL_VM_NAMES=$(qm list 2>/dev/null | awk 'NR>1 {print $2}') || exit 0
+# Snapshot all VMs once: "VMID NAME"
+ALL_VMS=$(qm list 2>/dev/null | awk 'NR>1 {print $1, $2}') || exit 0
+# Extract just names for slot checks
+ALL_VM_NAMES=$(echo "$ALL_VMS" | awk '{print $2}')
 
 # Process each org
 mapfile -t ORGS < <(list_orgs)
@@ -31,21 +33,24 @@ for org in "${ORGS[@]}"; do
     # Check snippet exists
     [[ -f "$SNIPPETS_DIR/runner-user-data-${org}.yaml" ]] || continue
 
-    # Count existing VMs by name and find first gap
-    existing=0
+    # Find first missing slot
     missing_slot=""
     for n in $(seq 1 "$count"); do
         slot="${prefix}-${n}"
-        if echo "$ALL_VM_NAMES" | grep -qxF "$slot"; then
-            existing=$((existing + 1))
-        elif [[ -z "$missing_slot" ]]; then
+        if ! echo "$ALL_VM_NAMES" | grep -qxF "$slot"; then
             missing_slot="$slot"
+            break
         fi
     done
 
     # Clone ONE missing slot per org per tick
     if [[ -n "$missing_slot" ]]; then
         log_info "[watch] Creating $missing_slot for org $org"
+        # Load org config in subshell first to avoid crashing the watcher
+        if ! ( load_org_config "$org" ) 2>/dev/null; then
+            log_warn "[watch] Org config for '$org' is invalid, skipping"
+            continue
+        fi
         load_org_config "$org"
         clone_runner "$missing_slot" "$org" >/dev/null \
             || log_warn "[watch] Failed to create $missing_slot"
@@ -54,10 +59,11 @@ done
 
 # Stuck VM detection: force-stop VMs running >30 min without the runner-ready sentinel.
 # The hookscript auto-destroys them on stop, and next tick fills the gap.
-ALL_VMS=$(qm list 2>/dev/null | awk 'NR>1 {print $1, $2}') || true
 while read -r vm_id vm_name; do
     [[ -z "$vm_id" ]] && continue
-    [[ -n "$(get_vm_org "$vm_id")" && "$(get_vm_org "$vm_id")" != "unknown" ]] || continue
+
+    vm_org=$(get_vm_org "$vm_id")
+    [[ -n "$vm_org" && "$vm_org" != "unknown" ]] || continue
 
     vm_status=$(qm status "$vm_id" 2>/dev/null | awk '{print $2}') || continue
     [[ "$vm_status" == "running" ]] || continue
