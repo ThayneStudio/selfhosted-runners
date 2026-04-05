@@ -1,9 +1,9 @@
 [Unit]
-Description=Poll ephemeral GitHub Actions runners for recycling
+Description=Safety-net timer for GitHub Actions runner recycling
 
 [Timer]
-OnBootSec=120
-OnUnitInactiveSec=120
+OnBootSec=300
+OnUnitInactiveSec=600
 
 [Install]
 WantedBy=timers.target

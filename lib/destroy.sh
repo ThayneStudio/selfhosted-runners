@@ -89,6 +89,11 @@ if [[ "$CONFIRM" != "yes" ]]; then
     exit 0
 fi
 
+# Remove state file BEFORE stopping VM to prevent the post-stop hookscript
+# from triggering a recycle. Save org for deregistration.
+SAVED_ORG="$VM_ORG"
+rm -f "${RUNNERS_DIR}/${RUNNER_NAME}.conf"
+
 # Stop VM if not already stopped
 if [[ "$VM_STATUS" != "stopped" && "$VM_STATUS" != "unknown" ]]; then
     log_info "Stopping VM (status: $VM_STATUS)..."
@@ -111,14 +116,14 @@ if [[ "$VM_STATUS" != "stopped" && "$VM_STATUS" != "unknown" ]]; then
 fi
 
 # Deregister runner from GitHub before destroying (best-effort)
-if [[ "$VM_ORG" != "unknown" ]]; then
+if [[ "$SAVED_ORG" != "unknown" ]]; then
     log_info "Deregistering runner from GitHub..."
-    if deregister_runner "$VM_ORG" "$RUNNER_NAME"; then
+    if deregister_runner "$SAVED_ORG" "$RUNNER_NAME"; then
         log_info "Runner deregistered from GitHub."
     else
         log_warn "Could not deregister runner from GitHub."
         echo "Remove it manually at:"
-        echo "  https://github.com/organizations/$VM_ORG/settings/actions/runners"
+        echo "  https://github.com/organizations/$SAVED_ORG/settings/actions/runners"
     fi
 fi
 
@@ -130,9 +135,8 @@ if ! qm destroy "$VMID" --purge; then
     exit 1
 fi
 
-# Clean up per-VM snippets and runner state file
+# Clean up per-VM snippets (state file already removed above)
 rm -f "${SNIPPETS_DIR}/runner-${VMID}-meta.yaml" "${SNIPPETS_DIR}/runner-${VMID}-vendor.yaml"
-rm -f "${RUNNERS_DIR}/${RUNNER_NAME}.conf"
 
 echo ""
 log_info "Runner '$RUNNER_NAME' (VMID: $VMID) destroyed."

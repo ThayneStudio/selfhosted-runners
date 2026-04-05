@@ -226,6 +226,13 @@ if ! qm set "$VMID" --ciuser runner; then
     exit 1
 fi
 
+# Set hookscript for event-driven recycling (if hookscript is installed)
+if [[ -f "$SNIPPETS_DIR/runner-hookscript.sh" ]]; then
+    if ! qm set "$VMID" --hookscript "local:snippets/runner-hookscript.sh"; then
+        log_warn "Failed to set hookscript (safety timer will handle recycling)"
+    fi
+fi
+
 # Release lock and close fd — VMID is claimed in Proxmox, safe to let recycler proceed
 # Show MAC and pause so user can configure DHCP static mapping
 echo ""

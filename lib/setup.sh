@@ -172,6 +172,11 @@ if ! pvesm status --content snippets 2>/dev/null | awk '{print $1}' | grep -qx "
 fi
 mkdir -p "$SNIPPETS_DIR"
 
+# Install hookscript for event-driven recycling
+log_info "Installing runner hookscript..."
+cp "$INSTALL_DIR/templates/runner-hookscript.sh" "$SNIPPETS_DIR/runner-hookscript.sh"
+chmod 755 "$SNIPPETS_DIR/runner-hookscript.sh"
+
 # Save infra config
 log_info "[3/6] Saving configuration..."
 mkdir -p "$ORG_CONFIG_DIR"
@@ -405,16 +410,35 @@ else
     log_info "Template created successfully (tools baked in)"
 fi
 
-log_info "[5/6] Installing recycle timer..."
+log_info "[5/6] Installing safety-net recycle timer..."
 cp "$INSTALL_DIR/templates/github-runner-recycle.service" /etc/systemd/system/
 cp "$INSTALL_DIR/templates/github-runner-recycle.timer" /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable --now github-runner-recycle.timer 2>/dev/null || true
-log_info "Recycle timer installed (120s interval)"
+log_info "Safety-net timer installed (600s interval, hookscript handles normal recycling)"
+
+# Install logrotate for hookscript log
+if [[ -f "$INSTALL_DIR/templates/github-runner-hookscript.logrotate" ]]; then
+    cp "$INSTALL_DIR/templates/github-runner-hookscript.logrotate" /etc/logrotate.d/github-runner-hookscript
+fi
 
 log_info "[6/6] Preparing runner state directory..."
 mkdir -p "$RUNNERS_DIR"
 chmod 700 "$RUNNERS_DIR"
+
+# Migrate existing VMs: set hookscript on any runners that don't have it yet
+shopt -s nullglob
+for _state_file in "$RUNNERS_DIR"/*.conf; do
+    _vmid=""
+    _vmid=$(grep '^VMID=' "$_state_file" | head -1 | sed 's/^VMID=//' | tr -d '"') || true
+    if [[ -n "$_vmid" ]] && qm status "$_vmid" &>/dev/null; then
+        qm set "$_vmid" --hookscript "local:snippets/runner-hookscript.sh" 2>/dev/null || {
+            _name=$(basename "$_state_file" .conf)
+            log_warn "Could not set hookscript on VM $_vmid ($_name)"
+        }
+    fi
+done
+shopt -u nullglob
 
 echo ""
 echo "========================================"
