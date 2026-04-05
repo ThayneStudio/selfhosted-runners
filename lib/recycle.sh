@@ -205,15 +205,17 @@ STATEEOF
             }
         fi
 
-        # Release lock and close fd BEFORE any qm commands that spawn persistent processes.
-        # VMID is allocated — that's all the lock protects.
-        exec 200>&-
-
-        # Clone template
-        if ! qm clone "$TEMPLATE_ID" "$NEW_VMID" --name "$RUNNER_NAME" --full --storage "$VM_STORAGE"; then
+        # Clone template under lock so no other subshell can allocate the same VMID.
+        # Use 200>&- to close the lock fd for the child process only (prevents KVM
+        # from inheriting it) while keeping it open in this shell to hold the lock.
+        if ! qm clone "$TEMPLATE_ID" "$NEW_VMID" --name "$RUNNER_NAME" --full --storage "$VM_STORAGE" 200>&-; then
             log_recycle_err " $RUNNER_NAME — failed to clone template"
+            exec 200>&-
             exit 1
         fi
+
+        # Release lock — VMID is now claimed in Proxmox
+        exec 200>&-
 
         # Configure cloud-init
         cat > "${SNIPPETS_DIR}/runner-${NEW_VMID}-meta.yaml" << METAEOF
