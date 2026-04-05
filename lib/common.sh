@@ -188,13 +188,15 @@ clone_runner() {
     local vmid
     vmid=$(next_vmid) || return 1
 
-    # Cleanup helper: destroy VM (only if it belongs to us) and remove snippet
+    # Cleanup helper: destroy VM (only if it belongs to us) and remove snippet.
+    # The ownership check prevents destroying another process's VM on VMID collision.
     _fail() {
-        rm -f "${SNIPPETS_DIR}/runner-${vmid}-meta.yaml"
-        # Only destroy if the VM was created by us (prevents destroying another process's VM on VMID collision)
         local owner
         owner=$(qm config "$vmid" 2>/dev/null | awk '/^name:/{print $2}') || true
-        [[ "$owner" == "$name" ]] && qm destroy "$vmid" --purge 2>/dev/null || true
+        if [[ "$owner" == "$name" ]]; then
+            rm -f "${SNIPPETS_DIR}/runner-${vmid}-meta.yaml"
+            qm destroy "$vmid" --purge 2>/dev/null || true
+        fi
     }
 
     # Clone

@@ -1,5 +1,5 @@
 #!/bin/bash
-set -uo pipefail
+set -euo pipefail
 # Destroy a stopped VM and clone a replacement with the same name/org.
 # Called by the hookscript AFTER it exits (runs detached from Proxmox task).
 # Usage: reclone.sh <vmid>
@@ -20,9 +20,14 @@ if [[ -z "$NAME" || -z "$ORG" || "$ORG" == "unknown" ]]; then
     exit 0
 fi
 
-# Destroy the old VM
+# Destroy the old VM (retry briefly in case Proxmox lock from stop task hasn't released)
 rm -f "${SNIPPETS_DIR}/runner-${VMID}-meta.yaml"
-qm destroy "$VMID" --purge 2>&1 | logger -t github-runner || true
+for attempt in 1 2 3; do
+    if qm destroy "$VMID" --purge 2>&1 | logger -t github-runner; then
+        break
+    fi
+    sleep 2
+done
 
 # Check if someone else already filled this slot (watcher, manual create)
 if qm list 2>/dev/null | awk '{print $2}' | grep -qxF "$NAME"; then
