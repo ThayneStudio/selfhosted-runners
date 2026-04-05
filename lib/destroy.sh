@@ -113,5 +113,5 @@ rm -f "${SNIPPETS_DIR}/runner-${VMID}-meta.yaml" "${SNIPPETS_DIR}/runner-${VMID}
 
 echo ""
 log_info "Runner '$RUNNER_NAME' (VMID: $VMID) destroyed."
-echo "The pool watcher will NOT replace it. To restore pool size, run 'runner add-org' or adjust RUNNER_COUNT."
+echo "The pool watcher will automatically replace it on the next tick (~30s)."
 echo ""

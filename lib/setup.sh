@@ -172,7 +172,7 @@ if ! pvesm status --content snippets 2>/dev/null | awk '{print $1}' | grep -qx "
 fi
 mkdir -p "$SNIPPETS_DIR"
 
-# Install hookscript for event-driven recycling
+# Install hookscript for auto-destroy on VM shutdown
 log_info "Installing runner hookscript..."
 cp "$INSTALL_DIR/templates/runner-hookscript.sh" "$SNIPPETS_DIR/runner-hookscript.sh"
 chmod 755 "$SNIPPETS_DIR/runner-hookscript.sh"

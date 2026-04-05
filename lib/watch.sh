@@ -58,6 +58,7 @@ clone_runner() {
     exec 200>"$LOCK_FILE"
     flock -w 180 200 || {
         log_watch_warn "Could not acquire lock, skipping clone"
+        exec 200>&-
         return 1
     }
 
@@ -85,7 +86,8 @@ clone_runner() {
 
     # Clone under lock (close lock fd for child to prevent KVM inheritance)
     if ! qm clone "$TEMPLATE_ID" "$vmid" --name "$name" --full --storage "$VM_STORAGE" 200>&-; then
-        log_watch_warn "$name — clone failed"
+        log_watch_warn "$name — clone failed, cleaning up"
+        qm destroy "$vmid" --purge 2>/dev/null || true
         exec 200>&-
         return 1
     fi
@@ -154,7 +156,7 @@ if ! qm config "$TEMPLATE_ID" 2>/dev/null | grep -q "^template: 1"; then
 fi
 
 # Snapshot all VMs (filtering happens per-org by prefix)
-ALL_VMS=$(get_all_vms)
+ALL_VMS=$(get_all_vms) || { log_watch_warn "Failed to list VMs, skipping tick"; exit 0; }
 
 # Iterate each org and fill its pool
 mapfile -t ORGS < <(list_orgs)
