@@ -1,28 +1,17 @@
 #!/bin/bash
-# Proxmox hookscript: destroy VM on shutdown, then re-clone it.
+# Proxmox hookscript: on VM shutdown, background a destroy + re-clone.
 # No set -e: a failing hookscript makes Proxmox report the stop task as failed.
+# The actual work (destroy, re-clone) happens in reclone.sh AFTER this exits,
+# so Proxmox's task queue is not blocked and the VMID lock is released.
 
 VMID="$1"
 PHASE="$2"
 
 if [[ "$PHASE" == "post-stop" ]]; then
-    # Capture name and org BEFORE destroying
-    CONFIG=$(qm config "$VMID" 2>/dev/null) || exit 0
-    NAME=$(echo "$CONFIG" | awk '/^name:/{print $2}')
-    ORG=$(echo "$CONFIG" | grep -o 'runner-user-data-[^.]*' | sed 's/runner-user-data-//')
-
-    # Destroy
-    rm -f "/var/lib/vz/snippets/runner-${VMID}-meta.yaml"
-    qm destroy "$VMID" --purge 2>&1 | logger -t github-runner &
-    wait
-
-    # Re-clone in background (must not block Proxmox task queue)
-    if [[ -n "$NAME" && -n "$ORG" ]]; then
-        logger -t github-runner "Re-cloning $NAME for org $ORG"
-        nohup /opt/selfhosted-runners/lib/reclone.sh "$NAME" "$ORG" \
-            </dev/null >>/var/log/github-runner.log 2>&1 &
-        disown
-    fi
+    logger -t github-runner "VM $VMID stopped, triggering reclone"
+    nohup /opt/selfhosted-runners/lib/reclone.sh "$VMID" \
+        </dev/null >>/var/log/github-runner.log 2>&1 &
+    disown
 fi
 
 exit 0
