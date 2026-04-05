@@ -97,16 +97,23 @@ if [[ "$HTTP_CODE" != "200" ]]; then
 fi
 log_info "PAT validated successfully"
 
-# Runner pool configuration
-read -rp "Runner name prefix [runner]: " RUNNER_PREFIX
-RUNNER_PREFIX=${RUNNER_PREFIX:-runner}
+# Runner pool configuration (pre-populate from existing config if updating)
+EXISTING_PREFIX=""
+EXISTING_COUNT=""
+if [[ -f "$ORG_CONFIG_DIR/${GITHUB_ORG}.conf" ]]; then
+    EXISTING_PREFIX=$(grep '^RUNNER_PREFIX=' "$ORG_CONFIG_DIR/${GITHUB_ORG}.conf" 2>/dev/null | head -1 | sed 's/^RUNNER_PREFIX=//' | tr -d '"') || true
+    EXISTING_COUNT=$(grep '^RUNNER_COUNT=' "$ORG_CONFIG_DIR/${GITHUB_ORG}.conf" 2>/dev/null | head -1 | sed 's/^RUNNER_COUNT=//' | tr -d '"') || true
+fi
+
+read -rp "Runner name prefix [${EXISTING_PREFIX:-runner}]: " RUNNER_PREFIX
+RUNNER_PREFIX=${RUNNER_PREFIX:-${EXISTING_PREFIX:-runner}}
 if [[ ! "$RUNNER_PREFIX" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]*$ ]]; then
     log_error "Invalid prefix. Use only letters, numbers, dots, hyphens, underscores."
     exit 1
 fi
 
-read -rp "Number of runners for this org [2]: " RUNNER_COUNT
-RUNNER_COUNT=${RUNNER_COUNT:-2}
+read -rp "Number of runners for this org [${EXISTING_COUNT:-2}]: " RUNNER_COUNT
+RUNNER_COUNT=${RUNNER_COUNT:-${EXISTING_COUNT:-2}}
 if [[ ! "$RUNNER_COUNT" =~ ^[0-9]+$ ]] || [[ "$RUNNER_COUNT" -lt 1 || "$RUNNER_COUNT" -gt 50 ]]; then
     log_error "Runner count must be between 1 and 50"
     exit 1

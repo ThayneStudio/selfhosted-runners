@@ -73,7 +73,7 @@ if [[ ! -f "$SNIPPETS_DIR/runner-user-data-${SELECTED_ORG}.yaml" ]]; then
     exit 1
 fi
 
-# Lock file to prevent race conditions (shared with recycle.sh)
+# Lock file to prevent VMID races (shared with watch.sh)
 exec 200>"$LOCK_FILE"
 if ! flock -n 200; then
     log_error "Another runner creation is in progress. Please wait."
@@ -103,8 +103,7 @@ else
     fi
 fi
 
-# Release lock and close fd during interactive prompts so recycler isn't blocked
-# and no child processes inherit the fd
+# Release lock during interactive prompts so watcher isn't blocked
 flock -u 200
 exec 200>&-
 
@@ -162,7 +161,7 @@ else
     fi
 fi
 
-# Clone under lock so recycler can't allocate the same VMID.
+# Clone under lock so watcher can't allocate the same VMID.
 # Use 200>&- to close the lock fd for the child process only (prevents KVM
 # from inheriting it) while keeping it open in this shell to hold the lock.
 log_info "Cloning template..."

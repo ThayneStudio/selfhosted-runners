@@ -241,7 +241,7 @@ migrate_config_if_needed() {
         log_info "Org config already exists at $ORG_CONFIG_DIR/${old_org}.conf, stripping old keys from main config"
     else
         # Write per-org config
-        printf 'GITHUB_ORG="%s"\nGITHUB_PAT="%s"\n' "$old_org" "$old_pat" > "$ORG_CONFIG_DIR/${old_org}.conf"
+        printf 'GITHUB_ORG="%s"\nGITHUB_PAT="%s"\nRUNNER_PREFIX="runner"\nRUNNER_COUNT="2"\n' "$old_org" "$old_pat" > "$ORG_CONFIG_DIR/${old_org}.conf"
         chmod 600 "$ORG_CONFIG_DIR/${old_org}.conf"
     fi
 

@@ -11,7 +11,7 @@ if [[ "$PHASE" == "post-stop" ]]; then
     # Clean up snippet files (qm destroy --purge doesn't remove these)
     rm -f "/var/lib/vz/snippets/runner-${VMID}-meta.yaml" \
           "/var/lib/vz/snippets/runner-${VMID}-vendor.yaml" 2>/dev/null
-    nohup /usr/sbin/qm destroy "$VMID" --purge &>/dev/null &
+    nohup /usr/sbin/qm destroy "$VMID" --purge 2>&1 | logger -t github-runner &
 fi
 
 exit 0

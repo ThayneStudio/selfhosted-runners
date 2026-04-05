@@ -22,7 +22,7 @@ if ! command -v pvesm &> /dev/null; then
 fi
 
 if ! command -v jq &> /dev/null; then
-    log_info "Installing jq (required for runner recycling)..."
+    log_info "Installing jq (required for pool watcher)..."
     apt-get install -y jq > /dev/null 2>&1 || {
         log_error "Failed to install jq. Install it manually: apt-get install jq"
         exit 1

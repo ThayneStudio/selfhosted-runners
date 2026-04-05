@@ -42,6 +42,11 @@ vm_org() {
 clone_runner() {
     local name="$1" org="$2"
 
+    # Validate org config in subshell so a bad config doesn't kill the watcher
+    if ! ( load_org_config "$org" ) 2>/dev/null; then
+        log_watch_warn "Org config for '$org' is invalid, skipping"
+        return 1
+    fi
     load_org_config "$org"
 
     if [[ ! -f "$SNIPPETS_DIR/runner-user-data-${org}.yaml" ]]; then
@@ -55,6 +60,13 @@ clone_runner() {
         log_watch_warn "Could not acquire lock, skipping clone"
         return 1
     }
+
+    # Re-check name uniqueness under lock (race with manual `runner create`)
+    if qm list 2>/dev/null | awk '{print $2}' | grep -qxF "$name"; then
+        log_watch "$name already exists, skipping"
+        exec 200>&-
+        return 0
+    fi
 
     # Find next free VMID
     local vmid
@@ -126,6 +138,21 @@ EOF
 
 # --- Main ---
 
+# Verify template exists and is actually a template (not still baking)
+TEMPLATE_STATUS=$(qm status "$TEMPLATE_ID" 2>/dev/null | awk '{print $2}') || true
+if [[ "$TEMPLATE_STATUS" != "stopped" ]]; then
+    # Template is missing, running (still baking), or in a bad state — skip this tick
+    if [[ -n "$TEMPLATE_STATUS" ]]; then
+        log_watch "Template VM $TEMPLATE_ID is $TEMPLATE_STATUS (not ready), skipping"
+    fi
+    exit 0
+fi
+# Verify it's actually a template (not a regular VM)
+if ! qm config "$TEMPLATE_ID" 2>/dev/null | grep -q "^template: 1"; then
+    log_watch "VM $TEMPLATE_ID is not a template yet, skipping"
+    exit 0
+fi
+
 # Snapshot all VMs (filtering happens per-org by prefix)
 ALL_VMS=$(get_all_vms)
 
@@ -140,7 +167,8 @@ for org_name in "${ORGS[@]}"; do
     local_count="${local_count:-0}"
     local_prefix="${local_prefix:-${RUNNER_PREFIX}}"
 
-    if [[ "$local_count" -le 0 ]]; then
+    # Skip if RUNNER_COUNT is missing, non-numeric, or zero
+    if [[ ! "$local_count" =~ ^[0-9]+$ ]] || [[ "$local_count" -le 0 ]]; then
         continue
     fi
 
@@ -181,12 +209,12 @@ while read -r vm_id vm_name; do
     [[ "$vm_status" == "running" ]] || continue
 
     # Check sentinel via guest agent
-    sentinel=$(qm guest exec "$vm_id" -- test -f /opt/.runner-ready 2>/dev/null) || continue
+    sentinel=$(timeout 10 qm guest exec "$vm_id" -- test -f /opt/.runner-ready 2>/dev/null) || continue
     sentinel_exit=$(echo "$sentinel" | jq -r '.exitcode // "1"' 2>/dev/null) || sentinel_exit="1"
     [[ "$sentinel_exit" == "0" ]] && continue
 
     # No sentinel — check uptime
-    uptime_result=$(qm guest exec "$vm_id" -- cat /proc/uptime 2>/dev/null) || continue
+    uptime_result=$(timeout 10 qm guest exec "$vm_id" -- cat /proc/uptime 2>/dev/null) || continue
     uptime_secs=$(echo "$uptime_result" | jq -r '.["out-data"] // ""' 2>/dev/null | awk 'NR==1{printf "%d", $1}') || uptime_secs=0
 
     if [[ "$uptime_secs" -gt 1800 ]]; then
