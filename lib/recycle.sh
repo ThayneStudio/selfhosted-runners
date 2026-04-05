@@ -80,8 +80,7 @@ for STATE_FILE in "${STATE_FILES[@]}"; do
             exit 0
         fi
 
-        # Delegate to recycle-one.sh
-        LIB_DIR="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+        # Delegate to recycle-one.sh (LIB_DIR inherited from common.sh)
         exec "$LIB_DIR/recycle-one.sh" "$STATE_FILE"
     ) &
     PIDS+=($!)

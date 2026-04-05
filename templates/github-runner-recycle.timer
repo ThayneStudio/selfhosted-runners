@@ -2,7 +2,7 @@
 Description=Safety-net timer for GitHub Actions runner recycling
 
 [Timer]
-OnBootSec=300
+OnBootSec=120
 OnUnitInactiveSec=600
 
 [Install]
