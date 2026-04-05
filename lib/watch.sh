@@ -46,10 +46,13 @@ for entry in "${MISSING[@]}"; do
     org="${entry##* }"
     (
         # Re-check: reclone.sh or another process may have filled this slot
-        if qm list 2>/dev/null | awk '{print $2}' | grep -qxF "$slot"; then
+        if qm list 2>/dev/null | awk 'NR>1{print $2}' | grep -qxF "$slot"; then
             exit 0
         fi
-        load_org_config "$org" 2>/dev/null || { log_warn "[watch] Skipping $slot — bad config for $org"; exit 0; }
+        if ! (load_org_config "$org") 2>/dev/null; then
+            log_warn "[watch] Skipping $slot — bad config for $org"
+            exit 0
+        fi
         clone_runner "$slot" "$org" >/dev/null \
             && log_info "[watch] Created $slot" \
             || log_warn "[watch] Failed to create $slot"
