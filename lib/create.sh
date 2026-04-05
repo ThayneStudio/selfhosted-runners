@@ -176,9 +176,13 @@ fi
 exec 200>&-
 VM_CLONED=true
 
-# Capture MAC address for DHCP static mapping (e.g., pfSense)
+# Apply deterministic MAC address
+MAC_ADDRESS=$(echo -n "$RUNNER_NAME" | md5sum | sed 's/\(..\)\(..\)\(..\)\(..\)\(..\).*/02:\1:\2:\3:\4:\5/')
 NET0_LINE=$(qm config "$VMID" | grep '^net0:' | sed 's/^net0: //') || true
-MAC_ADDRESS=$(echo "$NET0_LINE" | sed -n 's/.*virtio=\([^,]*\).*/\1/p') || true
+if [[ -n "$NET0_LINE" ]]; then
+    NET0_LINE=$(echo "$NET0_LINE" | sed "s/virtio=[^,]*/virtio=$MAC_ADDRESS/")
+    qm set "$VMID" --net0 "$NET0_LINE" || log_warn "Failed to set MAC address"
+fi
 
 log_info "Configuring cloud-init..."
 
@@ -204,48 +208,20 @@ VENDOREOF
     CICUSTOM="${CICUSTOM},vendor=local:snippets/runner-${VMID}-vendor.yaml"
 fi
 
-if ! qm set "$VMID" --cicustom "$CICUSTOM"; then
-    log_error "Failed to set cloud-init config"
-    exit 1
-fi
-
-if ! qm set "$VMID" --ipconfig0 ip=dhcp; then
-    log_error "Failed to set IP config"
-    exit 1
-fi
-
+qm set "$VMID" --cicustom "$CICUSTOM" || { log_error "Failed to set cloud-init config"; exit 1; }
+qm set "$VMID" --ipconfig0 ip=dhcp || { log_error "Failed to set IP config"; exit 1; }
 if [[ -n "${DNS_SERVERS:-}" ]]; then
-    if ! qm set "$VMID" --nameserver "$DNS_SERVERS"; then
-        log_error "Failed to set DNS servers"
-        exit 1
-    fi
+    qm set "$VMID" --nameserver "$DNS_SERVERS" || { log_error "Failed to set DNS servers"; exit 1; }
 fi
+qm set "$VMID" --ciuser runner || { log_error "Failed to set cloud-init user"; exit 1; }
 
-if ! qm set "$VMID" --ciuser runner; then
-    log_error "Failed to set cloud-init user"
-    exit 1
-fi
-
-# Set hookscript for event-driven recycling (if hookscript is installed)
+# Set hookscript for auto-destroy on shutdown
 if [[ -f "$SNIPPETS_DIR/runner-hookscript.sh" ]]; then
-    if ! qm set "$VMID" --hookscript "local:snippets/runner-hookscript.sh"; then
-        log_warn "Failed to set hookscript (safety timer will handle recycling)"
-    fi
+    qm set "$VMID" --hookscript "local:snippets/runner-hookscript.sh" || true
 fi
 
-# Release lock and close fd — VMID is claimed in Proxmox, safe to let recycler proceed
-# Show MAC and pause so user can configure DHCP static mapping
 echo ""
-log_info "Runner '$RUNNER_NAME' cloned successfully (VMID: $VMID)"
-if [[ -n "$MAC_ADDRESS" ]]; then
-    echo "  MAC: $MAC_ADDRESS"
-    echo ""
-    echo "Configure a static DHCP lease for this MAC in your router,"
-    read -rp "then press Enter to start the VM. "
-else
-    log_warn "Could not detect MAC address"
-    read -rp "Press Enter to start the VM. "
-fi
+log_info "Runner '$RUNNER_NAME' cloned successfully (VMID: $VMID, MAC: $MAC_ADDRESS)"
 
 log_info "Starting VM..."
 if ! qm start "$VMID"; then
@@ -253,44 +229,11 @@ if ! qm start "$VMID"; then
     exit 1
 fi
 
-# VM start was accepted by Proxmox — disable destructive cleanup trap
-# from this point on. A transient status-check failure should not destroy
-# a VM that Proxmox already acknowledged starting.
 trap - EXIT
-
-# Wait briefly and verify VM is running (advisory check only)
-sleep 2
-VM_STATUS=$(qm status "$VMID" 2>/dev/null | awk '{print $2}') || true
-if [[ "$VM_STATUS" != "running" ]]; then
-    log_warn "VM may not be running yet (status: ${VM_STATUS:-unknown})"
-    log_warn "Check manually: qm status $VMID"
-fi
-
-# Write per-runner state file (used by recycler for MAC preservation + auto-recycle)
-mkdir -p "$RUNNERS_DIR"
-chmod 700 "$RUNNERS_DIR"
-STATE_TMP=$(mktemp "${RUNNERS_DIR}/.${RUNNER_NAME}.XXXXXX")
-cat > "$STATE_TMP" << STATEEOF
-RUNNER_NAME="$RUNNER_NAME"
-VMID="$VMID"
-ORG="$SELECTED_ORG"
-MAC_ADDRESS="$MAC_ADDRESS"
-LABELS="$LABELS_FLAG"
-CREATED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-LAST_RECYCLED_AT=""
-STATEEOF
-chmod 600 "$STATE_TMP"
-mv "$STATE_TMP" "${RUNNERS_DIR}/${RUNNER_NAME}.conf"
 
 echo ""
 log_info "Runner '$RUNNER_NAME' started (VMID: $VMID)"
 echo ""
 echo "The runner will appear in GitHub in ~30 seconds:"
 echo "  https://github.com/organizations/$GITHUB_ORG/settings/actions/runners"
-echo ""
-echo "To watch registration progress:"
-echo "  qm guest exec $VMID -- cat /var/log/runner-setup.log"
-echo ""
-echo "To check runner service status:"
-echo "  qm guest exec $VMID -- systemctl status actions.runner.*"
 echo ""

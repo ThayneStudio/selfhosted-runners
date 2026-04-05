@@ -97,6 +97,21 @@ if [[ "$HTTP_CODE" != "200" ]]; then
 fi
 log_info "PAT validated successfully"
 
+# Runner pool configuration
+read -rp "Runner name prefix [runner]: " RUNNER_PREFIX
+RUNNER_PREFIX=${RUNNER_PREFIX:-runner}
+if [[ ! "$RUNNER_PREFIX" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]*$ ]]; then
+    log_error "Invalid prefix. Use only letters, numbers, dots, hyphens, underscores."
+    exit 1
+fi
+
+read -rp "Number of runners for this org [2]: " RUNNER_COUNT
+RUNNER_COUNT=${RUNNER_COUNT:-2}
+if [[ ! "$RUNNER_COUNT" =~ ^[0-9]+$ ]] || [[ "$RUNNER_COUNT" -lt 1 || "$RUNNER_COUNT" -gt 50 ]]; then
+    log_error "Runner count must be between 1 and 50"
+    exit 1
+fi
+
 # Generate cloud-init snippet from template using awk (avoids PAT in process list)
 log_info "Generating cloud-init snippet for '$GITHUB_ORG'..."
 mkdir -p "$SNIPPETS_DIR"
@@ -128,7 +143,7 @@ SNIPPET_TMP=""
 mkdir -p "$ORG_CONFIG_DIR"
 chmod 700 "$ORG_CONFIG_DIR"
 CONF_TMP=$(mktemp "$ORG_CONFIG_DIR/.${GITHUB_ORG}.XXXXXX")
-printf 'GITHUB_ORG="%s"\nGITHUB_PAT="%s"\n' "$GITHUB_ORG" "$GITHUB_PAT" > "$CONF_TMP"
+printf 'GITHUB_ORG="%s"\nGITHUB_PAT="%s"\nRUNNER_PREFIX="%s"\nRUNNER_COUNT="%s"\n' "$GITHUB_ORG" "$GITHUB_PAT" "$RUNNER_PREFIX" "$RUNNER_COUNT" > "$CONF_TMP"
 chmod 600 "$CONF_TMP"
 mv "$CONF_TMP" "$ORG_CONFIG_DIR/${GITHUB_ORG}.conf"
 CONF_TMP=""

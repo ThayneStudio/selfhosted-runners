@@ -30,14 +30,12 @@ if [[ -z "$RUNNER_NAME" ]]; then
     echo "Usage: runner destroy <runner-name>"
     echo ""
     echo "Current runners:"
-    qm list | awk 'NR==1 || $2 ~ /^runner-/ || $2 ~ /^build-/'
+    qm list | awk 'NR==1 || /runner/'
     exit 1
 fi
 
-# Validate runner name format (reject clearly malicious input)
 if [[ ! "$RUNNER_NAME" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]*$ ]]; then
     log_error "Invalid runner name: $RUNNER_NAME"
-    log_error "Use only letters, numbers, dots, hyphens, underscores. Must start with letter or number."
     exit 1
 fi
 
@@ -48,16 +46,13 @@ if [[ -z "$VMID" ]]; then
     log_error "Runner '$RUNNER_NAME' not found"
     echo ""
     echo "Available VMs:"
-    qm list | head -1
-    qm list | tail -n +2 | sort -k2
+    qm list
     exit 1
 fi
 
-# Check for multiple matches (shouldn't happen with exact match, but be safe)
 MATCH_COUNT=$(echo "$VMID" | wc -l)
 if [[ "$MATCH_COUNT" -gt 1 ]]; then
-    log_error "Multiple VMs found matching '$RUNNER_NAME'. This shouldn't happen."
-    echo "Matches:"
+    log_error "Multiple VMs found matching '$RUNNER_NAME':"
     echo "$VMID"
     exit 1
 fi
@@ -65,12 +60,8 @@ fi
 # Resolve org from VM's cloud-init config
 VM_ORG=$(get_vm_org "$VMID")
 
-# Get VM status for display
+# Get VM info for display
 VM_STATUS=$(qm status "$VMID" 2>/dev/null | awk '{print $2}') || VM_STATUS="unknown"
-[[ -z "$VM_STATUS" ]] && VM_STATUS="unknown"
-VM_CONFIG=$(qm config "$VMID" 2>/dev/null || true)
-VM_MEMORY=$(echo "$VM_CONFIG" | grep "^memory:" | awk '{print $2}' || true)
-VM_CORES=$(echo "$VM_CONFIG" | grep "^cores:" | awk '{print $2}' || true)
 
 echo ""
 echo "Runner to destroy:"
@@ -78,7 +69,6 @@ echo "  Name:   $RUNNER_NAME"
 echo "  VMID:   $VMID"
 echo "  Status: $VM_STATUS"
 echo "  Org:    $VM_ORG"
-echo "  Spec:   ${VM_CORES:-?} cores, ${VM_MEMORY:-?} MB RAM"
 echo ""
 log_warn "This action cannot be undone!"
 echo ""
@@ -89,64 +79,39 @@ if [[ "$CONFIRM" != "yes" ]]; then
     exit 0
 fi
 
-# Acquire per-runner lock to prevent racing with recycle-one.sh
-RUNNER_LOCK="/var/lock/github-runner-${RUNNER_NAME}.lock"
-exec 201>"$RUNNER_LOCK"
-if ! flock -w 60 201; then
-    log_error "Runner '$RUNNER_NAME' is currently being recycled. Try again shortly."
-    exit 1
-fi
-
-# Remove state file BEFORE stopping VM to prevent the post-stop hookscript
-# from triggering a recycle. Save org for deregistration.
-SAVED_ORG="$VM_ORG"
-rm -f "${RUNNERS_DIR}/${RUNNER_NAME}.conf"
+# Remove hookscript BEFORE stopping to prevent auto-destroy from racing
+qm set "$VMID" --delete hookscript 2>/dev/null || true
 
 # Stop VM if not already stopped
 if [[ "$VM_STATUS" != "stopped" && "$VM_STATUS" != "unknown" ]]; then
-    log_info "Stopping VM (status: $VM_STATUS)..."
-    if ! qm stop "$VMID" --timeout 30; then
-        log_warn "Graceful stop failed, forcing..."
+    log_info "Stopping VM..."
+    qm stop "$VMID" --timeout 30 2>/dev/null || {
         qm stop "$VMID" --skiplock 2>/dev/null || true
-    fi
-    # Wait for VM to actually stop
-    current_status=""
+    }
     for i in {1..15}; do
-        current_status=$(qm status "$VMID" 2>/dev/null | awk '{print $2}') || true
-        if [[ "$current_status" == "stopped" ]]; then
-            break
-        fi
+        current=$(qm status "$VMID" 2>/dev/null | awk '{print $2}') || true
+        [[ "$current" == "stopped" ]] && break
         sleep 1
     done
-    if [[ "$current_status" != "stopped" ]]; then
-        log_warn "VM may not be fully stopped (status: ${current_status:-unknown}), attempting destroy anyway"
-    fi
 fi
 
-# Deregister runner from GitHub before destroying (best-effort)
-if [[ "$SAVED_ORG" != "unknown" ]]; then
+# Deregister from GitHub (best-effort)
+if [[ "$VM_ORG" != "unknown" ]]; then
     log_info "Deregistering runner from GitHub..."
-    if deregister_runner "$SAVED_ORG" "$RUNNER_NAME"; then
-        log_info "Runner deregistered from GitHub."
-    else
-        log_warn "Could not deregister runner from GitHub."
-        echo "Remove it manually at:"
-        echo "  https://github.com/organizations/$SAVED_ORG/settings/actions/runners"
-    fi
+    deregister_runner "$VM_ORG" "$RUNNER_NAME" || true
 fi
 
 # Destroy VM
 log_info "Destroying VM..."
 if ! qm destroy "$VMID" --purge; then
     log_error "Failed to destroy VM $VMID"
-    log_error "You may need to manually stop it first: qm stop $VMID --skiplock"
     exit 1
 fi
 
-# Clean up per-VM snippets, state file (already removed above), and lock file
+# Clean up snippets
 rm -f "${SNIPPETS_DIR}/runner-${VMID}-meta.yaml" "${SNIPPETS_DIR}/runner-${VMID}-vendor.yaml"
-rm -f "$RUNNER_LOCK"
 
 echo ""
 log_info "Runner '$RUNNER_NAME' (VMID: $VMID) destroyed."
+echo "The pool watcher will NOT replace it. To restore pool size, run 'runner add-org' or adjust RUNNER_COUNT."
 echo ""

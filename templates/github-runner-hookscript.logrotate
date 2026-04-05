@@ -1,8 +1,0 @@
-/var/log/github-runner-hookscript.log {
-    weekly
-    rotate 4
-    compress
-    missingok
-    notifempty
-    create 0640 root root
-}

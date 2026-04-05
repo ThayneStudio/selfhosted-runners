@@ -410,35 +410,39 @@ else
     log_info "Template created successfully (tools baked in)"
 fi
 
-log_info "[5/6] Installing safety-net recycle timer..."
-cp "$INSTALL_DIR/templates/github-runner-recycle.service" /etc/systemd/system/
-cp "$INSTALL_DIR/templates/github-runner-recycle.timer" /etc/systemd/system/
+log_info "[5/6] Installing pool watcher timer..."
+# Remove old recycle timer if it exists
+systemctl disable --now github-runner-recycle.timer 2>/dev/null || true
+rm -f /etc/systemd/system/github-runner-recycle.service /etc/systemd/system/github-runner-recycle.timer
+# Install watch timer
+cp "$INSTALL_DIR/templates/github-runner-watch.service" /etc/systemd/system/
+cp "$INSTALL_DIR/templates/github-runner-watch.timer" /etc/systemd/system/
 systemctl daemon-reload
-systemctl enable --now github-runner-recycle.timer 2>/dev/null || true
-log_info "Safety-net timer installed (600s interval, hookscript handles normal recycling)"
+systemctl enable --now github-runner-watch.timer 2>/dev/null || true
+log_info "Pool watcher timer installed (30s interval)"
 
-# Install logrotate for hookscript log
-if [[ -f "$INSTALL_DIR/templates/github-runner-hookscript.logrotate" ]]; then
-    cp "$INSTALL_DIR/templates/github-runner-hookscript.logrotate" /etc/logrotate.d/github-runner-hookscript
-fi
+log_info "[6/6] Cleaning up legacy state..."
+# Remove old state files (no longer needed — Proxmox VM list is the source of truth)
+rm -rf "$RUNNERS_DIR" 2>/dev/null || true
+# Remove old recycle scripts if they exist in the install dir
+rm -f "$INSTALL_DIR/lib/recycle.sh" "$INSTALL_DIR/lib/recycle-one.sh" 2>/dev/null || true
 
-log_info "[6/6] Preparing runner state directory..."
-mkdir -p "$RUNNERS_DIR"
-chmod 700 "$RUNNERS_DIR"
-
-# Migrate existing VMs: set hookscript on any runners that don't have it yet
-shopt -s nullglob
-for _state_file in "$RUNNERS_DIR"/*.conf; do
-    _vmid=""
-    _vmid=$(grep '^VMID=' "$_state_file" | head -1 | sed 's/^VMID=//' | tr -d '"') || true
-    if [[ -n "$_vmid" ]] && qm status "$_vmid" &>/dev/null; then
-        qm set "$_vmid" --hookscript "local:snippets/runner-hookscript.sh" 2>/dev/null || {
-            _name=$(basename "$_state_file" .conf)
-            log_warn "Could not set hookscript on VM $_vmid ($_name)"
-        }
+# Set hookscript on any existing runner VMs that don't have it
+log_info "Setting hookscript on existing runner VMs..."
+QM_LIST=$(qm list 2>/dev/null | tail -n +2 || true)
+while read -r _line; do
+    [[ -z "$_line" ]] && continue
+    _vmid=$(echo "$_line" | awk '{print $1}')
+    _name=$(echo "$_line" | awk '{print $2}')
+    # Skip template and non-runner VMs
+    [[ "$_vmid" == "$TEMPLATE_ID" ]] && continue
+    # Check if VM already has hookscript
+    _hook=$(qm config "$_vmid" 2>/dev/null | grep "^hookscript:" || true)
+    if [[ -z "$_hook" ]]; then
+        qm set "$_vmid" --hookscript "local:snippets/runner-hookscript.sh" 2>/dev/null && \
+            echo "  Set hookscript on VM $_vmid ($_name)" || true
     fi
-done
-shopt -u nullglob
+done <<< "$QM_LIST"
 
 echo ""
 echo "========================================"

@@ -1,0 +1,201 @@
+#!/bin/bash
+set -euo pipefail
+# Pool watcher: ensures each org has its target number of runner VMs.
+# Runs via systemd timer every 30s. Clones ONE VM per org per tick.
+# Also detects stuck VMs (running >30 min without becoming ready).
+
+source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/common.sh"
+
+require_root "watch"
+
+if [[ ! -f "$CONFIG_FILE" ]]; then
+    exit 0
+fi
+load_infra_config
+
+RUNNER_PREFIX="${RUNNER_PREFIX:-runner}"
+
+log_watch() { log_info "[watch] $1"; }
+log_watch_warn() { log_warn "[watch] $1"; }
+
+# Generate a deterministic MAC address from a runner name.
+# Uses locally-administered unicast prefix (02:xx:xx:xx:xx:xx).
+generate_mac() {
+    echo -n "$1" | md5sum | sed 's/\(..\)\(..\)\(..\)\(..\)\(..\).*/02:\1:\2:\3:\4:\5/'
+}
+
+# Get all runner VMs (matching prefix) as "VMID NAME" pairs
+get_runner_vms() {
+    qm list 2>/dev/null | awk -v prefix="${RUNNER_PREFIX}-" 'NR>1 && $2 ~ "^"prefix {print $1, $2}'
+}
+
+# Get the org for a VM from its cicustom config
+vm_org() {
+    local cicustom
+    cicustom=$(qm config "$1" 2>/dev/null | grep "^cicustom:" || true)
+    if [[ "$cicustom" =~ runner-user-data-([^.]+)\.yaml ]]; then
+        echo "${BASH_REMATCH[1]}"
+    fi
+}
+
+# Clone a new runner VM
+clone_runner() {
+    local name="$1" org="$2"
+
+    load_org_config "$org"
+
+    if [[ ! -f "$SNIPPETS_DIR/runner-user-data-${org}.yaml" ]]; then
+        log_watch_warn "Org snippet for '$org' not found, skipping"
+        return 1
+    fi
+
+    # Acquire global lock for VMID allocation + clone
+    exec 200>"$LOCK_FILE"
+    flock -w 180 200 || {
+        log_watch_warn "Could not acquire lock, skipping clone"
+        return 1
+    }
+
+    # Find next free VMID
+    local vmid
+    if [[ "${MIN_VMID:-0}" -gt 0 ]]; then
+        vmid="$MIN_VMID"
+        while qm status "$vmid" &>/dev/null; do
+            vmid=$((vmid + 1))
+        done
+    else
+        vmid=$(pvesh get /cluster/nextid 2>&1) || {
+            log_watch_warn "Failed to get next VM ID: $vmid"
+            exec 200>&-
+            return 1
+        }
+    fi
+
+    # Clone under lock (close lock fd for child to prevent KVM inheritance)
+    if ! qm clone "$TEMPLATE_ID" "$vmid" --name "$name" --full --storage "$VM_STORAGE" 200>&-; then
+        log_watch_warn "$name — clone failed"
+        exec 200>&-
+        return 1
+    fi
+    exec 200>&-
+
+    # Apply deterministic MAC address
+    local mac
+    mac=$(generate_mac "$name")
+    local net0
+    net0=$(qm config "$vmid" | grep '^net0:' | sed 's/^net0: //') || true
+    if [[ -n "$net0" ]]; then
+        net0=$(echo "$net0" | sed "s/virtio=[^,]*/virtio=$mac/")
+        qm set "$vmid" --net0 "$net0" || {
+            log_watch_warn "$name — failed to set MAC, destroying"
+            qm destroy "$vmid" --purge 2>/dev/null || true
+            return 1
+        }
+    fi
+
+    # Configure cloud-init
+    cat > "${SNIPPETS_DIR}/runner-${vmid}-meta.yaml" << EOF
+instance-id: "$name"
+local-hostname: "$name"
+EOF
+    chmod 600 "${SNIPPETS_DIR}/runner-${vmid}-meta.yaml"
+
+    local cicustom="user=local:snippets/runner-user-data-${org}.yaml,meta=local:snippets/runner-${vmid}-meta.yaml"
+
+    qm set "$vmid" --cicustom "$cicustom" || { log_watch_warn "$name — failed to set cicustom"; qm destroy "$vmid" --purge 2>/dev/null || true; return 1; }
+    qm set "$vmid" --ipconfig0 ip=dhcp || { log_watch_warn "$name — failed to set ipconfig"; qm destroy "$vmid" --purge 2>/dev/null || true; return 1; }
+    if [[ -n "${DNS_SERVERS:-}" ]]; then
+        qm set "$vmid" --nameserver "$DNS_SERVERS" || { log_watch_warn "$name — failed to set DNS"; qm destroy "$vmid" --purge 2>/dev/null || true; return 1; }
+    fi
+    qm set "$vmid" --ciuser runner || { log_watch_warn "$name — failed to set ciuser"; qm destroy "$vmid" --purge 2>/dev/null || true; return 1; }
+
+    # Set hookscript for auto-destroy on shutdown
+    if [[ -f "$SNIPPETS_DIR/runner-hookscript.sh" ]]; then
+        qm set "$vmid" --hookscript "local:snippets/runner-hookscript.sh" || true
+    fi
+
+    # Start
+    if ! qm start "$vmid"; then
+        log_watch_warn "$name (VM $vmid) — failed to start"
+        return 1
+    fi
+
+    log_watch "Created $name (VM $vmid) for org $org [MAC $mac]"
+    return 0
+}
+
+# --- Main ---
+
+# Snapshot current runner VMs
+RUNNER_VMS=$(get_runner_vms)
+
+# Iterate each org and fill its pool
+mapfile -t ORGS < <(list_orgs)
+
+CREATED=0
+for org_name in "${ORGS[@]}"; do
+    # Load org config to get RUNNER_COUNT
+    ORG_RUNNER_COUNT=""
+    ORG_RUNNER_PREFIX=""
+    # Source in subshell to avoid polluting scope
+    eval "$(grep -E '^(RUNNER_COUNT|RUNNER_PREFIX)=' "$ORG_CONFIG_DIR/${org_name}.conf" 2>/dev/null || true)"
+    local_count="${ORG_RUNNER_COUNT:-${RUNNER_COUNT:-0}}"
+    local_prefix="${ORG_RUNNER_PREFIX:-${RUNNER_PREFIX}}"
+
+    if [[ "$local_count" -le 0 ]]; then
+        continue
+    fi
+
+    # Count existing VMs for this org
+    existing=0
+    while read -r vm_id vm_name; do
+        [[ -z "$vm_id" ]] && continue
+        if [[ "$(vm_org "$vm_id")" == "$org_name" ]]; then
+            existing=$((existing + 1))
+        fi
+    done <<< "$RUNNER_VMS"
+
+    if [[ $existing -ge $local_count ]]; then
+        continue
+    fi
+
+    # Find first missing slot name and clone ONE VM
+    for n in $(seq 1 "$local_count"); do
+        slot_name="${local_prefix}-${n}"
+        # Check if this name exists in the VM list
+        if ! echo "$RUNNER_VMS" | awk '{print $2}' | grep -qxF "$slot_name"; then
+            if clone_runner "$slot_name" "$org_name"; then
+                CREATED=$((CREATED + 1))
+            fi
+            break  # One clone per org per tick
+        fi
+    done
+done
+
+# --- Stuck VM detection ---
+# Force-stop VMs running >30 min without the runner-ready sentinel.
+# The hookscript auto-destroys them on stop, and next tick fills the gap.
+while read -r vm_id vm_name; do
+    [[ -z "$vm_id" ]] && continue
+    vm_status=$(qm status "$vm_id" 2>/dev/null | awk '{print $2}') || continue
+    [[ "$vm_status" == "running" ]] || continue
+
+    # Check sentinel via guest agent
+    sentinel=$(qm guest exec "$vm_id" -- test -f /opt/.runner-ready 2>/dev/null) || continue
+    sentinel_exit=$(echo "$sentinel" | jq -r '.exitcode // "1"' 2>/dev/null) || sentinel_exit="1"
+    [[ "$sentinel_exit" == "0" ]] && continue
+
+    # No sentinel — check uptime
+    uptime_result=$(qm guest exec "$vm_id" -- cat /proc/uptime 2>/dev/null) || continue
+    uptime_secs=$(echo "$uptime_result" | jq -r '.["out-data"] // ""' 2>/dev/null | awk 'NR==1{printf "%d", $1}') || uptime_secs=0
+
+    if [[ "$uptime_secs" -gt 1800 ]]; then
+        log_watch_warn "$vm_name (VM $vm_id) stuck for ${uptime_secs}s — force stopping"
+        qm stop "$vm_id" --timeout 10 2>/dev/null || qm stop "$vm_id" --skiplock 2>/dev/null || true
+        # Hookscript will auto-destroy on post-stop, watcher fills the gap next tick
+    fi
+done <<< "$RUNNER_VMS"
+
+if [[ $CREATED -gt 0 ]]; then
+    log_watch "Created $CREATED runner(s)"
+fi
