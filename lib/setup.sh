@@ -133,7 +133,7 @@ read -rp "Proceed? [Y/n]: " CONFIRM
 
 # Install to /opt and create symlink
 echo ""
-log_info "[1/6] Installing to $INSTALL_DIR..."
+log_info "[1/5] Installing to $INSTALL_DIR..."
 if [[ "$REPO_DIR" != "$INSTALL_DIR" ]]; then
     mkdir -p "$INSTALL_DIR"
     cp -r "$REPO_DIR"/* "$INSTALL_DIR/"
@@ -150,7 +150,7 @@ ln -sf "$INSTALL_DIR/runner" /usr/local/bin/runner
 log_info "Command available: runner"
 
 # Enable snippets on local storage
-log_info "[2/6] Enabling snippets storage..."
+log_info "[2/5] Enabling snippets storage..."
 if ! pvesm status --content snippets 2>/dev/null | awk '{print $1}' | grep -qx "local"; then
     # Read current content types to avoid overwriting them
     EXISTING_CONTENT=$(awk '/^dir: local$/,/^[^[:space:]]/' /etc/pve/storage.cfg 2>/dev/null | awk '/^[[:space:]]+content/ {print $2}')
@@ -178,7 +178,7 @@ cp "$INSTALL_DIR/templates/runner-hookscript.sh" "$SNIPPETS_DIR/runner-hookscrip
 chmod 755 "$SNIPPETS_DIR/runner-hookscript.sh"
 
 # Save infra config
-log_info "[3/6] Saving configuration..."
+log_info "[3/5] Saving configuration..."
 mkdir -p "$ORG_CONFIG_DIR"
 chmod 700 "$ORG_CONFIG_DIR"
 CONF_TMP=$(mktemp "${CONFIG_FILE}.XXXXXX")
@@ -196,11 +196,11 @@ mv "$CONF_TMP" "$CONFIG_FILE"
 
 # Check if template already exists
 if qm status "$TEMPLATE_ID" &> /dev/null; then
-    log_info "[4/6] Template VM $TEMPLATE_ID already exists. Skipping creation."
+    log_info "[4/5] Template VM $TEMPLATE_ID already exists. Skipping creation."
     log_warn "To recreate: qm destroy $TEMPLATE_ID && runner setup"
 else
     # Download and create template
-    log_info "[4/6] Creating baked Ubuntu cloud template..."
+    log_info "[4/5] Creating baked Ubuntu cloud template..."
     CLOUD_IMG="noble-server-cloudimg-amd64.img"
     CLOUD_IMG_URL="https://cloud-images.ubuntu.com/noble/current/$CLOUD_IMG"
 
@@ -410,40 +410,12 @@ else
     log_info "Template created successfully (tools baked in)"
 fi
 
-log_info "[5/6] Installing pool watcher timer..."
-# Remove old recycle timer if it exists
-systemctl disable --now github-runner-recycle.timer 2>/dev/null || true
-rm -f /etc/systemd/system/github-runner-recycle.service /etc/systemd/system/github-runner-recycle.timer
-# Install watch timer
+log_info "[5/5] Installing pool watcher timer..."
 cp "$INSTALL_DIR/templates/github-runner-watch.service" /etc/systemd/system/
 cp "$INSTALL_DIR/templates/github-runner-watch.timer" /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable --now github-runner-watch.timer 2>/dev/null || true
 log_info "Pool watcher timer installed (30s interval)"
-
-log_info "[6/6] Cleaning up legacy state..."
-# Remove old state files (no longer needed — Proxmox VM list is the source of truth)
-rm -rf "$RUNNERS_DIR" 2>/dev/null || true
-# Remove old recycle scripts if they exist in the install dir
-rm -f "$INSTALL_DIR/lib/recycle.sh" "$INSTALL_DIR/lib/recycle-one.sh" 2>/dev/null || true
-
-# Set hookscript on existing runner VMs (only VMs whose cicustom references an org snippet)
-log_info "Setting hookscript on existing runner VMs..."
-QM_LIST=$(qm list 2>/dev/null | tail -n +2 || true)
-while read -r _line; do
-    [[ -z "$_line" ]] && continue
-    _vmid=$(echo "$_line" | awk '{print $1}')
-    _name=$(echo "$_line" | awk '{print $2}')
-    [[ "$_vmid" == "$TEMPLATE_ID" ]] && continue
-    # Only set hookscript on VMs that have a runner cloud-init snippet (i.e., actual runners)
-    _cicustom=$(qm config "$_vmid" 2>/dev/null | grep "^cicustom:" || true)
-    [[ "$_cicustom" == *"runner-user-data-"* ]] || continue
-    _hook=$(qm config "$_vmid" 2>/dev/null | grep "^hookscript:" || true)
-    if [[ -z "$_hook" ]]; then
-        qm set "$_vmid" --hookscript "local:snippets/runner-hookscript.sh" 2>/dev/null && \
-            echo "  Set hookscript on VM $_vmid ($_name)" || true
-    fi
-done <<< "$QM_LIST"
 
 echo ""
 echo "========================================"

@@ -19,7 +19,6 @@ if [[ ! -f "$CONFIG_FILE" ]]; then
     log_error "Configuration not found. Run 'runner setup' first."
     exit 1
 fi
-migrate_config_if_needed
 
 # Verify template file exists
 if [[ ! -f "$INSTALL_DIR/templates/runner-user-data.yaml" ]]; then

@@ -9,7 +9,6 @@ if [[ ! -f "$CONFIG_FILE" ]]; then
     log_error "Configuration not found. Run 'runner setup' first."
     exit 1
 fi
-migrate_config_if_needed
 
 mapfile -t orgs < <(list_orgs)
 
