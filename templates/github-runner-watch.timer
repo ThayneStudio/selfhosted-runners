@@ -1,9 +1,9 @@
 [Unit]
-Description=GitHub Actions runner pool watcher timer
+Description=GitHub Actions runner pool safety-net timer
 
 [Timer]
 OnBootSec=60
-OnUnitInactiveSec=30
+OnUnitInactiveSec=300
 
 [Install]
 WantedBy=timers.target

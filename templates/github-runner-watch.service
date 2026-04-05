@@ -1,5 +1,5 @@
 [Unit]
-Description=GitHub Actions runner pool watcher
+Description=GitHub Actions runner pool safety-net
 After=network-online.target
 Wants=network-online.target
 
