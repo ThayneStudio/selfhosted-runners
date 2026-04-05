@@ -89,6 +89,14 @@ if [[ "$CONFIRM" != "yes" ]]; then
     exit 0
 fi
 
+# Acquire per-runner lock to prevent racing with recycle-one.sh
+RUNNER_LOCK="/var/lock/github-runner-${RUNNER_NAME}.lock"
+exec 201>"$RUNNER_LOCK"
+if ! flock -w 60 201; then
+    log_error "Runner '$RUNNER_NAME' is currently being recycled. Try again shortly."
+    exit 1
+fi
+
 # Remove state file BEFORE stopping VM to prevent the post-stop hookscript
 # from triggering a recycle. Save org for deregistration.
 SAVED_ORG="$VM_ORG"
@@ -135,8 +143,9 @@ if ! qm destroy "$VMID" --purge; then
     exit 1
 fi
 
-# Clean up per-VM snippets (state file already removed above)
+# Clean up per-VM snippets, state file (already removed above), and lock file
 rm -f "${SNIPPETS_DIR}/runner-${VMID}-meta.yaml" "${SNIPPETS_DIR}/runner-${VMID}-vendor.yaml"
+rm -f "$RUNNER_LOCK"
 
 echo ""
 log_info "Runner '$RUNNER_NAME' (VMID: $VMID) destroyed."

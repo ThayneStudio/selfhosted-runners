@@ -1,16 +1,23 @@
 #!/bin/bash
 set -euo pipefail
 # Recycle a single runner: destroy old VM (if any) and clone a fresh one.
-# Usage: recycle-one.sh <state-file-path>
+# Usage: recycle-one.sh [--force] <state-file-path>
 # Exit codes: 0 = no action, 1 = error, 2 = recycled successfully
+# --force: recycle even if VM is running (used by safety timer for stuck VMs)
 
 source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/common.sh"
 
 require_root "recycle-one"
 
+FORCE_RECYCLE=false
+if [[ "${1:-}" == "--force" ]]; then
+    FORCE_RECYCLE=true
+    shift
+fi
+
 STATE_FILE="${1:-}"
 if [[ -z "$STATE_FILE" || ! -f "$STATE_FILE" ]]; then
-    log_error "Usage: recycle-one.sh <state-file-path>"
+    log_error "Usage: recycle-one.sh [--force] <state-file-path>"
     exit 1
 fi
 
@@ -60,12 +67,11 @@ else
             log_recycle " $RUNNER_NAME VM $VMID not running (status: ${VM_STATUS:-unknown}) — skipping"
             exit 0
         else
-            # VM is running — caller must decide whether to force-recycle.
-            # When invoked from hookscript (post-stop), we never reach here.
-            # When invoked from safety timer, caller only invokes us for VMs
-            # that are stopped or need force-recycle.
-            log_recycle " $RUNNER_NAME VM $VMID is running — skipping"
-            exit 0
+            # VM is running — only recycle if --force was passed (stuck-boot detection)
+            if [[ "$FORCE_RECYCLE" != true ]]; then
+                exit 0
+            fi
+            log_recycle_warn " $RUNNER_NAME VM $VMID is running — force recycling (stuck)"
         fi
 
         # --- Destroy the old VM ---
@@ -150,8 +156,8 @@ else
     }
 fi
 
-# Clone template under lock. Close lock fd for child to prevent KVM inheritance.
-if ! qm clone "$TEMPLATE_ID" "$NEW_VMID" --name "$RUNNER_NAME" --full --storage "$VM_STORAGE" 200>&-; then
+# Clone template under lock. Close lock fds for child to prevent KVM inheritance.
+if ! qm clone "$TEMPLATE_ID" "$NEW_VMID" --name "$RUNNER_NAME" --full --storage "$VM_STORAGE" 200>&- 201>&-; then
     log_recycle_err " $RUNNER_NAME — failed to clone template"
     exec 200>&-
     exit 1
@@ -240,7 +246,7 @@ chmod 600 "$STATE_TMP"
 mv "$STATE_TMP" "$STATE_FILE"
 
 # Start VM
-if ! qm start "$NEW_VMID"; then
+if ! qm start "$NEW_VMID" 201>&-; then
     log_recycle_err " $RUNNER_NAME — failed to start VM $NEW_VMID"
     exit 1
 fi

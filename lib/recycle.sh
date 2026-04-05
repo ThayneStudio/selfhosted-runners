@@ -38,8 +38,12 @@ for STATE_FILE in "${STATE_FILES[@]}"; do
     RUNNER_BASE=$(basename "$STATE_FILE" .conf)
 
     (
+        # State file may have been deleted by a concurrent destroy
+        [[ -f "$STATE_FILE" ]] || exit 0
+
         RUNNER_NAME=""
         VMID=""
+        FORCE_STUCK=false
 
         source "$STATE_FILE"
 
@@ -62,9 +66,11 @@ for STATE_FILE in "${STATE_FILES[@]}"; do
             elif [[ "$VM_STATUS" == "running" ]]; then
                 # Check for stuck boot (>30 min without becoming ready)
                 UPTIME_RESULT=$(qm guest exec "$VMID" -- cat /proc/uptime 2>/dev/null) || true
-                UPTIME_SECS=$(echo "$UPTIME_RESULT" | jq -r '.["out-data"] // ""' 2>/dev/null | awk '{printf "%d", $1}') || UPTIME_SECS=0
+                UPTIME_SECS=0
+                UPTIME_SECS=$(echo "$UPTIME_RESULT" | jq -r '.["out-data"] // ""' 2>/dev/null | awk 'NR==1{printf "%d", $1}') || UPTIME_SECS=0
                 if [[ "$UPTIME_SECS" -gt 1800 ]]; then
                     log_recycle_warn " $RUNNER_NAME (VM $VMID) stuck for ${UPTIME_SECS}s — safety-net force recycling"
+                    FORCE_STUCK=true
                     NEEDS_RECYCLE=true
                 fi
             fi
@@ -81,7 +87,11 @@ for STATE_FILE in "${STATE_FILES[@]}"; do
         fi
 
         # Delegate to recycle-one.sh (LIB_DIR inherited from common.sh)
-        exec "$LIB_DIR/recycle-one.sh" "$STATE_FILE"
+        if [[ "$FORCE_STUCK" == true ]]; then
+            exec "$LIB_DIR/recycle-one.sh" --force "$STATE_FILE"
+        else
+            exec "$LIB_DIR/recycle-one.sh" "$STATE_FILE"
+        fi
     ) &
     PIDS+=($!)
     echo $! > "$RESULT_DIR/$RUNNER_BASE.pid"
