@@ -427,16 +427,17 @@ rm -rf "$RUNNERS_DIR" 2>/dev/null || true
 # Remove old recycle scripts if they exist in the install dir
 rm -f "$INSTALL_DIR/lib/recycle.sh" "$INSTALL_DIR/lib/recycle-one.sh" 2>/dev/null || true
 
-# Set hookscript on any existing runner VMs that don't have it
+# Set hookscript on existing runner VMs (only VMs whose cicustom references an org snippet)
 log_info "Setting hookscript on existing runner VMs..."
 QM_LIST=$(qm list 2>/dev/null | tail -n +2 || true)
 while read -r _line; do
     [[ -z "$_line" ]] && continue
     _vmid=$(echo "$_line" | awk '{print $1}')
     _name=$(echo "$_line" | awk '{print $2}')
-    # Skip template and non-runner VMs
     [[ "$_vmid" == "$TEMPLATE_ID" ]] && continue
-    # Check if VM already has hookscript
+    # Only set hookscript on VMs that have a runner cloud-init snippet (i.e., actual runners)
+    _cicustom=$(qm config "$_vmid" 2>/dev/null | grep "^cicustom:" || true)
+    [[ "$_cicustom" == *"runner-user-data-"* ]] || continue
     _hook=$(qm config "$_vmid" 2>/dev/null | grep "^hookscript:" || true)
     if [[ -z "$_hook" ]]; then
         qm set "$_vmid" --hookscript "local:snippets/runner-hookscript.sh" 2>/dev/null && \
