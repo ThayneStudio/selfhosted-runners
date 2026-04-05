@@ -26,6 +26,10 @@ for attempt in 1 2 3; do
     if qm destroy "$VMID" --purge 2>&1 | logger -t github-runner; then
         break
     fi
+    if [[ $attempt -eq 3 ]]; then
+        log_error "reclone: failed to destroy VM $VMID after 3 attempts, deferring to watcher"
+        exit 1
+    fi
     sleep 2
 done
 
