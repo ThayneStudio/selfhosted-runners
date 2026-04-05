@@ -20,10 +20,12 @@ if [[ -z "$NAME" || -z "$ORG" || "$ORG" == "unknown" ]]; then
     exit 0
 fi
 
-# Destroy the old VM (retry briefly in case Proxmox lock from stop task hasn't released)
+# Destroy the old VM (retry briefly in case Proxmox lock hasn't released)
 rm -f "${SNIPPETS_DIR}/runner-${VMID}-meta.yaml"
 for attempt in 1 2 3; do
-    if qm destroy "$VMID" --purge 2>&1 | logger -t github-runner; then
+    destroy_output=$(qm destroy "$VMID" --purge 2>&1) && destroy_rc=0 || destroy_rc=$?
+    printf '%s\n' "$destroy_output" | logger -t github-runner || true
+    if [[ $destroy_rc -eq 0 ]]; then
         break
     fi
     if [[ $attempt -eq 3 ]]; then
@@ -34,13 +36,16 @@ for attempt in 1 2 3; do
 done
 
 # Check if someone else already filled this slot (watcher, manual create)
-if qm list 2>/dev/null | awk '{print $2}' | grep -qxF "$NAME"; then
+if qm list 2>/dev/null | awk 'NR>1{print $2}' | grep -qxF "$NAME"; then
     log_info "reclone: $NAME already exists, skipping"
     exit 0
 fi
 
 # Clone replacement
 load_org_config "$ORG"
-clone_runner "$NAME" "$ORG" >/dev/null \
-    && log_info "reclone: re-cloned $NAME for org $ORG" \
-    || log_error "reclone: failed to re-clone $NAME for org $ORG"
+if clone_runner "$NAME" "$ORG" >/dev/null; then
+    log_info "reclone: re-cloned $NAME for org $ORG"
+else
+    log_error "reclone: failed to re-clone $NAME for org $ORG"
+    exit 1
+fi

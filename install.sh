@@ -15,7 +15,23 @@ chmod +x "$INSTALL_DIR/runner" "$INSTALL_DIR/lib/"*.sh
 ln -sf "$INSTALL_DIR/runner" /usr/local/bin/runner
 
 echo "Installed to $INSTALL_DIR"
-echo ""
-echo "Run the setup wizard:"
-echo "  runner setup"
+
+# If setup was already run, sync deployed files (hookscript, systemd units)
+if [[ -f /etc/github-runners.conf ]]; then
+    echo "Updating deployed files..."
+    if [[ -d /var/lib/vz/snippets ]]; then
+        cp "$INSTALL_DIR/templates/runner-hookscript.sh" /var/lib/vz/snippets/runner-hookscript.sh
+        chmod 755 /var/lib/vz/snippets/runner-hookscript.sh
+    fi
+    if [[ -f /etc/systemd/system/github-runner-watch.timer ]]; then
+        cp "$INSTALL_DIR/templates/github-runner-watch.service" /etc/systemd/system/
+        cp "$INSTALL_DIR/templates/github-runner-watch.timer" /etc/systemd/system/
+        systemctl daemon-reload
+    fi
+    echo "Done. No need to re-run setup."
+else
+    echo ""
+    echo "Run the setup wizard:"
+    echo "  runner setup"
+fi
 echo ""

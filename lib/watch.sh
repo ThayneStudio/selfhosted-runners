@@ -49,7 +49,7 @@ for entry in "${MISSING[@]}"; do
         if qm list 2>/dev/null | awk '{print $2}' | grep -qxF "$slot"; then
             exit 0
         fi
-        load_org_config "$org"
+        load_org_config "$org" 2>/dev/null || { log_warn "[watch] Skipping $slot — bad config for $org"; exit 0; }
         clone_runner "$slot" "$org" >/dev/null \
             && log_info "[watch] Created $slot" \
             || log_warn "[watch] Failed to create $slot"
