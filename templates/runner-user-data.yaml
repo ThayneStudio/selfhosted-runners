@@ -135,9 +135,10 @@ write_files:
       sudo -u $RUNNER_USER ./run.sh || true
       # EXIT trap handles shutdown
 
-runcmd:
-  # Regenerate machine-id so DHCP doesn't conflict between clones
+bootcmd:
+  # Regenerate machine-id BEFORE networking starts so each clone gets a unique DHCP lease
   - rm -f /etc/machine-id /var/lib/dbus/machine-id
   - systemd-machine-id-setup
-  - networkctl reconfigure eth0
+
+runcmd:
   - /opt/register-runner.sh 2>&1 | tee /var/log/runner-setup.log
