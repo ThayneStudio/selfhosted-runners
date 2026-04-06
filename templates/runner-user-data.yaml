@@ -54,6 +54,16 @@ write_files:
 
       cd $RUNNER_HOME
 
+      # Remove DHCP-provided DNS (often unreachable from VMs on bridged networks)
+      # and keep only the explicitly configured nameservers from Proxmox cloud-init.
+      CONFIGURED_DNS=$(resolvectl status eth0 2>/dev/null | grep "DNS Servers:" | sed 's/.*DNS Servers: //')
+      # Filter out the DHCP gateway IP (first hop, often not a DNS server for VMs)
+      GATEWAY=$(ip route | awk '/default/{print $3}')
+      CLEAN_DNS=$(echo "$CONFIGURED_DNS" | tr ' ' '\n' | grep -vxF "$GATEWAY" | tr '\n' ' ')
+      if [[ -n "$CLEAN_DNS" ]]; then
+        resolvectl dns eth0 $CLEAN_DNS 2>/dev/null || true
+      fi
+
       # Wait for network connectivity
       log "[1/3] Checking network connectivity..."
       for i in {1..30}; do
