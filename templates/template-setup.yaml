@@ -178,4 +178,4 @@ write_files:
 
 runcmd:
   - /opt/setup-template.sh 2>&1 | tee /var/log/template-setup.log
-  - bash -c 'test -f /opt/.template-setup-complete && { cloud-init clean --logs; poweroff; }'
+  - bash -c 'test -f /opt/.template-setup-complete && { cloud-init clean --logs; truncate -s 0 /etc/machine-id; rm -f /var/lib/dbus/machine-id; rm -f /etc/ssh/ssh_host_*; poweroff; }'
