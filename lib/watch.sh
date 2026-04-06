@@ -41,23 +41,42 @@ done
 
 log_info "[watch] Filling ${#MISSING[@]} missing slot(s) in parallel"
 
-for entry in "${MISSING[@]}"; do
+# Pre-allocate VMIDs sequentially so parallel clones don't race.
+# (A concurrent reclone.sh could grab one of these IDs; clone_runner
+# handles that gracefully via _fail() ownership check.)
+VMIDS=()
+if [[ "${MIN_VMID:-0}" -gt 0 ]]; then
+    vmid="$MIN_VMID"
+else
+    vmid=$(pvesh get /cluster/nextid)
+fi
+for _ in "${MISSING[@]}"; do
+    while qm status "$vmid" &>/dev/null; do
+        vmid=$((vmid + 1))
+    done
+    VMIDS+=("$vmid")
+    vmid=$((vmid + 1))
+done
+
+for i in "${!MISSING[@]}"; do
+    entry="${MISSING[$i]}"
+    vmid="${VMIDS[$i]}"
     slot="${entry%% *}"
     org="${entry##* }"
     (
-        # Re-check: reclone.sh or another process may have filled this slot
+        # Re-check: another process may have filled this slot
         if qm list 2>/dev/null | awk 'NR>1{print $2}' | grep -qxF "$slot"; then
             exit 0
         fi
-        if ! (load_org_config "$org") 2>/dev/null; then
+        if ! load_org_config "$org" 2>/dev/null; then
             log_warn "[watch] Skipping $slot — bad config for $org"
             exit 0
         fi
-        clone_runner "$slot" "$org" >/dev/null \
+        clone_runner "$slot" "$org" "$vmid" >/dev/null \
             && log_info "[watch] Created $slot" \
             || log_warn "[watch] Failed to create $slot"
     ) &
 done
 
-# Wait for all background jobs — || true prevents set -e from killing us if any subshell fails
+# Wait for all background jobs
 wait || true

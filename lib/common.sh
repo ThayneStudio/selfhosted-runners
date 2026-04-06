@@ -183,10 +183,11 @@ next_vmid() {
 # Clone template, configure cloud-init, set hookscript, start VM.
 # Returns VMID on stdout. Returns 1 on failure (cleans up partial clone).
 clone_runner() {
-    local name="$1" org="$2"
+    local name="$1" org="$2" vmid="${3:-}"
 
-    local vmid
-    vmid=$(next_vmid) || return 1
+    if [[ -z "$vmid" ]]; then
+        vmid=$(next_vmid) || return 1
+    fi
 
     # Cleanup helper: destroy VM (only if it belongs to us) and remove snippet.
     # The ownership check prevents destroying another process's VM on VMID collision.
