@@ -18,9 +18,10 @@ write_files:
       log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"; }
       log_error() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: $1" >&2; }
 
-      # On ANY failure, shut down the VM so the hookscript reclones.
+      # Always shut down the VM when this script exits (success or failure).
       # Prevents zombie VMs that block a runner slot forever.
-      trap 'log_error "Script failed, shutting down VM..."; shutdown -h now' ERR
+      # EXIT fires on any exit — ERR does NOT fire for handled errors (|| blocks).
+      trap 'log "Shutting down VM..."; shutdown -h now' EXIT
 
       log "=== GitHub Actions Runner Registration ==="
 
@@ -99,18 +100,25 @@ write_files:
         exit 1
       fi
 
-      # Configure runner as ephemeral
-      sudo -u $RUNNER_USER ./config.sh \
-        --url "https://github.com/${GITHUB_ORG}" \
-        --token "$REG_TOKEN" \
-        --name "$(hostname)" \
-        --labels "$RUNNER_LABELS" \
-        --unattended \
-        --replace \
-        --ephemeral || {
-        log_error "Runner configuration failed"
-        exit 1
-      }
+      # Configure runner as ephemeral (retry on timeout — simultaneous VMs can overload the API)
+      for attempt in 1 2 3; do
+        if sudo -u $RUNNER_USER ./config.sh \
+          --url "https://github.com/${GITHUB_ORG}" \
+          --token "$REG_TOKEN" \
+          --name "$(hostname)" \
+          --labels "$RUNNER_LABELS" \
+          --unattended \
+          --replace \
+          --ephemeral; then
+          break
+        fi
+        if [[ $attempt -eq 3 ]]; then
+          log_error "Runner configuration failed after 3 attempts"
+          exit 1
+        fi
+        log "Config attempt $attempt failed, retrying in 10s..."
+        sleep 10
+      done
       log "Runner configured successfully (ephemeral mode)"
 
       # Signal that the runner is ready
@@ -125,9 +133,7 @@ write_files:
       # (job complete or error), the VM shuts down immediately.
       # The Proxmox hookscript then destroys and reclones.
       sudo -u $RUNNER_USER ./run.sh || true
-
-      log "Runner exited, shutting down VM..."
-      shutdown -h now
+      # EXIT trap handles shutdown
 
 runcmd:
   - /opt/register-runner.sh 2>&1 | tee /var/log/runner-setup.log
