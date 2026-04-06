@@ -415,7 +415,7 @@ cp "$INSTALL_DIR/templates/github-runner-watch.service" /etc/systemd/system/
 cp "$INSTALL_DIR/templates/github-runner-watch.timer" /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable --now github-runner-watch.timer 2>/dev/null || true
-log_info "Safety-net timer installed (5 min interval, hookscript handles steady-state)"
+log_info "Pool watcher timer installed (30s interval)"
 
 echo ""
 echo "========================================"
