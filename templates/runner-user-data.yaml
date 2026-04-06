@@ -18,6 +18,10 @@ write_files:
       log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"; }
       log_error() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: $1" >&2; }
 
+      # On ANY failure, shut down the VM so the hookscript reclones.
+      # Prevents zombie VMs that block a runner slot forever.
+      trap 'log_error "Script failed, shutting down VM..."; shutdown -h now' ERR
+
       log "=== GitHub Actions Runner Registration ==="
 
       # Validate environment

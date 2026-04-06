@@ -28,6 +28,34 @@ if [[ -f /etc/github-runners.conf ]]; then
         cp "$INSTALL_DIR/templates/github-runner-watch.timer" /etc/systemd/system/
         systemctl daemon-reload
     fi
+    # Regenerate per-org cloud-init snippets from updated template
+    if [[ -d /etc/github-runners.d ]]; then
+        for org_conf in /etc/github-runners.d/*.conf; do
+            [[ -f "$org_conf" ]] || continue
+            org=$(basename "$org_conf" .conf)
+            # Source org config to get PAT and org name
+            GITHUB_PAT="" GITHUB_ORG=""
+            source "$org_conf"
+            [[ -n "$GITHUB_PAT" && -n "$GITHUB_ORG" ]] || continue
+            # Re-render the snippet using the same awk substitution as add-org.sh
+            GITHUB_PAT="$GITHUB_PAT" GITHUB_ORG="$GITHUB_ORG" awk '
+            function lreplace(str, old, new,    i, result) {
+                result = ""
+                while ((i = index(str, old)) > 0) {
+                    result = result substr(str, 1, i - 1) new
+                    str = substr(str, i + length(old))
+                }
+                return result str
+            }
+            {
+                $0 = lreplace($0, "{{GITHUB_PAT}}", ENVIRON["GITHUB_PAT"])
+                $0 = lreplace($0, "{{GITHUB_ORG}}", ENVIRON["GITHUB_ORG"])
+                print
+            }' "$INSTALL_DIR/templates/runner-user-data.yaml" > "/var/lib/vz/snippets/runner-user-data-${org}.yaml"
+            chmod 600 "/var/lib/vz/snippets/runner-user-data-${org}.yaml"
+            echo "  Updated snippet for $org"
+        done
+    fi
     echo "Done. No need to re-run setup."
 else
     echo ""
