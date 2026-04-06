@@ -1,6 +1,18 @@
 #cloud-config
 
 write_files:
+  # Force DHCP to use MAC address instead of machine-id derived DUID.
+  # Prevents clones from getting the same IP even if machine-id regeneration fails.
+  - path: /etc/netplan/99-dhcp-mac.yaml
+    permissions: '0600'
+    content: |
+      network:
+        version: 2
+        ethernets:
+          eth0:
+            dhcp4: true
+            dhcp-identifier: mac
+
   - path: /etc/github-runner/config.env
     permissions: '0600'
     content: |
