@@ -99,36 +99,21 @@ write_files:
       }
       log "Runner configured successfully (ephemeral mode)"
 
-      log "[3/3] Starting runner service..."
-      ./svc.sh install $RUNNER_USER || {
-        log_error "Failed to install runner service"
-        exit 1
-      }
-      ./svc.sh start || {
-        log_error "Failed to start runner service"
-        exit 1
-      }
-
-      # Verify service is running
-      sleep 3
-      if systemctl is-active --quiet "actions.runner.*"; then
-        log "Runner service is running"
-      else
-        log_error "Runner service failed to start"
-        systemctl status "actions.runner.*" || true
-        exit 1
-      fi
-
-      # Signal that the runner is ready (used by watcher for stuck-VM detection)
+      # Signal that the runner is ready
       touch /opt/.runner-ready
 
-      echo ""
-      log "=== Runner registration complete! ==="
+      log "[3/3] Starting runner (ephemeral — will shut down after one job)..."
       log "Runner name: $(hostname)"
       log "Labels: $RUNNER_LABELS"
       log "Organization: $GITHUB_ORG"
-      log "Mode: ephemeral (single job, then exit)"
-      echo ""
+
+      # Run directly (not as systemd service). When the runner exits
+      # (job complete or error), the VM shuts down immediately.
+      # The Proxmox hookscript then destroys and reclones.
+      sudo -u $RUNNER_USER ./run.sh || true
+
+      log "Runner exited, shutting down VM..."
+      shutdown -h now
 
 runcmd:
   - /opt/register-runner.sh 2>&1 | tee /var/log/runner-setup.log
