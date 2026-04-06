@@ -4,6 +4,7 @@ Description=GitHub Actions runner pool safety-net timer
 [Timer]
 OnBootSec=30
 OnUnitInactiveSec=30
+AccuracySec=5s
 
 [Install]
 WantedBy=timers.target

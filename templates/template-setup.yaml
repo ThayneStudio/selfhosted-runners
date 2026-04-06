@@ -105,10 +105,8 @@ write_files:
       log "Docker installed and running"
 
       log "[3/7] Installing GitHub CLI..."
-      retry "curl -fsSL --retry 3 --retry-delay 2 https://cli.github.com/packages/githubcli-archive-keyring.gpg -o /tmp/gh.gpg"
-      gpg --dearmor -o /etc/apt/keyrings/githubcli-archive-keyring.gpg < /tmp/gh.gpg
+      retry "curl -fsSL --retry 3 --retry-delay 2 https://cli.github.com/packages/githubcli-archive-keyring.gpg -o /etc/apt/keyrings/githubcli-archive-keyring.gpg"
       chmod a+r /etc/apt/keyrings/githubcli-archive-keyring.gpg
-      rm /tmp/gh.gpg
       echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | tee /etc/apt/sources.list.d/github-cli.list > /dev/null
       retry "apt-get update"
       retry "apt-get install -y gh"

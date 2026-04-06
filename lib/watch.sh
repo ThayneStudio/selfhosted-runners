@@ -48,7 +48,7 @@ VMIDS=()
 if [[ "${MIN_VMID:-0}" -gt 0 ]]; then
     vmid="$MIN_VMID"
 else
-    vmid=$(pvesh get /cluster/nextid)
+    vmid=$(pvesh get /cluster/nextid) || { log_warn "[watch] pvesh failed, skipping cycle"; exit 0; }
 fi
 for _ in "${MISSING[@]}"; do
     while qm status "$vmid" &>/dev/null; do
@@ -64,6 +64,10 @@ for i in "${!MISSING[@]}"; do
     slot="${entry%% *}"
     org="${entry##* }"
     (
+        # Per-runner lock prevents races with reclone.sh
+        exec 200>"/run/lock/runner-${slot}.lock"
+        flock -n 200 || exit 0
+
         # Re-check: another process may have filled this slot
         if qm list 2>/dev/null | awk 'NR>1{print $2}' | grep -qxF "$slot"; then
             exit 0

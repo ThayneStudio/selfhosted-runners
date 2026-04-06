@@ -20,6 +20,10 @@ if [[ -z "$NAME" || -z "$ORG" || "$ORG" == "unknown" ]]; then
     exit 0
 fi
 
+# Per-runner lock prevents races with watch.sh cloning the same slot
+exec 200>"/run/lock/runner-${NAME}.lock"
+flock -n 200 || { log_info "reclone: another process is handling $NAME"; exit 0; }
+
 # Destroy the old VM (retry briefly in case Proxmox lock hasn't released)
 rm -f "${SNIPPETS_DIR}/runner-${VMID}-meta.yaml"
 for attempt in 1 2 3; do

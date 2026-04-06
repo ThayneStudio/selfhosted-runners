@@ -31,7 +31,7 @@ require_root() {
 }
 
 validate_org_name() {
-    [[ "$1" =~ ^[a-zA-Z0-9_-]+$ ]]
+    [[ "$1" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?$ ]]
 }
 
 load_infra_config() {
@@ -149,7 +149,7 @@ deregister_runner() {
     runner_id=$(curl -sf --max-time 10 \
         -H "Accept: application/vnd.github.v3+json" \
         --config <(printf 'header = "Authorization: token %s"\n' "$pat") \
-        "https://api.github.com/orgs/${github_org}/actions/runners" 2>/dev/null \
+        "https://api.github.com/orgs/${github_org}/actions/runners?per_page=100" 2>/dev/null \
         | jq --arg name "$runner_name" -r '.runners[] | select(.name == $name) | .id' 2>/dev/null) || return 0
 
     [[ -n "$runner_id" && "$runner_id" != "null" && "$runner_id" =~ ^[0-9]+$ ]] || return 0
@@ -232,7 +232,8 @@ EOF
 
     # Hookscript for auto-destroy on shutdown
     if [[ -f "$SNIPPETS_DIR/runner-hookscript.sh" ]]; then
-        qm set "$vmid" --hookscript "local:snippets/runner-hookscript.sh" || true
+        qm set "$vmid" --hookscript "local:snippets/runner-hookscript.sh" \
+            || log_warn "Failed to set hookscript on $vmid — VM will not auto-recycle"
     fi
 
     # Start

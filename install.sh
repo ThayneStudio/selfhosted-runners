@@ -38,6 +38,8 @@ if [[ -f /etc/github-runners.conf ]]; then
             source "$org_conf"
             [[ -n "$GITHUB_PAT" && -n "$GITHUB_ORG" ]] || continue
             # Re-render the snippet using the same awk substitution as add-org.sh
+            snippet_tmp=$(mktemp "/var/lib/vz/snippets/.runner-user-data-${org}.XXXXXX")
+            chmod 600 "$snippet_tmp"
             GITHUB_PAT="$GITHUB_PAT" GITHUB_ORG="$GITHUB_ORG" awk '
             function lreplace(str, old, new,    i, result) {
                 result = ""
@@ -51,8 +53,8 @@ if [[ -f /etc/github-runners.conf ]]; then
                 $0 = lreplace($0, "{{GITHUB_PAT}}", ENVIRON["GITHUB_PAT"])
                 $0 = lreplace($0, "{{GITHUB_ORG}}", ENVIRON["GITHUB_ORG"])
                 print
-            }' "$INSTALL_DIR/templates/runner-user-data.yaml" > "/var/lib/vz/snippets/runner-user-data-${org}.yaml"
-            chmod 600 "/var/lib/vz/snippets/runner-user-data-${org}.yaml"
+            }' "$INSTALL_DIR/templates/runner-user-data.yaml" > "$snippet_tmp"
+            mv "$snippet_tmp" "/var/lib/vz/snippets/runner-user-data-${org}.yaml"
             echo "  Updated snippet for $org"
         done
     fi

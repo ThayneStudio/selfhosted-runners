@@ -257,10 +257,17 @@ else
         exit 1
     fi
 
+    # Cleanup trap: destroy template VM on any failure or interrupt from this point
+    cleanup_bake() {
+        log_warn "Baking failed, cleaning up template VM..."
+        qm stop "$TEMPLATE_ID" --timeout 30 2>/dev/null || true
+        qm destroy "$TEMPLATE_ID" --purge 2>/dev/null || true
+    }
+    trap cleanup_bake EXIT
+
     IMPORT_OUTPUT=$(qm importdisk "$TEMPLATE_ID" "$IMG_CACHE_DIR/$CLOUD_IMG" "$VM_STORAGE" 2>&1) || {
         log_error "Failed to import disk"
         echo "$IMPORT_OUTPUT" >&2
-        qm destroy "$TEMPLATE_ID" --purge 2>/dev/null || true
         exit 1
     }
 
@@ -276,47 +283,34 @@ else
         log_warn "Assuming: $IMPORTED_DISK"
     fi
 
-    if ! qm set "$TEMPLATE_ID" --scsihw virtio-scsi-pci \
-        --scsi0 "$IMPORTED_DISK"; then
-        log_error "Failed to configure SCSI"
-        qm destroy "$TEMPLATE_ID" --purge 2>/dev/null || true
-        exit 1
-    fi
-
-    if ! qm set "$TEMPLATE_ID" --ide2 "${VM_STORAGE}:cloudinit"; then
-        log_error "Failed to add cloud-init drive"
-        qm destroy "$TEMPLATE_ID" --purge 2>/dev/null || true
-        exit 1
-    fi
-
-    qm set "$TEMPLATE_ID" --boot c --bootdisk scsi0 || { log_error "Failed to set boot disk"; qm destroy "$TEMPLATE_ID" --purge 2>/dev/null || true; exit 1; }
-    qm set "$TEMPLATE_ID" --serial0 socket --vga serial0 || { log_error "Failed to set serial"; qm destroy "$TEMPLATE_ID" --purge 2>/dev/null || true; exit 1; }
-    qm set "$TEMPLATE_ID" --agent enabled=1 || { log_error "Failed to enable agent"; qm destroy "$TEMPLATE_ID" --purge 2>/dev/null || true; exit 1; }
-    qm resize "$TEMPLATE_ID" scsi0 30G || { log_error "Failed to resize disk"; qm destroy "$TEMPLATE_ID" --purge 2>/dev/null || true; exit 1; }
+    qm set "$TEMPLATE_ID" --scsihw virtio-scsi-pci --scsi0 "$IMPORTED_DISK" \
+        || { log_error "Failed to configure SCSI"; exit 1; }
+    qm set "$TEMPLATE_ID" --ide2 "${VM_STORAGE}:cloudinit" \
+        || { log_error "Failed to add cloud-init drive"; exit 1; }
+    qm set "$TEMPLATE_ID" --boot c --bootdisk scsi0 \
+        || { log_error "Failed to set boot disk"; exit 1; }
+    qm set "$TEMPLATE_ID" --serial0 socket --vga serial0 \
+        || { log_error "Failed to set serial"; exit 1; }
+    qm set "$TEMPLATE_ID" --agent enabled=1 \
+        || { log_error "Failed to enable agent"; exit 1; }
+    qm resize "$TEMPLATE_ID" scsi0 30G \
+        || { log_error "Failed to resize disk"; exit 1; }
 
     # Copy template-setup cloud-init to snippets and configure
     log_info "Configuring template cloud-init..."
     cp "$INSTALL_DIR/templates/template-setup.yaml" "$SNIPPETS_DIR/template-setup.yaml"
     chmod 600 "$SNIPPETS_DIR/template-setup.yaml"
 
-    if ! qm set "$TEMPLATE_ID" --cicustom "user=local:snippets/template-setup.yaml"; then
-        log_error "Failed to set cloud-init config"
-        qm destroy "$TEMPLATE_ID" --purge 2>/dev/null || true
-        exit 1
-    fi
-    qm set "$TEMPLATE_ID" --ipconfig0 ip=dhcp || { log_error "Failed to set IP config"; qm destroy "$TEMPLATE_ID" --purge 2>/dev/null || true; exit 1; }
+    qm set "$TEMPLATE_ID" --cicustom "user=local:snippets/template-setup.yaml" \
+        || { log_error "Failed to set cloud-init config"; exit 1; }
+    qm set "$TEMPLATE_ID" --ipconfig0 ip=dhcp \
+        || { log_error "Failed to set IP config"; exit 1; }
     if [[ -n "${DNS_SERVERS:-}" ]]; then
-        qm set "$TEMPLATE_ID" --nameserver "$DNS_SERVERS" || { log_error "Failed to set DNS servers"; qm destroy "$TEMPLATE_ID" --purge 2>/dev/null || true; exit 1; }
+        qm set "$TEMPLATE_ID" --nameserver "$DNS_SERVERS" \
+            || { log_error "Failed to set DNS servers"; exit 1; }
     fi
-    qm set "$TEMPLATE_ID" --ciuser runner || { log_error "Failed to set cloud-init user"; qm destroy "$TEMPLATE_ID" --purge 2>/dev/null || true; exit 1; }
-
-    # Cleanup trap for baking phase (set before start so interrupted starts are cleaned up)
-    cleanup_bake() {
-        log_warn "Baking failed, cleaning up template VM..."
-        qm stop "$TEMPLATE_ID" --timeout 30 2>/dev/null || true
-        qm destroy "$TEMPLATE_ID" --purge 2>/dev/null || true
-    }
-    trap cleanup_bake EXIT
+    qm set "$TEMPLATE_ID" --ciuser runner \
+        || { log_error "Failed to set cloud-init user"; exit 1; }
 
     # Boot VM to bake tools into the template
     log_info "Starting VM to install tools (this takes 10-20 minutes)..."
