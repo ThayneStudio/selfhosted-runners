@@ -148,6 +148,7 @@ write_files:
       # EXIT trap handles shutdown
 
 runcmd:
-  # Hard ceiling: shut down after 6 hours even if run.sh hangs
-  - shutdown -h +360 "Safety timeout: max VM lifetime reached" &
+  # Hard ceiling: shut down after 6 hours even if run.sh hangs.
+  # Single-quoted so YAML doesn't parse the colon in "Safety timeout:" as a mapping.
+  - 'shutdown -h +360 "Safety timeout: max VM lifetime reached" &'
   - /opt/register-runner.sh 2>&1 | tee /var/log/runner-setup.log
