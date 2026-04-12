@@ -201,7 +201,7 @@ clone_runner() {
     }
 
     # Clone
-    if ! qm clone "$TEMPLATE_ID" "$vmid" --name "$name" --full --storage "$VM_STORAGE"; then
+    if ! qm clone "$TEMPLATE_ID" "$vmid" --name "$name" --storage "$VM_STORAGE"; then
         _fail; return 1
     fi
 
