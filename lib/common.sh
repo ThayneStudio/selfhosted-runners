@@ -196,11 +196,12 @@ clone_runner() {
     _fail() {
         local owner
         owner=$(qm config "$vmid" 2>/dev/null | awk '/^name:/{print $2}') || true
-        rm -f "${SNIPPETS_DIR}/runner-${vmid}-meta.yaml"
         if [[ "$owner" == "$name" ]]; then
+            rm -f "${SNIPPETS_DIR}/runner-${vmid}-meta.yaml"
             qm destroy "$vmid" --purge 2>/dev/null || true
         elif [[ -z "$owner" ]]; then
             # No VM config — free any orphan volumes left by a half-finished clone.
+            rm -f "${SNIPPETS_DIR}/runner-${vmid}-meta.yaml"
             local volid
             while read -r volid; do
                 [[ -n "$volid" ]] || continue
