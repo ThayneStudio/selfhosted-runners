@@ -191,12 +191,21 @@ clone_runner() {
 
     # Cleanup helper: destroy VM (only if it belongs to us) and remove snippet.
     # The ownership check prevents destroying another process's VM on VMID collision.
+    # If there's no VM config at all, the clone failed mid-transaction — free any
+    # orphan storage volumes at this VMID so ZFS/LVM datasets don't leak.
     _fail() {
         local owner
         owner=$(qm config "$vmid" 2>/dev/null | awk '/^name:/{print $2}') || true
+        rm -f "${SNIPPETS_DIR}/runner-${vmid}-meta.yaml"
         if [[ "$owner" == "$name" ]]; then
-            rm -f "${SNIPPETS_DIR}/runner-${vmid}-meta.yaml"
             qm destroy "$vmid" --purge 2>/dev/null || true
+        elif [[ -z "$owner" ]]; then
+            # No VM config — free any orphan volumes left by a half-finished clone.
+            local volid
+            while read -r volid; do
+                [[ -n "$volid" ]] || continue
+                pvesm free "$volid" 2>/dev/null || log_warn "Failed to free orphan volume $volid"
+            done < <(pvesm list "$VM_STORAGE" 2>/dev/null | awk -v v="$vmid" 'NR>1 && $NF==v {print $1}')
         fi
     }
 
