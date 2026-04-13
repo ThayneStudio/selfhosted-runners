@@ -21,6 +21,11 @@ CONFIG_FILE="/etc/github-runners.conf"
 ORG_CONFIG_DIR="/etc/github-runners.d"
 SNIPPETS_DIR="/var/lib/vz/snippets"
 INSTALL_DIR="/opt/selfhosted-runners"
+# Global lock serializing VMID allocation across reclone.sh/watch.sh/create.sh.
+# Scope is narrow: "pick free VMID -> qm clone returns (config persisted)".
+# pvesh get /cluster/nextid is not atomic and does not reserve, so without
+# this lock two parallel clones reliably pick the same VMID.
+VMID_LOCK_FILE="/run/lock/runner-vmid.lock"
 
 require_root() {
     if [[ $EUID -ne 0 ]]; then
@@ -185,10 +190,6 @@ next_vmid() {
 clone_runner() {
     local name="$1" org="$2" vmid="${3:-}"
 
-    if [[ -z "$vmid" ]]; then
-        vmid=$(next_vmid) || return 1
-    fi
-
     # Cleanup helper: destroy VM (only if it belongs to us) and remove snippet.
     # The ownership check prevents destroying another process's VM on VMID collision.
     # If there's no VM config at all, the clone failed mid-transaction — free any
@@ -210,10 +211,40 @@ clone_runner() {
         fi
     }
 
-    # Clone
-    if ! qm clone "$TEMPLATE_ID" "$vmid" --name "$name"; then
-        _fail; return 1
+    # Acquire global VMID allocation lock. Scope is tight: "pick VMID -> qm
+    # clone returns (config persisted)". qm set/start run unlocked.
+    exec 201>"$VMID_LOCK_FILE"
+    if ! flock -w 30 201; then
+        log_error "clone_runner: timed out acquiring VMID lock for $name"
+        exec 201>&-
+        return 1
     fi
+
+    if [[ -z "$vmid" ]]; then
+        if ! vmid=$(next_vmid); then
+            exec 201>&-
+            return 1
+        fi
+    else
+        # Caller pre-allocated. Re-verify under lock — a concurrent process
+        # could have grabbed it between the caller's check and now.
+        while qm status "$vmid" &>/dev/null; do
+            vmid=$((vmid + 1))
+        done
+    fi
+
+    # Clone. 201>&- closes the lock fd for the qm child so kvm can't inherit
+    # and hold it past our parent's flock release. Matches the fd-close
+    # pattern established in earlier commits (e.g. 431d8c1, fca3467).
+    if ! qm clone "$TEMPLATE_ID" "$vmid" --name "$name" 201>&-; then
+        _fail
+        exec 201>&-
+        return 1
+    fi
+
+    # Clone succeeded — VMID is now claimed in Proxmox. Release lock before
+    # the long tail of qm set / qm start so other clones can proceed.
+    exec 201>&-
 
     # Deterministic MAC
     local mac net0

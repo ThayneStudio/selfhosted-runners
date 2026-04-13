@@ -41,30 +41,13 @@ done
 
 log_info "[watch] Filling ${#MISSING[@]} missing slot(s) in parallel"
 
-# Pre-allocate VMIDs sequentially so parallel clones don't race.
-# (A concurrent reclone.sh could grab one of these IDs; clone_runner
-# handles that gracefully via _fail() ownership check.)
-VMIDS=()
-if [[ "${MIN_VMID:-0}" -gt 0 ]]; then
-    vmid="$MIN_VMID"
-else
-    vmid=$(pvesh get /cluster/nextid) || { log_warn "[watch] pvesh failed, skipping cycle"; exit 0; }
-fi
-for _ in "${MISSING[@]}"; do
-    while qm status "$vmid" &>/dev/null; do
-        vmid=$((vmid + 1))
-    done
-    VMIDS+=("$vmid")
-    vmid=$((vmid + 1))
-done
-
-for i in "${!MISSING[@]}"; do
-    entry="${MISSING[$i]}"
-    vmid="${VMIDS[$i]}"
+# VMID allocation is serialized inside clone_runner via the global
+# $VMID_LOCK_FILE flock, so parallel subshells can safely pick their own.
+for entry in "${MISSING[@]}"; do
     slot="${entry%% *}"
     org="${entry##* }"
     (
-        # Per-runner lock prevents races with reclone.sh
+        # Per-runner lock prevents races with reclone.sh on the same slot
         exec 200>"/run/lock/runner-${slot}.lock"
         flock -n 200 || exit 0
 
@@ -76,7 +59,7 @@ for i in "${!MISSING[@]}"; do
             log_warn "[watch] Skipping $slot — bad config for $org"
             exit 0
         fi
-        clone_runner "$slot" "$org" "$vmid" >/dev/null \
+        clone_runner "$slot" "$org" >/dev/null \
             && log_info "[watch] Created $slot" \
             || log_warn "[watch] Failed to create $slot"
     ) &
