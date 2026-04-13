@@ -24,20 +24,35 @@ fi
 exec 200>"/run/lock/runner-${NAME}.lock"
 flock -n 200 || { log_info "reclone: another process is handling $NAME"; exit 0; }
 
-# Backoff: if this slot was recloned less than 2 minutes ago, the VM likely
-# has a config error (bad PAT, network) and would just fail again. Defer to
-# the watcher's 30s schedule to avoid a tight boot-fail-reclone loop.
+# Backoff: defer to the watcher only after N consecutive rapid deaths.
+# A single fast reclone is normal — short linter jobs (~45s) complete well
+# inside any time-based window, so the old 120s blanket backoff misfired on
+# every short job. A *streak* of rapid deaths is what indicates a real
+# config error (bad PAT, network, cloud-init failure) worth deferring.
 RECLONE_TS="/run/runner-${NAME}.reclone-ts"
-if [[ -f "$RECLONE_TS" ]]; then
-    LAST=$(cat "$RECLONE_TS" 2>/dev/null) || LAST=0
-    NOW=$(date +%s)
-    if (( NOW - LAST < 120 )); then
-        logger -t github-runner "reclone: $NAME died within 2min of last reclone, deferring to watcher"
-        # Still destroy the failed VM to free resources
-        rm -f "${SNIPPETS_DIR}/runner-${VMID}-meta.yaml"
-        qm destroy "$VMID" --purge 2>/dev/null || true
-        exit 0
-    fi
+FAIL_STREAK_FILE="/run/runner-${NAME}.fail-streak"
+FAIL_THRESHOLD=3
+
+NOW=$(date +%s)
+LAST=0
+[[ -f "$RECLONE_TS" ]] && LAST=$(cat "$RECLONE_TS" 2>/dev/null || echo 0)
+STREAK=0
+[[ -f "$FAIL_STREAK_FILE" ]] && STREAK=$(cat "$FAIL_STREAK_FILE" 2>/dev/null || echo 0)
+[[ "$LAST"   =~ ^[0-9]+$ ]] || LAST=0
+[[ "$STREAK" =~ ^[0-9]+$ ]] || STREAK=0
+
+if (( LAST > 0 && NOW - LAST < 120 )); then
+    STREAK=$((STREAK + 1))
+else
+    STREAK=0
+fi
+echo "$STREAK" > "$FAIL_STREAK_FILE"
+
+if (( STREAK >= FAIL_THRESHOLD )); then
+    logger -t github-runner "reclone: $NAME hit $STREAK rapid deaths in a row, deferring to watcher"
+    rm -f "${SNIPPETS_DIR}/runner-${VMID}-meta.yaml"
+    qm destroy "$VMID" --purge 2>/dev/null || true
+    exit 0
 fi
 
 # Destroy the old VM (retry briefly in case Proxmox lock hasn't released)
