@@ -41,6 +41,13 @@ STREAK=0
 [[ "$LAST"   =~ ^[0-9]+$ ]] || LAST=0
 [[ "$STREAK" =~ ^[0-9]+$ ]] || STREAK=0
 
+# RECLONE_TS means "time this slot was last processed by reclone.sh". Write
+# it unconditionally so the streak check on the next invocation reflects
+# time-since-last-death, not time-since-last-success. Without this, a
+# deferred slot stays stuck — LAST never updates and every subsequent
+# death within 120s of the stale value keeps incrementing STREAK.
+echo "$NOW" > "$RECLONE_TS"
+
 if (( LAST > 0 && NOW - LAST < 120 )); then
     STREAK=$((STREAK + 1))
 else
@@ -50,6 +57,10 @@ echo "$STREAK" > "$FAIL_STREAK_FILE"
 
 if (( STREAK >= FAIL_THRESHOLD )); then
     logger -t github-runner "reclone: $NAME hit $STREAK rapid deaths in a row, deferring to watcher"
+    # Reset the streak so the next invocation starts fresh. If the underlying
+    # problem persists, we'll re-accumulate to threshold and defer again
+    # (bounded-rate backoff). If it resolved, we proceed normally.
+    echo 0 > "$FAIL_STREAK_FILE"
     rm -f "${SNIPPETS_DIR}/runner-${VMID}-meta.yaml"
     qm destroy "$VMID" --purge 2>/dev/null || true
     exit 0
@@ -76,10 +87,10 @@ if qm list 2>/dev/null | awk 'NR>1{print $2}' | grep -qxF "$NAME"; then
     exit 0
 fi
 
-# Clone replacement
+# Clone replacement. RECLONE_TS was already written at the top of this
+# script — no need to update it again on success.
 load_org_config "$ORG"
 if clone_runner "$NAME" "$ORG" >/dev/null; then
-    date +%s > "$RECLONE_TS"
     log_info "reclone: re-cloned $NAME for org $ORG"
 else
     log_error "reclone: failed to re-clone $NAME for org $ORG"
