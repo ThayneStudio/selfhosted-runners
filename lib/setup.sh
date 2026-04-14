@@ -107,6 +107,19 @@ for ns in $DNS_SERVERS; do
     fi
 done
 
+# Docker registry mirror for public.ecr.aws (optional, e.g., local Zot cache)
+# Leave empty to disable — runners will pull directly from public.ecr.aws.
+echo ""
+echo "Docker mirror: a local OCI registry (e.g., Zot) that caches public.ecr.aws"
+echo "pulls. Enables transparent pull-through caching — no workflow changes needed."
+read -rp "Docker mirror URL for public.ecr.aws (empty to disable): " DOCKER_MIRROR_URL
+if [[ -n "$DOCKER_MIRROR_URL" ]]; then
+    if [[ ! "$DOCKER_MIRROR_URL" =~ ^https?://[^[:space:]]+$ ]]; then
+        log_error "Docker mirror URL must start with http:// or https://"
+        exit 1
+    fi
+fi
+
 # Validate template ID is a valid Proxmox VM ID (100-999999999)
 if [[ ! "$TEMPLATE_ID" =~ ^[0-9]+$ ]]; then
     log_error "Template ID must be a number"
@@ -127,6 +140,7 @@ echo "  Template ID:    $TEMPLATE_ID"
 echo "  Min VM ID:      $([ "${MIN_VMID:-0}" -eq 0 ] && echo "auto" || echo "$MIN_VMID")"
 echo "  Balloon:        ${BALLOON:-0} MB ($([ "${BALLOON:-0}" -eq 0 ] && echo "disabled" || echo "enabled"))"
 echo "  DNS Servers:    ${DNS_SERVERS:-DHCP only}"
+echo "  Docker Mirror:  ${DOCKER_MIRROR_URL:-none}"
 echo ""
 read -rp "Proceed? [Y/n]: " CONFIRM
 [[ "${CONFIRM:-Y}" =~ ^[Yy]([Ee][Ss])?$ ]] || exit 0
@@ -190,6 +204,7 @@ TEMPLATE_ID="$TEMPLATE_ID"
 MIN_VMID="$MIN_VMID"
 BALLOON="$BALLOON"
 DNS_SERVERS="$DNS_SERVERS"
+DOCKER_MIRROR_URL="${DOCKER_MIRROR_URL:-}"
 EOF
 chmod 600 "$CONF_TMP"
 mv "$CONF_TMP" "$CONFIG_FILE"

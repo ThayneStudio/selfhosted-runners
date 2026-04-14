@@ -19,6 +19,7 @@ write_files:
       GITHUB_PAT="{{GITHUB_PAT}}"
       GITHUB_ORG="{{GITHUB_ORG}}"
       RUNNER_LABELS="self-hosted,linux,x64"
+      DOCKER_MIRROR_URL="{{DOCKER_MIRROR_URL}}"
 
   - path: /opt/register-runner.sh
     permissions: '0755'
@@ -54,6 +55,33 @@ write_files:
       : ${GITHUB_PAT:?GITHUB_PAT not set}
       : ${GITHUB_ORG:?GITHUB_ORG not set}
       : ${RUNNER_LABELS:=self-hosted,linux,x64}
+
+      # Configure Docker mirror if set. Transparent pull-through cache
+      # for public.ecr.aws via containerd's per-registry host config.
+      # Non-fatal: a failed mirror restart falls back to direct pulls.
+      if [[ -n "${DOCKER_MIRROR_URL:-}" ]]; then
+        log "Configuring Docker mirror for public.ecr.aws: $DOCKER_MIRROR_URL"
+        mkdir -p /etc/docker /etc/containerd/certs.d/public.ecr.aws
+        cat > /etc/docker/daemon.json <<'DOCKEREOF'
+      {
+        "features": {
+          "containerd-snapshotter": true
+        }
+      }
+      DOCKEREOF
+        cat > /etc/containerd/certs.d/public.ecr.aws/hosts.toml <<TOMLEOF
+      server = "https://public.ecr.aws"
+
+      [host."$DOCKER_MIRROR_URL"]
+        capabilities = ["pull", "resolve"]
+        skip_verify = true
+      TOMLEOF
+        if systemctl restart docker; then
+          log "Docker mirror configured"
+        else
+          log_error "Docker restart failed — continuing with direct pulls"
+        fi
+      fi
 
       RUNNER_HOME=/home/runner/actions-runner
       RUNNER_USER=runner

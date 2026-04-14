@@ -20,6 +20,10 @@ if [[ ! -f "$CONFIG_FILE" ]]; then
     exit 1
 fi
 
+# Load infra config (for DOCKER_MIRROR_URL substitution below)
+# shellcheck source=/dev/null
+source "$CONFIG_FILE"
+
 # Verify template file exists
 if [[ ! -f "$INSTALL_DIR/templates/runner-user-data.yaml" ]]; then
     log_error "Template not found at $INSTALL_DIR/templates/runner-user-data.yaml"
@@ -123,7 +127,7 @@ log_info "Generating cloud-init snippet for '$GITHUB_ORG'..."
 mkdir -p "$SNIPPETS_DIR"
 SNIPPET_TMP=$(mktemp "$SNIPPETS_DIR/.runner-user-data-${GITHUB_ORG}.XXXXXX")
 chmod 600 "$SNIPPET_TMP"
-GITHUB_PAT="$GITHUB_PAT" GITHUB_ORG="$GITHUB_ORG" awk '
+GITHUB_PAT="$GITHUB_PAT" GITHUB_ORG="$GITHUB_ORG" DOCKER_MIRROR_URL="${DOCKER_MIRROR_URL:-}" awk '
 # Literal string replace (avoids gsub special chars: & and \)
 function lreplace(str, old, new,    i, result) {
     result = ""
@@ -136,6 +140,7 @@ function lreplace(str, old, new,    i, result) {
 {
     $0 = lreplace($0, "{{GITHUB_PAT}}", ENVIRON["GITHUB_PAT"])
     $0 = lreplace($0, "{{GITHUB_ORG}}", ENVIRON["GITHUB_ORG"])
+    $0 = lreplace($0, "{{DOCKER_MIRROR_URL}}", ENVIRON["DOCKER_MIRROR_URL"])
     print
 }' "$INSTALL_DIR/templates/runner-user-data.yaml" > "$SNIPPET_TMP" || {
     log_error "Failed to generate cloud-init snippet"
