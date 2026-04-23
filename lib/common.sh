@@ -158,6 +158,96 @@ get_vm_org() {
     fi
 }
 
+vm_config_path() {
+    local vmid="$1"
+    compgen -G "/etc/pve/nodes/*/qemu-server/${vmid}.conf" | head -n 1
+}
+
+list_template_base_volids() {
+    qm config "$TEMPLATE_ID" 2>/dev/null | awk -F': ' -v storage="$VM_STORAGE:" '
+        $1 ~ /^(ide|sata|scsi|virtio)[0-9]+$/ {
+            split($2, parts, ",")
+            if (index(parts[1], storage "base-") == 1) {
+                print parts[1]
+            }
+        }
+    '
+}
+
+linked_clone_child_vmid() {
+    local volid="$1"
+    local child_name="${volid##*/}"
+    if [[ "$child_name" =~ ^vm-([0-9]+)-disk- ]]; then
+        echo "${BASH_REMATCH[1]}"
+    fi
+}
+
+list_template_linked_clone_volids() {
+    local storage_list base_volid base_path prefix volid child_name
+    local -A seen=()
+
+    storage_list=$(pvesm list "$VM_STORAGE" 2>/dev/null || true)
+    [[ -n "$storage_list" ]] || return 0
+
+    while read -r base_volid; do
+        [[ -n "$base_volid" ]] || continue
+        base_path="${base_volid#*:}"
+        prefix="${VM_STORAGE}:${base_path}/"
+
+        while read -r volid _; do
+            [[ "$volid" == "$prefix"* ]] || continue
+            child_name="${volid#$prefix}"
+            [[ "$child_name" =~ ^vm-[0-9]+-disk- ]] || continue
+            [[ -n "${seen[$volid]:-}" ]] && continue
+            seen["$volid"]=1
+            printf '%s\n' "$volid"
+        done <<< "$storage_list"
+    done < <(list_template_base_volids)
+}
+
+cleanup_template_orphan_volumes() {
+    local child_vmid config_path volid
+    local -a child_volids=()
+    local -a blocked_volids=()
+    local -a freed_volids=()
+
+    mapfile -t child_volids < <(list_template_linked_clone_volids)
+    [[ ${#child_volids[@]} -gt 0 ]] || return 0
+
+    log_info "Checking ${#child_volids[@]} linked-clone child volume(s) for template $TEMPLATE_ID..."
+
+    for volid in "${child_volids[@]}"; do
+        child_vmid=$(linked_clone_child_vmid "$volid")
+        config_path=""
+        [[ -n "$child_vmid" ]] && config_path=$(vm_config_path "$child_vmid")
+
+        if [[ -n "$config_path" ]]; then
+            log_warn "Template child volume still has a VM config: $volid ($config_path)"
+            blocked_volids+=("$volid")
+            continue
+        fi
+
+        log_info "Freeing orphaned template child volume: $volid"
+        if ! pvesm free "$volid"; then
+            log_error "Failed to free orphaned template child volume: $volid"
+            return 1
+        fi
+        freed_volids+=("$volid")
+    done
+
+    if [[ ${#freed_volids[@]} -gt 0 ]]; then
+        log_info "Freed ${#freed_volids[@]} orphaned linked-clone volume(s) for template $TEMPLATE_ID."
+    fi
+
+    if [[ ${#blocked_volids[@]} -gt 0 ]]; then
+        log_error "Template $TEMPLATE_ID still has linked-clone child volume(s) with VM configs."
+        log_error "Destroy those VMs/templates before deleting the template."
+        return 2
+    fi
+
+    return 0
+}
+
 deregister_runner() {
     local org="$1" runner_name="$2"
     local org_file="$ORG_CONFIG_DIR/${org}.conf"

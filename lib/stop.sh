@@ -97,6 +97,9 @@ elif [[ ${#RUNNERS[@]} -gt 0 ]]; then
 else
     echo "  - destroy 0 managed runner VMs"
 fi
+if [[ "$WATCH_ONLY" != true && -z "$VMID_MIN" ]]; then
+    echo "  - free orphaned linked-clone child volumes for template $TEMPLATE_ID when safe"
+fi
 if [[ -n "$VMID_MIN" ]]; then
     echo "  - limit runner destruction to VMIDs ${VMID_MIN}-${VMID_MAX}"
 fi
@@ -157,6 +160,18 @@ if [[ ${#FAILURES[@]} -gt 0 ]]; then
     log_warn "Watcher remains stopped and pool drain remains active. Resolve the failures before resuming."
     exec 202>&-
     exit 1
+fi
+
+if [[ -z "$VMID_MIN" ]]; then
+    cleanup_rc=0
+    cleanup_template_orphan_volumes || cleanup_rc=$?
+    if [[ $cleanup_rc -ne 0 ]]; then
+        log_warn "Watcher remains stopped and pool drain remains active. Resolve the template storage issue before resuming."
+        exec 202>&-
+        exit 1
+    fi
+else
+    log_info "Skipping template orphan-volume cleanup because --vmid-range was specified."
 fi
 
 log_info "Watcher stopped and managed runners destroyed. Pool drain remains active."

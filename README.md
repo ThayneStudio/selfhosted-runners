@@ -176,7 +176,7 @@ cloned runner VM):
 To update prebaked software in the base VM template:
 
 1. Edit `/opt/selfhosted-runners/templates/template-setup.yaml`
-2. Stop the watcher and remove managed runners so no linked clones still depend on the old template:
+2. Stop the watcher, remove managed runners, and free any orphaned linked-clone child volumes that still point at the current template:
    ```bash
    runner stop
    ```
@@ -197,6 +197,10 @@ To update prebaked software in the base VM template:
 do not take effect until the old template is removed and recreated.
 
 `runner stop` leaves the pool in maintenance mode until you run `runner start`.
+On full stops, it also frees orphaned linked-clone child volumes for the current
+template when those volumes no longer have a VM config anywhere in the cluster.
+If any child volumes still belong to live VM/template configs, `runner stop`
+fails and tells you to resolve those dependents before deleting the template.
 
 `runner stop --vmid-range <min:max>` is for partial maintenance windows only.
 Do not use a VMID-limited stop immediately before destroying a linked-clone
