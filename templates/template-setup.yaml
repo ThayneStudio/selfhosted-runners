@@ -6,23 +6,6 @@ users:
     shell: /bin/bash
     groups: docker
 
-package_update: true
-package_upgrade: true
-
-packages:
-  - ca-certificates
-  - curl
-  - gnupg
-  - jq
-  - unzip
-  - zstd
-  - build-essential
-  - git
-  - wget
-  - apt-transport-https
-  - software-properties-common
-  - qemu-guest-agent
-
 write_files:
   - path: /opt/setup-template.sh
     permissions: '0755'
@@ -72,7 +55,7 @@ write_files:
       fi
       log "Disk space check passed: ${FREE_SPACE}GB free"
 
-      log "[1/10] Checking network connectivity..."
+      log "[1/11] Checking network connectivity..."
       for i in {1..30}; do
         if curl -sf --max-time 5 https://github.com > /dev/null 2>&1; then
           log "Network connectivity confirmed"
@@ -86,7 +69,18 @@ write_files:
         sleep 2
       done
 
-      log "[2/10] Installing Docker..."
+      log "[2/11] Updating system packages and installing base prerequisites..."
+      retry "apt-get update"
+      retry "apt-get install -y ca-certificates curl gnupg jq unzip zstd build-essential git wget apt-transport-https software-properties-common qemu-guest-agent"
+      systemctl enable --now qemu-guest-agent
+      if ! systemctl is-active --quiet qemu-guest-agent; then
+        log_error "qemu-guest-agent failed to start"
+        exit 1
+      fi
+      retry "apt-get upgrade -y"
+      log "Base packages installed and qemu-guest-agent running"
+
+      log "[3/11] Installing Docker..."
       install -m 0755 -d /etc/apt/keyrings
 
       # Docker GPG key with retry
@@ -111,7 +105,7 @@ write_files:
       usermod -aG docker runner
       log "Docker installed and running"
 
-      log "[3/10] Installing GitHub CLI..."
+      log "[4/11] Installing GitHub CLI..."
       retry "curl -fsSL --retry 3 --retry-delay 2 https://cli.github.com/packages/githubcli-archive-keyring.gpg -o /etc/apt/keyrings/githubcli-archive-keyring.gpg"
       chmod a+r /etc/apt/keyrings/githubcli-archive-keyring.gpg
       echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | tee /etc/apt/sources.list.d/github-cli.list > /dev/null
@@ -119,14 +113,14 @@ write_files:
       retry "apt-get install -y gh"
       log "GitHub CLI $(gh --version | head -1) installed"
 
-      log "[4/10] Installing Node.js LTS..."
+      log "[5/11] Installing Node.js LTS..."
       retry "curl -fsSL --retry 3 https://deb.nodesource.com/setup_lts.x -o /tmp/nodesource_setup.sh"
       bash /tmp/nodesource_setup.sh
       rm /tmp/nodesource_setup.sh
       retry "apt-get install -y nodejs"
       log "Node.js $(node --version) installed"
 
-      log "[5/10] Installing AWS CLI v2..."
+      log "[6/11] Installing AWS CLI v2..."
       (
         set -euo pipefail
         AWS_TMP_DIR=$(mktemp -d)
@@ -143,7 +137,7 @@ write_files:
       fi
       log "AWS CLI $AWS_VERSION installed"
 
-      log "[6/10] Installing Supabase CLI ${SUPABASE_VERSION}..."
+      log "[7/11] Installing Supabase CLI ${SUPABASE_VERSION}..."
       (
         set -euo pipefail
         SUPABASE_TMP_DIR=$(mktemp -d)
@@ -160,7 +154,7 @@ write_files:
       fi
       log "Supabase CLI v${SUPABASE_INSTALLED_VERSION} installed"
 
-      log "[7/10] Warming Supabase local development images..."
+      log "[8/11] Warming Supabase local development images..."
       (
         set -euo pipefail
         SUPABASE_WARMUP_DIR=$(mktemp -d)
@@ -173,7 +167,7 @@ write_files:
       )
       log "Supabase local development Docker cache warmed"
 
-      log "[8/10] Installing Playwright Chromium..."
+      log "[9/11] Installing Playwright Chromium..."
       install -d -o runner -g runner -m 0755 /home/runner/.cache "$PLAYWRIGHT_BROWSERS_PATH"
       retry "env PLAYWRIGHT_BROWSERS_PATH='$PLAYWRIGHT_BROWSERS_PATH' npm exec --yes --package=playwright@${PLAYWRIGHT_VERSION} playwright install --with-deps chromium"
       if ! env PLAYWRIGHT_BROWSERS_PATH="$PLAYWRIGHT_BROWSERS_PATH" npm exec --yes --package=playwright@"${PLAYWRIGHT_VERSION}" playwright --version | grep -q "${PLAYWRIGHT_VERSION}"; then
@@ -196,7 +190,7 @@ write_files:
         exit 1
       fi
 
-      log "[9/10] Downloading GitHub Actions runner..."
+      log "[10/11] Downloading GitHub Actions runner..."
       RUNNER_HOME=/home/runner/actions-runner
       RUNNER_USER=runner
       mkdir -p $RUNNER_HOME
@@ -234,7 +228,7 @@ write_files:
       }
       log "Runner extracted and dependencies installed"
 
-      log "[10/10] Cleaning up for template conversion..."
+      log "[11/11] Cleaning up for template conversion..."
       apt-get clean
       rm -rf /tmp/* /var/tmp/*
       truncate -s 0 /var/log/*.log 2>/dev/null || true
