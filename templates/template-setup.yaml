@@ -169,9 +169,10 @@ write_files:
 
       log "[9/11] Installing Playwright Chromium..."
       install -d -o runner -g runner -m 0755 /home/runner/.cache "$PLAYWRIGHT_BROWSERS_PATH"
-      retry "env PLAYWRIGHT_BROWSERS_PATH='$PLAYWRIGHT_BROWSERS_PATH' npm exec --yes --package=playwright@${PLAYWRIGHT_VERSION} playwright install --with-deps chromium"
-      if ! env PLAYWRIGHT_BROWSERS_PATH="$PLAYWRIGHT_BROWSERS_PATH" npm exec --yes --package=playwright@"${PLAYWRIGHT_VERSION}" playwright --version | grep -q "${PLAYWRIGHT_VERSION}"; then
-        log_error "Playwright CLI version verification failed: expected ${PLAYWRIGHT_VERSION}"
+      retry "env PLAYWRIGHT_BROWSERS_PATH='$PLAYWRIGHT_BROWSERS_PATH' npm exec --yes --package=playwright@${PLAYWRIGHT_VERSION} -- playwright install --with-deps chromium"
+      PLAYWRIGHT_CLI_VERSION=$(env PLAYWRIGHT_BROWSERS_PATH="$PLAYWRIGHT_BROWSERS_PATH" npm exec --yes --package=playwright@"${PLAYWRIGHT_VERSION}" -- playwright --version 2>&1 || true)
+      if [[ "$PLAYWRIGHT_CLI_VERSION" != *"${PLAYWRIGHT_VERSION}"* ]]; then
+        log_error "Playwright CLI version verification failed: expected ${PLAYWRIGHT_VERSION}, got ${PLAYWRIGHT_CLI_VERSION:-missing output}"
         exit 1
       fi
       if [[ ! -d "$PLAYWRIGHT_BROWSERS_PATH" ]] || ! find "$PLAYWRIGHT_BROWSERS_PATH" -maxdepth 1 -type d -name 'chromium-*' | grep -q .; then
