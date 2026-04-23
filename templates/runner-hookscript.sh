@@ -6,8 +6,13 @@
 
 VMID="$1"
 PHASE="$2"
+POOL_DRAIN_FILE="/run/lock/github-runner-drain"
 
 if [[ "$PHASE" == "post-stop" ]]; then
+    if [[ -e "$POOL_DRAIN_FILE" ]]; then
+        logger -t github-runner "VM $VMID stopped during pool drain, skipping reclone"
+        exit 0
+    fi
     logger -t github-runner "VM $VMID stopped, triggering reclone"
     nohup /opt/selfhosted-runners/lib/reclone.sh "$VMID" \
         </dev/null >>/var/log/github-runner.log 2>&1 &

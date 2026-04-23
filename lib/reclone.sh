@@ -11,6 +11,11 @@ VMID="${1:-}"
 
 load_infra_config
 
+if pool_is_draining; then
+    logger -t github-runner "reclone: pool drain active, skipping VM $VMID"
+    exit 0
+fi
+
 # Read name and org from the stopped VM's config (still exists, just stopped)
 NAME=$(qm config "$VMID" 2>/dev/null | awk '/^name:/{print $2}') || true
 ORG=$(get_vm_org "$VMID") || true
@@ -23,6 +28,11 @@ fi
 # Per-runner lock prevents races with watch.sh cloning the same slot
 exec 200>"/run/lock/runner-${NAME}.lock"
 flock -n 200 || { log_info "reclone: another process is handling $NAME"; exit 0; }
+
+if pool_is_draining; then
+    logger -t github-runner "reclone: pool drain active for $NAME, skipping"
+    exit 0
+fi
 
 # Backoff: defer to the watcher only after N consecutive rapid deaths.
 # A single fast reclone is normal — short linter jobs (~45s) complete well
@@ -84,6 +94,11 @@ done
 # Check if someone else already filled this slot (watcher, manual create)
 if qm list 2>/dev/null | awk 'NR>1{print $2}' | grep -qxF "$NAME"; then
     log_info "reclone: $NAME already exists, skipping"
+    exit 0
+fi
+
+if pool_is_draining; then
+    logger -t github-runner "reclone: pool drain active after destroy for $NAME, leaving slot empty"
     exit 0
 fi
 

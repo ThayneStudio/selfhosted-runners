@@ -21,6 +21,11 @@ CONFIG_FILE="/etc/github-runners.conf"
 ORG_CONFIG_DIR="/etc/github-runners.d"
 SNIPPETS_DIR="/var/lib/vz/snippets"
 INSTALL_DIR="/opt/selfhosted-runners"
+POOL_DRAIN_FILE="/run/lock/github-runner-drain"
+# Shared/exclusive lock coordinating maintenance mode with in-flight clones.
+# clone_runner holds a shared lock for its full lifecycle; runner stop takes an
+# exclusive lock so it can wait until all clone activity is quiesced.
+POOL_ACTIVITY_LOCK_FILE="/run/lock/github-runner-pool.lock"
 # Global lock serializing VMID allocation across reclone.sh/watch.sh/create.sh.
 # Scope is narrow: "pick free VMID -> qm clone returns (config persisted)".
 # pvesh get /cluster/nextid is not atomic and does not reserve, so without
@@ -70,6 +75,19 @@ load_org_config() {
         log_error "Invalid org config for '$org_name' — missing GITHUB_ORG or GITHUB_PAT"
         exit 1
     fi
+}
+
+pool_is_draining() {
+    [[ -e "$POOL_DRAIN_FILE" ]]
+}
+
+enable_pool_drain() {
+    install -d -m 755 "$(dirname "$POOL_DRAIN_FILE")"
+    : > "$POOL_DRAIN_FILE"
+}
+
+disable_pool_drain() {
+    rm -f "$POOL_DRAIN_FILE"
 }
 
 list_orgs() {
@@ -190,6 +208,15 @@ next_vmid() {
 clone_runner() {
     local name="$1" org="$2" vmid="${3:-}"
 
+    exec 202>"$POOL_ACTIVITY_LOCK_FILE"
+    flock -s 202
+
+    if pool_is_draining; then
+        log_warn "clone_runner: pool drain active, refusing to create $name"
+        exec 202>&-
+        return 1
+    fi
+
     # Cleanup helper: destroy VM (only if it belongs to us) and remove snippet.
     # The ownership check prevents destroying another process's VM on VMID collision.
     # If there's no VM config at all, the clone failed mid-transaction — free any
@@ -222,12 +249,14 @@ clone_runner() {
     if ! flock -w 120 201; then
         log_error "clone_runner: timed out acquiring VMID lock for $name"
         exec 201>&-
+        exec 202>&-
         return 1
     fi
 
     if [[ -z "$vmid" ]]; then
         if ! vmid=$(next_vmid); then
             exec 201>&-
+            exec 202>&-
             return 1
         fi
     else
@@ -238,12 +267,28 @@ clone_runner() {
         done
     fi
 
+    if pool_is_draining; then
+        log_warn "clone_runner: pool drain became active before cloning $name"
+        exec 201>&-
+        exec 202>&-
+        return 1
+    fi
+
     # Clone. 201>&- closes the lock fd for the qm child so kvm can't inherit
     # and hold it past our parent's flock release. Matches the fd-close
     # pattern established in earlier commits (e.g. 431d8c1, fca3467).
     if ! qm clone "$TEMPLATE_ID" "$vmid" --name "$name" 201>&-; then
         _fail
         exec 201>&-
+        exec 202>&-
+        return 1
+    fi
+
+    if pool_is_draining; then
+        log_warn "clone_runner: pool drain became active after cloning $name, cleaning up VM $vmid"
+        exec 201>&-
+        _fail
+        exec 202>&-
         return 1
     fi
 
@@ -257,7 +302,7 @@ clone_runner() {
     net0=$(qm config "$vmid" | grep '^net0:' | sed 's/^net0: //') || true
     if [[ -n "$net0" ]]; then
         net0=$(echo "$net0" | sed "s/virtio=[^,]*/virtio=$mac/")
-        qm set "$vmid" --net0 "$net0" || { _fail; return 1; }
+        qm set "$vmid" --net0 "$net0" || { _fail; exec 202>&-; return 1; }
     fi
 
     # Cloud-init
@@ -268,13 +313,13 @@ EOF
     chmod 600 "${SNIPPETS_DIR}/runner-${vmid}-meta.yaml"
 
     qm set "$vmid" --cicustom "user=local:snippets/runner-user-data-${org}.yaml,meta=local:snippets/runner-${vmid}-meta.yaml" \
-        || { _fail; return 1; }
+        || { _fail; exec 202>&-; return 1; }
     qm set "$vmid" --ipconfig0 ip=dhcp \
-        || { _fail; return 1; }
+        || { _fail; exec 202>&-; return 1; }
     [[ -z "${DNS_SERVERS:-}" ]] || qm set "$vmid" --nameserver "$DNS_SERVERS" \
-        || { _fail; return 1; }
+        || { _fail; exec 202>&-; return 1; }
     qm set "$vmid" --ciuser runner \
-        || { _fail; return 1; }
+        || { _fail; exec 202>&-; return 1; }
 
     # Hookscript for auto-destroy on shutdown
     if [[ -f "$SNIPPETS_DIR/runner-hookscript.sh" ]]; then
@@ -282,10 +327,20 @@ EOF
             || log_warn "Failed to set hookscript on $vmid — VM will not auto-recycle"
     fi
 
-    # Start
-    if ! qm start "$vmid"; then
-        _fail; return 1
+    if pool_is_draining; then
+        log_warn "clone_runner: pool drain became active while configuring $name, cleaning up VM $vmid"
+        _fail
+        exec 202>&-
+        return 1
     fi
 
+    # Start
+    if ! qm start "$vmid"; then
+        _fail
+        exec 202>&-
+        return 1
+    fi
+
+    exec 202>&-
     echo "$vmid"
 }

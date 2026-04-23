@@ -9,6 +9,8 @@ shift 2>/dev/null || true
 case "$COMMAND" in
     create)    exec "$SCRIPT_DIR/lib/create.sh" "$@" ;;
     destroy)   exec "$SCRIPT_DIR/lib/destroy.sh" "$@" ;;
+    start)     exec "$SCRIPT_DIR/lib/start.sh" "$@" ;;
+    stop)      exec "$SCRIPT_DIR/lib/stop.sh" "$@" ;;
     list)      exec "$SCRIPT_DIR/lib/list.sh" "$@" ;;
     setup)     exec "$SCRIPT_DIR/lib/setup.sh" "$@" ;;
     add-org)   exec "$SCRIPT_DIR/lib/add-org.sh" "$@" ;;
@@ -24,7 +26,9 @@ case "$COMMAND" in
         echo "  remove-org [<org>]          Remove a GitHub organization"
         echo "  list-orgs                   List configured organizations"
         echo "  create [--org <org>] <name> Create a runner VM manually"
-        echo "  destroy <name>              Destroy a runner VM"
+        echo "  destroy <name>              Destroy a managed runner VM"
+        echo "  start                       Exit maintenance mode and resume watcher"
+        echo "  stop [options]              Enter maintenance mode and stop managed runners"
         echo "  list                        List all runner VMs"
         echo "  watch                       Fill runner pools (run by timer)"
         echo ""

@@ -1,0 +1,166 @@
+#!/bin/bash
+set -euo pipefail
+# Stop the watcher and optionally destroy managed runner VMs.
+
+source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/common.sh"
+
+require_root "stop"
+load_infra_config
+
+VMID_RANGE=""
+VMID_MIN=""
+VMID_MAX=""
+WATCH_ONLY=false
+ASSUME_YES=false
+
+collect_managed_runners() {
+    local vmid_min="${1:-}"
+    local vmid_max="${2:-}"
+    local all_vms vmid vm_name status vm_org
+
+    all_vms=$(qm list 2>/dev/null | tail -n +2 || true)
+    [[ -n "$all_vms" ]] || return 0
+
+    while read -r line; do
+        [[ -n "$line" ]] || continue
+        vmid=$(echo "$line" | awk '{print $1}')
+        vm_name=$(echo "$line" | awk '{print $2}')
+        status=$(echo "$line" | awk '{print $3}')
+
+        [[ "$vmid" == "$TEMPLATE_ID" ]] && continue
+
+        if [[ -n "$vmid_min" ]]; then
+            [[ "$vmid" -ge "$vmid_min" && "$vmid" -le "$vmid_max" ]] || continue
+        fi
+
+        vm_org=$(get_vm_org "$vmid")
+        [[ "$vm_org" != "unknown" ]] || continue
+
+        printf '%s|%s|%s|%s\n' "$vmid" "$vm_name" "$vm_org" "$status"
+    done <<< "$all_vms"
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --vmid-range)
+            [[ $# -ge 2 ]] || { log_error "--vmid-range requires MIN:MAX"; exit 1; }
+            VMID_RANGE="$2"
+            shift 2
+            ;;
+        --vmid-range=*)
+            VMID_RANGE="${1#--vmid-range=}"
+            shift
+            ;;
+        --watch-only)
+            WATCH_ONLY=true
+            shift
+            ;;
+        --yes|-y)
+            ASSUME_YES=true
+            shift
+            ;;
+        -*)
+            log_error "Unknown option: $1"
+            echo "Usage: runner stop [--watch-only] [--vmid-range <min:max>] [--yes]"
+            exit 1
+            ;;
+        *)
+            log_error "Unexpected argument: $1"
+            echo "Usage: runner stop [--watch-only] [--vmid-range <min:max>] [--yes]"
+            exit 1
+            ;;
+    esac
+done
+
+if [[ -n "$VMID_RANGE" ]]; then
+    if [[ ! "$VMID_RANGE" =~ ^([0-9]+):([0-9]+)$ ]]; then
+        log_error "Invalid VMID range: $VMID_RANGE (expected MIN:MAX)"
+        exit 1
+    fi
+    VMID_MIN="${BASH_REMATCH[1]}"
+    VMID_MAX="${BASH_REMATCH[2]}"
+    if [[ "$VMID_MIN" -gt "$VMID_MAX" ]]; then
+        log_error "Invalid VMID range: min must be <= max"
+        exit 1
+    fi
+fi
+
+mapfile -t RUNNERS < <(collect_managed_runners "$VMID_MIN" "$VMID_MAX")
+
+echo ""
+echo "This will:"
+echo "  - stop github-runner-watch.timer and github-runner-watch.service"
+if [[ "$WATCH_ONLY" == true ]]; then
+    echo "  - leave all runner VMs intact"
+elif [[ ${#RUNNERS[@]} -gt 0 ]]; then
+    echo "  - destroy ${#RUNNERS[@]} managed runner VM(s)"
+else
+    echo "  - destroy 0 managed runner VMs"
+fi
+if [[ -n "$VMID_MIN" ]]; then
+    echo "  - limit runner destruction to VMIDs ${VMID_MIN}-${VMID_MAX}"
+fi
+echo ""
+
+if [[ "$WATCH_ONLY" != true && ${#RUNNERS[@]} -gt 0 ]]; then
+    echo "Managed runners selected:"
+    for entry in "${RUNNERS[@]}"; do
+        IFS='|' read -r VMID VM_NAME VM_ORG STATUS <<< "$entry"
+        printf "  %-8s %-25s %-15s %-10s\n" "$VMID" "$VM_NAME" "$VM_ORG" "$STATUS"
+    done
+    echo ""
+fi
+
+if [[ "$ASSUME_YES" != true ]]; then
+    echo -n "Type 'yes' to continue: " >&2
+    read -r CONFIRM </dev/tty || { log_error "No input"; exit 1; }
+    [[ "$CONFIRM" == "yes" ]] || { log_info "Aborted."; exit 0; }
+fi
+
+log_info "Stopping runner watcher..."
+enable_pool_drain
+systemctl stop github-runner-watch.timer github-runner-watch.service 2>/dev/null || true
+
+log_info "Waiting for in-flight clone activity to drain..."
+exec 202>"$POOL_ACTIVITY_LOCK_FILE"
+flock 202
+
+mapfile -t RUNNERS < <(collect_managed_runners "$VMID_MIN" "$VMID_MAX")
+
+if [[ "$WATCH_ONLY" == true ]]; then
+    log_info "Watcher stopped. Pool drain remains active; runner VMs left intact."
+    echo "Resume later with:"
+    echo "  runner start"
+    echo ""
+    exec 202>&-
+    exit 0
+fi
+
+FAILURES=()
+while true; do
+    [[ ${#RUNNERS[@]} -gt 0 ]] || break
+
+    for entry in "${RUNNERS[@]}"; do
+        IFS='|' read -r VMID VM_NAME _ _ <<< "$entry"
+        if ! "$LIB_DIR/destroy.sh" --vmid "$VMID"; then
+            FAILURES+=("$VM_NAME (VMID $VMID)")
+        fi
+    done
+
+    [[ ${#FAILURES[@]} -eq 0 ]] || break
+    mapfile -t RUNNERS < <(collect_managed_runners "$VMID_MIN" "$VMID_MAX")
+done
+
+echo ""
+if [[ ${#FAILURES[@]} -gt 0 ]]; then
+    log_error "Failed to destroy: ${FAILURES[*]}"
+    log_warn "Watcher remains stopped and pool drain remains active. Resolve the failures before resuming."
+    exec 202>&-
+    exit 1
+fi
+
+log_info "Watcher stopped and managed runners destroyed. Pool drain remains active."
+echo "Resume later with:"
+echo "  runner start"
+echo ""
+exec 202>&-

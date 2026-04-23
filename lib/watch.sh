@@ -11,6 +11,11 @@ require_root "watch"
 [[ -f "$CONFIG_FILE" ]] || exit 0
 load_infra_config
 
+if pool_is_draining; then
+    log_info "[watch] Pool drain active — skipping refill"
+    exit 0
+fi
+
 # Template must be ready
 qm config "$TEMPLATE_ID" 2>/dev/null | grep -q "^template: 1" || exit 0
 

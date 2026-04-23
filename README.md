@@ -115,7 +115,9 @@ After setup, the `runner` command is available globally:
 |---------|-------------|
 | `runner setup` | Re-run the setup wizard |
 | `runner create <name>` | Create a new runner VM |
-| `runner destroy <name>` | Destroy a runner VM |
+| `runner destroy <name>` | Destroy a managed runner VM |
+| `runner start` | Exit maintenance mode and resume watcher |
+| `runner stop [options]` | Enter maintenance mode and stop managed runners |
 | `runner list` | List all runner VMs |
 | `runner help` | Show available commands |
 
@@ -174,22 +176,32 @@ cloned runner VM):
 To update prebaked software in the base VM template:
 
 1. Edit `/opt/selfhosted-runners/templates/template-setup.yaml`
-2. Destroy the existing template VM (default ID `9000`, or your configured template ID):
+2. Stop the watcher and remove managed runners so no linked clones still depend on the old template:
+   ```bash
+   runner stop
+   ```
+3. Destroy the existing template VM (default ID `9000`, or your configured template ID):
    ```bash
    qm destroy 9000
    ```
-3. Re-run setup to bake a fresh template:
+4. Re-run setup to bake a fresh template:
    ```bash
    runner setup
    ```
-4. Destroy and recreate runners so they clone from the rebuilt template:
+5. Resume the pool and refill it:
    ```bash
-   runner destroy runner-01
-   runner create runner-01
+   runner start
    ```
 
 `runner setup` skips rebuilding an existing template VM, so baked-image changes
 do not take effect until the old template is removed and recreated.
+
+`runner stop` leaves the pool in maintenance mode until you run `runner start`.
+
+`runner stop --vmid-range <min:max>` is for partial maintenance windows only.
+Do not use a VMID-limited stop immediately before destroying a linked-clone
+template, because every dependent clone must be removed before `qm destroy`
+will succeed.
 
 ## Troubleshooting
 

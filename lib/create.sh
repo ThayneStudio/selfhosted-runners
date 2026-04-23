@@ -7,6 +7,11 @@ source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/common.sh"
 require_root "create"
 load_infra_config
 
+if pool_is_draining; then
+    log_error "Runner pool is stopped for maintenance. Run 'runner start' to resume."
+    exit 1
+fi
+
 # Parse: [--org <org>] <name>
 ORG_FLAG=""
 RUNNER_NAME=""
