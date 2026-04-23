@@ -44,11 +44,20 @@ done
 
 [[ ${#MISSING[@]} -gt 0 ]] || exit 0
 
-log_info "[watch] Filling ${#MISSING[@]} missing slot(s) in parallel"
+WATCH_MAX_PARALLEL=6
+
+wait_for_watch_slot() {
+    while (( $(jobs -rp | wc -l) >= WATCH_MAX_PARALLEL )); do
+        wait -n || true
+    done
+}
+
+log_info "[watch] Filling ${#MISSING[@]} missing slot(s) with up to ${WATCH_MAX_PARALLEL} parallel worker(s)"
 
 # VMID allocation is serialized inside clone_runner via the global
 # $VMID_LOCK_FILE flock, so parallel subshells can safely pick their own.
 for entry in "${MISSING[@]}"; do
+    wait_for_watch_slot
     slot="${entry%% *}"
     org="${entry##* }"
     (

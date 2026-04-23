@@ -330,13 +330,13 @@ clone_runner() {
 
     # Acquire global VMID allocation lock. Scope is tight: "pick VMID -> qm
     # clone returns (config persisted)". qm set/start run unlocked.
-    # Timeout generous (120s) because a burst can queue up to
-    # ~14 reclones + 14 watch subshells on the same lock, and linked clones
-    # take ~1-2s each (28 waiters * 2s = 56s worst-case serial time).
+    # Timeout is intentionally high because qm clone is serialized here and a
+    # cold pool refill can queue many linked clones behind the same lock on
+    # slower storage backends.
     # Callers (reclone.sh/watch.sh) must acquire their per-slot fd 200 lock
     # before entering clone_runner to avoid deadlock on lock order inversion.
     exec 201>"$VMID_LOCK_FILE"
-    if ! flock -w 120 201; then
+    if ! flock -w 300 201; then
         log_error "clone_runner: timed out acquiring VMID lock for $name"
         exec 201>&-
         exec 202>&-
