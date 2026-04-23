@@ -209,6 +209,42 @@ EOF
 chmod 600 "$CONF_TMP"
 mv "$CONF_TMP" "$CONFIG_FILE"
 
+# Re-render any existing org snippets from the current runner-user-data template.
+# This keeps cloned runners aligned with updated bootstrap settings and mirror config.
+if compgen -G "$ORG_CONFIG_DIR/*.conf" > /dev/null; then
+    log_info "Refreshing existing runner cloud-init snippets..."
+    for org_conf in "$ORG_CONFIG_DIR"/*.conf; do
+        [[ -f "$org_conf" ]] || continue
+        GITHUB_PAT="" GITHUB_ORG=""
+        # shellcheck source=/dev/null
+        source "$org_conf"
+        [[ -n "$GITHUB_PAT" && -n "$GITHUB_ORG" ]] || continue
+
+        snippet_tmp=$(mktemp "$SNIPPETS_DIR/.runner-user-data-${GITHUB_ORG}.XXXXXX")
+        chmod 600 "$snippet_tmp"
+        GITHUB_PAT="$GITHUB_PAT" GITHUB_ORG="$GITHUB_ORG" DOCKER_MIRROR_URL="${DOCKER_MIRROR_URL:-}" awk '
+        function lreplace(str, old, new,    i, result) {
+            result = ""
+            while ((i = index(str, old)) > 0) {
+                result = result substr(str, 1, i - 1) new
+                str = substr(str, i + length(old))
+            }
+            return result str
+        }
+        {
+            $0 = lreplace($0, "{{GITHUB_PAT}}", ENVIRON["GITHUB_PAT"])
+            $0 = lreplace($0, "{{GITHUB_ORG}}", ENVIRON["GITHUB_ORG"])
+            $0 = lreplace($0, "{{DOCKER_MIRROR_URL}}", ENVIRON["DOCKER_MIRROR_URL"])
+            print
+        }' "$INSTALL_DIR/templates/runner-user-data.yaml" > "$snippet_tmp" || {
+            log_error "Failed to regenerate cloud-init snippet for $GITHUB_ORG"
+            exit 1
+        }
+        mv "$snippet_tmp" "$SNIPPETS_DIR/runner-user-data-${GITHUB_ORG}.yaml"
+        log_info "  Updated snippet for $GITHUB_ORG"
+    done
+fi
+
 # Check if template already exists
 if qm status "$TEMPLATE_ID" &> /dev/null; then
     log_info "[4/5] Template VM $TEMPLATE_ID already exists. Skipping creation."
@@ -328,21 +364,20 @@ else
         || { log_error "Failed to set cloud-init user"; exit 1; }
 
     # Boot VM to bake tools into the template
-    log_info "Starting VM to install tools (this takes 10-20 minutes)..."
+    log_info "Starting VM to install tools (this can take a while on cold caches)..."
     if ! qm start "$TEMPLATE_ID"; then
         log_error "Failed to start template VM"
         exit 1
     fi
 
-    # Poll for template setup completion (timeout: 20 minutes)
+    # Poll for template setup completion until the VM powers off after baking.
     log_info "Waiting for tool installation to complete..."
     log_info "  (Monitor progress: qm guest exec $TEMPLATE_ID -- cat /var/log/template-setup.log)"
-    BAKE_TIMEOUT=1200
     BAKE_ELAPSED=0
     BAKE_INTERVAL=15
     BAKE_READY=false
 
-    while [[ $BAKE_ELAPSED -lt $BAKE_TIMEOUT ]]; do
+    while true; do
         sleep $BAKE_INTERVAL
         BAKE_ELAPSED=$((BAKE_ELAPSED + BAKE_INTERVAL))
 
@@ -361,7 +396,7 @@ else
             # Guest agent not ready yet (still installing qemu-guest-agent)
             MINUTES=$((BAKE_ELAPSED / 60))
             SECONDS_REM=$((BAKE_ELAPSED % 60))
-            printf '\r  Elapsed: %dm%02ds / %dm (waiting for guest agent...)' "$MINUTES" "$SECONDS_REM" "$((BAKE_TIMEOUT / 60))" >&2
+            printf '\r  Elapsed: %dm%02ds (waiting for guest agent...)' "$MINUTES" "$SECONDS_REM" >&2
             continue
         }
 
@@ -376,16 +411,9 @@ else
 
         MINUTES=$((BAKE_ELAPSED / 60))
         SECONDS_REM=$((BAKE_ELAPSED % 60))
-        printf '\r  Elapsed: %dm%02ds / %dm (installing tools...)' "$MINUTES" "$SECONDS_REM" "$((BAKE_TIMEOUT / 60))" >&2
+        printf '\r  Elapsed: %dm%02ds (installing tools...)' "$MINUTES" "$SECONDS_REM" >&2
     done
     echo "" >&2
-
-    if [[ "$BAKE_READY" != true ]]; then
-        log_error "Template setup timed out after $((BAKE_TIMEOUT / 60)) minutes"
-        log_error "The VM is still running — setup may have failed."
-        log_error "Check logs: qm guest exec $TEMPLATE_ID -- cat /var/log/template-setup.log"
-        exit 1
-    fi
 
     # Stop VM if still running
     VM_STATUS=$(qm status "$TEMPLATE_ID" 2>/dev/null | awk '{print $2}') || true

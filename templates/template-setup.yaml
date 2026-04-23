@@ -15,6 +15,7 @@ packages:
   - gnupg
   - jq
   - unzip
+  - zstd
   - build-essential
   - git
   - wget
@@ -32,6 +33,13 @@ write_files:
       # Logging with timestamps
       log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"; }
       log_error() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: $1" >&2; }
+
+      export DEBIAN_FRONTEND=noninteractive
+      export NEEDRESTART_MODE=a
+
+      SUPABASE_VERSION=2.93.1
+      PLAYWRIGHT_VERSION=1.59.1
+      PLAYWRIGHT_BROWSERS_PATH=/home/runner/.cache/ms-playwright
 
       # Retry wrapper for network operations
       retry() {
@@ -64,8 +72,7 @@ write_files:
       fi
       log "Disk space check passed: ${FREE_SPACE}GB free"
 
-      # Wait for network connectivity
-      log "[1/7] Checking network connectivity..."
+      log "[1/10] Checking network connectivity..."
       for i in {1..30}; do
         if curl -sf --max-time 5 https://github.com > /dev/null 2>&1; then
           log "Network connectivity confirmed"
@@ -79,7 +86,7 @@ write_files:
         sleep 2
       done
 
-      log "[2/7] Installing Docker..."
+      log "[2/10] Installing Docker..."
       install -m 0755 -d /etc/apt/keyrings
 
       # Docker GPG key with retry
@@ -104,7 +111,7 @@ write_files:
       usermod -aG docker runner
       log "Docker installed and running"
 
-      log "[3/7] Installing GitHub CLI..."
+      log "[3/10] Installing GitHub CLI..."
       retry "curl -fsSL --retry 3 --retry-delay 2 https://cli.github.com/packages/githubcli-archive-keyring.gpg -o /etc/apt/keyrings/githubcli-archive-keyring.gpg"
       chmod a+r /etc/apt/keyrings/githubcli-archive-keyring.gpg
       echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | tee /etc/apt/sources.list.d/github-cli.list > /dev/null
@@ -112,20 +119,84 @@ write_files:
       retry "apt-get install -y gh"
       log "GitHub CLI $(gh --version | head -1) installed"
 
-      log "[4/7] Installing Node.js LTS..."
+      log "[4/10] Installing Node.js LTS..."
       retry "curl -fsSL --retry 3 https://deb.nodesource.com/setup_lts.x -o /tmp/nodesource_setup.sh"
       bash /tmp/nodesource_setup.sh
       rm /tmp/nodesource_setup.sh
       retry "apt-get install -y nodejs"
       log "Node.js $(node --version) installed"
 
-      log "[5/7] Installing Playwright dependencies..."
-      timeout 300 npx playwright install-deps || {
-        log_error "Playwright deps installation timed out or failed"
-        log "Continuing anyway - Playwright can be installed in workflows"
-      }
+      log "[5/10] Installing AWS CLI v2..."
+      (
+        set -euo pipefail
+        AWS_TMP_DIR=$(mktemp -d)
+        trap 'rm -rf "$AWS_TMP_DIR"' EXIT
 
-      log "[6/7] Downloading GitHub Actions runner..."
+        retry "curl -fsSL --retry 3 --retry-delay 2 https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip -o '$AWS_TMP_DIR/awscliv2.zip'"
+        unzip -q "$AWS_TMP_DIR/awscliv2.zip" -d "$AWS_TMP_DIR"
+        "$AWS_TMP_DIR/aws/install" --bin-dir /usr/local/bin --install-dir /usr/local/aws-cli --update
+      )
+      AWS_VERSION=$(aws --version 2>&1 || true)
+      if [[ "$AWS_VERSION" != aws-cli/2* ]]; then
+        log_error "AWS CLI v2 install verification failed: ${AWS_VERSION:-missing output}"
+        exit 1
+      fi
+      log "AWS CLI $AWS_VERSION installed"
+
+      log "[6/10] Installing Supabase CLI ${SUPABASE_VERSION}..."
+      (
+        set -euo pipefail
+        SUPABASE_TMP_DIR=$(mktemp -d)
+        trap 'rm -rf "$SUPABASE_TMP_DIR"' EXIT
+
+        SUPABASE_DEB="$SUPABASE_TMP_DIR/supabase_${SUPABASE_VERSION}_linux_amd64.deb"
+        retry "curl -fsSL --retry 3 --retry-delay 2 https://github.com/supabase/cli/releases/download/v${SUPABASE_VERSION}/supabase_${SUPABASE_VERSION}_linux_amd64.deb -o '$SUPABASE_DEB'"
+        apt-get install -y "$SUPABASE_DEB"
+      )
+      SUPABASE_INSTALLED_VERSION=$(supabase --version 2>/dev/null | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)
+      if [[ "$SUPABASE_INSTALLED_VERSION" != "$SUPABASE_VERSION" ]]; then
+        log_error "Supabase CLI install verification failed: expected ${SUPABASE_VERSION}, got ${SUPABASE_INSTALLED_VERSION:-missing output}"
+        exit 1
+      fi
+      log "Supabase CLI v${SUPABASE_INSTALLED_VERSION} installed"
+
+      log "[7/10] Warming Supabase local development images..."
+      (
+        set -euo pipefail
+        SUPABASE_WARMUP_DIR=$(mktemp -d)
+        trap 'cd / && rm -rf "$SUPABASE_WARMUP_DIR"' EXIT
+
+        cd "$SUPABASE_WARMUP_DIR"
+        printf 'n\n' | supabase init
+        retry "supabase start"
+        supabase stop --no-backup
+      )
+      log "Supabase local development Docker cache warmed"
+
+      log "[8/10] Installing Playwright Chromium..."
+      install -d -o runner -g runner -m 0755 /home/runner/.cache "$PLAYWRIGHT_BROWSERS_PATH"
+      retry "env PLAYWRIGHT_BROWSERS_PATH='$PLAYWRIGHT_BROWSERS_PATH' npm exec --yes --package=playwright@${PLAYWRIGHT_VERSION} playwright install --with-deps chromium"
+      if ! env PLAYWRIGHT_BROWSERS_PATH="$PLAYWRIGHT_BROWSERS_PATH" npm exec --yes --package=playwright@"${PLAYWRIGHT_VERSION}" playwright --version | grep -q "${PLAYWRIGHT_VERSION}"; then
+        log_error "Playwright CLI version verification failed: expected ${PLAYWRIGHT_VERSION}"
+        exit 1
+      fi
+      if [[ ! -d "$PLAYWRIGHT_BROWSERS_PATH" ]] || ! find "$PLAYWRIGHT_BROWSERS_PATH" -maxdepth 1 -type d -name 'chromium-*' | grep -q .; then
+        log_error "Playwright Chromium install verification failed: no Chromium browser directory found in $PLAYWRIGHT_BROWSERS_PATH"
+        exit 1
+      fi
+      chown -R runner:runner /home/runner/.cache
+      log "Playwright Chromium ${PLAYWRIGHT_VERSION} installed in $PLAYWRIGHT_BROWSERS_PATH"
+
+      if ! command -v unzip > /dev/null 2>&1; then
+        log_error "unzip not found on PATH after package installation"
+        exit 1
+      fi
+      if ! command -v zstd > /dev/null 2>&1; then
+        log_error "zstd not found on PATH after package installation"
+        exit 1
+      fi
+
+      log "[9/10] Downloading GitHub Actions runner..."
       RUNNER_HOME=/home/runner/actions-runner
       RUNNER_USER=runner
       mkdir -p $RUNNER_HOME
@@ -163,7 +234,7 @@ write_files:
       }
       log "Runner extracted and dependencies installed"
 
-      log "[7/7] Cleaning up for template conversion..."
+      log "[10/10] Cleaning up for template conversion..."
       apt-get clean
       rm -rf /tmp/* /var/tmp/*
       truncate -s 0 /var/log/*.log 2>/dev/null || true
@@ -172,7 +243,7 @@ write_files:
       touch /opt/.template-setup-complete
 
       log "=== Template setup complete! ==="
-      log "Installed: Docker, GitHub CLI, Node.js, Playwright deps, Actions runner"
+      log "Installed: Docker, GitHub CLI, Node.js, zstd, unzip, AWS CLI v2, Supabase CLI ${SUPABASE_VERSION} with warmed local Docker cache, Playwright Chromium ${PLAYWRIGHT_VERSION}, Actions runner"
 
 runcmd:
   - /opt/setup-template.sh 2>&1 | tee /var/log/template-setup.log

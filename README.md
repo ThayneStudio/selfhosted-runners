@@ -78,6 +78,9 @@ The Proxmox host and runner VMs need outbound access to:
 | *.actions.githubusercontent.com | 443 | Workflow artifacts |
 | download.docker.com | 443 | Docker installation |
 | deb.nodesource.com | 443 | Node.js installation |
+| awscli.amazonaws.com | 443 | AWS CLI v2 installer |
+| registry.npmjs.org | 443 | Playwright package download |
+| Microsoft Playwright CDN | 443 | Playwright Chromium browser download |
 | cloud-images.ubuntu.com | 443 | Ubuntu cloud image |
 
 ### GitHub Requirements
@@ -122,8 +125,23 @@ Runners come pre-installed with:
 
 - **Docker CE** + Docker Compose
 - **Node.js LTS** (via NodeSource)
-- **Playwright** system dependencies
-- **Build tools**: git, curl, jq, build-essential, wget
+- **AWS CLI v2**
+- **Supabase CLI** `2.93.1` with warmed local development Docker image cache
+- **Playwright Chromium** for `playwright@1.59.1`, plus Playwright system dependencies
+- **Build tools**: git, curl, jq, build-essential, wget, unzip, zstd
+
+Playwright Chromium is baked into the runner user's default cache at
+`/home/runner/.cache/ms-playwright`, so jobs running as `runner` can use it
+without extra path configuration. Consumer repos need to pin Playwright to
+`1.59.1` to use the prebaked cache. Change the pinned version in
+`templates/template-setup.yaml` and rebuild the template when upgrading
+intentionally.
+
+During template baking, the installer also runs a throwaway `supabase init`,
+`supabase start`, and `supabase stop --no-backup` in a temporary directory.
+The temporary working directory is deleted afterwards, while the Docker artifacts
+from that warmup run remain on the VM so later `supabase start` runs avoid cold
+pulls.
 
 ## Using in Workflows
 
@@ -139,10 +157,11 @@ jobs:
 
 ## Updating Runners
 
-To update runner configuration or installed software:
+To update runner registration/bootstrap behavior (cloud-init that runs on every
+cloned runner VM):
 
 1. Edit `/opt/selfhosted-runners/templates/runner-user-data.yaml`
-2. Re-run setup to regenerate the cloud-init snippet:
+2. Re-run setup to regenerate the per-org runner cloud-init snippets:
    ```bash
    runner setup
    ```
@@ -151,6 +170,26 @@ To update runner configuration or installed software:
    runner destroy runner-01
    runner create runner-01
    ```
+
+To update prebaked software in the base VM template:
+
+1. Edit `/opt/selfhosted-runners/templates/template-setup.yaml`
+2. Destroy the existing template VM (default ID `9000`, or your configured template ID):
+   ```bash
+   qm destroy 9000
+   ```
+3. Re-run setup to bake a fresh template:
+   ```bash
+   runner setup
+   ```
+4. Destroy and recreate runners so they clone from the rebuilt template:
+   ```bash
+   runner destroy runner-01
+   runner create runner-01
+   ```
+
+`runner setup` skips rebuilding an existing template VM, so baked-image changes
+do not take effect until the old template is removed and recreated.
 
 ## Troubleshooting
 

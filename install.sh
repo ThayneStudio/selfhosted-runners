@@ -19,6 +19,8 @@ echo "Installed to $INSTALL_DIR"
 # If setup was already run, sync deployed files (hookscript, systemd units)
 if [[ -f /etc/github-runners.conf ]]; then
     echo "Updating deployed files..."
+    # shellcheck source=/dev/null
+    source /etc/github-runners.conf
     if [[ -d /var/lib/vz/snippets ]]; then
         cp "$INSTALL_DIR/templates/runner-hookscript.sh" /var/lib/vz/snippets/runner-hookscript.sh
         chmod 755 /var/lib/vz/snippets/runner-hookscript.sh
@@ -40,7 +42,8 @@ if [[ -f /etc/github-runners.conf ]]; then
             # Re-render the snippet using the same awk substitution as add-org.sh
             snippet_tmp=$(mktemp "/var/lib/vz/snippets/.runner-user-data-${org}.XXXXXX")
             chmod 600 "$snippet_tmp"
-            GITHUB_PAT="$GITHUB_PAT" GITHUB_ORG="$GITHUB_ORG" awk '
+            DOCKER_MIRROR_URL="${DOCKER_MIRROR_URL:-}"
+            GITHUB_PAT="$GITHUB_PAT" GITHUB_ORG="$GITHUB_ORG" DOCKER_MIRROR_URL="$DOCKER_MIRROR_URL" awk '
             function lreplace(str, old, new,    i, result) {
                 result = ""
                 while ((i = index(str, old)) > 0) {
@@ -52,6 +55,7 @@ if [[ -f /etc/github-runners.conf ]]; then
             {
                 $0 = lreplace($0, "{{GITHUB_PAT}}", ENVIRON["GITHUB_PAT"])
                 $0 = lreplace($0, "{{GITHUB_ORG}}", ENVIRON["GITHUB_ORG"])
+                $0 = lreplace($0, "{{DOCKER_MIRROR_URL}}", ENVIRON["DOCKER_MIRROR_URL"])
                 print
             }' "$INSTALL_DIR/templates/runner-user-data.yaml" > "$snippet_tmp"
             mv "$snippet_tmp" "/var/lib/vz/snippets/runner-user-data-${org}.yaml"
