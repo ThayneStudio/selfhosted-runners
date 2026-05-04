@@ -24,6 +24,20 @@ if [[ -f /etc/github-runners.conf ]]; then
     if [[ -d /var/lib/vz/snippets ]]; then
         cp "$INSTALL_DIR/templates/runner-hookscript.sh" /var/lib/vz/snippets/runner-hookscript.sh
         chmod 755 /var/lib/vz/snippets/runner-hookscript.sh
+        DOCKER_MIRROR_URL="${DOCKER_MIRROR_URL:-}" awk '
+        function lreplace(str, old, new,    i, result) {
+            result = ""
+            while ((i = index(str, old)) > 0) {
+                result = result substr(str, 1, i - 1) new
+                str = substr(str, i + length(old))
+            }
+            return result str
+        }
+        {
+            $0 = lreplace($0, "{{DOCKER_MIRROR_URL}}", ENVIRON["DOCKER_MIRROR_URL"])
+            print
+        }' "$INSTALL_DIR/templates/template-setup.yaml" > /var/lib/vz/snippets/template-setup.yaml
+        chmod 600 /var/lib/vz/snippets/template-setup.yaml
     fi
     if [[ -f /etc/systemd/system/github-runner-watch.timer ]]; then
         cp "$INSTALL_DIR/templates/github-runner-watch.service" /etc/systemd/system/

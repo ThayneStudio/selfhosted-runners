@@ -114,8 +114,11 @@ echo "Docker mirror: a local OCI registry (e.g., http://lxc-ip:5000 Zot) that ca
 echo "pulls. Enables transparent pull-through caching — no workflow changes needed."
 read -rp "Docker mirror URL for public.ecr.aws (empty to disable): " DOCKER_MIRROR_URL
 if [[ -n "$DOCKER_MIRROR_URL" ]]; then
-    if [[ ! "$DOCKER_MIRROR_URL" =~ ^https?://[^[:space:]]+$ ]]; then
-        log_error "Docker mirror URL must include http:// or https://"
+    while [[ "$DOCKER_MIRROR_URL" == */ ]]; do
+        DOCKER_MIRROR_URL="${DOCKER_MIRROR_URL%/}"
+    done
+    if [[ ! "$DOCKER_MIRROR_URL" =~ ^https?://([A-Za-z0-9.-]+|\[[0-9A-Fa-f:]+\])(:[0-9]+)?$ ]]; then
+        log_error "Docker mirror URL must be scheme://host[:port], for example http://10.20.1.19:8080"
         exit 1
     fi
 fi
@@ -196,16 +199,16 @@ log_info "[3/5] Saving configuration..."
 mkdir -p "$ORG_CONFIG_DIR"
 chmod 700 "$ORG_CONFIG_DIR"
 CONF_TMP=$(mktemp "${CONFIG_FILE}.XXXXXX")
-cat > "$CONF_TMP" << EOF
-NETWORK_BRIDGE="$NETWORK_BRIDGE"
-VLAN_TAG="${VLAN_TAG}"
-VM_STORAGE="$VM_STORAGE"
-TEMPLATE_ID="$TEMPLATE_ID"
-MIN_VMID="$MIN_VMID"
-BALLOON="$BALLOON"
-DNS_SERVERS="$DNS_SERVERS"
-DOCKER_MIRROR_URL="${DOCKER_MIRROR_URL:-}"
-EOF
+{
+    printf 'NETWORK_BRIDGE=%q\n' "$NETWORK_BRIDGE"
+    printf 'VLAN_TAG=%q\n' "${VLAN_TAG}"
+    printf 'VM_STORAGE=%q\n' "$VM_STORAGE"
+    printf 'TEMPLATE_ID=%q\n' "$TEMPLATE_ID"
+    printf 'MIN_VMID=%q\n' "$MIN_VMID"
+    printf 'BALLOON=%q\n' "$BALLOON"
+    printf 'DNS_SERVERS=%q\n' "$DNS_SERVERS"
+    printf 'DOCKER_MIRROR_URL=%q\n' "${DOCKER_MIRROR_URL:-}"
+} > "$CONF_TMP"
 chmod 600 "$CONF_TMP"
 mv "$CONF_TMP" "$CONFIG_FILE"
 

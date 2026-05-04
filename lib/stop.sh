@@ -120,13 +120,16 @@ if [[ "$ASSUME_YES" != true ]]; then
     [[ "$CONFIRM" == "yes" ]] || { log_info "Aborted."; exit 0; }
 fi
 
-log_info "Stopping runner watcher..."
+log_info "Stopping runner watcher timer..."
 enable_pool_drain
-systemctl stop github-runner-watch.timer github-runner-watch.service 2>/dev/null || true
+systemctl stop github-runner-watch.timer 2>/dev/null || true
 
 log_info "Waiting for in-flight clone activity to drain..."
 exec 202>"$POOL_ACTIVITY_LOCK_FILE"
 flock 202
+
+log_info "Stopping runner watcher service..."
+systemctl stop github-runner-watch.service 2>/dev/null || true
 
 mapfile -t RUNNERS < <(collect_managed_runners "$VMID_MIN" "$VMID_MAX")
 

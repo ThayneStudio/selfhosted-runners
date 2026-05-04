@@ -200,7 +200,10 @@ list_template_linked_clone_volids() {
     local storage_list base_volid base_path prefix volid child_name base_dataset dataset origin
     local -A seen=()
 
-    storage_list=$(pvesm list "$VM_STORAGE" 2>/dev/null || true)
+    if ! storage_list=$(pvesm list "$VM_STORAGE" 2>/dev/null); then
+        log_error "Failed to list storage volumes on $VM_STORAGE"
+        return 1
+    fi
     [[ -n "$storage_list" ]] || return 0
 
     while read -r base_volid; do
@@ -244,7 +247,13 @@ cleanup_template_orphan_volumes() {
     local -a blocked_volids=()
     local -a freed_volids=()
 
-    mapfile -t child_volids < <(list_template_linked_clone_volids)
+    local child_list
+    if ! child_list=$(list_template_linked_clone_volids); then
+        return 1
+    fi
+    if [[ -n "$child_list" ]]; then
+        mapfile -t child_volids <<< "$child_list"
+    fi
     [[ ${#child_volids[@]} -gt 0 ]] || return 0
 
     log_info "Checking ${#child_volids[@]} linked-clone child volume(s) for template $TEMPLATE_ID..."
@@ -357,7 +366,10 @@ clone_runner() {
             while read -r volid; do
                 [[ -n "$volid" ]] || continue
                 pvesm free "$volid" 2>/dev/null || log_warn "Failed to free orphan volume $volid"
-            done < <(pvesm list "$VM_STORAGE" 2>/dev/null | awk -v v="$vmid" 'NR>1 && $NF==v {print $1}')
+            done < <(
+                { pvesm list "$VM_STORAGE" --vmid "$vmid" 2>/dev/null || pvesm list "$VM_STORAGE" 2>/dev/null; } |
+                    awk -v v="$vmid" 'NR>1 && ($1 ~ (":vm-" v "-disk-") || $1 ~ (":" v "/vm-" v "-disk-")) {print $1}'
+            )
         fi
     }
 

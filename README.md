@@ -149,7 +149,7 @@ The temporary working directory is deleted afterwards, while the Docker artifact
 from that warmup run remain on the VM so later `supabase start` and
 database test/diff runs avoid cold pulls.
 If a Docker mirror URL is supplied during `runner setup`, the template bake and
-cloned runners use it as a transparent pull-through cache for `public.ecr.aws`.
+cloned runners route Supabase image pulls through that registry cache.
 Local HTTP mirrors are supported by entering the URL with an explicit `http://`
 scheme, for example `http://10.0.0.20:5000`.
 
