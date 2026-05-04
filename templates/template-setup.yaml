@@ -25,6 +25,7 @@ write_files:
       SUPABASE_SCHEMA_DIFF_IMAGE=public.ecr.aws/supabase/pgadmin-schema-diff:cli-0.0.5
       SUPABASE_MIGRA_IMAGE=public.ecr.aws/supabase/migra:3.0.1663481299
       DOCKER_MIRROR_URL="{{DOCKER_MIRROR_URL}}"
+      SUPABASE_IMAGE_REGISTRY=""
       PLAYWRIGHT_VERSION=1.59.1
       PLAYWRIGHT_BROWSERS_PATH=/home/runner/.cache/ms-playwright
 
@@ -112,9 +113,10 @@ write_files:
       if [[ -n "${DOCKER_MIRROR_URL:-}" ]]; then
         log "Configuring Docker mirror for public.ecr.aws: $DOCKER_MIRROR_URL"
         mkdir -p /etc/docker /etc/containerd/certs.d/public.ecr.aws
+        SUPABASE_IMAGE_REGISTRY="${DOCKER_MIRROR_URL#http://}"
+        SUPABASE_IMAGE_REGISTRY="${SUPABASE_IMAGE_REGISTRY#https://}"
+        MIRROR_REGISTRY="${SUPABASE_IMAGE_REGISTRY%%/*}"
         if [[ "$DOCKER_MIRROR_URL" == http://* ]]; then
-          MIRROR_REGISTRY="${DOCKER_MIRROR_URL#http://}"
-          MIRROR_REGISTRY="${MIRROR_REGISTRY%%/*}"
           cat > /etc/docker/daemon.json <<DOCKEREOF
       {
         "features": {
@@ -141,6 +143,7 @@ write_files:
       TOMLEOF
         systemctl restart docker
         log "Docker mirror configured for template bake"
+        log "Supabase image registry override: $SUPABASE_IMAGE_REGISTRY"
       fi
 
       log "[4/11] Installing GitHub CLI..."
@@ -200,6 +203,12 @@ write_files:
 
         cd "$SUPABASE_WARMUP_DIR"
         printf 'n\n' | supabase init
+        if [[ -n "${SUPABASE_IMAGE_REGISTRY:-}" ]]; then
+          export INTERNAL_IMAGE_REGISTRY="$SUPABASE_IMAGE_REGISTRY"
+          SUPABASE_PG_PROVE_IMAGE="${SUPABASE_IMAGE_REGISTRY}/${SUPABASE_PG_PROVE_IMAGE#public.ecr.aws/}"
+          SUPABASE_SCHEMA_DIFF_IMAGE="${SUPABASE_IMAGE_REGISTRY}/${SUPABASE_SCHEMA_DIFF_IMAGE#public.ecr.aws/}"
+          SUPABASE_MIGRA_IMAGE="${SUPABASE_IMAGE_REGISTRY}/${SUPABASE_MIGRA_IMAGE#public.ecr.aws/}"
+        fi
         retry "supabase start"
         supabase stop --no-backup
         retry "docker pull ${SUPABASE_PG_PROVE_IMAGE}"

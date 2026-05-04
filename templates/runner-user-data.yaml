@@ -62,9 +62,10 @@ write_files:
       if [[ -n "${DOCKER_MIRROR_URL:-}" ]]; then
         log "Configuring Docker mirror for public.ecr.aws: $DOCKER_MIRROR_URL"
         mkdir -p /etc/docker /etc/containerd/certs.d/public.ecr.aws
+        SUPABASE_IMAGE_REGISTRY="${DOCKER_MIRROR_URL#http://}"
+        SUPABASE_IMAGE_REGISTRY="${SUPABASE_IMAGE_REGISTRY#https://}"
+        MIRROR_REGISTRY="${SUPABASE_IMAGE_REGISTRY%%/*}"
         if [[ "$DOCKER_MIRROR_URL" == http://* ]]; then
-          MIRROR_REGISTRY="${DOCKER_MIRROR_URL#http://}"
-          MIRROR_REGISTRY="${MIRROR_REGISTRY%%/*}"
           cat > /etc/docker/daemon.json <<DOCKEREOF
       {
         "features": {
@@ -91,8 +92,10 @@ write_files:
       TOMLEOF
         if systemctl restart docker; then
           log "Docker mirror configured"
+          log "Supabase image registry override: $SUPABASE_IMAGE_REGISTRY"
         else
           log_error "Docker restart failed — continuing with direct pulls"
+          SUPABASE_IMAGE_REGISTRY=""
         fi
       fi
 
@@ -185,7 +188,11 @@ write_files:
       # Run directly (not as systemd service). When the runner exits
       # (job complete or error), the VM shuts down immediately.
       # The Proxmox hookscript then destroys and reclones.
-      sudo -u $RUNNER_USER ./run.sh || true
+      if [[ -n "${SUPABASE_IMAGE_REGISTRY:-}" ]]; then
+        sudo -u $RUNNER_USER env INTERNAL_IMAGE_REGISTRY="$SUPABASE_IMAGE_REGISTRY" ./run.sh || true
+      else
+        sudo -u $RUNNER_USER ./run.sh || true
+      fi
       # EXIT trap handles shutdown
 
 runcmd:
