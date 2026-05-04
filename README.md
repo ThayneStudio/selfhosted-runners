@@ -128,7 +128,7 @@ Runners come pre-installed with:
 - **Docker CE** + Docker Compose
 - **Node.js LTS** (via NodeSource)
 - **AWS CLI v2**
-- **Supabase CLI** `2.93.1` with warmed local development and pgTAP Docker image cache
+- **Supabase CLI** `2.98.1` with warmed local development and database job Docker image cache
 - **Playwright Chromium** for `playwright@1.59.1`, plus Playwright system dependencies
 - **Build tools**: git, curl, jq, build-essential, wget, unzip, zstd
 
@@ -141,11 +141,13 @@ intentionally.
 
 During template baking, the installer also runs a throwaway `supabase init`,
 `supabase start`, and `supabase stop --no-backup` in a temporary directory.
-It also explicitly pulls the `public.ecr.aws/supabase/pg_prove:3.36` image used
-by `supabase test db`.
+It also explicitly pulls the database job images used by `supabase test db` and
+`supabase db diff`: `public.ecr.aws/supabase/pg_prove:3.36`,
+`public.ecr.aws/supabase/pgadmin-schema-diff:cli-0.0.5`, and
+`public.ecr.aws/supabase/migra:3.0.1663481299`.
 The temporary working directory is deleted afterwards, while the Docker artifacts
 from that warmup run remain on the VM so later `supabase start` and
-`supabase test db` runs avoid cold pulls.
+database test/diff runs avoid cold pulls.
 
 ## Using in Workflows
 
