@@ -65,6 +65,7 @@ write_files:
         SUPABASE_IMAGE_REGISTRY="${DOCKER_MIRROR_URL#http://}"
         SUPABASE_IMAGE_REGISTRY="${SUPABASE_IMAGE_REGISTRY#https://}"
         MIRROR_REGISTRY="${SUPABASE_IMAGE_REGISTRY%%/*}"
+        mkdir -p "/etc/containerd/certs.d/$MIRROR_REGISTRY"
         if [[ "$DOCKER_MIRROR_URL" == http://* ]]; then
           cat > /etc/docker/daemon.json <<DOCKEREOF
       {
@@ -85,6 +86,13 @@ write_files:
         fi
         cat > /etc/containerd/certs.d/public.ecr.aws/hosts.toml <<TOMLEOF
       server = "https://public.ecr.aws"
+
+      [host."$DOCKER_MIRROR_URL"]
+        capabilities = ["pull", "resolve"]
+        skip_verify = true
+      TOMLEOF
+        cat > "/etc/containerd/certs.d/$MIRROR_REGISTRY/hosts.toml" <<TOMLEOF
+      server = "$DOCKER_MIRROR_URL"
 
       [host."$DOCKER_MIRROR_URL"]
         capabilities = ["pull", "resolve"]

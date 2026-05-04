@@ -151,7 +151,8 @@ database test/diff runs avoid cold pulls.
 If a Docker mirror URL is supplied during `runner setup`, the template bake and
 cloned runners route Supabase image pulls through that registry cache.
 Local HTTP mirrors are supported by entering the URL with an explicit `http://`
-scheme, for example `http://10.0.0.20:5000`.
+scheme, for example `http://10.0.0.20:5000`; the bake configures both the
+`public.ecr.aws` pull-through host and the direct Supabase registry override.
 
 ## Using in Workflows
 
