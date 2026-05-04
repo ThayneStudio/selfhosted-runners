@@ -120,9 +120,7 @@ write_files:
         if [[ "$DOCKER_MIRROR_URL" == http://* ]]; then
           cat > /etc/docker/daemon.json <<DOCKEREOF
       {
-        "features": {
-          "containerd-snapshotter": true
-        },
+        "storage-driver": "overlay2",
         "insecure-registries": ["$MIRROR_REGISTRY"]
       }
       DOCKEREOF
