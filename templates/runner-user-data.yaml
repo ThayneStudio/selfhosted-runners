@@ -189,7 +189,7 @@ write_files:
       # (job complete or error), the VM shuts down immediately.
       # The Proxmox hookscript then destroys and reclones.
       if [[ -n "${SUPABASE_IMAGE_REGISTRY:-}" ]]; then
-        sudo -u $RUNNER_USER env INTERNAL_IMAGE_REGISTRY="$SUPABASE_IMAGE_REGISTRY" ./run.sh || true
+        sudo -u $RUNNER_USER env SUPABASE_INTERNAL_IMAGE_REGISTRY="$SUPABASE_IMAGE_REGISTRY" INTERNAL_IMAGE_REGISTRY="$SUPABASE_IMAGE_REGISTRY" ./run.sh || true
       else
         sudo -u $RUNNER_USER ./run.sh || true
       fi
