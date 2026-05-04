@@ -100,9 +100,14 @@ write_files:
           log "Docker mirror configured"
           log "Supabase image registry override: $SUPABASE_IMAGE_REGISTRY"
         else
-          log_error "Docker restart failed — continuing with direct pulls"
-          SUPABASE_IMAGE_REGISTRY=""
+          log_error "Docker restart failed after mirror config; refusing to register runner"
+          exit 1
         fi
+      fi
+
+      if ! systemctl is-active --quiet docker; then
+        log_error "Docker is not running; refusing to register runner"
+        exit 1
       fi
 
       RUNNER_HOME=/home/runner/actions-runner

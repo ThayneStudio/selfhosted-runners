@@ -108,12 +108,13 @@ for ns in $DNS_SERVERS; do
     fi
 done
 
-# Docker registry mirror for public.ecr.aws (optional, e.g., local Zot cache)
+# Docker registry mirror for Supabase images (optional, e.g., local Zot cache)
 # Leave empty to disable — runners will pull directly from public.ecr.aws.
 echo ""
-echo "Docker mirror: a local OCI registry (e.g., http://lxc-ip:5000 Zot) that caches public.ecr.aws"
-echo "pulls. Enables transparent pull-through caching — no workflow changes needed."
-read -rp "Docker mirror URL for public.ecr.aws (empty to disable): " DOCKER_MIRROR_URL
+echo "Docker mirror: a local OCI registry (e.g., http://lxc-ip:5000 Zot) that caches"
+echo "Supabase public.ecr.aws images. HTTP mirrors are routed through Supabase's image"
+echo "registry override; HTTPS mirrors also configure containerd pull-through hosts."
+read -rp "Supabase Docker mirror URL (empty to disable): " DOCKER_MIRROR_URL
 if [[ -n "$DOCKER_MIRROR_URL" ]]; then
     while [[ "$DOCKER_MIRROR_URL" == */ ]]; do
         DOCKER_MIRROR_URL="${DOCKER_MIRROR_URL%/}"

@@ -151,9 +151,9 @@ database test/diff runs avoid cold pulls.
 If a Docker mirror URL is supplied during `runner setup`, the template bake and
 cloned runners route Supabase image pulls through that registry cache.
 Local HTTP mirrors are supported by entering the URL with an explicit `http://`
-scheme, for example `http://10.0.0.20:5000`; for HTTP mirrors Docker is pinned
-to the classic `overlay2` storage driver so insecure registry pulls use plain
-HTTP reliably.
+scheme, for example `http://10.0.0.20:5000`. For HTTP mirrors, the bake pins
+Docker to the classic `overlay2` storage driver as a compatibility workaround
+for Docker 29's containerd image store trying HTTPS against local HTTP mirrors.
 
 ## Using in Workflows
 
