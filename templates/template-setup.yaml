@@ -112,13 +112,26 @@ write_files:
       if [[ -n "${DOCKER_MIRROR_URL:-}" ]]; then
         log "Configuring Docker mirror for public.ecr.aws: $DOCKER_MIRROR_URL"
         mkdir -p /etc/docker /etc/containerd/certs.d/public.ecr.aws
-        cat > /etc/docker/daemon.json <<'DOCKEREOF'
+        if [[ "$DOCKER_MIRROR_URL" == http://* ]]; then
+          MIRROR_REGISTRY="${DOCKER_MIRROR_URL#http://}"
+          MIRROR_REGISTRY="${MIRROR_REGISTRY%%/*}"
+          cat > /etc/docker/daemon.json <<DOCKEREOF
+      {
+        "features": {
+          "containerd-snapshotter": true
+        },
+        "insecure-registries": ["$MIRROR_REGISTRY"]
+      }
+      DOCKEREOF
+        else
+          cat > /etc/docker/daemon.json <<'DOCKEREOF'
       {
         "features": {
           "containerd-snapshotter": true
         }
       }
       DOCKEREOF
+        fi
         cat > /etc/containerd/certs.d/public.ecr.aws/hosts.toml <<TOMLEOF
       server = "https://public.ecr.aws"
 
