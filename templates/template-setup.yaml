@@ -163,9 +163,10 @@ write_files:
         cd "$SUPABASE_WARMUP_DIR"
         printf 'n\n' | supabase init
         retry "supabase start"
+        retry "docker pull public.ecr.aws/supabase/pg_prove:3.36"
         supabase stop --no-backup
       )
-      log "Supabase local development Docker cache warmed"
+      log "Supabase local development and pgTAP Docker cache warmed"
 
       log "[9/11] Installing Playwright Chromium..."
       install -d -o runner -g runner -m 0755 /home/runner/.cache "$PLAYWRIGHT_BROWSERS_PATH"
