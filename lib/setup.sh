@@ -110,12 +110,12 @@ done
 # Docker registry mirror for public.ecr.aws (optional, e.g., local Zot cache)
 # Leave empty to disable — runners will pull directly from public.ecr.aws.
 echo ""
-echo "Docker mirror: a local OCI registry (e.g., Zot) that caches public.ecr.aws"
+echo "Docker mirror: a local OCI registry (e.g., http://lxc-ip:5000 Zot) that caches public.ecr.aws"
 echo "pulls. Enables transparent pull-through caching — no workflow changes needed."
 read -rp "Docker mirror URL for public.ecr.aws (empty to disable): " DOCKER_MIRROR_URL
 if [[ -n "$DOCKER_MIRROR_URL" ]]; then
     if [[ ! "$DOCKER_MIRROR_URL" =~ ^https?://[^[:space:]]+$ ]]; then
-        log_error "Docker mirror URL must start with http:// or https://"
+        log_error "Docker mirror URL must include http:// or https://"
         exit 1
     fi
 fi
@@ -349,7 +349,19 @@ else
 
     # Copy template-setup cloud-init to snippets and configure
     log_info "Configuring template cloud-init..."
-    cp "$INSTALL_DIR/templates/template-setup.yaml" "$SNIPPETS_DIR/template-setup.yaml"
+    DOCKER_MIRROR_URL="${DOCKER_MIRROR_URL:-}" awk '
+    function lreplace(str, old, new,    i, result) {
+        result = ""
+        while ((i = index(str, old)) > 0) {
+            result = result substr(str, 1, i - 1) new
+            str = substr(str, i + length(old))
+        }
+        return result str
+    }
+    {
+        $0 = lreplace($0, "{{DOCKER_MIRROR_URL}}", ENVIRON["DOCKER_MIRROR_URL"])
+        print
+    }' "$INSTALL_DIR/templates/template-setup.yaml" > "$SNIPPETS_DIR/template-setup.yaml"
     chmod 600 "$SNIPPETS_DIR/template-setup.yaml"
 
     qm set "$TEMPLATE_ID" --cicustom "user=local:snippets/template-setup.yaml" \

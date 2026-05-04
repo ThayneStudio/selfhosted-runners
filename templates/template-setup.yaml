@@ -24,6 +24,7 @@ write_files:
       SUPABASE_PG_PROVE_IMAGE=public.ecr.aws/supabase/pg_prove:3.36
       SUPABASE_SCHEMA_DIFF_IMAGE=public.ecr.aws/supabase/pgadmin-schema-diff:cli-0.0.5
       SUPABASE_MIGRA_IMAGE=public.ecr.aws/supabase/migra:3.0.1663481299
+      DOCKER_MIRROR_URL="{{DOCKER_MIRROR_URL}}"
       PLAYWRIGHT_VERSION=1.59.1
       PLAYWRIGHT_BROWSERS_PATH=/home/runner/.cache/ms-playwright
 
@@ -107,6 +108,27 @@ write_files:
       # the user before the docker group existed)
       usermod -aG docker runner
       log "Docker installed and running"
+
+      if [[ -n "${DOCKER_MIRROR_URL:-}" ]]; then
+        log "Configuring Docker mirror for public.ecr.aws: $DOCKER_MIRROR_URL"
+        mkdir -p /etc/docker /etc/containerd/certs.d/public.ecr.aws
+        cat > /etc/docker/daemon.json <<'DOCKEREOF'
+      {
+        "features": {
+          "containerd-snapshotter": true
+        }
+      }
+      DOCKEREOF
+        cat > /etc/containerd/certs.d/public.ecr.aws/hosts.toml <<TOMLEOF
+      server = "https://public.ecr.aws"
+
+      [host."$DOCKER_MIRROR_URL"]
+        capabilities = ["pull", "resolve"]
+        skip_verify = true
+      TOMLEOF
+        systemctl restart docker
+        log "Docker mirror configured for template bake"
+      fi
 
       log "[4/11] Installing GitHub CLI..."
       retry "curl -fsSL --retry 3 --retry-delay 2 https://cli.github.com/packages/githubcli-archive-keyring.gpg -o /etc/apt/keyrings/githubcli-archive-keyring.gpg"
