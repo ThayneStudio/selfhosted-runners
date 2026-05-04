@@ -364,10 +364,10 @@ clone_runner() {
         return 1
     fi
 
-    # Clone. 201>&- closes the lock fd for the qm child so kvm can't inherit
-    # and hold it past our parent's flock release. Matches the fd-close
-    # pattern established in earlier commits (e.g. 431d8c1, fca3467).
-    if ! qm clone "$TEMPLATE_ID" "$vmid" --name "$name" 201>&-; then
+    # Keep maintenance locks in this shell only. Proxmox helper children can
+    # spawn long-lived kvm processes; those must not inherit fd 202 or runner
+    # stop will wait on live VMs instead of just active clone setup.
+    if ! qm clone "$TEMPLATE_ID" "$vmid" --name "$name" 201>&- 202>&-; then
         _fail
         exec 201>&-
         exec 202>&-
@@ -392,7 +392,7 @@ clone_runner() {
     net0=$(qm config "$vmid" | grep '^net0:' | sed 's/^net0: //') || true
     if [[ -n "$net0" ]]; then
         net0=$(echo "$net0" | sed "s/virtio=[^,]*/virtio=$mac/")
-        qm set "$vmid" --net0 "$net0" || { _fail; exec 202>&-; return 1; }
+        qm set "$vmid" --net0 "$net0" 202>&- || { _fail; exec 202>&-; return 1; }
     fi
 
     # Cloud-init
@@ -403,17 +403,22 @@ EOF
     chmod 600 "${SNIPPETS_DIR}/runner-${vmid}-meta.yaml"
 
     qm set "$vmid" --cicustom "user=local:snippets/runner-user-data-${org}.yaml,meta=local:snippets/runner-${vmid}-meta.yaml" \
+        202>&- \
         || { _fail; exec 202>&-; return 1; }
     qm set "$vmid" --ipconfig0 ip=dhcp \
+        202>&- \
         || { _fail; exec 202>&-; return 1; }
     [[ -z "${DNS_SERVERS:-}" ]] || qm set "$vmid" --nameserver "$DNS_SERVERS" \
+        202>&- \
         || { _fail; exec 202>&-; return 1; }
     qm set "$vmid" --ciuser runner \
+        202>&- \
         || { _fail; exec 202>&-; return 1; }
 
     # Hookscript for auto-destroy on shutdown
     if [[ -f "$SNIPPETS_DIR/runner-hookscript.sh" ]]; then
         qm set "$vmid" --hookscript "local:snippets/runner-hookscript.sh" \
+            202>&- \
             || log_warn "Failed to set hookscript on $vmid — VM will not auto-recycle"
     fi
 
@@ -425,7 +430,7 @@ EOF
     fi
 
     # Start
-    if ! qm start "$vmid"; then
+    if ! qm start "$vmid" 202>&-; then
         _fail
         exec 202>&-
         return 1
