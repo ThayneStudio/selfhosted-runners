@@ -78,8 +78,9 @@ read -rp "Template VM ID [9000]: " TEMPLATE_ID
 TEMPLATE_ID=${TEMPLATE_ID:-9000}
 
 # Minimum VM ID for runners (0 = use Proxmox default)
-read -rp "Minimum VM ID for runners (0 = auto) [0]: " MIN_VMID
-MIN_VMID=${MIN_VMID:-0}
+DEFAULT_MIN_VMID=$((TEMPLATE_ID + 1))
+read -rp "Minimum VM ID for runners (0 = auto) [${DEFAULT_MIN_VMID}]: " MIN_VMID
+MIN_VMID=${MIN_VMID:-$DEFAULT_MIN_VMID}
 if [[ ! "$MIN_VMID" =~ ^[0-9]+$ ]]; then
     log_error "Minimum VM ID must be a non-negative number"
     exit 1
