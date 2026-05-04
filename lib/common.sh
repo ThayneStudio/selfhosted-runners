@@ -176,14 +176,28 @@ list_template_base_volids() {
 
 linked_clone_child_vmid() {
     local volid="$1"
-    local child_name="${volid##*/}"
+    local child_name="${volid#*:}"
+    child_name="${child_name##*/}"
     if [[ "$child_name" =~ ^vm-([0-9]+)-disk- ]]; then
         echo "${BASH_REMATCH[1]}"
     fi
 }
 
+zfs_dataset_from_volid() {
+    local volid="$1"
+    local path dataset
+
+    command -v zfs >/dev/null 2>&1 || return 1
+    path=$(pvesm path "$volid" 2>/dev/null) || return 1
+    [[ "$path" == /dev/zvol/* ]] || return 1
+
+    dataset="${path#/dev/zvol/}"
+    zfs list -H -o name "$dataset" >/dev/null 2>&1 || return 1
+    printf '%s\n' "$dataset"
+}
+
 list_template_linked_clone_volids() {
-    local storage_list base_volid base_path prefix volid child_name
+    local storage_list base_volid base_path prefix volid child_name base_dataset dataset origin
     local -A seen=()
 
     storage_list=$(pvesm list "$VM_STORAGE" 2>/dev/null || true)
@@ -199,6 +213,25 @@ list_template_linked_clone_volids() {
             child_name="${volid#$prefix}"
             [[ "$child_name" =~ ^vm-[0-9]+-disk- ]] || continue
             [[ -n "${seen[$volid]:-}" ]] && continue
+            seen["$volid"]=1
+            printf '%s\n' "$volid"
+        done <<< "$storage_list"
+    done < <(list_template_base_volids)
+
+    # ZFS linked clones are sibling zvols, not nested volids. They point at
+    # the template base volume snapshot via the ZFS origin property.
+    while read -r base_volid; do
+        [[ -n "$base_volid" ]] || continue
+        base_dataset=$(zfs_dataset_from_volid "$base_volid") || continue
+
+        while read -r volid _; do
+            [[ "$volid" == "$VM_STORAGE:vm-"* ]] || continue
+            [[ -n "${seen[$volid]:-}" ]] && continue
+
+            dataset=$(zfs_dataset_from_volid "$volid") || continue
+            origin=$(zfs get -H -o value origin "$dataset" 2>/dev/null || true)
+            [[ "$origin" == "$base_dataset@"* ]] || continue
+
             seen["$volid"]=1
             printf '%s\n' "$volid"
         done <<< "$storage_list"
