@@ -27,10 +27,15 @@ POOL_DRAIN_FILE="/run/lock/github-runner-drain"
 # exclusive lock so it can wait until all clone activity is quiesced.
 POOL_ACTIVITY_LOCK_FILE="/run/lock/github-runner-pool.lock"
 # Global lock serializing VMID allocation across reclone.sh/watch.sh/create.sh.
-# Scope is narrow: "pick free VMID -> qm clone returns (config persisted)".
+# Scope is narrow: "pick free VMID -> reserve it". A per-VMID reservation
+# stays held until qm clone returns, so clone tasks can run with bounded
+# parallelism without racing on the same VMID.
 # pvesh get /cluster/nextid is not atomic and does not reserve, so without
 # this lock two parallel clones reliably pick the same VMID.
 VMID_LOCK_FILE="/run/lock/runner-vmid.lock"
+VMID_RESERVATION_LOCK_PREFIX="/run/lock/runner-vmid-reserve"
+CLONE_SLOT_LOCK_PREFIX="/run/lock/runner-clone-slot"
+DEFAULT_CLONE_MAX_PARALLEL=2
 
 require_root() {
     if [[ $EUID -ne 0 ]]; then
@@ -165,6 +170,77 @@ vm_config_path() {
 
 vmid_in_use() {
     [[ -n "$(vm_config_path "$1")" ]]
+}
+
+vmid_reservation_lock_file() {
+    printf '%s-%s.lock\n' "$VMID_RESERVATION_LOCK_PREFIX" "$1"
+}
+
+reserve_vmid() {
+    local vmid="${1:-}"
+    local lock_file
+
+    if [[ -z "$vmid" ]]; then
+        if [[ "${MIN_VMID:-0}" -gt 0 ]]; then
+            vmid="$MIN_VMID"
+        else
+            vmid=$(pvesh get /cluster/nextid) || return 1
+        fi
+    fi
+
+    while true; do
+        if vmid_in_use "$vmid"; then
+            vmid=$((vmid + 1))
+            continue
+        fi
+
+        lock_file=$(vmid_reservation_lock_file "$vmid")
+        exec 203>"$lock_file"
+        if flock -n 203; then
+            if vmid_in_use "$vmid"; then
+                exec 203>&-
+                vmid=$((vmid + 1))
+                continue
+            fi
+            RESERVED_VMID="$vmid"
+            return 0
+        fi
+        exec 203>&-
+        vmid=$((vmid + 1))
+    done
+}
+
+release_vmid_reservation() {
+    exec 203>&- 2>/dev/null || true
+}
+
+clone_max_parallel() {
+    local max="${CLONE_MAX_PARALLEL:-$DEFAULT_CLONE_MAX_PARALLEL}"
+    if [[ ! "$max" =~ ^[0-9]+$ || "$max" -lt 1 ]]; then
+        max="$DEFAULT_CLONE_MAX_PARALLEL"
+    fi
+    echo "$max"
+}
+
+acquire_clone_slot() {
+    local max slot
+    max=$(clone_max_parallel)
+
+    while true; do
+        pool_is_draining && return 1
+        for ((slot = 1; slot <= max; slot++)); do
+            exec 204>"${CLONE_SLOT_LOCK_PREFIX}-${slot}.lock"
+            if flock -n 204; then
+                return 0
+            fi
+            exec 204>&-
+        done
+        sleep 1
+    done
+}
+
+release_clone_slot() {
+    exec 204>&- 2>/dev/null || true
 }
 
 list_template_base_volids() {
@@ -326,25 +402,11 @@ generate_mac() {
     echo -n "$1" | md5sum | sed 's/\(..\)\(..\)\(..\)\(..\)\(..\).*/02:\1:\2:\3:\4:\5/'
 }
 
-# Find next free VMID
-next_vmid() {
-    if [[ "${MIN_VMID:-0}" -gt 0 ]]; then
-        local vmid="$MIN_VMID"
-        # This runs while fd 201 is held. Check pmxcfs config presence instead
-        # of invoking qm status so a stuck status probe cannot block all clones.
-        while vmid_in_use "$vmid"; do
-            vmid=$((vmid + 1))
-        done
-        echo "$vmid"
-    else
-        pvesh get /cluster/nextid
-    fi
-}
-
 # Clone template, configure cloud-init, set hookscript, start VM.
 # Returns VMID on stdout. Returns 1 on failure (cleans up partial clone).
 clone_runner() {
     local name="$1" org="$2" vmid="${3:-}"
+    local RESERVED_VMID=""
 
     exec 202>"$POOL_ACTIVITY_LOCK_FILE"
     flock -s 202
@@ -361,10 +423,10 @@ clone_runner() {
     # orphan storage volumes at this VMID so ZFS/LVM datasets don't leak.
     _fail() {
         local owner
-        owner=$(qm config "$vmid" 200>&- 201>&- 202>&- 2>/dev/null | awk '/^name:/{print $2}') || true
+        owner=$(qm config "$vmid" 200>&- 201>&- 202>&- 203>&- 204>&- 2>/dev/null | awk '/^name:/{print $2}') || true
         if [[ "$owner" == "$name" ]]; then
             rm -f "${SNIPPETS_DIR}/runner-${vmid}-meta.yaml"
-            qm destroy "$vmid" --purge 200>&- 201>&- 202>&- 2>/dev/null || true
+            qm destroy "$vmid" --purge 200>&- 201>&- 202>&- 203>&- 204>&- 2>/dev/null || true
         elif [[ -z "$owner" ]]; then
             # No VM config — free any orphan volumes left by a half-finished clone.
             rm -f "${SNIPPETS_DIR}/runner-${vmid}-meta.yaml"
@@ -379,11 +441,11 @@ clone_runner() {
         fi
     }
 
-    # Acquire global VMID allocation lock. Scope is tight: "pick VMID -> qm
-    # clone returns (config persisted)". qm set/start run unlocked.
-    # Timeout is intentionally high because qm clone is serialized here and a
-    # cold pool refill can queue many linked clones behind the same lock on
-    # slower storage backends.
+    # Acquire global VMID allocation lock only long enough to reserve one VMID.
+    # The per-VMID reservation stays held until qm clone returns, which lets
+    # other workers reserve different VMIDs and clone with bounded parallelism.
+    # Timeout is intentionally high because a cold pool refill can queue many
+    # workers behind the same allocation lock.
     # Callers (reclone.sh/watch.sh) must acquire their per-slot fd 200 lock
     # before entering clone_runner to avoid deadlock on lock order inversion.
     exec 201>"$VMID_LOCK_FILE"
@@ -395,46 +457,71 @@ clone_runner() {
     fi
 
     if [[ -z "$vmid" ]]; then
-        if ! vmid=$(next_vmid); then
+        if ! reserve_vmid; then
             exec 201>&-
             exec 202>&-
             return 1
         fi
+        vmid="$RESERVED_VMID"
     else
         # Caller pre-allocated. Re-verify under lock — a concurrent process
         # could have grabbed it between the caller's check and now.
-        while vmid_in_use "$vmid"; do
-            vmid=$((vmid + 1))
-        done
+        if ! reserve_vmid "$vmid"; then
+            exec 201>&-
+            exec 202>&-
+            return 1
+        fi
+        vmid="$RESERVED_VMID"
     fi
 
     if pool_is_draining; then
         log_warn "clone_runner: pool drain became active before cloning $name"
         exec 201>&-
+        release_vmid_reservation
+        exec 202>&-
+        return 1
+    fi
+
+    # VMID is reserved; release the allocator so other workers can reserve and
+    # clone different VMIDs while this clone runs.
+    exec 201>&-
+
+    if ! acquire_clone_slot; then
+        log_warn "clone_runner: pool drain became active before cloning $name"
+        release_vmid_reservation
+        exec 202>&-
+        return 1
+    fi
+
+    if pool_is_draining; then
+        log_warn "clone_runner: pool drain became active before cloning $name"
+        release_clone_slot
+        release_vmid_reservation
         exec 202>&-
         return 1
     fi
 
     # Keep maintenance locks in this shell only. Proxmox helper children can
     # spawn long-lived kvm processes; those must not inherit runner lock fds.
-    if ! qm clone "$TEMPLATE_ID" "$vmid" --name "$name" 200>&- 201>&- 202>&-; then
+    if ! qm clone "$TEMPLATE_ID" "$vmid" --name "$name" 200>&- 201>&- 202>&- 203>&- 204>&-; then
+        release_clone_slot
         _fail
-        exec 201>&-
+        release_vmid_reservation
         exec 202>&-
         return 1
     fi
+    release_clone_slot
 
     if pool_is_draining; then
         log_warn "clone_runner: pool drain became active after cloning $name, cleaning up VM $vmid"
-        exec 201>&-
         _fail
+        release_vmid_reservation
         exec 202>&-
         return 1
     fi
 
-    # Clone succeeded — VMID is now claimed in Proxmox. Release lock before
-    # the long tail of qm set / qm start so other clones can proceed.
-    exec 201>&-
+    # Clone succeeded — VMID is now claimed in Proxmox.
+    release_vmid_reservation
 
     # Deterministic MAC
     local mac net0
