@@ -163,6 +163,10 @@ vm_config_path() {
     compgen -G "/etc/pve/nodes/*/qemu-server/${vmid}.conf" | head -n 1
 }
 
+vmid_in_use() {
+    [[ -n "$(vm_config_path "$1")" ]]
+}
+
 list_template_base_volids() {
     qm config "$TEMPLATE_ID" 2>/dev/null | awk -F': ' -v storage="$VM_STORAGE:" '
         $1 ~ /^(ide|sata|scsi|virtio)[0-9]+$/ {
@@ -326,7 +330,9 @@ generate_mac() {
 next_vmid() {
     if [[ "${MIN_VMID:-0}" -gt 0 ]]; then
         local vmid="$MIN_VMID"
-        while qm status "$vmid" 200>&- 201>&- 202>&- >/dev/null 2>&1; do
+        # This runs while fd 201 is held. Check pmxcfs config presence instead
+        # of invoking qm status so a stuck status probe cannot block all clones.
+        while vmid_in_use "$vmid"; do
             vmid=$((vmid + 1))
         done
         echo "$vmid"
@@ -397,7 +403,7 @@ clone_runner() {
     else
         # Caller pre-allocated. Re-verify under lock — a concurrent process
         # could have grabbed it between the caller's check and now.
-        while qm status "$vmid" 200>&- 201>&- 202>&- >/dev/null 2>&1; do
+        while vmid_in_use "$vmid"; do
             vmid=$((vmid + 1))
         done
     fi
