@@ -72,14 +72,14 @@ if (( STREAK >= FAIL_THRESHOLD )); then
     # (bounded-rate backoff). If it resolved, we proceed normally.
     echo 0 > "$FAIL_STREAK_FILE"
     rm -f "${SNIPPETS_DIR}/runner-${VMID}-meta.yaml"
-    qm destroy "$VMID" --purge 2>/dev/null || true
+    qm destroy "$VMID" --purge 200>&- 2>/dev/null || true
     exit 0
 fi
 
 # Destroy the old VM (retry briefly in case Proxmox lock hasn't released)
 rm -f "${SNIPPETS_DIR}/runner-${VMID}-meta.yaml"
 for attempt in 1 2 3; do
-    destroy_output=$(qm destroy "$VMID" --purge 2>&1) && destroy_rc=0 || destroy_rc=$?
+    destroy_output=$(qm destroy "$VMID" --purge 200>&- 2>&1) && destroy_rc=0 || destroy_rc=$?
     printf '%s\n' "$destroy_output" | logger -t github-runner || true
     if [[ $destroy_rc -eq 0 ]]; then
         break
@@ -92,7 +92,7 @@ for attempt in 1 2 3; do
 done
 
 # Check if someone else already filled this slot (watcher, manual create)
-if qm list 2>/dev/null | awk 'NR>1{print $2}' | grep -qxF "$NAME"; then
+if qm list 200>&- 2>/dev/null | awk 'NR>1{print $2}' | grep -qxF "$NAME"; then
     log_info "reclone: $NAME already exists, skipping"
     exit 0
 fi

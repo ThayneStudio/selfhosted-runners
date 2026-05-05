@@ -66,16 +66,18 @@ for entry in "${MISSING[@]}"; do
         flock -n 200 || exit 0
 
         # Re-check: another process may have filled this slot
-        if qm list 2>/dev/null | awk 'NR>1{print $2}' | grep -qxF "$slot"; then
+        if qm list 200>&- 2>/dev/null | awk 'NR>1{print $2}' | grep -qxF "$slot"; then
             exit 0
         fi
         if ! load_org_config "$org" 2>/dev/null; then
             log_warn "[watch] Skipping $slot — bad config for $org"
             exit 0
         fi
-        clone_runner "$slot" "$org" >/dev/null \
-            && log_info "[watch] Created $slot" \
-            || log_warn "[watch] Failed to create $slot"
+        if clone_runner "$slot" "$org" >/dev/null; then
+            log_info "[watch] Created $slot"
+        else
+            log_warn "[watch] Failed to create $slot"
+        fi
     ) &
 done
 

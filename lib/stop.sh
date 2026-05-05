@@ -148,7 +148,7 @@ while true; do
 
     for entry in "${RUNNERS[@]}"; do
         IFS='|' read -r VMID VM_NAME _ _ <<< "$entry"
-        if ! "$LIB_DIR/destroy.sh" --vmid "$VMID"; then
+        if ! "$LIB_DIR/destroy.sh" --vmid "$VMID" 200>&- 201>&- 202>&-; then
             FAILURES+=("$VM_NAME (VMID $VMID)")
         fi
     done

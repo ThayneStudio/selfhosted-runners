@@ -326,7 +326,7 @@ generate_mac() {
 next_vmid() {
     if [[ "${MIN_VMID:-0}" -gt 0 ]]; then
         local vmid="$MIN_VMID"
-        while qm status "$vmid" &>/dev/null; do
+        while qm status "$vmid" 200>&- 201>&- 202>&- >/dev/null 2>&1; do
             vmid=$((vmid + 1))
         done
         echo "$vmid"
@@ -355,10 +355,10 @@ clone_runner() {
     # orphan storage volumes at this VMID so ZFS/LVM datasets don't leak.
     _fail() {
         local owner
-        owner=$(qm config "$vmid" 2>/dev/null | awk '/^name:/{print $2}') || true
+        owner=$(qm config "$vmid" 200>&- 201>&- 202>&- 2>/dev/null | awk '/^name:/{print $2}') || true
         if [[ "$owner" == "$name" ]]; then
             rm -f "${SNIPPETS_DIR}/runner-${vmid}-meta.yaml"
-            qm destroy "$vmid" --purge 2>/dev/null || true
+            qm destroy "$vmid" --purge 200>&- 201>&- 202>&- 2>/dev/null || true
         elif [[ -z "$owner" ]]; then
             # No VM config — free any orphan volumes left by a half-finished clone.
             rm -f "${SNIPPETS_DIR}/runner-${vmid}-meta.yaml"
@@ -397,7 +397,7 @@ clone_runner() {
     else
         # Caller pre-allocated. Re-verify under lock — a concurrent process
         # could have grabbed it between the caller's check and now.
-        while qm status "$vmid" &>/dev/null; do
+        while qm status "$vmid" 200>&- 201>&- 202>&- >/dev/null 2>&1; do
             vmid=$((vmid + 1))
         done
     fi
@@ -410,9 +410,8 @@ clone_runner() {
     fi
 
     # Keep maintenance locks in this shell only. Proxmox helper children can
-    # spawn long-lived kvm processes; those must not inherit fd 202 or runner
-    # stop will wait on live VMs instead of just active clone setup.
-    if ! qm clone "$TEMPLATE_ID" "$vmid" --name "$name" 201>&- 202>&-; then
+    # spawn long-lived kvm processes; those must not inherit runner lock fds.
+    if ! qm clone "$TEMPLATE_ID" "$vmid" --name "$name" 200>&- 201>&- 202>&-; then
         _fail
         exec 201>&-
         exec 202>&-
@@ -434,10 +433,10 @@ clone_runner() {
     # Deterministic MAC
     local mac net0
     mac=$(generate_mac "$name")
-    net0=$(qm config "$vmid" | grep '^net0:' | sed 's/^net0: //') || true
+    net0=$(qm config "$vmid" 200>&- 201>&- 202>&- | grep '^net0:' | sed 's/^net0: //') || true
     if [[ -n "$net0" ]]; then
         net0=$(echo "$net0" | sed "s/virtio=[^,]*/virtio=$mac/")
-        qm set "$vmid" --net0 "$net0" 202>&- || { _fail; exec 202>&-; return 1; }
+        qm set "$vmid" --net0 "$net0" 200>&- 201>&- 202>&- || { _fail; exec 202>&-; return 1; }
     fi
 
     # Cloud-init
@@ -448,21 +447,31 @@ EOF
     chmod 600 "${SNIPPETS_DIR}/runner-${vmid}-meta.yaml"
 
     qm set "$vmid" --cicustom "user=local:snippets/runner-user-data-${org}.yaml,meta=local:snippets/runner-${vmid}-meta.yaml" \
+        200>&- \
+        201>&- \
         202>&- \
         || { _fail; exec 202>&-; return 1; }
     qm set "$vmid" --ipconfig0 ip=dhcp \
+        200>&- \
+        201>&- \
         202>&- \
         || { _fail; exec 202>&-; return 1; }
     [[ -z "${DNS_SERVERS:-}" ]] || qm set "$vmid" --nameserver "$DNS_SERVERS" \
+        200>&- \
+        201>&- \
         202>&- \
         || { _fail; exec 202>&-; return 1; }
     qm set "$vmid" --ciuser runner \
+        200>&- \
+        201>&- \
         202>&- \
         || { _fail; exec 202>&-; return 1; }
 
     # Hookscript for auto-destroy on shutdown
     if [[ -f "$SNIPPETS_DIR/runner-hookscript.sh" ]]; then
         qm set "$vmid" --hookscript "local:snippets/runner-hookscript.sh" \
+            200>&- \
+            201>&- \
             202>&- \
             || log_warn "Failed to set hookscript on $vmid — VM will not auto-recycle"
     fi
@@ -475,7 +484,7 @@ EOF
     fi
 
     # Start
-    if ! qm start "$vmid" 202>&-; then
+    if ! qm start "$vmid" 200>&- 201>&- 202>&-; then
         _fail
         exec 202>&-
         return 1

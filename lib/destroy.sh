@@ -35,7 +35,7 @@ done
 
 if [[ -n "$VMID" ]]; then
     [[ "$VMID" =~ ^[0-9]+$ ]] || { log_error "Invalid VMID: $VMID"; exit 1; }
-    RUNNER_NAME=$(qm config "$VMID" 2>/dev/null | awk '/^name:/{print $2}') || true
+    RUNNER_NAME=$(qm config "$VMID" 200>&- 201>&- 202>&- 2>/dev/null | awk '/^name:/{print $2}') || true
     [[ -n "$RUNNER_NAME" ]] || { log_error "VMID $VMID not found"; exit 1; }
 else
     if [[ -z "$RUNNER_NAME" ]]; then
@@ -48,7 +48,7 @@ else
         exit 1
     fi
 
-    mapfile -t MATCHING_VMIDS < <(qm list | awk -v n="$RUNNER_NAME" '$2==n {print $1}')
+    mapfile -t MATCHING_VMIDS < <(qm list 200>&- 201>&- 202>&- | awk -v n="$RUNNER_NAME" '$2==n {print $1}')
     [[ ${#MATCHING_VMIDS[@]} -gt 0 ]] || { log_error "'$RUNNER_NAME' not found"; exit 1; }
 
     MANAGED_VMIDS=()
@@ -77,13 +77,13 @@ if [[ "$VM_ORG" == "unknown" ]]; then
 fi
 
 # Remove hookscript to prevent auto-destroy from racing with us
-qm set "$VMID" --delete hookscript 2>/dev/null || true
+qm set "$VMID" --delete hookscript 200>&- 201>&- 202>&- 2>/dev/null || true
 
 # Stop if running
-STATUS=$(qm status "$VMID" 2>/dev/null | awk '{print $2}') || true
+STATUS=$(qm status "$VMID" 200>&- 201>&- 202>&- 2>/dev/null | awk '{print $2}') || true
 if [[ "$STATUS" == "running" ]]; then
     log_info "Stopping $RUNNER_NAME..."
-    qm stop "$VMID" --timeout 30 2>/dev/null || qm stop "$VMID" --skiplock 2>/dev/null || true
+    qm stop "$VMID" --timeout 30 200>&- 201>&- 202>&- 2>/dev/null || qm stop "$VMID" --skiplock 200>&- 201>&- 202>&- 2>/dev/null || true
 fi
 
 # Deregister from GitHub (best-effort)
@@ -91,7 +91,7 @@ fi
 
 # Destroy
 log_info "Destroying $RUNNER_NAME (VMID $VMID)..."
-qm destroy "$VMID" --purge || { log_error "Failed to destroy $VMID"; exit 1; }
+qm destroy "$VMID" --purge 200>&- 201>&- 202>&- || { log_error "Failed to destroy $VMID"; exit 1; }
 
 # Clean up snippets
 rm -f "${SNIPPETS_DIR}/runner-${VMID}-meta.yaml" "${SNIPPETS_DIR}/runner-${VMID}-vendor.yaml"
