@@ -526,10 +526,10 @@ clone_runner() {
     # Deterministic MAC
     local mac net0
     mac=$(generate_mac "$name")
-    net0=$(qm config "$vmid" 200>&- 201>&- 202>&- | grep '^net0:' | sed 's/^net0: //') || true
+    net0=$(qm config "$vmid" 200>&- 201>&- 202>&- 203>&- 204>&- | grep '^net0:' | sed 's/^net0: //') || true
     if [[ -n "$net0" ]]; then
         net0=$(echo "$net0" | sed "s/virtio=[^,]*/virtio=$mac/")
-        qm set "$vmid" --net0 "$net0" 200>&- 201>&- 202>&- || { _fail; exec 202>&-; return 1; }
+        qm set "$vmid" --net0 "$net0" 200>&- 201>&- 202>&- 203>&- 204>&- || { _fail; exec 202>&-; return 1; }
     fi
 
     # Cloud-init
@@ -543,21 +543,29 @@ EOF
         200>&- \
         201>&- \
         202>&- \
+        203>&- \
+        204>&- \
         || { _fail; exec 202>&-; return 1; }
     qm set "$vmid" --ipconfig0 ip=dhcp \
         200>&- \
         201>&- \
         202>&- \
+        203>&- \
+        204>&- \
         || { _fail; exec 202>&-; return 1; }
     [[ -z "${DNS_SERVERS:-}" ]] || qm set "$vmid" --nameserver "$DNS_SERVERS" \
         200>&- \
         201>&- \
         202>&- \
+        203>&- \
+        204>&- \
         || { _fail; exec 202>&-; return 1; }
     qm set "$vmid" --ciuser runner \
         200>&- \
         201>&- \
         202>&- \
+        203>&- \
+        204>&- \
         || { _fail; exec 202>&-; return 1; }
 
     # Hookscript for auto-destroy on shutdown
@@ -566,6 +574,8 @@ EOF
             200>&- \
             201>&- \
             202>&- \
+            203>&- \
+            204>&- \
             || log_warn "Failed to set hookscript on $vmid — VM will not auto-recycle"
     fi
 
@@ -577,7 +587,7 @@ EOF
     fi
 
     # Start
-    if ! qm start "$vmid" 200>&- 201>&- 202>&-; then
+    if ! qm start "$vmid" 200>&- 201>&- 202>&- 203>&- 204>&-; then
         _fail
         exec 202>&-
         return 1
