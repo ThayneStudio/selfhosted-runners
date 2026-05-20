@@ -211,7 +211,9 @@ reserve_vmid() {
 }
 
 release_vmid_reservation() {
+    local vmid="${1:-${RESERVED_VMID:-}}"
     exec 203>&- 2>/dev/null || true
+    [[ -n "$vmid" ]] && rm -f "$(vmid_reservation_lock_file "$vmid")" 2>/dev/null || true
 }
 
 clone_max_parallel() {
@@ -370,6 +372,42 @@ cleanup_template_orphan_volumes() {
     return 0
 }
 
+# Sweep zvols on $VM_STORAGE whose VMID has no /etc/pve config — leftovers from
+# clones that failed before writing config (or whose _fail cleanup couldn't
+# fully reap). Holds the pool activity lock exclusive non-blocking so it can
+# never race a clone in progress. Scoped to vmid >= MIN_VMID and != TEMPLATE_ID
+# so non-runner VMs on the same storage are never touched.
+cleanup_runner_orphan_volumes() {
+    local min_vmid="${MIN_VMID:-$((TEMPLATE_ID + 1))}"
+
+    exec 202>"$POOL_ACTIVITY_LOCK_FILE"
+    if ! flock -n -x 202; then
+        exec 202>&-
+        return 0
+    fi
+
+    local volid vmid freed=0
+    while IFS= read -r volid; do
+        [[ -n "$volid" ]] || continue
+        if [[ "$volid" =~ (:|/)vm-([0-9]+)-(disk-[0-9]+|cloudinit)$ ]]; then
+            vmid="${BASH_REMATCH[2]}"
+        else
+            continue
+        fi
+        [[ "$vmid" -ge "$min_vmid" && "$vmid" -ne "$TEMPLATE_ID" ]] || continue
+        [[ -z "$(vm_config_path "$vmid")" ]] || continue
+        log_info "[orphan-sweep] freeing $volid (vmid $vmid has no config)"
+        if pvesm free "$volid" 2>/dev/null; then
+            freed=$((freed + 1))
+        else
+            log_warn "[orphan-sweep] pvesm free $volid failed"
+        fi
+    done < <(pvesm list "$VM_STORAGE" 2>/dev/null | awk 'NR>1 {print $1}')
+
+    [[ "$freed" -gt 0 ]] && log_info "[orphan-sweep] reaped $freed orphan volume(s)"
+    exec 202>&-
+}
+
 deregister_runner() {
     local org="$1" runner_name="$2"
     local org_file="$ORG_CONFIG_DIR/${org}.conf"
@@ -417,28 +455,38 @@ clone_runner() {
         return 1
     fi
 
-    # Cleanup helper: destroy VM (only if it belongs to us) and remove snippet.
-    # The ownership check prevents destroying another process's VM on VMID collision.
-    # If there's no VM config at all, the clone failed mid-transaction — free any
-    # orphan storage volumes at this VMID so ZFS/LVM datasets don't leak.
+    # Cleanup helper: destroy VM (only if it belongs to us), remove snippet, and
+    # sweep orphan zvols at this VMID. The ownership check prevents touching
+    # another process's VM on VMID collision. Orphan sweep runs unconditionally
+    # for our-VMID and no-owner cases because qm destroy --purge can silently
+    # leave residue (busy ZFS dataset, etc.) and a clone that fails before
+    # writing config leaves zvols with no VM to attach to.
     _fail() {
         local owner
         owner=$(qm config "$vmid" 200>&- 201>&- 202>&- 203>&- 204>&- 2>/dev/null | awk '/^name:/{print $2}') || true
-        if [[ "$owner" == "$name" ]]; then
-            rm -f "${SNIPPETS_DIR}/runner-${vmid}-meta.yaml"
-            qm destroy "$vmid" --purge 200>&- 201>&- 202>&- 203>&- 204>&- 2>/dev/null || true
-        elif [[ -z "$owner" ]]; then
-            # No VM config — free any orphan volumes left by a half-finished clone.
-            rm -f "${SNIPPETS_DIR}/runner-${vmid}-meta.yaml"
-            local volid
-            while read -r volid; do
-                [[ -n "$volid" ]] || continue
-                pvesm free "$volid" 2>/dev/null || log_warn "Failed to free orphan volume $volid"
-            done < <(
-                { pvesm list "$VM_STORAGE" --vmid "$vmid" 2>/dev/null || pvesm list "$VM_STORAGE" 2>/dev/null; } |
-                    awk -v v="$vmid" 'NR>1 && ($1 ~ (":vm-" v "-disk-") || $1 ~ (":" v "/vm-" v "-disk-")) {print $1}'
-            )
+
+        if [[ -n "$owner" && "$owner" != "$name" ]]; then
+            return 0
         fi
+
+        rm -f "${SNIPPETS_DIR}/runner-${vmid}-meta.yaml"
+
+        if [[ "$owner" == "$name" ]]; then
+            local destroy_err; destroy_err=$(mktemp)
+            if ! qm destroy "$vmid" --purge 200>&- 201>&- 202>&- 203>&- 204>&- 2>"$destroy_err"; then
+                log_warn "qm destroy $vmid failed: $(tr '\n' ' ' < "$destroy_err")"
+            fi
+            rm -f "$destroy_err"
+        fi
+
+        local volid
+        while read -r volid; do
+            [[ -n "$volid" ]] || continue
+            pvesm free "$volid" 2>/dev/null || log_warn "Failed to free orphan volume $volid"
+        done < <(
+            pvesm list "$VM_STORAGE" 2>/dev/null |
+                awk -v v="$vmid" 'NR>1 && $1 ~ ("(^|:|/)vm-" v "-(disk-[0-9]+|cloudinit)$") {print $1}'
+        )
     }
 
     # Acquire global VMID allocation lock only long enough to reserve one VMID.
@@ -477,7 +525,7 @@ clone_runner() {
     if pool_is_draining; then
         log_warn "clone_runner: pool drain became active before cloning $name"
         exec 201>&-
-        release_vmid_reservation
+        release_vmid_reservation "$vmid"
         exec 202>&-
         return 1
     fi
@@ -488,7 +536,7 @@ clone_runner() {
 
     if ! acquire_clone_slot; then
         log_warn "clone_runner: pool drain became active before cloning $name"
-        release_vmid_reservation
+        release_vmid_reservation "$vmid"
         exec 202>&-
         return 1
     fi
@@ -496,32 +544,41 @@ clone_runner() {
     if pool_is_draining; then
         log_warn "clone_runner: pool drain became active before cloning $name"
         release_clone_slot
-        release_vmid_reservation
+        release_vmid_reservation "$vmid"
         exec 202>&-
         return 1
     fi
 
     # Keep maintenance locks in this shell only. Proxmox helper children can
     # spawn long-lived kvm processes; those must not inherit runner lock fds.
-    if ! qm clone "$TEMPLATE_ID" "$vmid" --name "$name" 200>&- 201>&- 202>&- 203>&- 204>&-; then
+    # Capture stderr so the actual ZFS/Proxmox error surfaces under
+    # `journalctl -t github-runner` instead of being buried under the service
+    # unit log (which the operator does not look at first).
+    local clone_err; clone_err=$(mktemp)
+    if ! qm clone "$TEMPLATE_ID" "$vmid" --name "$name" 200>&- 201>&- 202>&- 203>&- 204>&- 2>"$clone_err"; then
+        while IFS= read -r line; do
+            [[ -n "$line" ]] && log_error "qm clone $vmid: $line"
+        done < "$clone_err"
+        rm -f "$clone_err"
         release_clone_slot
         _fail
-        release_vmid_reservation
+        release_vmid_reservation "$vmid"
         exec 202>&-
         return 1
     fi
+    rm -f "$clone_err"
     release_clone_slot
 
     if pool_is_draining; then
         log_warn "clone_runner: pool drain became active after cloning $name, cleaning up VM $vmid"
         _fail
-        release_vmid_reservation
+        release_vmid_reservation "$vmid"
         exec 202>&-
         return 1
     fi
 
     # Clone succeeded — VMID is now claimed in Proxmox.
-    release_vmid_reservation
+    release_vmid_reservation "$vmid"
 
     # Deterministic MAC
     local mac net0

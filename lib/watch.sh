@@ -19,6 +19,10 @@ fi
 # Template must be ready
 qm config "$TEMPLATE_ID" 2>/dev/null | grep -q "^template: 1" || exit 0
 
+# Reap zvols left behind by failed clones before computing missing slots, so
+# VMIDs whose only residue was an orphan zvol become available for refill.
+cleanup_runner_orphan_volumes
+
 # Snapshot all VM names once
 ALL_VM_NAMES=$(qm list 2>/dev/null | awk 'NR>1 {print $2}') || exit 0
 
