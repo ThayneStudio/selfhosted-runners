@@ -1,0 +1,4 @@
+interface:
+  display_name: "Spec"
+  short_description: "Complete spec, then file the GitHub issue graph. Do not implement."
+  default_prompt: "Use $spec to fully specify this system and file GitHub issues for all of it. Do not implement."

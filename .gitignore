@@ -19,5 +19,6 @@ Thumbs.db
 *.img
 *.qcow2
 
-# Claude Code
-.claude/
+# Claude Code local state (keep committed skills)
+.claude/*
+!.claude/skills
