@@ -387,25 +387,36 @@ else
         exit 1
     fi
 
-    # Poll for template setup completion until the VM powers off after baking.
+    # Poll for the guest's completion marker. The guest stays running until we
+    # confirm the marker and shut it down ourselves — see templates/template-setup.yaml.
     log_info "Waiting for tool installation to complete..."
     log_info "  (Monitor progress: qm guest exec $TEMPLATE_ID -- cat /var/log/template-setup.log)"
     BAKE_ELAPSED=0
     BAKE_INTERVAL=15
+    BAKE_TIMEOUT="${BAKE_TIMEOUT:-5400}"   # 90 min; a healthy bake runs ~30-45
     BAKE_READY=false
 
     while true; do
         sleep $BAKE_INTERVAL
         BAKE_ELAPSED=$((BAKE_ELAPSED + BAKE_INTERVAL))
 
-        # Check if VM is still running (it will poweroff after setup completes)
+        if [[ $BAKE_ELAPSED -ge $BAKE_TIMEOUT ]]; then
+            echo "" >&2
+            log_error "Bake timed out after $((BAKE_TIMEOUT / 60)) minutes (override with BAKE_TIMEOUT=<seconds>)"
+            log_error "Last 40 lines from the guest:"
+            qm guest exec "$TEMPLATE_ID" -- tail -n 40 /var/log/template-setup.log 2>/dev/null \
+                | jq -r '."out-data" // empty' >&2 || true
+            exit 1
+        fi
+
+        # The guest never powers itself off, so a stopped VM means a crash or an
+        # external `qm stop` — never success. Refuse to publish.
         VM_STATUS=$(qm status "$TEMPLATE_ID" 2>/dev/null | awk '{print $2}') || true
         if [[ "$VM_STATUS" != "running" ]]; then
-            # VM powered off — setup succeeded (poweroff only runs if marker exists)
-            BAKE_READY=true
             echo "" >&2
-            log_info "Template VM powered off (setup complete)"
-            break
+            log_error "Template VM stopped before setup completion was confirmed"
+            log_error "Refusing to publish a possibly half-baked template."
+            exit 1
         fi
 
         # Try to check for completion marker via guest agent
@@ -432,20 +443,25 @@ else
     done
     echo "" >&2
 
-    # Stop VM if still running
-    VM_STATUS=$(qm status "$TEMPLATE_ID" 2>/dev/null | awk '{print $2}') || true
-    if [[ "$VM_STATUS" == "running" ]]; then
-        log_info "Stopping template VM..."
-        qm stop "$TEMPLATE_ID" --timeout 60 || {
-            log_warn "Graceful stop failed, forcing..."
-            qm stop "$TEMPLATE_ID" --skiplock 2>/dev/null || true
-        }
-        # Wait for stopped state
-        for i in {1..30}; do
-            VM_STATUS=$(qm status "$TEMPLATE_ID" 2>/dev/null | awk '{print $2}') || true
-            [[ "$VM_STATUS" == "stopped" ]] && break
-            sleep 2
-        done
+    # Publish gate: never convert a VM whose marker we did not confirm.
+    if [[ "$BAKE_READY" != "true" ]]; then
+        log_error "Internal error: bake loop exited without a confirmed completion marker"
+        exit 1
+    fi
+
+    log_info "Shutting down template VM..."
+    qm shutdown "$TEMPLATE_ID" --timeout 120 || {
+        log_warn "Graceful shutdown failed, forcing..."
+        qm stop "$TEMPLATE_ID" --skiplock 2>/dev/null || true
+    }
+    for i in {1..60}; do
+        VM_STATUS=$(qm status "$TEMPLATE_ID" 2>/dev/null | awk '{print $2}') || true
+        [[ "$VM_STATUS" == "stopped" ]] && break
+        sleep 2
+    done
+    if [[ "$VM_STATUS" != "stopped" ]]; then
+        log_error "Template VM did not reach stopped state; refusing to convert to template"
+        exit 1
     fi
 
     # Clear bake-time cloud-init settings so clones start fresh

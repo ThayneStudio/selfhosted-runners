@@ -168,6 +168,16 @@ write_files:
       fi
 
       # Configure runner as ephemeral (retry on timeout — simultaneous VMs can overload the API)
+      #
+      # --disableupdate: these VMs are ephemeral clones of a baked template, so a
+      # runner self-update would re-download the ~225MB runner package on EVERY
+      # job boot until the template is rebaked.
+      #
+      # The trade-off: the template MUST be rebaked within 30 days of a new runner
+      # release (sooner for critical security updates) or GitHub stops queuing jobs
+      # to these runners. Registration still SUCCEEDS -- runners appear Online/Idle
+      # while jobs queue forever, which reads like a GitHub outage rather than a
+      # stale template. Keep the rebake schedule healthy.
       for attempt in 1 2 3; do
         if sudo -u $RUNNER_USER ./config.sh \
           --url "https://github.com/${GITHUB_ORG}" \
@@ -176,6 +186,7 @@ write_files:
           --labels "$RUNNER_LABELS" \
           --unattended \
           --replace \
+          --disableupdate \
           --ephemeral; then
           break
         fi

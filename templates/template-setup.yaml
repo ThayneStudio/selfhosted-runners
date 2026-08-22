@@ -20,13 +20,14 @@ write_files:
       export DEBIAN_FRONTEND=noninteractive
       export NEEDRESTART_MODE=a
 
-      SUPABASE_VERSION=2.98.1
+      SUPABASE_VERSION=2.115.0
       SUPABASE_PG_PROVE_IMAGE=public.ecr.aws/supabase/pg_prove:3.36
       SUPABASE_SCHEMA_DIFF_IMAGE=public.ecr.aws/supabase/pgadmin-schema-diff:cli-0.0.5
       SUPABASE_MIGRA_IMAGE=public.ecr.aws/supabase/migra:3.0.1663481299
       DOCKER_MIRROR_URL="{{DOCKER_MIRROR_URL}}"
       SUPABASE_IMAGE_REGISTRY=""
-      PLAYWRIGHT_VERSION=1.59.1
+      POSTGRES_CLIENT_VERSION=17
+      PLAYWRIGHT_VERSION=1.62.1
       PLAYWRIGHT_BROWSERS_PATH=/home/runner/.cache/ms-playwright
 
       # Retry wrapper for network operations
@@ -60,7 +61,7 @@ write_files:
       fi
       log "Disk space check passed: ${FREE_SPACE}GB free"
 
-      log "[1/11] Checking network connectivity..."
+      log "[1/12] Checking network connectivity..."
       for i in {1..30}; do
         if curl -sf --max-time 5 https://github.com > /dev/null 2>&1; then
           log "Network connectivity confirmed"
@@ -74,7 +75,7 @@ write_files:
         sleep 2
       done
 
-      log "[2/11] Updating system packages and installing base prerequisites..."
+      log "[2/12] Updating system packages and installing base prerequisites..."
       retry "apt-get update"
       retry "apt-get install -y ca-certificates curl gnupg jq unzip zstd build-essential git wget apt-transport-https software-properties-common qemu-guest-agent"
       systemctl enable --now qemu-guest-agent
@@ -85,12 +86,12 @@ write_files:
       retry "apt-get upgrade -y"
       log "Base packages installed and qemu-guest-agent running"
 
-      log "[3/11] Installing Docker..."
+      log "[3/12] Installing Docker..."
       install -m 0755 -d /etc/apt/keyrings
 
       # Docker GPG key with retry
       retry "curl -fsSL --retry 3 --retry-delay 2 https://download.docker.com/linux/ubuntu/gpg -o /tmp/docker.gpg"
-      gpg --dearmor -o /etc/apt/keyrings/docker.gpg < /tmp/docker.gpg
+      gpg --batch --yes --dearmor -o /etc/apt/keyrings/docker.gpg < /tmp/docker.gpg
       chmod a+r /etc/apt/keyrings/docker.gpg
       rm /tmp/docker.gpg
 
@@ -152,7 +153,7 @@ write_files:
         log "Supabase image registry override: $SUPABASE_IMAGE_REGISTRY"
       fi
 
-      log "[4/11] Installing GitHub CLI..."
+      log "[4/12] Installing GitHub CLI..."
       retry "curl -fsSL --retry 3 --retry-delay 2 https://cli.github.com/packages/githubcli-archive-keyring.gpg -o /etc/apt/keyrings/githubcli-archive-keyring.gpg"
       chmod a+r /etc/apt/keyrings/githubcli-archive-keyring.gpg
       echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | tee /etc/apt/sources.list.d/github-cli.list > /dev/null
@@ -160,14 +161,14 @@ write_files:
       retry "apt-get install -y gh"
       log "GitHub CLI $(gh --version | head -1) installed"
 
-      log "[5/11] Installing Node.js LTS..."
+      log "[5/12] Installing Node.js LTS..."
       retry "curl -fsSL --retry 3 https://deb.nodesource.com/setup_lts.x -o /tmp/nodesource_setup.sh"
       bash /tmp/nodesource_setup.sh
       rm /tmp/nodesource_setup.sh
       retry "apt-get install -y nodejs"
       log "Node.js $(node --version) installed"
 
-      log "[6/11] Installing AWS CLI v2..."
+      log "[6/12] Installing AWS CLI v2..."
       (
         set -euo pipefail
         AWS_TMP_DIR=$(mktemp -d)
@@ -184,7 +185,37 @@ write_files:
       fi
       log "AWS CLI $AWS_VERSION installed"
 
-      log "[7/11] Installing Supabase CLI ${SUPABASE_VERSION}..."
+      log "[7/12] Installing PostgreSQL client ${POSTGRES_CLIENT_VERSION}..."
+      # Ubuntu 24.04 ships PostgreSQL 16 clients, but Supabase local development
+      # defaults to Postgres 17. pg_dump/pg_restore refuse to talk to a server
+      # newer than themselves, so take the matching client from PGDG instead.
+      retry "curl -fsSL --retry 3 --retry-delay 2 https://www.postgresql.org/media/keys/ACCC4CF8.asc -o /tmp/pgdg.asc"
+      gpg --batch --yes --dearmor -o /etc/apt/keyrings/pgdg.gpg < /tmp/pgdg.asc
+      chmod a+r /etc/apt/keyrings/pgdg.gpg
+      rm /tmp/pgdg.asc
+
+      echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/pgdg.gpg] https://apt.postgresql.org/pub/repos/apt $(. /etc/os-release && echo "$VERSION_CODENAME")-pgdg main" | tee /etc/apt/sources.list.d/pgdg.list > /dev/null
+
+      retry "apt-get update"
+      retry "apt-get install -y postgresql-client-${POSTGRES_CLIENT_VERSION}"
+      # Capture stdout+stderr once so a failure has something to report, then parse
+      # anchored on the version line. /usr/bin/psql is postgresql-common's pg_wrapper,
+      # which prints a clusterless warning containing "pg_wrapper(1)" to stderr on a
+      # client-only install -- an unanchored digit match would read that as major 1.
+      PSQL_VERSION_RAW=$(psql --version 2>&1 || true)
+      PSQL_INSTALLED_MAJOR=$(printf '%s\n' "$PSQL_VERSION_RAW" | grep -Eo 'psql \(PostgreSQL\) [0-9]+' | head -1 | grep -Eo '[0-9]+$' || true)
+      if [[ "$PSQL_INSTALLED_MAJOR" != "$POSTGRES_CLIENT_VERSION" ]]; then
+        log_error "PostgreSQL client install verification failed: expected major ${POSTGRES_CLIENT_VERSION}"
+        log_error "psql --version output: ${PSQL_VERSION_RAW:-missing output}"
+        exit 1
+      fi
+      if ! command -v pg_dump > /dev/null 2>&1; then
+        log_error "pg_dump not found on PATH after PostgreSQL client installation"
+        exit 1
+      fi
+      log "PostgreSQL client major ${PSQL_INSTALLED_MAJOR} installed"
+
+      log "[8/12] Installing Supabase CLI ${SUPABASE_VERSION}..."
       (
         set -euo pipefail
         SUPABASE_TMP_DIR=$(mktemp -d)
@@ -201,14 +232,14 @@ write_files:
       fi
       log "Supabase CLI v${SUPABASE_INSTALLED_VERSION} installed"
 
-      log "[8/11] Warming Supabase local development images..."
+      log "[9/12] Warming Supabase local development images..."
       (
         set -euo pipefail
         SUPABASE_WARMUP_DIR=$(mktemp -d)
         trap 'cd / && rm -rf "$SUPABASE_WARMUP_DIR"' EXIT
 
         cd "$SUPABASE_WARMUP_DIR"
-        printf 'n\n' | supabase init
+        supabase init < /dev/null
         if [[ -n "${SUPABASE_IMAGE_REGISTRY:-}" ]]; then
           export SUPABASE_INTERNAL_IMAGE_REGISTRY="$SUPABASE_IMAGE_REGISTRY"
           export INTERNAL_IMAGE_REGISTRY="$SUPABASE_IMAGE_REGISTRY"
@@ -224,7 +255,7 @@ write_files:
       )
       log "Supabase local development and database job Docker cache warmed"
 
-      log "[9/11] Installing Playwright Chromium..."
+      log "[10/12] Installing Playwright Chromium..."
       install -d -o runner -g runner -m 0755 /home/runner/.cache "$PLAYWRIGHT_BROWSERS_PATH"
       retry "env PLAYWRIGHT_BROWSERS_PATH='$PLAYWRIGHT_BROWSERS_PATH' npm exec --yes --package=playwright@${PLAYWRIGHT_VERSION} -- playwright install --with-deps chromium"
       PLAYWRIGHT_CLI_VERSION=$(env PLAYWRIGHT_BROWSERS_PATH="$PLAYWRIGHT_BROWSERS_PATH" npm exec --yes --package=playwright@"${PLAYWRIGHT_VERSION}" -- playwright --version 2>&1 || true)
@@ -248,7 +279,7 @@ write_files:
         exit 1
       fi
 
-      log "[10/11] Downloading GitHub Actions runner..."
+      log "[11/12] Downloading GitHub Actions runner..."
       RUNNER_HOME=/home/runner/actions-runner
       RUNNER_USER=runner
       mkdir -p $RUNNER_HOME
@@ -286,17 +317,26 @@ write_files:
       }
       log "Runner extracted and dependencies installed"
 
-      log "[11/11] Cleaning up for template conversion..."
+      log "[12/12] Cleaning up for template conversion..."
       apt-get clean
       rm -rf /tmp/* /var/tmp/*
       truncate -s 0 /var/log/*.log 2>/dev/null || true
 
-      # Mark template setup as complete
-      touch /opt/.template-setup-complete
-
       log "=== Template setup complete! ==="
-      log "Installed: Docker, GitHub CLI, Node.js, zstd, unzip, AWS CLI v2, Supabase CLI ${SUPABASE_VERSION} with warmed local and database job Docker cache, Playwright Chromium ${PLAYWRIGHT_VERSION}, Actions runner"
+      log "Installed: Docker, GitHub CLI, Node.js, zstd, unzip, AWS CLI v2, PostgreSQL client ${POSTGRES_CLIENT_VERSION}, Supabase CLI ${SUPABASE_VERSION} with warmed local and database job Docker cache, Playwright Chromium ${PLAYWRIGHT_VERSION}, Actions runner"
+
+      # Reset instance identity so clones get a fresh machine-id and SSH host keys.
+      cloud-init clean --logs
+      truncate -s 0 /etc/machine-id
+      rm -f /var/lib/dbus/machine-id
+      rm -f /etc/ssh/ssh_host_*
+
+      # Completion marker, written LAST. The guest deliberately does NOT power
+      # itself off: a self-poweroff is indistinguishable from a crash or an
+      # operator `qm stop`, which is how a half-baked template used to get
+      # published. The host waits for this marker, confirms it over the guest
+      # agent while the VM is still up, then shuts the VM down itself.
+      touch /opt/.template-setup-complete
 
 runcmd:
   - /opt/setup-template.sh 2>&1 | tee /var/log/template-setup.log
-  - bash -c 'test -f /opt/.template-setup-complete && { cloud-init clean --logs; truncate -s 0 /etc/machine-id; rm -f /var/lib/dbus/machine-id; rm -f /etc/ssh/ssh_host_*; poweroff; }'
