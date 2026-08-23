@@ -230,9 +230,12 @@ bootcmd:
   # dbus/logind may not be up yet — that failure is silent and buys nothing.
   # `systemctl` as root reaches PID 1 over /run/systemd/private, no bus needed.
   #
-  # OnBootSec= is what actually re-arms after a reboot: the enable symlink is on
-  # disk, so timers.target starts the timer before cloud-init runs at all.
-  # Re-installing here is the belt-and-braces path; every command is idempotent.
+  # OnBootSec= is what re-arms after a reboot, because the enable symlink is on
+  # the VM's disk. Which path arms it on the second boot is NOT ordered:
+  # cloud-init.service sets DefaultDependencies=no and carries no ordering
+  # against timers.target, so either timers.target or this bootcmd may win.
+  # It does not matter — both paths are idempotent, verified by running the
+  # rendered bootcmd twice against a fake root and diffing the result.
   - |
     cat > /etc/systemd/system/github-runner-lifetime.service <<'CEILINGEOF'
     [Unit]
@@ -240,7 +243,10 @@ bootcmd:
 
     [Service]
     Type=oneshot
-    ExecStart=/usr/bin/logger -t github-runner "Safety timeout: max VM lifetime reached"
+    # Leading "-": oneshot stops at the first ExecStart that fails and marks the
+    # unit failed, so a sick logger (journald socket gone, util-linux removed by
+    # a job) must not be allowed to swallow the poweroff below.
+    ExecStart=-/usr/bin/logger -t github-runner "Safety timeout: max VM lifetime reached"
     # --no-block: the poweroff job stops this unit, so waiting on it deadlocks.
     ExecStart=/usr/bin/systemctl --no-block poweroff
     CEILINGEOF
@@ -255,7 +261,14 @@ bootcmd:
     WantedBy=timers.target
     CEILINGEOF
     systemctl daemon-reload
-    systemctl enable --now github-runner-lifetime.timer
+    # enable is the durable half — if the symlink is not written the ceiling is
+    # gone for this VM's life, so let a failure there fail the module loudly.
+    systemctl enable github-runner-lifetime.timer || exit 1
+    # start is the this-boot half, and --no-block because a timer implicitly
+    # gains After=sysinit.target while cloud-init.service is not ordered after
+    # it: a blocking start can wait, and its rc would fail cc_bootcmd for
+    # nothing. timers.target arms the timer on any boot where this loses.
+    systemctl start --no-block github-runner-lifetime.timer || true
 
 runcmd:
   - /opt/register-runner.sh 2>&1 | tee /var/log/runner-setup.log
