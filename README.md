@@ -234,6 +234,97 @@ jobs:
       - run: npm test
 ```
 
+## Canary workflow
+
+A newly baked template is promoted only after a runner cloned from it
+**completes a real GitHub Actions job**. Registering is not evidence: a runner
+that registers, shows Online/Idle and is never assigned work is the exact
+failure this platform exists to catch, and no local smoke test sees it. The job
+that supplies that evidence is `templates/canary-workflow.yml`, which doubles as
+the acceptance test for everything the bake installs.
+
+### Installing it into `CANARY_REPO`
+
+The copy in this repo is canonical; it has to be installed into whichever repo
+hosts the canary (`CANARY_REPO`):
+
+```bash
+# in a clone of CANARY_REPO
+mkdir -p .github/workflows
+cp /opt/selfhosted-runners/templates/canary-workflow.yml \
+   .github/workflows/runner-canary.yml
+git add .github/workflows/runner-canary.yml
+git commit -m "Add runner canary workflow"
+git push
+```
+
+The filename must match `CANARY_WORKFLOW` (default `runner-canary.yml`), and
+`workflow_dispatch` only becomes dispatchable once the file is on the repo's
+default branch. Dispatching it needs `repo` scope on a classic PAT or
+`actions:write` on a fine-grained one -- the org PAT collected by `runner setup`
+only needs `admin:org`, so a separate `CANARY_PAT` may be required.
+
+Edit the copy in this repo and reinstall it. A copy edited only in `CANARY_REPO`
+drifts away from the bake it exists to validate.
+
+### The label contract
+
+The canary gate dispatches the workflow with the generation id as the
+`generation` input, and the job targets `gen-<generation>-canary` -- **that label
+alone, with no `self-hosted`**. The canary registers with `--no-default-labels`
+so it carries nothing else. GitHub assigns a queued job to any idle runner whose
+labels are a superset of `runs-on`, so adding `self-hosted` here would make the
+canary eligible for real production jobs: it would run one on an unvalidated
+image and then destroy itself (it is `--ephemeral`), leaving the canary dispatch
+with no runner and rejecting a good image.
+
+Dispatch it by hand against any runner carrying that one label:
+
+```bash
+gh workflow run runner-canary.yml --repo <org>/<canary-repo> -f generation=1
+```
+
+### What it asserts
+
+Roughly three minutes on a warm template, against `CANARY_TIMEOUT`'s 1800s
+budget for dispatch through conclusion:
+
+- every baked tool is on `PATH` for the job user
+- `psql` reports major `17`, and `pg_dump` completes a schema dump against the
+  Supabase database it starts -- the version string alone would not catch the
+  client/server mismatch the `17` pin exists to prevent
+- `supabase --version` is `2.115.0`
+- the Playwright CLI is `1.62.1`, `playwright install --dry-run` resolves
+  Chromium inside the prebaked `/home/runner/.cache/ms-playwright` rather than
+  planning a download, and the prebaked binary actually executes
+- `aws --version` reports v2
+- `docker pull` of `public.ecr.aws/supabase/pg_prove:3.36` succeeds, through the
+  configured Docker mirror when the template has one
+- a `supabase start` / `supabase stop` round trip
+
+Each assertion emits a GitHub `::error::` annotation naming what was expected and
+what was found, because that annotation is what an operator sees quoted in the
+promotion-blocked notification.
+
+### Keeping version expectations in sync
+
+The workflow runs in `CANARY_REPO` and cannot read this repo, so its expectations
+are duplicated in the `env:` block at the top of the file rather than derived:
+
+| `templates/template-setup.yaml` | `templates/canary-workflow.yml` |
+|---|---|
+| `POSTGRES_CLIENT_VERSION` | `EXPECTED_PSQL_MAJOR` |
+| `SUPABASE_VERSION` | `EXPECTED_SUPABASE_VERSION` |
+| `PLAYWRIGHT_VERSION` | `EXPECTED_PLAYWRIGHT_VERSION` |
+| `PLAYWRIGHT_BROWSERS_PATH` | `PLAYWRIGHT_BROWSERS_PATH` |
+| `SUPABASE_PG_PROVE_IMAGE` | `CANARY_PROBE_IMAGE` |
+
+**Bumping a version on the left means bumping it on the right in the same change,
+then reinstalling the workflow.** Otherwise the next canary blocks promotion of a
+perfectly good image, and "wrong version installed" and "we bumped it and forgot
+this file" look identical in a job log. The failure messages name the mapping for
+that reason.
+
 ## Updating Runners
 
 To update runner registration/bootstrap behavior (cloud-init that runs on every
