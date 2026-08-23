@@ -127,7 +127,72 @@ After setup, the `runner` command is available globally:
 | `runner start` | Exit maintenance mode and resume watcher |
 | `runner stop [options]` | Enter maintenance mode and stop managed runners |
 | `runner list` | List all runner VMs |
+| `runner guard [--dry-run]` | Reap stopped and over-age runner VMs (normally run by timer) |
 | `runner help` | Show available commands |
+
+## Runner Lifetime and Reaping
+
+Runners are ephemeral: one job, shutdown, auto-destroy, watcher recreates. Two
+things break that cycle and silently kill a pool slot, so `setup` installs
+`github-runner-guard.timer` (5 minute interval) to enforce it from the host:
+
+- **A managed VM stuck in `stopped`.** The hookscript skips its re-clone while
+  maintenance mode is active, and a host reboot brings VMs back stopped with
+  any in-flight re-clone long dead. The watcher still sees the name in
+  `qm list`, so it counts the slot as filled and never refills it. A stopped
+  ephemeral runner is always garbage — it either finished its job or crashed.
+- **A managed VM that outlives its ceiling.** The guest arms
+  `shutdown -h +360` itself, but the `runner` user has passwordless sudo so a
+  job can cancel it, and a wedged guest never runs it at all.
+
+`runner start` also reaps stopped runner VMs before resuming the watcher, so a
+slot that died during maintenance comes back on its own.
+
+| Setting in `/etc/github-runners.conf` | Default | Meaning |
+|---|---|---|
+| `MAX_VM_LIFETIME_HOURS` | `8` | Destroy a managed runner VM whose uptime exceeds this. Keep it above the guest's own 6h ceiling so the cooperative shutdown normally wins. |
+| `STOPPED_REAP_MINUTES` | `10` | Destroy a managed runner VM seen `stopped` for this long. Keep it comfortably above normal destroy-and-re-clone turnaround. |
+| `GUARD_EXCLUDE_VMIDS` | *(empty)* | VMIDs the guard never touches, space- or comma-separated. |
+
+A missing or non-numeric value falls back to the default — the guard is never
+disabled by a typo, because the failure mode is a dead pool slot.
+
+**See what it would do before it does it:**
+
+```bash
+runner guard --dry-run     # prints candidates and reasons, destroys nothing
+```
+
+### What the guard will never touch
+
+- Any VM whose cloud-init snippet does not identify a configured org — the same
+  check `runner destroy` uses. Unrelated VMs on the same host are invisible to
+  it.
+- `TEMPLATE_ID`, and any VM that is itself a template.
+- Any VM below the runner VMID floor. That floor is `MIN_VMID`; if the key is
+  absent from your config it is `TEMPLATE_ID + 1`, and an explicit `MIN_VMID=0`
+  ("let Proxmox pick") means no floor, since runner VMIDs can then land
+  anywhere.
+- Any VM with `protection: 1` or a `lock:` line — including one suspended to
+  disk. **This is the escape hatch**: to keep a wedged runner for forensics,
+  `qm set <vmid> --protection 1`. A copy taken with `qm clone`/`qm restore`
+  inherits the runner's `cicustom` and *is* a candidate, so protect it too.
+- Anything listed in `GUARD_EXCLUDE_VMIDS`.
+- Anything whose slot is locked by an in-flight clone or re-clone, or whose
+  Proxmox config was written in the last 60 seconds.
+
+Every run and every forced destroy is logged, and each destroy also emits a
+`lifetime.forced_destroy` or `stopped_vm.reaped` notification when the webhook
+notifier is configured:
+
+```bash
+journalctl -t github-runner | grep '\[guard\]'
+systemctl list-timers github-runner-guard.timer
+```
+
+The summary line each run carries `deferred`, `skipped`, `no-uptime`,
+`no-mtime` and `unreadable` counts alongside `destroyed`, so a guard that has
+gone quietly inert does not look like a guard with nothing to do.
 
 ## Installed Software
 
@@ -394,7 +459,8 @@ To update prebaked software in the base VM template:
    > `DOCKER_MIRROR_URL` and `VLAN_TAG`, for the bake and for every future clone.
    > Run `cat /etc/github-runners.conf` beforehand and retype every
    > non-default value. Your PAT and org configs are not touched -- `add-org` only
-   > runs when no orgs exist yet.
+   > runs when no orgs exist yet, and the unprompted guard thresholds
+   > (`MAX_VM_LIFETIME_HOURS`, `STOPPED_REAP_MINUTES`) are read back and kept.
 5. Resume the pool and refill it:
    ```bash
    runner start

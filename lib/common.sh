@@ -49,6 +49,13 @@ POOL_DRAIN_FILE="/var/lib/github-runners/drain"
 # path can both see and clear the drain. install.sh migrates it to the
 # persistent path on upgrade; disable_pool_drain clears both.
 POOL_DRAIN_FILE_LEGACY="/run/lock/github-runner-drain"
+
+# Where the lifetime guard records when it first saw a VM stopped. A stopped VM
+# reports no uptime, so the observation has to come from the host. Per-boot
+# state on purpose, unlike the rest of the platform's state: a reboot makes
+# every VM freshly observed, which is exactly what it is.
+# shellcheck disable=SC2034  # consumed by lib/guard.sh via this shared file
+GUARD_STATE_DIR="/run/github-runner-guard"
 # Shared/exclusive lock coordinating maintenance mode with in-flight clones.
 # clone_runner holds a shared lock for its full lifecycle; runner stop takes an
 # exclusive lock so it can wait until all clone activity is quiesced.
@@ -62,13 +69,33 @@ POOL_ACTIVITY_LOCK_FILE="/run/lock/github-runner-pool.lock"
 VMID_LOCK_FILE="/run/lock/runner-vmid.lock"
 VMID_RESERVATION_LOCK_PREFIX="/run/lock/runner-vmid-reserve"
 CLONE_SLOT_LOCK_PREFIX="/run/lock/runner-clone-slot"
-# Per-slot lock keeping lib/reclone.sh and lib/watch.sh off the same runner name.
-# shellcheck disable=SC2034  # consumed by sourcing scripts (lib/reclone.sh, lib/watch.sh)
+# Per-slot lock keeping lib/reclone.sh, lib/watch.sh and lib/guard.sh off the
+# same runner name. reclone/watch hold it across a clone; the guard holds it
+# around a single destroy. One definition on purpose: if these drifted apart the
+# guard would stop coordinating with the clone path and destroy mid-clone.
+# shellcheck disable=SC2034  # consumed by sourcing scripts (reclone.sh, watch.sh, guard.sh)
 RUNNER_SLOT_LOCK_PREFIX="/run/lock/runner"
 # Per-slot reclone bookkeeping (last-processed timestamp, rapid-death streak).
 # shellcheck disable=SC2034  # consumed by sourcing scripts (lib/reclone.sh)
 RECLONE_STATE_PREFIX="/run/runner"
 DEFAULT_CLONE_MAX_PARALLEL=2
+# Host-side termination guard (lib/guard.sh). The lifetime ceiling sits above
+# the guest's own 6h `shutdown -h +360` so the cooperative path normally wins.
+# shellcheck disable=SC2034  # consumed by lib/guard.sh and lib/setup.sh
+DEFAULT_MAX_VM_LIFETIME_HOURS=8
+# shellcheck disable=SC2034  # consumed by lib/guard.sh and lib/setup.sh
+DEFAULT_STOPPED_REAP_MINUTES=10
+# shellcheck disable=SC2034  # consumed by lib/setup.sh; empty = exclude nothing
+DEFAULT_GUARD_EXCLUDE_VMIDS=""
+# Floor under the guard's structural freshness check. A VM whose config was
+# written this recently may be a clone still in flight, so it is never reaped —
+# this is what lets the guard skip the global pool lock entirely.
+# shellcheck disable=SC2034  # consumed by lib/guard.sh via this shared file
+GUARD_MIN_CONFIG_AGE_SECONDS=60
+# Consecutive runs a VM may be deferred on a busy slot lock before the guard
+# stops treating it as normal churn and says so.
+# shellcheck disable=SC2034  # consumed by lib/guard.sh via this shared file
+GUARD_DEFER_WARN_RUNS=3
 
 # Persistent platform state, as opposed to the /run/lock files above, which are
 # tmpfs and clear on reboot. Overridable only so unit tests can point the

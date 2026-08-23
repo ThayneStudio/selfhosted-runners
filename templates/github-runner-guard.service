@@ -1,0 +1,14 @@
+[Unit]
+Description=GitHub Actions runner lifetime guard
+# pvedaemon must be up before `qm list` means anything, and a failed list is
+# reported as a failed run rather than silently doing nothing.
+After=network-online.target pve-cluster.service pvedaemon.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/runner guard
+TimeoutStartSec=900
+MemoryMax=512M
+CPUQuota=200%
+SyslogIdentifier=github-runner-guard

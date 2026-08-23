@@ -75,7 +75,8 @@ fi
 echo ""
 if [[ $RUNNER_COUNT -gt 0 ]]; then
     log_warn "$RUNNER_COUNT runner(s) still registered with '$ORG_NAME'."
-    log_warn "They will become unmanaged — destroy them first, or remove them from GitHub manually."
+    log_warn "The lifetime guard still destroys them, but without this org's config it cannot"
+    log_warn "deregister them — destroy them first, or remove them from GitHub manually."
     echo ""
 fi
 

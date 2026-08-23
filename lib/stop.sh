@@ -92,7 +92,9 @@ echo ""
 echo "This will:"
 echo "  - stop github-runner-watch.timer and github-runner-watch.service"
 if [[ "$WATCH_ONLY" == true ]]; then
-    echo "  - leave all runner VMs intact"
+    echo "  - leave running runner VMs in place to finish their jobs"
+    echo "  - still let the lifetime guard reap them once they stop or age out,"
+    echo "    with no watcher running to refill the slots"
 elif [[ ${#RUNNERS[@]} -gt 0 ]]; then
     echo "  - destroy ${#RUNNERS[@]} managed runner VM(s)"
 else
@@ -135,7 +137,9 @@ systemctl stop github-runner-watch.service 2>/dev/null || true
 mapfile -t RUNNERS < <(collect_managed_runners "$VMID_MIN" "$VMID_MAX")
 
 if [[ "$WATCH_ONLY" == true ]]; then
-    log_info "Watcher stopped. Pool drain remains active; runner VMs left intact."
+    log_info "Watcher stopped. Pool drain remains active; running runner VMs left in place."
+    log_warn "The lifetime guard still reaps them once they stop or exceed MAX_VM_LIFETIME_HOURS."
+    log_warn "To keep one for inspection: qm set <vmid> --protection 1"
     echo "Resume later with:"
     echo "  runner start"
     echo ""
@@ -150,7 +154,12 @@ while true; do
     for entry in "${RUNNERS[@]}"; do
         IFS='|' read -r VMID VM_NAME _ _ <<< "$entry"
         if ! "$LIB_DIR/destroy.sh" --vmid "$VMID" 200>&- 201>&- 202>&-; then
-            FAILURES+=("$VM_NAME (VMID $VMID)")
+            # reclone.sh and the lifetime guard destroy without this lock, so a
+            # VM can legitimately disappear mid-loop. Only a VM that is still
+            # here after a failed destroy is an actual failure.
+            if qm status "$VMID" >/dev/null 2>&1; then
+                FAILURES+=("$VM_NAME (VMID $VMID)")
+            fi
         fi
     done
 

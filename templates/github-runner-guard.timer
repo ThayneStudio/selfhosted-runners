@@ -1,0 +1,12 @@
+[Unit]
+Description=GitHub Actions runner lifetime guard timer
+
+[Timer]
+# Early first tick so a host reboot — which brings every runner VM back stopped
+# — starts the stopped-VM clock right away instead of a full interval later.
+OnBootSec=2min
+OnUnitInactiveSec=5min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target
