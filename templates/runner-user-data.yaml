@@ -217,8 +217,45 @@ write_files:
       fi
       # EXIT trap handles shutdown
 
+bootcmd:
+  # Hard ceiling: power the VM off 6 hours after boot even if run.sh hangs.
+  #
+  # This lives in bootcmd, not runcmd, because runcmd is per-instance and the
+  # instance-id is pinned host-side at clone time — a guest reboot presents the
+  # same instance-id, so runcmd never re-runs and the ceiling would be lost for
+  # the rest of the VM's life. bootcmd runs on every boot.
+  #
+  # It is a systemd timer, not `shutdown -h +360`, because `shutdown` schedules
+  # through logind over D-Bus and bootcmd runs in cloud-init's init stage, where
+  # dbus/logind may not be up yet — that failure is silent and buys nothing.
+  # `systemctl` as root reaches PID 1 over /run/systemd/private, no bus needed.
+  #
+  # OnBootSec= is what actually re-arms after a reboot: the enable symlink is on
+  # disk, so timers.target starts the timer before cloud-init runs at all.
+  # Re-installing here is the belt-and-braces path; every command is idempotent.
+  - |
+    cat > /etc/systemd/system/github-runner-lifetime.service <<'CEILINGEOF'
+    [Unit]
+    Description=Power off the runner VM at its maximum lifetime
+
+    [Service]
+    Type=oneshot
+    ExecStart=/usr/bin/logger -t github-runner "Safety timeout: max VM lifetime reached"
+    # --no-block: the poweroff job stops this unit, so waiting on it deadlocks.
+    ExecStart=/usr/bin/systemctl --no-block poweroff
+    CEILINGEOF
+    cat > /etc/systemd/system/github-runner-lifetime.timer <<'CEILINGEOF'
+    [Unit]
+    Description=6-hour ceiling on runner VM lifetime
+
+    [Timer]
+    OnBootSec=6h
+
+    [Install]
+    WantedBy=timers.target
+    CEILINGEOF
+    systemctl daemon-reload
+    systemctl enable --now github-runner-lifetime.timer
+
 runcmd:
-  # Hard ceiling: shut down after 6 hours even if run.sh hangs.
-  # Single-quoted so YAML doesn't parse the colon in "Safety timeout:" as a mapping.
-  - 'shutdown -h +360 "Safety timeout: max VM lifetime reached" &'
   - /opt/register-runner.sh 2>&1 | tee /var/log/runner-setup.log
