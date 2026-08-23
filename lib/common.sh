@@ -62,6 +62,12 @@ RUNNER_SLOT_LOCK_PREFIX="/run/lock/runner"
 RECLONE_STATE_PREFIX="/run/runner"
 DEFAULT_CLONE_MAX_PARALLEL=2
 
+# Persistent platform state, as opposed to the /run/lock files above, which are
+# tmpfs and clear on reboot. Overridable only so unit tests can point the
+# generation store at a temp directory; production always uses the default.
+RUNNER_STATE_DIR="${RUNNER_STATE_DIR:-/var/lib/github-runners}"
+GENERATIONS_DIR="${GENERATIONS_DIR:-$RUNNER_STATE_DIR/generations}"
+
 # Webhook notifications. Sourced here so every script that already sources
 # common.sh can call `notify` (and `redact_secrets`) without extra wiring.
 #
@@ -110,6 +116,19 @@ load_infra_config() {
             exit 1
         fi
     done
+    apply_generation_defaults
+}
+
+# Generation-model settings (spec 14). Defaulting them here rather than writing
+# them into /etc/github-runners.conf keeps the upgrade a no-op: an existing
+# config file stays valid and unedited, and an operator only adds a key to
+# override it.
+apply_generation_defaults() {
+    TEMPLATE_BAND_MIN="${TEMPLATE_BAND_MIN:-8900}"
+    TEMPLATE_BAND_MAX="${TEMPLATE_BAND_MAX:-8999}"
+    GENERATION_RETAIN="${GENERATION_RETAIN:-1}"
+    FAILED_GEN_RETAIN_DAYS="${FAILED_GEN_RETAIN_DAYS:-7}"
+    CANDIDATE_MAX_AGE_DAYS="${CANDIDATE_MAX_AGE_DAYS:-3}"
 }
 
 load_org_config() {
