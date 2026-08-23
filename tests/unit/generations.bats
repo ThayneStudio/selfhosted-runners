@@ -58,6 +58,21 @@ create_full_record() {
     [ -d "$GENERATIONS_DIR" ]
 }
 
+@test "an abandoned staging file is reaped once it is stale" {
+    gen_create 8903 GEN_ID=1 GEN_STATE=baking
+    local stale="$GENERATIONS_DIR/8903.conf.abc123"
+    local fresh="$GENERATIONS_DIR/8904.conf.def456"
+    : > "$stale"
+    : > "$fresh"
+    touch -t 202001010000 "$stale"
+
+    gen_store_init
+
+    [ ! -e "$stale" ]
+    # A concurrent writer's staging file must survive the sweep.
+    [ -e "$fresh" ]
+}
+
 # ---------------------------------------------------------------------------
 # Record round-tripping
 # ---------------------------------------------------------------------------
@@ -99,6 +114,17 @@ create_full_record() {
     [ "$output" = "8|failed|$reason" ]
 }
 
+@test "a newline in a value is folded so the record still parses" {
+    gen_create 8903 GEN_ID=1 GEN_STATE=baking
+    gen_transition 8903 failed "$(printf 'bake timed out\nafter 5400s')"
+
+    # One line per field, still thirteen of them: an unfolded newline would
+    # split the record and the next read would report it as malformed.
+    [ "$(grep -c '^GEN_' "$GENERATIONS_DIR/8903.conf")" = "13" ]
+    gen_read 8903
+    [ "$GEN_FAILED_REASON" = "bake timed out after 5400s" ]
+}
+
 @test "a record is written root-only" {
     create_full_record
     [ "$(file_mode "$GENERATIONS_DIR/8903.conf")" = "600" ]
@@ -116,6 +142,30 @@ create_full_record() {
     [ "$GEN_FAILED_REASON" = "" ]
 }
 
+@test "a short record does not inherit fields from the record read before it" {
+    create_full_record
+    printf 'GEN_ID="9"\nGEN_VMID="8904"\nGEN_STATE="baking"\n' > "$GENERATIONS_DIR/8904.conf"
+
+    gen_read 8903
+    [ "$GEN_RUNNER_VERSION" = "2.336.0" ]
+    gen_read 8904
+    [ "$GEN_RUNNER_VERSION" = "" ]
+    [ "$GEN_CANARY_RUN_URL" = "" ]
+    [ "$GEN_FAILED_REASON" = "" ]
+}
+
+@test "a failed read leaves no fields from the record read before it" {
+    create_full_record
+    gen_read 8903
+    [ "$GEN_STATE" = "active" ]
+
+    gen_read 9999 || true
+
+    [ "$GEN_STATE" = "" ]
+    [ "$GEN_ID" = "" ]
+    [ "$GEN_RUNNER_VERSION" = "" ]
+}
+
 @test "reading a missing record fails" {
     run gen_read 9999
     [ "$status" -eq 1 ]
@@ -131,6 +181,33 @@ create_full_record() {
     [[ "$output" == *"Malformed line"* ]]
 }
 
+@test "a truncated value is reported rather than guessed at" {
+    gen_create 8903 GEN_ID=1 GEN_STATE=baking
+    printf 'GEN_FAILED_REASON="unterminated\n' >> "$GENERATIONS_DIR/8903.conf"
+
+    run gen_read 8903
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"Malformed value"* ]]
+}
+
+@test "a record with CRLF line endings still reads" {
+    gen_create 8903 GEN_ID=1 GEN_STATE=active
+    awk '{ printf "%s\r\n", $0 }' "$GENERATIONS_DIR/8903.conf" > "$GEN_TEST_DIR/crlf"
+    cp "$GEN_TEST_DIR/crlf" "$GENERATIONS_DIR/8903.conf"
+
+    gen_read 8903
+    [ "$GEN_STATE" = "active" ]
+    [ "$GEN_ID" = "1" ]
+}
+
+@test "an unquoted value, as spec 4.3 writes them, is accepted" {
+    printf 'GEN_ID=7\nGEN_VMID=8903\nGEN_STATE=active\n' > "$GENERATIONS_DIR/8903.conf"
+
+    gen_read 8903
+    [ "$GEN_ID" = "7" ]
+    [ "$GEN_STATE" = "active" ]
+}
+
 @test "an unknown field in a record is ignored with a warning" {
     gen_create 8903 GEN_ID=1 GEN_STATE=baking
     printf 'GEN_FUTURE_FIELD="whatever"\n' >> "$GENERATIONS_DIR/8903.conf"
@@ -140,6 +217,10 @@ create_full_record() {
     [[ "$output" == *"Ignoring unknown field GEN_FUTURE_FIELD"* ]]
 }
 
+# ---------------------------------------------------------------------------
+# Creating, updating and removing
+# ---------------------------------------------------------------------------
+
 @test "creating over an existing record is refused" {
     gen_create 8903 GEN_ID=1 GEN_STATE=baking
     run gen_create 8903 GEN_ID=2 GEN_STATE=baking
@@ -148,6 +229,31 @@ create_full_record() {
 
     gen_read 8903
     [ "$GEN_ID" = "1" ]
+}
+
+@test "concurrent creates of one vmid leave exactly one record" {
+    local codes="$GEN_TEST_DIR/codes"
+    mkdir -p "$codes"
+
+    local i
+    for ((i = 0; i < 8; i++)); do
+        (
+            rc=0
+            gen_create 8903 "GEN_RUNNER_VERSION=2.336.$i" > /dev/null 2>&1 || rc=$?
+            printf '%s\n' "$rc" > "$codes/$i"
+        ) &
+    done
+    wait
+
+    local wins
+    wins=$(cat "$codes"/* | grep -c '^0$' || true)
+    [ "$wins" = "1" ]
+
+    # The survivor is a complete record, not a half-written one.
+    [ "$(ls "$GENERATIONS_DIR"/*.conf | wc -l | tr -d ' ')" = "1" ]
+    gen_read 8903
+    [ "$GEN_VMID" = "8903" ]
+    [ "$GEN_STATE" = "baking" ]
 }
 
 @test "creating with an unknown field is refused" {
@@ -184,6 +290,36 @@ create_full_record() {
     [[ "$GEN_CREATED_AT" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]
 }
 
+@test "creating with an id another record already holds is refused" {
+    gen_create 8903 GEN_ID=7 GEN_STATE=active
+
+    run gen_create 8904 GEN_ID=7 GEN_STATE=baking
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"already issued"* ]]
+    [ ! -e "$GENERATIONS_DIR/8904.conf" ]
+
+    # The id must still resolve to the generation that actually holds it.
+    [ "$(gen_vmid_for_id 7)" = "8903" ]
+}
+
+@test "creating with an id the archive log records is refused" {
+    gen_archive_append 5 8902 destroyed runner=2.335.0
+
+    run gen_create 8904 GEN_ID=5
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"already issued"* ]]
+}
+
+@test "creating refuses when it cannot verify the id against a corrupt store" {
+    gen_create 8903 GEN_ID=1 GEN_STATE=active
+    printf 'garbage\n' >> "$GENERATIONS_DIR/8903.conf"
+
+    run gen_create 8904 GEN_ID=2
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"Cannot verify"* ]]
+    [ ! -e "$GENERATIONS_DIR/8904.conf" ]
+}
+
 @test "update rewrites the given fields and preserves the rest" {
     create_full_record
     gen_update 8903 GEN_CANARY_ATTEMPTS=3 GEN_CANARY_RUN_URL=https://example.test/runs/99
@@ -207,20 +343,73 @@ create_full_record() {
     [ "$(gen_state_of 8903)" = "failed" ]
 }
 
-@test "update refuses to re-point a record at another vmid" {
+@test "update refuses to change the record's identity" {
     gen_create 8903 GEN_ID=1 GEN_STATE=baking
+
+    run gen_update 8903 GEN_ID=99
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"identity"* ]]
+
     run gen_update 8903 GEN_VMID=8904
+    [ "$status" -eq 1 ]
+
+    gen_read 8903
+    [ "$GEN_ID" = "1" ]
+    [ "$GEN_VMID" = "8903" ]
+}
+
+@test "an unquoted caller argument cannot smuggle a second field" {
+    gen_create 8903 GEN_ID=1 GEN_STATE=candidate
+
+    # One argument that was meant to be two. Parsed as a single pair, its value
+    # carries a whole second assignment.
+    run gen_update 8903 "GEN_ID=1 GEN_STATE=active"
+    [ "$status" -eq 1 ]
+
+    run gen_update 8903 "GEN_RUNNER_VERSION=2.336.0 GEN_STATE=active"
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"whitespace"* ]]
+
+    [ "$(gen_state_of 8903)" = "candidate" ]
+    gen_read 8903
+    [ "$GEN_RUNNER_VERSION" = "" ]
+}
+
+@test "field values are validated on the way in" {
+    gen_create 8903 GEN_ID=1 GEN_STATE=candidate
+
+    run gen_update 8903 GEN_CANARY_ATTEMPTS=lots
+    [ "$status" -eq 1 ]
+    run gen_update 8903 GEN_PROMOTED_AT=yesterday
+    [ "$status" -eq 1 ]
+    run gen_update 8903 GEN_CANARY_RUN_URL="https://example.test/a b"
+    [ "$status" -eq 1 ]
+    run gen_create 8905 GEN_ID=abc
+    [ "$status" -eq 1 ]
+    run gen_create 8905 GEN_ID=-1
     [ "$status" -eq 1 ]
 }
 
+@test "an oversized failure reason is clipped rather than stored whole" {
+    local long
+    long=$(head -c 4096 < /dev/zero | tr '\0' 'x')
+    gen_create 8903 GEN_ID=1 GEN_STATE=baking
+    gen_transition 8903 failed "$long"
+
+    gen_read 8903
+    [ "${#GEN_FAILED_REASON}" -lt 600 ]
+    [[ "$GEN_FAILED_REASON" == *"(truncated)"* ]]
+}
+
 @test "listing filters by state and sorts numerically" {
-    gen_create 9010 GEN_ID=1 GEN_STATE=superseded
-    gen_create 890 GEN_ID=2 GEN_STATE=active
+    # 900 sorts after 8900 lexicographically and before it numerically.
+    gen_create 8900 GEN_ID=1 GEN_STATE=superseded
+    gen_create 900 GEN_ID=2 GEN_STATE=active
     gen_create 8903 GEN_ID=3 GEN_STATE=superseded
 
-    [ "$(gen_list)" = "$(printf '890\n8903\n9010')" ]
-    [ "$(gen_list superseded)" = "$(printf '8903\n9010')" ]
-    [ "$(gen_list active)" = "890" ]
+    [ "$(gen_list)" = "$(printf '900\n8900\n8903')" ]
+    [ "$(gen_list superseded)" = "$(printf '8900\n8903')" ]
+    [ "$(gen_list active)" = "900" ]
     [ "$(gen_list candidate)" = "" ]
 }
 
@@ -234,6 +423,15 @@ create_full_record() {
 
 @test "listing rejects an unknown state filter" {
     run gen_list zombie
+    [ "$status" -eq 1 ]
+}
+
+@test "a filtered listing fails rather than silently omitting a bad record" {
+    gen_create 8903 GEN_ID=1 GEN_STATE=superseded
+    gen_create 8904 GEN_ID=2 GEN_STATE=superseded
+    printf 'garbage\n' >> "$GENERATIONS_DIR/8903.conf"
+
+    run gen_list superseded
     [ "$status" -eq 1 ]
 }
 
@@ -256,6 +454,49 @@ create_full_record() {
     gen_transition 8903 superseded
     gen_remove 8903
     [ ! -e "$GENERATIONS_DIR/8903.conf" ]
+}
+
+# ---------------------------------------------------------------------------
+# VMID validation
+#
+# Every entry point takes an identifier that spec 13 lets an operator supply.
+# gen_record_path interpolates it into a filename, so an unvalidated one reads,
+# overwrites or deletes a file outside the store.
+# ---------------------------------------------------------------------------
+
+@test "a traversing vmid is refused by every entry point" {
+    local outside="$GEN_TEST_DIR/outside.conf"
+    printf 'NETWORK_BRIDGE="vmbr0"\nTEMPLATE_ID="9000"\n' > "$outside"
+    local before
+    before="$(cat "$outside")"
+
+    # From $GENERATIONS_DIR ($RUNNER_STATE_DIR/generations) this resolves to
+    # the file above.
+    local traversal="../../outside"
+
+    run gen_read "$traversal"
+    [ "$status" -eq 1 ]
+    run gen_state_of "$traversal"
+    [ "$status" -eq 1 ]
+    run gen_update "$traversal" GEN_CANARY_ATTEMPTS=1
+    [ "$status" -eq 1 ]
+    run gen_transition "$traversal" active
+    [ "$status" -eq 1 ]
+    run gen_remove "$traversal"
+    [ "$status" -eq 1 ]
+    run gen_create "$traversal"
+    [ "$status" -eq 1 ]
+    run gen_exists "$traversal"
+    [ "$status" -eq 1 ]
+
+    [ -e "$outside" ]
+    [ "$(cat "$outside")" = "$before" ]
+}
+
+@test "an absolute vmid is refused too" {
+    run gen_read "/etc/github-runners"
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"Invalid generation VMID"* ]]
 }
 
 # ---------------------------------------------------------------------------
@@ -287,16 +528,6 @@ create_full_record() {
     [ "$(cat "$GENERATION_COUNTER_FILE")" = "20" ]
 }
 
-@test "an id is never reused after its generation is destroyed" {
-    local first
-    first=$(gen_next_id)
-    gen_create 8903 "GEN_ID=$first" GEN_STATE=superseded
-    gen_remove 8903
-
-    [ "$(gen_next_id)" != "$first" ]
-    [ "$(gen_next_id)" = "3" ]
-}
-
 @test "an id claimed directly by adoption is not handed out again" {
     # Adoption (spec 8) writes generation 1 for the already-deployed template
     # without going through the counter.
@@ -311,6 +542,50 @@ create_full_record() {
     rm -f "$GENERATION_COUNTER_FILE"
 
     [ "$(gen_next_id)" = "8" ]
+}
+
+@test "an id issued to a destroyed generation is never re-issued" {
+    # Destroying a generation removes the only record carrying its id, so the
+    # archive log is the sole surviving evidence that it was ever issued.
+    gen_create 8902 GEN_ID=6 GEN_STATE=superseded
+    gen_archive_append 6 8902 destroyed runner=2.335.0
+    gen_remove 8902
+    rm -f "$GENERATION_COUNTER_FILE"
+
+    [ "$(gen_next_id)" = "7" ]
+}
+
+@test "a corrupt record stops id allocation instead of re-issuing a live id" {
+    gen_create 8901 GEN_ID=1 GEN_STATE=superseded
+    gen_create 8902 GEN_ID=2 GEN_STATE=superseded
+    gen_create 8903 GEN_ID=3 GEN_STATE=superseded
+    gen_create 8904 GEN_ID=4 GEN_STATE=active
+
+    # One stray line in the record holding the highest id, plus a counter
+    # restored from an older copy. Skipping the unreadable record would put the
+    # maximum at 3 and hand id 4 — which the active generation holds — to the
+    # next generation baked.
+    printf 'this line does not parse\n' >> "$GENERATIONS_DIR/8904.conf"
+    printf '3\n' > "$GENERATION_COUNTER_FILE"
+
+    run gen_next_id
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"Malformed line"* ]]
+    [ "$(cat "$GENERATION_COUNTER_FILE")" = "3" ]
+}
+
+@test "a record with no usable id stops allocation" {
+    printf 'GEN_VMID="8903"\nGEN_STATE="active"\n' > "$GENERATIONS_DIR/8903.conf"
+
+    run gen_next_id
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"invalid GEN_ID"* ]]
+}
+
+@test "a hand-written zero-padded id still counts toward the next id" {
+    printf 'GEN_ID=08\nGEN_VMID="8903"\nGEN_STATE="active"\n' > "$GENERATIONS_DIR/8903.conf"
+
+    [ "$(gen_next_id)" = "9" ]
 }
 
 @test "a corrupt counter is reported rather than silently reset" {
@@ -395,14 +670,47 @@ create_full_record() {
     [ "$(cat "$GENERATIONS_DIR/8903.conf")" = "$before" ]
 }
 
-@test "transitioning to the current state is a no-op, not a rewrite" {
+@test "transitioning to the current state succeeds without rewriting" {
     gen_create 8903 GEN_ID=1 GEN_STATE=candidate
     local before
     before="$(cat "$GENERATIONS_DIR/8903.conf")"
 
     run gen_transition 8903 candidate
-    [ "$status" -eq 3 ]
+    [ "$status" -eq 0 ]
     [ "$(cat "$GENERATIONS_DIR/8903.conf")" = "$before" ]
+}
+
+@test "a no-op transition does not abort a caller running under set -e" {
+    gen_create 8903 GEN_ID=1 GEN_STATE=candidate
+
+    # Every consumer of this library inherits errexit from it. An idempotent
+    # retry — maintain re-running a stage it already completed — must not take
+    # the caller down with it.
+    run bash -c "
+        set -euo pipefail
+        export RUNNER_STATE_DIR='$RUNNER_STATE_DIR'
+        source '$REPO_ROOT/lib/generations.sh'
+        gen_transition 8903 candidate
+        echo REACHED
+    "
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"REACHED"* ]]
+}
+
+@test "a failed write is reported as 4, distinct from a policy refusal" {
+    gen_create 8903 GEN_ID=1 GEN_STATE=candidate
+
+    # Stage a write failure: a promotion has to be able to tell "already
+    # promoted" and "invalid edge" from "the disk is full" before it rewrites
+    # TEMPLATE_ID (spec 7.3).
+    mktemp() { return 1; }
+    run gen_transition 8903 active
+    [ "$status" -eq 4 ]
+    run gen_update 8903 GEN_CANARY_ATTEMPTS=2
+    [ "$status" -eq 4 ]
+    unset -f mktemp
+
+    [ "$(gen_state_of 8903)" = "candidate" ]
 }
 
 @test "transitioning to an unknown state is refused" {
@@ -450,6 +758,23 @@ create_full_record() {
     gen_read 8903
     [ "$GEN_STATE" = "failed" ]
     [ "$GEN_FAILED_REASON" = "image checksum mismatch after retry" ]
+}
+
+@test "a transition with no reason does not erase one already recorded" {
+    gen_create 8903 GEN_ID=1 GEN_STATE=baking GEN_FAILED_REASON='image checksum mismatch'
+    gen_transition 8903 failed
+
+    gen_read 8903
+    [ "$GEN_FAILED_REASON" = "image checksum mismatch" ]
+}
+
+@test "a rejection with no reason does not erase one already recorded" {
+    gen_create 8903 GEN_ID=1 GEN_STATE=active GEN_FAILED_REASON='canary flaked twice'
+    gen_transition 8903 rejected
+
+    gen_read 8903
+    [ "$GEN_STATE" = "rejected" ]
+    [ "$GEN_FAILED_REASON" = "canary flaked twice" ]
 }
 
 @test "a rejection records the operator reason and the time it left service" {
@@ -591,4 +916,12 @@ after 5400s"
 @test "the archive writer requires an event" {
     run gen_archive_append 6 8902
     [ "$status" -eq 1 ]
+}
+
+@test "the archive writer requires a numeric generation id" {
+    # The id in this log is what stops a destroyed generation's id being
+    # re-issued, so an unusable one must not be written at all.
+    run gen_archive_append "six" 8902 destroyed
+    [ "$status" -eq 1 ]
+    [ ! -e "$GENERATION_ARCHIVE_LOG" ]
 }
