@@ -19,6 +19,14 @@ fi
 
 TESTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$TESTS_DIR/.." && pwd)"
+
+# Platform-gap shims (GNU tools missing on BSD userland) go on PATH for the
+# whole run, not just for files that load tests/test_helper.bash. Appended,
+# never prepended, so a real binary always wins. Without this, a self-contained
+# test file silently skips whatever the host lacks -- which is how twelve
+# generation-store tests came to run only in CI.
+PATH="$PATH:$REPO_ROOT/tests/compat/bin"
+export PATH
 BATS_VERSION="v1.11.0"
 BATS_HOME="$TESTS_DIR/.bats"
 

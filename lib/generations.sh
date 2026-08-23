@@ -95,8 +95,8 @@ gen_now() {
 # ---------------------------------------------------------------------------
 
 gen_store_init() {
-    install -d -m 700 "$RUNNER_STATE_DIR" || return 1
-    install -d -m 700 "$GENERATIONS_DIR" || return 1
+    ensure_state_dir "$RUNNER_STATE_DIR" || return 1
+    ensure_state_dir "$GENERATIONS_DIR" || return 1
     gen_reap_stale_temp_files
 }
 

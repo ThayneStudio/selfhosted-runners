@@ -66,7 +66,7 @@ log_info "[watch] Filling ${#MISSING[@]} missing slot(s) with up to ${WATCH_MAX_
 # trap so an abnormal exit does not leave one for the next PID to inherit.
 # The trap is safe with the workers below: bash does not run an inherited EXIT
 # trap in an async ( ) & subshell.
-FAILED_SLOTS="/run/github-runner-watch-failures.$$"
+FAILED_SLOTS="${WATCH_FAILURE_LIST_PREFIX}.$$"
 rm -f "$FAILED_SLOTS"
 trap 'rm -f "$FAILED_SLOTS"' EXIT
 

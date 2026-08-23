@@ -40,15 +40,28 @@ PVE_NODES_DIR="/etc/pve/nodes"
 SNIPPETS_DIR="/var/lib/vz/snippets"
 # shellcheck disable=SC2034  # consumed by sourcing scripts (lib/setup.sh, lib/add-org.sh)
 INSTALL_DIR="/opt/selfhosted-runners"
-# Maintenance flag. Lives under /var/lib so it survives a host reboot: the
-# watcher timer stays enabled across a reboot, so a tmpfs flag meant rebooting
-# between `runner stop` and `runner start` silently resumed runner creation.
-POOL_DRAIN_FILE="/var/lib/github-runners/drain"
+# Persistent platform state, as opposed to the /run/lock files below, which are
+# tmpfs and clear on reboot. This is the ONLY place the directory is spelled:
+# everything persistent derives from it, so relocating the platform's state is a
+# one-line change. Overridable only so unit tests can point at a temp directory;
+# production always uses the default.
+RUNNER_STATE_DIR="${RUNNER_STATE_DIR:-/var/lib/github-runners}"
+GENERATIONS_DIR="${GENERATIONS_DIR:-$RUNNER_STATE_DIR/generations}"
+# One mode for everything under RUNNER_STATE_DIR. `install -d -m` re-applies the
+# mode to an existing directory, so two callers disagreeing about it would flip
+# the permissions depending on which ran last.
+STATE_DIR_MODE=700
+
+# Maintenance flag. Lives under RUNNER_STATE_DIR so it survives a host reboot:
+# the watcher timer stays enabled across a reboot, so a tmpfs flag meant
+# rebooting between `runner stop` and `runner start` silently resumed runner
+# creation.
+POOL_DRAIN_FILE="$RUNNER_STATE_DIR/drain"
 # Pre-upgrade tmpfs location. Read so upgrading mid-maintenance does not drop an
 # active drain, and still written so a rollback to a release that only knows this
 # path can both see and clear the drain. install.sh migrates it to the
 # persistent path on upgrade; disable_pool_drain clears both.
-POOL_DRAIN_FILE_LEGACY="/run/lock/github-runner-drain"
+POOL_DRAIN_FILE_LEGACY="${POOL_DRAIN_FILE_LEGACY:-/run/lock/github-runner-drain}"
 
 # Where the lifetime guard records when it first saw a VM stopped. A stopped VM
 # reports no uptime, so the observation has to come from the host. Per-boot
@@ -78,6 +91,10 @@ RUNNER_SLOT_LOCK_PREFIX="/run/lock/runner"
 # Per-slot reclone bookkeeping (last-processed timestamp, rapid-death streak).
 # shellcheck disable=SC2034  # consumed by sourcing scripts (lib/reclone.sh)
 RECLONE_STATE_PREFIX="/run/runner"
+# Where watch.sh's parallel workers pool their clone failures so the run sends
+# one notification instead of one per slot. Per-run: the PID is appended.
+# shellcheck disable=SC2034  # consumed by sourcing scripts (lib/watch.sh)
+WATCH_FAILURE_LIST_PREFIX="/run/github-runner-watch-failures"
 DEFAULT_CLONE_MAX_PARALLEL=2
 # Host-side termination guard (lib/guard.sh). The lifetime ceiling sits above
 # the guest's own 6h `shutdown -h +360` so the cooperative path normally wins.
@@ -96,12 +113,6 @@ GUARD_MIN_CONFIG_AGE_SECONDS=60
 # stops treating it as normal churn and says so.
 # shellcheck disable=SC2034  # consumed by lib/guard.sh via this shared file
 GUARD_DEFER_WARN_RUNS=3
-
-# Persistent platform state, as opposed to the /run/lock files above, which are
-# tmpfs and clear on reboot. Overridable only so unit tests can point the
-# generation store at a temp directory; production always uses the default.
-RUNNER_STATE_DIR="${RUNNER_STATE_DIR:-/var/lib/github-runners}"
-GENERATIONS_DIR="${GENERATIONS_DIR:-$RUNNER_STATE_DIR/generations}"
 
 # Webhook notifications. Sourced here so every script that already sources
 # common.sh can call `notify` (and `redact_secrets`) without extra wiring.
@@ -189,6 +200,12 @@ pool_is_draining() {
     [[ -e "$POOL_DRAIN_FILE" || -e "$POOL_DRAIN_FILE_LEGACY" ]]
 }
 
+# Create a directory under RUNNER_STATE_DIR at the one mode the platform uses.
+# Every persistent-state creator goes through here so the mode cannot drift.
+ensure_state_dir() {
+    install -d -m "$STATE_DIR_MODE" "${1:-$RUNNER_STATE_DIR}"
+}
+
 enable_pool_drain() {
     local state_dir
     state_dir="$(dirname "$POOL_DRAIN_FILE")"
@@ -197,7 +214,7 @@ enable_pool_drain() {
     # full host. Say so — the caller aborts before stopping the watcher, and a
     # bare `install:` error would leave the operator thinking the pool is
     # drained when the watcher is still cloning.
-    if ! install -d -m 700 "$state_dir"; then
+    if ! ensure_state_dir "$state_dir"; then
         log_error "Failed to create $state_dir — maintenance mode NOT entered"
         return 1
     fi

@@ -2,9 +2,21 @@
 set -euo pipefail
 
 INSTALL_DIR="/opt/selfhosted-runners"
-REPO_URL="https://github.com/ThayneStudio/selfhosted-runners/archive/refs/heads/master.tar.gz"
+# Which ref to install. Overridable so a branch can be deployed to a staging
+# host before it reaches master -- the integration pass on pve-test has no other
+# way to get the code onto a host, since this script IS the deploy mechanism:
+#
+#   REPO_REF=integration/phase-1 bash -c "$(curl -fsSL .../install.sh)"
+#
+# Branch names containing a slash work; GitHub's tarball endpoint accepts them.
+REPO_REF="${REPO_REF:-master}"
+REPO_URL="${REPO_URL:-https://github.com/ThayneStudio/selfhosted-runners/archive/refs/heads/${REPO_REF}.tar.gz}"
 
-echo "Installing selfhosted-runners..."
+if [[ "$REPO_REF" != "master" ]]; then
+    echo "Installing selfhosted-runners from ref: $REPO_REF"
+else
+    echo "Installing selfhosted-runners..."
+fi
 
 # Download and extract. tests/ is excluded on purpose: it contains executables
 # named qm, pvesm, pvesh and zfs that fake the Proxmox CLI, and they have no
@@ -23,10 +35,16 @@ echo "Installed to $INSTALL_DIR"
 # this one kept it on tmpfs, so upgrading mid-maintenance and then rebooting --
 # which is usually the whole reason the pool was stopped -- would wipe the flag
 # and let the watcher refill the pool on the next boot.
-if [[ -e /run/lock/github-runner-drain ]]; then
-    install -d -m 700 /var/lib/github-runners
-    : > /var/lib/github-runners/drain
-    echo "Migrated the active maintenance drain to /var/lib/github-runners/drain"
+# Paths come from the library we just extracted rather than being spelled again
+# here, so relocating the platform's state stays a one-line change in common.sh.
+# Safe to source: the tar above has completed, so the file is whole.
+# shellcheck source=lib/common.sh
+source "$INSTALL_DIR/lib/common.sh"
+
+if [[ -e "$POOL_DRAIN_FILE_LEGACY" ]]; then
+    ensure_state_dir
+    : > "$POOL_DRAIN_FILE"
+    echo "Migrated the active maintenance drain to $POOL_DRAIN_FILE"
     echo "The pool stays drained until you run 'runner start'."
 fi
 

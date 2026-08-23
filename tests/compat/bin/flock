@@ -1,0 +1,94 @@
+#!/usr/bin/env python3
+"""util-linux flock(1) shim for hosts without it (macOS).
+
+This directory is appended to PATH, never prepended, so a real flock is always
+preferred -- this only fills in where util-linux is absent. Proxmox is Debian,
+so CI and the production host use the real binary and never reach this file.
+
+Only the file-descriptor form is implemented -- `flock [-sxun] [-w secs] <fd>`
+-- because that is the only form this repo uses. The command form would need to
+fork, and nothing here asks for it; it errors loudly rather than pretending.
+
+The lock survives this process exiting, which is the whole point: flock(2)
+locks attach to the open file description, and an inherited fd shares one with
+the caller's shell. That is exactly how the real flock(1) fd form behaves.
+"""
+import fcntl
+import sys
+import time
+
+USAGE = "flock-shim: usage: flock [-sxun] [-w secs] <fd>\n"
+
+
+def main(argv):
+    mode = fcntl.LOCK_EX
+    nonblock = False
+    timeout = None
+    fd = None
+
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg in ("-s", "--shared"):
+            mode = fcntl.LOCK_SH
+        elif arg in ("-x", "-e", "--exclusive"):
+            mode = fcntl.LOCK_EX
+        elif arg in ("-u", "--unlock"):
+            mode = fcntl.LOCK_UN
+        elif arg in ("-n", "--nb", "--nonblock"):
+            nonblock = True
+        elif arg in ("-w", "--wait", "--timeout"):
+            i += 1
+            if i >= len(argv):
+                sys.stderr.write(USAGE)
+                return 64
+            timeout = float(argv[i])
+        elif arg.startswith("-w") and len(arg) > 2:
+            timeout = float(arg[2:])
+        elif arg.lstrip("-").isdigit() and not arg.startswith("-"):
+            fd = int(arg)
+            if i + 1 < len(argv):
+                sys.stderr.write(
+                    "flock-shim: command form is not implemented; "
+                    "this repo only uses the fd form\n"
+                )
+                return 64
+        else:
+            sys.stderr.write("flock-shim: unsupported argument %r\n" % arg)
+            return 64
+        i += 1
+
+    if fd is None:
+        sys.stderr.write(USAGE)
+        return 64
+
+    if mode == fcntl.LOCK_UN:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return 0
+
+    # -n and -w 0 both mean "try once". Anything else polls to the deadline,
+    # because fcntl.flock has no timeout of its own.
+    if nonblock or timeout == 0:
+        try:
+            fcntl.flock(fd, mode | fcntl.LOCK_NB)
+        except OSError:
+            return 1
+        return 0
+
+    if timeout is None:
+        fcntl.flock(fd, mode)
+        return 0
+
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            fcntl.flock(fd, mode | fcntl.LOCK_NB)
+            return 0
+        except OSError:
+            if time.monotonic() >= deadline:
+                return 1
+            time.sleep(0.05)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

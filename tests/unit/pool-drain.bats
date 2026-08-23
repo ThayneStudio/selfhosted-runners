@@ -75,9 +75,14 @@ reclone_triggered() {
 }
 
 @test "drain flag lives outside tmpfs so it survives a host reboot" {
-    run grep -m1 '^POOL_DRAIN_FILE=' "$REPO_ROOT/lib/common.sh"
+    # Assert the resolved path, not the source text: the definition derives
+    # from RUNNER_STATE_DIR so the platform's state root is spelled once.
+    run env -u RUNNER_STATE_DIR -u POOL_DRAIN_FILE_LEGACY bash -c \
+        'source "$1/lib/common.sh"; printf "%s" "$POOL_DRAIN_FILE"' _ "$REPO_ROOT"
     [ "$status" -eq 0 ]
-    [ "$output" = 'POOL_DRAIN_FILE="/var/lib/github-runners/drain"' ]
+    [ "$output" = "/var/lib/github-runners/drain" ]
+    # The whole point: not on tmpfs.
+    [[ "$output" != /run/* ]]
 }
 
 @test "pool_is_draining is false with no flag files" {
@@ -209,18 +214,23 @@ reclone_triggered() {
 # Extracting it keeps the assertion on the shipped text; install.sh itself
 # cannot run here because it starts by curling a release tarball.
 run_install_migration() {
-    awk '/^if \[\[ -e \/run\/lock\/github-runner-drain \]\]; then$/,/^fi$/' \
+    # The block sources the freshly-installed common.sh and works from its
+    # constants, so point INSTALL_DIR at the repo and override the two paths
+    # rather than rewriting literals that no longer exist.
+    awk '/^source "\$INSTALL_DIR\/lib\/common.sh"$/,/^fi$/' \
         "$REPO_ROOT/install.sh" > "$TEST_DIR/migrate-body.sh"
     # Explicit: this runs inside `run`, where a bare failing test would not
     # abort the helper and the migration's removal would go unnoticed.
     [ -s "$TEST_DIR/migrate-body.sh" ] || return 1
+    grep -q 'POOL_DRAIN_FILE_LEGACY' "$TEST_DIR/migrate-body.sh" || return 1
     {
         echo 'set -euo pipefail'
-        sed -e "s#/run/lock/github-runner-drain#$LEGACY_DRAIN_FILE#g" \
-            -e "s#/var/lib/github-runners#$(dirname "$DRAIN_FILE")#g" \
-            "$TEST_DIR/migrate-body.sh"
+        cat "$TEST_DIR/migrate-body.sh"
     } > "$TEST_DIR/migrate.sh"
-    bash "$TEST_DIR/migrate.sh"
+    INSTALL_DIR="$REPO_ROOT" \
+    RUNNER_STATE_DIR="$(dirname "$DRAIN_FILE")" \
+    POOL_DRAIN_FILE_LEGACY="$LEGACY_DRAIN_FILE" \
+        bash "$TEST_DIR/migrate.sh"
 }
 
 @test "install.sh migrates an active tmpfs drain to the persistent flag" {
