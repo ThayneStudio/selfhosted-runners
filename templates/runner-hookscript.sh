@@ -13,16 +13,29 @@ if [[ "$PHASE" == "post-stop" ]]; then
     # the install tree for pool_is_draining(). Hardcoding the flag path here is
     # what let this script drift from lib/common.sh when the flag moved off
     # tmpfs. The subshell keeps common.sh's `set -euo pipefail` out of here.
-    if [[ ! -r "$COMMON_LIB" ]]; then
-        # reclone.sh sources the same file, so it could not run either.
-        logger -t github-runner "VM $VMID stopped but $COMMON_LIB is unreadable, skipping reclone"
-        exit 0
-    fi
+    #
+    # The answer is a printed token, never an exit status. A common.sh that
+    # cannot be sourced also exits 1 — indistinguishable from "not draining" —
+    # and that is a real state during an upgrade, because install.sh untars
+    # over the live tree and common.sh lands before the helpers it sources.
+    # Silence is therefore treated as "draining": a missed reclone is repaired
+    # by the watcher on its next tick, a reclone mid-maintenance is not.
     # shellcheck source=/dev/null
-    if ( . "$COMMON_LIB" >/dev/null 2>&1 && pool_is_draining ); then
+    DRAIN=$(
+        . "$COMMON_LIB" >/dev/null 2>&1 || exit 0
+        declare -F pool_is_draining >/dev/null || exit 0
+        pool_is_draining && echo draining || echo clear
+    )
+
+    if [[ "$DRAIN" == "draining" ]]; then
         logger -t github-runner "VM $VMID stopped during pool drain, skipping reclone"
         exit 0
     fi
+    if [[ "$DRAIN" != "clear" ]]; then
+        logger -t github-runner "VM $VMID stopped but the drain check was inconclusive ($COMMON_LIB missing or unsourceable), skipping reclone"
+        exit 0
+    fi
+
     logger -t github-runner "VM $VMID stopped, triggering reclone"
     nohup /opt/selfhosted-runners/lib/reclone.sh "$VMID" \
         </dev/null >>/var/log/github-runner.log 2>&1 &

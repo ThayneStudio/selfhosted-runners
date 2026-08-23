@@ -93,6 +93,22 @@ reclone_triggered() {
     [ "$status" -eq 0 ]
 }
 
+@test "enable_pool_drain also writes the legacy path so a rollback sees it" {
+    drain_call enable_pool_drain
+    [ -f "$LEGACY_DRAIN_FILE" ]
+}
+
+@test "enable_pool_drain reports failure instead of half-entering maintenance" {
+    # A regular file where the state directory has to go. `install -d` fails on
+    # that for every uid including root, so this models the real failure (a full
+    # root filesystem) rather than a permission bit root would ignore.
+    : > "$TEST_DIR/blocked"
+    DRAIN_FILE="$TEST_DIR/blocked/drain"
+    run drain_call enable_pool_drain
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"maintenance mode NOT entered"* ]]
+}
+
 @test "pool_is_draining honors a drain set at the pre-upgrade tmpfs path" {
     : > "$LEGACY_DRAIN_FILE"
     run drain_call pool_is_draining
@@ -156,12 +172,68 @@ reclone_triggered() {
     ! reclone_triggered
 }
 
-@test "hookscript fails closed when the install tree is unreadable" {
+@test "hookscript fails closed when common.sh is missing" {
     setup_hookscript
-    chmod 000 "$HOOK_ROOT/lib/common.sh"
+    rm -f "$HOOK_ROOT/lib/common.sh"
     run_hookscript 107 post-stop
-    chmod 644 "$HOOK_ROOT/lib/common.sh"
     [ "$HOOK_STATUS" -eq 0 ]
     ! reclone_triggered
-    grep -q "unreadable" "$TEST_DIR/logger-out"
+    grep -q "inconclusive" "$TEST_DIR/logger-out"
+}
+
+# The state a host is in partway through `curl … install.sh | bash`: tar has
+# written lib/common.sh but not yet a helper common.sh sources, so common.sh
+# exists and is readable but cannot be sourced. An exit-status check reads that
+# as "not draining" under bash 3.2 and reclones mid-maintenance.
+@test "hookscript fails closed when common.sh cannot be sourced during a drain" {
+    setup_hookscript
+    mkdir -p "$(dirname "$DRAIN_FILE")"
+    : > "$DRAIN_FILE"
+    printf 'source "$LIB_DIR/definitely-not-extracted-yet.sh"\n' \
+        >> "$HOOK_ROOT/lib/common.sh"
+    run_hookscript 108 post-stop
+    [ "$HOOK_STATUS" -eq 0 ]
+    ! reclone_triggered
+}
+
+@test "hookscript fails closed when common.sh is truncated mid-function" {
+    setup_hookscript
+    head -n 20 "$REPO_ROOT/lib/common.sh" > "$HOOK_ROOT/lib/common.sh"
+    run_hookscript 109 post-stop
+    [ "$HOOK_STATUS" -eq 0 ]
+    ! reclone_triggered
+    grep -q "inconclusive" "$TEST_DIR/logger-out"
+}
+
+# install.sh's migration block, lifted verbatim and pointed at the temp dir.
+# Extracting it keeps the assertion on the shipped text; install.sh itself
+# cannot run here because it starts by curling a release tarball.
+run_install_migration() {
+    awk '/^if \[\[ -e \/run\/lock\/github-runner-drain \]\]; then$/,/^fi$/' \
+        "$REPO_ROOT/install.sh" > "$TEST_DIR/migrate-body.sh"
+    # Explicit: this runs inside `run`, where a bare failing test would not
+    # abort the helper and the migration's removal would go unnoticed.
+    [ -s "$TEST_DIR/migrate-body.sh" ] || return 1
+    {
+        echo 'set -euo pipefail'
+        sed -e "s#/run/lock/github-runner-drain#$LEGACY_DRAIN_FILE#g" \
+            -e "s#/var/lib/github-runners#$(dirname "$DRAIN_FILE")#g" \
+            "$TEST_DIR/migrate-body.sh"
+    } > "$TEST_DIR/migrate.sh"
+    bash "$TEST_DIR/migrate.sh"
+}
+
+@test "install.sh migrates an active tmpfs drain to the persistent flag" {
+    : > "$LEGACY_DRAIN_FILE"
+    run run_install_migration
+    [ "$status" -eq 0 ]
+    [ -f "$DRAIN_FILE" ]
+    run drain_call pool_is_draining
+    [ "$status" -eq 0 ]
+}
+
+@test "install.sh migration is a no-op, and not an error, with no drain set" {
+    run run_install_migration
+    [ "$status" -eq 0 ]
+    [ ! -e "$DRAIN_FILE" ]
 }

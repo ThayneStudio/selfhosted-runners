@@ -16,6 +16,17 @@ ln -sf "$INSTALL_DIR/runner" /usr/local/bin/runner
 
 echo "Installed to $INSTALL_DIR"
 
+# Carry an active maintenance drain over to the persistent flag. Releases before
+# this one kept it on tmpfs, so upgrading mid-maintenance and then rebooting --
+# which is usually the whole reason the pool was stopped -- would wipe the flag
+# and let the watcher refill the pool on the next boot.
+if [[ -e /run/lock/github-runner-drain ]]; then
+    install -d -m 700 /var/lib/github-runners
+    : > /var/lib/github-runners/drain
+    echo "Migrated the active maintenance drain to /var/lib/github-runners/drain"
+    echo "The pool stays drained until you run 'runner start'."
+fi
+
 # If setup was already run, sync deployed files (hookscript, systemd units)
 if [[ -f /etc/github-runners.conf ]]; then
     echo "Updating deployed files..."

@@ -6,6 +6,15 @@ set -euo pipefail
 
 source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/common.sh"
 
+# A partially-loaded common.sh leaves pool_is_draining undefined, and every
+# drain gate below is an `if` condition — where errexit is suppressed, so a
+# missing command reads as "not draining" and this script would destroy and
+# reclone a VM mid-maintenance. Refuse to run instead.
+if ! declare -F pool_is_draining >/dev/null; then
+    logger -t github-runner "reclone: common.sh did not load, refusing to touch VM ${1:-unknown}"
+    exit 1
+fi
+
 VMID="${1:-}"
 [[ -n "$VMID" ]] || { log_error "reclone: missing VMID argument"; exit 1; }
 
