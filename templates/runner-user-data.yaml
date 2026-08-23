@@ -217,8 +217,58 @@ write_files:
       fi
       # EXIT trap handles shutdown
 
+bootcmd:
+  # Hard ceiling: power the VM off 6 hours after boot even if run.sh hangs.
+  #
+  # This lives in bootcmd, not runcmd, because runcmd is per-instance and the
+  # instance-id is pinned host-side at clone time — a guest reboot presents the
+  # same instance-id, so runcmd never re-runs and the ceiling would be lost for
+  # the rest of the VM's life. bootcmd runs on every boot.
+  #
+  # It is a systemd timer, not `shutdown -h +360`, because `shutdown` schedules
+  # through logind over D-Bus and bootcmd runs in cloud-init's init stage, where
+  # dbus/logind may not be up yet — that failure is silent and buys nothing.
+  # `systemctl` as root reaches PID 1 over /run/systemd/private, no bus needed.
+  #
+  # OnBootSec= is what re-arms after a reboot, because the enable symlink is on
+  # the VM's disk. Which path arms it on the second boot is NOT ordered:
+  # cloud-init.service sets DefaultDependencies=no and carries no ordering
+  # against timers.target, so either timers.target or this bootcmd may win.
+  # It does not matter — both paths are idempotent, verified by running the
+  # rendered bootcmd twice against a fake root and diffing the result.
+  - |
+    cat > /etc/systemd/system/github-runner-lifetime.service <<'CEILINGEOF'
+    [Unit]
+    Description=Power off the runner VM at its maximum lifetime
+
+    [Service]
+    Type=oneshot
+    # Leading "-": oneshot stops at the first ExecStart that fails and marks the
+    # unit failed, so a sick logger (journald socket gone, util-linux removed by
+    # a job) must not be allowed to swallow the poweroff below.
+    ExecStart=-/usr/bin/logger -t github-runner "Safety timeout: max VM lifetime reached"
+    # --no-block: the poweroff job stops this unit, so waiting on it deadlocks.
+    ExecStart=/usr/bin/systemctl --no-block poweroff
+    CEILINGEOF
+    cat > /etc/systemd/system/github-runner-lifetime.timer <<'CEILINGEOF'
+    [Unit]
+    Description=6-hour ceiling on runner VM lifetime
+
+    [Timer]
+    OnBootSec=6h
+
+    [Install]
+    WantedBy=timers.target
+    CEILINGEOF
+    systemctl daemon-reload
+    # enable is the durable half — if the symlink is not written the ceiling is
+    # gone for this VM's life, so let a failure there fail the module loudly.
+    systemctl enable github-runner-lifetime.timer || exit 1
+    # start is the this-boot half, and --no-block because a timer implicitly
+    # gains After=sysinit.target while cloud-init.service is not ordered after
+    # it: a blocking start can wait, and its rc would fail cc_bootcmd for
+    # nothing. timers.target arms the timer on any boot where this loses.
+    systemctl start --no-block github-runner-lifetime.timer || true
+
 runcmd:
-  # Hard ceiling: shut down after 6 hours even if run.sh hangs.
-  # Single-quoted so YAML doesn't parse the colon in "Safety timeout:" as a mapping.
-  - 'shutdown -h +360 "Safety timeout: max VM lifetime reached" &'
   - /opt/register-runner.sh 2>&1 | tee /var/log/runner-setup.log
