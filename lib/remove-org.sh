@@ -1,6 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
+# shellcheck source=common.sh
 source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/common.sh"
 
 require_root "remove-org"

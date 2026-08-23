@@ -6,6 +6,7 @@ set -euo pipefail
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
+# shellcheck disable=SC2034  # consumed by sourcing scripts (lib/list-orgs.sh)
 CYAN='\033[0;36m'
 NC='\033[0m'
 
@@ -14,12 +15,14 @@ log_warn() { printf '%b[WARN]%b %s\n' "$YELLOW" "$NC" "$1" >&2; }
 log_error() { printf '%b[ERROR]%b %s\n' "$RED" "$NC" "$1" >&2; }
 
 LIB_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+# shellcheck disable=SC2034  # consumed by sourcing scripts (lib/setup.sh)
 REPO_DIR="$(cd "$LIB_DIR/.." && pwd)"
 
 # Path constants
 CONFIG_FILE="/etc/github-runners.conf"
 ORG_CONFIG_DIR="/etc/github-runners.d"
 SNIPPETS_DIR="/var/lib/vz/snippets"
+# shellcheck disable=SC2034  # consumed by sourcing scripts (lib/setup.sh, lib/add-org.sh)
 INSTALL_DIR="/opt/selfhosted-runners"
 POOL_DRAIN_FILE="/run/lock/github-runner-drain"
 # Shared/exclusive lock coordinating maintenance mode with in-flight clones.
@@ -55,6 +58,7 @@ load_infra_config() {
         log_error "Run 'runner setup' first."
         exit 1
     fi
+    # shellcheck source=/dev/null  # host config, written by setup at runtime
     source "$CONFIG_FILE"
     for var in NETWORK_BRIDGE VM_STORAGE TEMPLATE_ID; do
         if [[ -z "${!var:-}" ]]; then
@@ -75,6 +79,7 @@ load_org_config() {
         log_error "Organization '$org_name' not configured. Run 'runner add-org'."
         exit 1
     fi
+    # shellcheck source=/dev/null  # per-org config, written by add-org at runtime
     source "$org_file"
     if [[ -z "${GITHUB_ORG:-}" || -z "${GITHUB_PAT:-}" ]]; then
         log_error "Invalid org config for '$org_name' — missing GITHUB_ORG or GITHUB_PAT"
@@ -295,7 +300,7 @@ list_template_linked_clone_volids() {
 
         while read -r volid _; do
             [[ "$volid" == "$prefix"* ]] || continue
-            child_name="${volid#$prefix}"
+            child_name="${volid#"$prefix"}"
             [[ "$child_name" =~ ^vm-[0-9]+-disk- ]] || continue
             [[ -n "${seen[$volid]:-}" ]] && continue
             seen["$volid"]=1
@@ -414,7 +419,9 @@ deregister_runner() {
     [[ -f "$org_file" ]] || return 0
 
     local pat="" github_org=""
+    # shellcheck source=/dev/null  # per-org config, written by add-org at runtime
     pat=$(source "$org_file" && echo "$GITHUB_PAT") || return 0
+    # shellcheck source=/dev/null  # per-org config, written by add-org at runtime
     github_org=$(source "$org_file" && echo "$GITHUB_ORG") || return 0
     [[ -n "$pat" && -n "$github_org" ]] || return 0
 
@@ -585,6 +592,7 @@ clone_runner() {
     mac=$(generate_mac "$name")
     net0=$(qm config "$vmid" 200>&- 201>&- 202>&- 203>&- 204>&- | grep '^net0:' | sed 's/^net0: //') || true
     if [[ -n "$net0" ]]; then
+        # shellcheck disable=SC2001  # pattern is a regex; ${//} only does literals
         net0=$(echo "$net0" | sed "s/virtio=[^,]*/virtio=$mac/")
         qm set "$vmid" --net0 "$net0" 200>&- 201>&- 202>&- 203>&- 204>&- || { _fail; exec 202>&-; return 1; }
     fi

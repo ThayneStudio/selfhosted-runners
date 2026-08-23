@@ -4,6 +4,7 @@ set -euo pipefail
 # Called by the hookscript AFTER it exits (runs detached from Proxmox task).
 # Usage: reclone.sh <vmid>
 
+# shellcheck source=common.sh
 source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/common.sh"
 
 VMID="${1:-}"

@@ -22,3 +22,6 @@ Thumbs.db
 # Claude Code local state (keep committed skills)
 .claude/*
 !.claude/skills
+
+# Vendored test runner (fetched by tests/run.sh)
+tests/.bats/

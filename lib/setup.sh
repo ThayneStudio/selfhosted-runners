@@ -1,6 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
+# shellcheck source=common.sh
 source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/common.sh"
 
 require_root "setup"
@@ -41,6 +42,7 @@ BRIDGES=$(ip -br link | grep -E '^vmbr' | awk '{print $1}' || true)
 if [[ -z "$BRIDGES" ]]; then
     log_warn "No bridges found (vmbr*). Using default vmbr0."
 else
+    # shellcheck disable=SC2001  # indents every line of a multi-line list
     echo "$BRIDGES" | sed 's/^/  /'
 fi
 read -rp "Network bridge [vmbr0]: " NETWORK_BRIDGE
@@ -454,6 +456,7 @@ else
         log_warn "Graceful shutdown failed, forcing..."
         qm stop "$TEMPLATE_ID" --skiplock 2>/dev/null || true
     }
+    # shellcheck disable=SC2034  # loop counter is unused; this is a bounded poll
     for i in {1..60}; do
         VM_STATUS=$(qm status "$TEMPLATE_ID" 2>/dev/null | awk '{print $2}') || true
         [[ "$VM_STATUS" == "stopped" ]] && break

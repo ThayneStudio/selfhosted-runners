@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# Fake Proxmox CLI. Every executable in this directory is a symlink to this
+# file; the symlink name is the command being faked (qm, pvesm, pvesh, zfs).
+# tests/test_helper.bash puts this directory first on PATH, so anything the
+# code under test shells out to lands here instead of on a real host.
+#
+# Behavior is driven entirely by state under $STUB_DIR, written by the
+# stub_out/stub_status helpers in tests/test_helper.bash:
+#
+#   $STUB_DIR/<cmd>/calls              one line per invocation ("$*")
+#   $STUB_DIR/<cmd>/rules/<seq>/pattern  glob matched against "$*"
+#   $STUB_DIR/<cmd>/rules/<seq>/out      stdout to emit (may be absent/empty)
+#   $STUB_DIR/<cmd>/rules/<seq>/rc       exit status (default 0)
+#
+# The newest matching rule wins, so a test can override a rule registered in
+# setup(). With no matching rule the stub is silent and succeeds — the same
+# shape as a real command that ran and printed nothing.
+set -uo pipefail
+
+cmd=${0##*/}
+
+if [[ -z ${STUB_DIR:-} ]]; then
+    printf 'stub %s: STUB_DIR is unset — load tests/test_helper.bash first\n' "$cmd" >&2
+    exit 99
+fi
+
+state="$STUB_DIR/$cmd"
+mkdir -p "$state/rules"
+printf '%s\n' "$*" >> "$state/calls"
+
+# Escape hatch for cases a canned response cannot express (state that changes
+# between calls, argument-dependent output). Define <cmd>_stub in the test and
+# `export -f` it; exported functions are inherited by this child shell.
+if [[ $(type -t "${cmd}_stub") == function ]]; then
+    "${cmd}_stub" "$@"
+    exit $?
+fi
+
+args="$*"
+rules=("$state"/rules/*/)
+for (( i = ${#rules[@]} - 1; i >= 0; i-- )); do
+    rule="${rules[i]}"
+    [[ -f "${rule}pattern" ]] || continue
+    pattern=$(cat "${rule}pattern")
+    # Unquoted on purpose: the pattern is a glob, and an exact string is a
+    # glob that matches only itself.
+    # shellcheck disable=SC2053
+    [[ $args == $pattern ]] || continue
+    [[ -f "${rule}out" ]] && cat "${rule}out"
+    if [[ -f "${rule}rc" ]]; then
+        exit "$(cat "${rule}rc")"
+    fi
+    exit 0
+done
+
+exit 0

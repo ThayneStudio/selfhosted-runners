@@ -4,6 +4,7 @@ set -euo pipefail
 # The hookscript handles steady-state re-cloning. This is a fallback
 # for initial pool fill and missed re-clones.
 
+# shellcheck source=common.sh
 source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/common.sh"
 
 require_root "watch"

@@ -2,9 +2,11 @@
 set -euo pipefail
 # List all runner VMs.
 
+# shellcheck source=common.sh
 source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/common.sh"
 
 TEMPLATE_ID=""
+# shellcheck source=/dev/null  # host config, written by setup at runtime
 [[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
 
 echo ""

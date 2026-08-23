@@ -1,0 +1,8 @@
+# Mirrors the flags tests/run.sh passes, so a bare `shellcheck lib/foo.sh` and
+# an editor integration agree with CI.
+#
+# Following `source .../common.sh` is what lets shellcheck catch a call to a
+# helper that does not exist. Each lib script carries a `# shellcheck
+# source=common.sh` directive; SCRIPTDIR resolves it next to the sourcing file.
+external-sources=true
+source-path=SCRIPTDIR

@@ -2,6 +2,7 @@
 set -euo pipefail
 # Resume the runner pool after maintenance.
 
+# shellcheck source=common.sh
 source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/common.sh"
 
 require_root "start"

@@ -51,6 +51,7 @@ if [[ -f /etc/github-runners.conf ]]; then
             org=$(basename "$org_conf" .conf)
             # Source org config to get PAT and org name
             GITHUB_PAT="" GITHUB_ORG=""
+            # shellcheck source=/dev/null  # per-org config, written by add-org at runtime
             source "$org_conf"
             [[ -n "$GITHUB_PAT" && -n "$GITHUB_ORG" ]] || continue
             # Re-render the snippet using the same awk substitution as add-org.sh
