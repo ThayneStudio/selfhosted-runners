@@ -61,9 +61,13 @@ log_info "[watch] Filling ${#MISSING[@]} missing slot(s) with up to ${WATCH_MAX_
 # Workers report clone failures here rather than notifying individually. The
 # timer fires every 30s and a template or PAT problem fails every slot at once,
 # so one notification per run is the difference between an alert and a flood.
-# /run is tmpfs; rm first in case a killed run left this PID's file behind.
+# /run is tmpfs; rm first in case a killed run left this PID's file behind, and
+# trap so an abnormal exit does not leave one for the next PID to inherit.
+# The trap is safe with the workers below: bash does not run an inherited EXIT
+# trap in an async ( ) & subshell.
 FAILED_SLOTS="/run/github-runner-watch-failures.$$"
 rm -f "$FAILED_SLOTS"
+trap 'rm -f "$FAILED_SLOTS"' EXIT
 
 # VMID allocation is serialized inside clone_runner via the global
 # $VMID_LOCK_FILE flock, so parallel subshells can safely pick their own.
@@ -98,8 +102,13 @@ wait || true
 
 if [[ -s "$FAILED_SLOTS" ]]; then
     mapfile -t FAILED < "$FAILED_SLOTS"
-    notify warn clone.failed \
-        "watcher could not fill ${#FAILED[@]} runner slot(s)" \
+    # Every attempted slot failing is a pool-wide condition — bad template,
+    # revoked PAT, storage full — and has to page even at
+    # NOTIFY_MIN_SEVERITY=error. A partial fill is a flaky clone that the next
+    # timer tick will retry on its own.
+    SEVERITY="warn"
+    [[ "${#FAILED[@]}" -lt "${#MISSING[@]}" ]] || SEVERITY="error"
+    notify "$SEVERITY" clone.failed \
+        "watcher could not fill ${#FAILED[@]} of ${#MISSING[@]} runner slot(s)" \
         "slots: ${FAILED[*]} (template $TEMPLATE_ID)"
 fi
-rm -f "$FAILED_SLOTS"

@@ -389,15 +389,23 @@ What this is designed to do, and not do:
 - **Delivery is bounded.** One attempt plus at most two retries, 10 seconds each
   with 3 seconds of backoff, so a black-holed webhook can hold an operation for
   about 33 seconds and no longer.
-- **Secrets never leave.** PATs and the webhook URL itself are stripped from
-  every payload and every log line, including credentials that arrive embedded
-  in someone else's error text (`ghp_...`, `github_pat_...`,
-  `https://user:token@github.com/...`).
+- **Secrets are scrubbed, within limits.** Every payload and every log line goes
+  through a redaction pass. It strips this platform's own secrets verbatim --
+  the org PATs from `/etc/github-runners.d/*.conf` and `NOTIFY_WEBHOOK_URL` --
+  plus known credential shapes that arrive embedded in someone else's error
+  text: `ghp_...`, `github_pat_...`, `https://user:token@host/...`,
+  `Authorization: Bearer|Basic ...`, `password ...`, `-u user:pass`,
+  `?access_token=...`, and Slack/Discord/Teams webhook URLs. This is a
+  chokepoint, not a proof -- a third-party credential in a shape none of those
+  rules match can still get through, so prefer a summary over raw command
+  output when you build a `detail` string.
 - **No history, no dedup, no email.** This is a push to one webhook.
 
 Currently emitted: `clone.failed`, when the watcher cannot fill runner slots
-(one notification per watcher run, not one per slot) and when a re-clone leaves
-a slot empty.
+and when a re-clone leaves a slot empty. The watcher sends one notification per
+run rather than one per slot, at `error` when every slot it attempted failed
+(a pool-wide problem: bad template, revoked PAT, full storage) and at `warn`
+when only some did.
 
 To try it without waiting for a real failure:
 
@@ -501,7 +509,7 @@ The runner VM might not have network connectivity. Check:
 ## Security Notes
 
 - **PAT storage**: PATs are stored per-org in `/etc/github-runners.d/<org>.conf` with mode 600 (root only readable). `/etc/github-runners.conf` holds infrastructure settings, and — if you configure notifications — `NOTIFY_WEBHOOK_URL`, which is itself a credential; it is written mode 600 for that reason.
-- **Secrets in notifications**: PATs and the webhook URL are stripped from every notification payload and log line, and the URL is handed to `curl` through a config file rather than argv so it never shows up in `ps`.
+- **Secrets in notifications**: notification payloads and log lines are scrubbed of the configured org PATs, the webhook URL, and known credential shapes (see [Notifications](#notifications) for what that does and does not cover), and the URL is handed to `curl` through a config file rather than argv so it never shows up in `ps`.
 - **Runner user**: VMs run as user `runner` with sudo access (required for Docker)
 - **Docker access**: The `runner` user is in the `docker` group
 - **Rotate PAT**: Edit config, re-run `runner setup`, recreate runners

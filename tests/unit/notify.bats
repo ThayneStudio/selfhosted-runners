@@ -49,9 +49,11 @@ STUB
         "$NOTIFY_TEST_DIR/bin/logger"
     PATH="$NOTIFY_TEST_DIR/bin:$PATH"
 
-    # Point the lazy config loader at a file that does not exist so the tests
-    # never read the host's real /etc/github-runners.conf.
+    # Point the lazy config loader and the org-PAT reader at paths that do not
+    # exist, so running this suite on a real Proxmox host never reads the
+    # host's own /etc/github-runners.conf or /etc/github-runners.d/*.conf.
     CONFIG_FILE="$NOTIFY_TEST_DIR/absent.conf"
+    ORG_CONFIG_DIR="$NOTIFY_TEST_DIR/absent.d"
 
     # shellcheck source=../../lib/notify.sh
     source "$NOTIFY_LIB"
@@ -264,6 +266,32 @@ CALLER
     [[ "$output" == *"caller survived"* ]]
 }
 
+@test "notify with no arguments at all does nothing and returns 0" {
+    NOTIFY_WEBHOOK_URL="https://example.invalid/hook"
+    run notify
+    [ "$status" -eq 0 ]
+    [ ! -f "$CURL_CALLS" ]
+    [[ "$output" == *"no event name or message"* ]]
+}
+
+@test "a caller under set -u survives notify with missing arguments" {
+    cat > "$NOTIFY_TEST_DIR/caller.sh" <<'CALLER'
+#!/usr/bin/env bash
+set -euo pipefail
+# shellcheck source=/dev/null
+source "$NOTIFY_LIB"
+notify
+notify error clone.failed "no detail argument"
+echo "caller survived"
+CALLER
+    chmod +x "$NOTIFY_TEST_DIR/caller.sh"
+
+    export NOTIFY_WEBHOOK_URL="https://example.invalid/hook"
+    run "$NOTIFY_TEST_DIR/caller.sh"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"caller survived"* ]]
+}
+
 @test "a missing jq does not fail a caller running under set -e" {
     cat > "$NOTIFY_TEST_DIR/caller.sh" <<'CALLER'
 #!/usr/bin/env bash
@@ -282,4 +310,211 @@ CALLER
     [ "$status" -eq 0 ]
     [[ "$output" == *"caller survived"* ]]
     [ ! -f "$CURL_CALLS" ]
+}
+
+# --- credential shapes that arrive inside somebody else's error text ----------
+
+@test "redact_secrets masks a base64 Basic credential" {
+    run redact_secrets "> Authorization: Basic eC1hY2Nlc3MtdG9rZW46Z2hwX0FiQ2RFZjAxMjM0NTY3ODk="
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"eC1hY2Nlc3Mt"* ]]
+    [[ "$output" == *"Basic [REDACTED]"* ]]
+}
+
+@test "redact_secrets matches auth keywords case-insensitively and with a colon" {
+    local legacy="da39a3ee5e6b4b0d3255bfef95601890afd80709"
+    run redact_secrets "Authorization: TOKEN $legacy / bearer $legacy / token:$legacy"
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"$legacy"* ]]
+}
+
+@test "redact_secrets masks netrc and curl -u credentials" {
+    local legacy="da39a3ee5e6b4b0d3255bfef95601890afd80709"
+    run redact_secrets "machine github.com login x password $legacy"
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"$legacy"* ]]
+
+    run redact_secrets "curl -u x-access-token:$legacy https://api.github.com"
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"$legacy"* ]]
+}
+
+@test "redact_secrets masks a token query parameter" {
+    local legacy="da39a3ee5e6b4b0d3255bfef95601890afd80709"
+    run redact_secrets "GET /orgs/acme/runners?access_token=$legacy returned 401"
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"$legacy"* ]]
+    [[ "$output" == *"returned 401"* ]]
+}
+
+@test "redact_secrets masks org PATs that were never in the caller's scope" {
+    # watch.sh notifies from its parent shell, which never sourced an org
+    # config, so the exact-value pass has to read the PATs itself.
+    mkdir -p "$NOTIFY_TEST_DIR/orgs"
+    printf 'GITHUB_ORG="acme"\nGITHUB_PAT="ghp_acme0123456789acme0123456789acme01"\n' \
+        > "$NOTIFY_TEST_DIR/orgs/acme.conf"
+    printf 'GITHUB_ORG="beta"\nGITHUB_PAT="not-token-shaped-beta-pat"\n' \
+        > "$NOTIFY_TEST_DIR/orgs/beta.conf"
+    ORG_CONFIG_DIR="$NOTIFY_TEST_DIR/orgs"
+    unset GITHUB_PAT CANARY_PAT
+
+    run redact_secrets "watcher failed: not-token-shaped-beta-pat was rejected"
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"not-token-shaped-beta-pat"* ]]
+    [[ "$output" == *"was rejected"* ]]
+}
+
+@test "redact_secrets withholds the field when sed fails instead of blanking it" {
+    printf '#!/usr/bin/env bash\nexit 1\n' > "$NOTIFY_TEST_DIR/bin/sed"
+    chmod +x "$NOTIFY_TEST_DIR/bin/sed"
+
+    run redact_secrets "expected 5fa5b05e got deadbeef"
+    [ "$status" -eq 0 ]
+    [ "$output" = "[REDACTION FAILED - content withheld]" ]
+
+    NOTIFY_WEBHOOK_URL="https://example.invalid/hook"
+    run notify error bake.failed "bake failed for generation 8" "raw guest output"
+    [ "$status" -eq 0 ]
+    [ "$(jq -r '.detail' "$CURL_BODY")" = "[REDACTION FAILED - content withheld]" ]
+}
+
+# --- misconfiguration fails open, and says so --------------------------------
+
+@test "an unrecognized NOTIFY_MIN_SEVERITY fails open and says so" {
+    NOTIFY_WEBHOOK_URL="https://example.invalid/hook"
+    NOTIFY_MIN_SEVERITY="debug"
+    run notify info generation.promoted "generation 8 promoted" ""
+    [ "$status" -eq 0 ]
+    [ "$(jq -r '.severity' "$CURL_BODY")" = "info" ]
+    [[ "$output" == *"unknown NOTIFY_MIN_SEVERITY"* ]]
+}
+
+@test "NOTIFY_MIN_SEVERITY tolerates stray whitespace and case" {
+    NOTIFY_WEBHOOK_URL="https://example.invalid/hook"
+    NOTIFY_MIN_SEVERITY=" ERROR "
+    run notify warn clone.failed "one flaky slot" ""
+    [ "$status" -eq 0 ]
+    [ ! -f "$CURL_CALLS" ]
+    [[ "$output" != *"unknown NOTIFY_MIN_SEVERITY"* ]]
+}
+
+@test "an unknown NOTIFY_FORMAT falls back to slack and says so" {
+    NOTIFY_WEBHOOK_URL="https://example.invalid/hook"
+    NOTIFY_FORMAT="xml"
+    run notify error clone.failed "re-clone failed" ""
+    [ "$status" -eq 0 ]
+    [ "$(jq -r '.event' "$CURL_BODY")" = "clone.failed" ]
+    [[ "$output" == *"unknown NOTIFY_FORMAT"* ]]
+}
+
+@test "a config with NOTIFY_ settings but no URL warns that alerting is off" {
+    printf 'NOTIFY_MIN_SEVERITY="error"\nNOTIFY_FORMAT="slack"\n' \
+        > "$NOTIFY_TEST_DIR/half.conf"
+    CONFIG_FILE="$NOTIFY_TEST_DIR/half.conf"
+    unset NOTIFY_WEBHOOK_URL
+    run notify error clone.failed "re-clone failed" ""
+    [ "$status" -eq 0 ]
+    [ ! -f "$CURL_CALLS" ]
+    [[ "$output" == *"no NOTIFY_WEBHOOK_URL"* ]]
+}
+
+@test "a config that never opted in stays completely silent" {
+    printf 'NETWORK_BRIDGE="vmbr0"\nTEMPLATE_ID="9000"\n' > "$NOTIFY_TEST_DIR/plain.conf"
+    CONFIG_FILE="$NOTIFY_TEST_DIR/plain.conf"
+    unset NOTIFY_WEBHOOK_URL
+    run notify error clone.failed "re-clone failed" ""
+    [ "$status" -eq 0 ]
+    [ "$output" = "" ]
+    [ ! -f "$CURL_CALLS" ]
+}
+
+# --- call sites ---------------------------------------------------------------
+
+@test "the watch.sh aggregation block sends one notification, scaled to the damage" {
+    # Runs the real block out of lib/watch.sh rather than a copy, so a reworded
+    # block fails here instead of quietly drifting out of test coverage.
+    local block
+    block=$(awk 'index($0, "if [[ -s \"$FAILED_SLOTS\" ]]; then") {f=1}
+                 f {print}
+                 f && $0 == "fi" {exit}' "$BATS_TEST_DIRNAME/../../lib/watch.sh")
+    [ -n "$block" ]
+
+    NOTIFY_WEBHOOK_URL="https://example.invalid/hook"
+    NOTIFY_MIN_SEVERITY="info"
+    TEMPLATE_ID=9000
+    FAILED_SLOTS="$NOTIFY_TEST_DIR/failed"
+    MISSING=("runner-1 acme" "runner-2 acme" "runner-3 acme")
+
+    # Two of three: one flaky clone, the next tick retries it.
+    printf 'runner-1\nrunner-2\n' > "$FAILED_SLOTS"
+    eval "$block"
+    [ "$(grep -c severity "$CURL_BODY")" -eq 1 ]
+    [ "$(jq -r '.severity' "$CURL_BODY")" = "warn" ]
+    [[ "$(jq -r '.text' "$CURL_BODY")" == *"2 of 3 runner slot(s)"* ]]
+    [[ "$(jq -r '.detail' "$CURL_BODY")" == "slots: runner-1 runner-2 (template 9000)" ]]
+
+    # All three: pool-wide, has to page through NOTIFY_MIN_SEVERITY=error.
+    : > "$CURL_BODY"
+    printf 'runner-1\nrunner-2\nrunner-3\n' > "$FAILED_SLOTS"
+    eval "$block"
+    [ "$(grep -c severity "$CURL_BODY")" -eq 1 ]
+    [ "$(jq -r '.severity' "$CURL_BODY")" = "error" ]
+}
+
+@test "common.sh degrades to silence when notify.sh is missing" {
+    # install.sh untars file by file, so common.sh exists before notify.sh does.
+    mkdir -p "$NOTIFY_TEST_DIR/lib"
+    cp "$BATS_TEST_DIRNAME/../../lib/common.sh" "$NOTIFY_TEST_DIR/lib/common.sh"
+
+    cat > "$NOTIFY_TEST_DIR/caller.sh" <<'CALLER'
+#!/usr/bin/env bash
+set -euo pipefail
+# shellcheck source=/dev/null
+source "$LIB_UNDER_TEST/common.sh"
+notify error clone.failed "re-clone failed" "org=acme"
+printf 'redaction: %s\n' "$(redact_secrets "ghp_AbCdEf0123456789AbCdEf0123456789AbCd")"
+echo "caller survived"
+CALLER
+    chmod +x "$NOTIFY_TEST_DIR/caller.sh"
+
+    export LIB_UNDER_TEST="$NOTIFY_TEST_DIR/lib"
+    run "$NOTIFY_TEST_DIR/caller.sh"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"caller survived"* ]]
+    [[ "$output" == *"redaction: [REDACTION UNAVAILABLE]"* ]]
+    [ ! -f "$CURL_CALLS" ]
+
+    # The hookscript's own form. A source that fails here short-circuits the
+    # && and reads as "not draining", which re-clones during maintenance.
+    run bash -c '. "$LIB_UNDER_TEST/common.sh" && declare -F pool_is_draining >/dev/null && echo "drain check reachable"'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"drain check reachable"* ]]
+}
+
+@test "common.sh degrades to silence when notify.sh is half-written" {
+    mkdir -p "$NOTIFY_TEST_DIR/lib"
+    cp "$BATS_TEST_DIRNAME/../../lib/common.sh" "$NOTIFY_TEST_DIR/lib/common.sh"
+    # Cut the file at an opening brace: an unterminated function, which is what
+    # a half-extracted tarball member looks like to `source`.
+    sed -n '1,/^redact_secrets() {$/p' "$NOTIFY_LIB" > "$NOTIFY_TEST_DIR/lib/notify.sh"
+
+    cat > "$NOTIFY_TEST_DIR/caller.sh" <<'CALLER'
+#!/usr/bin/env bash
+set -euo pipefail
+# shellcheck source=/dev/null
+source "$LIB_UNDER_TEST/common.sh" 2>/dev/null
+notify error clone.failed "re-clone failed" "org=acme"
+echo "caller survived"
+CALLER
+    chmod +x "$NOTIFY_TEST_DIR/caller.sh"
+
+    export LIB_UNDER_TEST="$NOTIFY_TEST_DIR/lib"
+    run "$NOTIFY_TEST_DIR/caller.sh"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"caller survived"* ]]
+    [ ! -f "$CURL_CALLS" ]
+
+    run bash -c '. "$LIB_UNDER_TEST/common.sh" 2>/dev/null && declare -F pool_is_draining >/dev/null && echo "drain check reachable"'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"drain check reachable"* ]]
 }

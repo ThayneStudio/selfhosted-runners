@@ -31,37 +31,87 @@
 # Sourced by common.sh. Deliberately does not set shell options: it inherits
 # the caller's, and notify() is written to survive `set -e`.
 
+# The exact values this platform holds. GITHUB_PAT and CANARY_PAT are only ever
+# in a caller's scope by accident — watch.sh notifies from its parent shell,
+# where only the ( ) workers ever ran load_org_config — so relying on scope
+# would leave that call site with shape matching alone. Read every org PAT once,
+# directly, so the exact-value pass is live wherever notify is called from.
+_notify_load_org_secrets() {
+    [[ -z "${_NOTIFY_ORG_PATS+set}" ]] || return 0
+    _NOTIFY_ORG_PATS=""
+
+    local org_file pat
+    for org_file in "${ORG_CONFIG_DIR:-/etc/github-runners.d}"/*.conf; do
+        [[ -r "$org_file" ]] || continue
+        pat=$(
+            # shellcheck source=/dev/null
+            source "$org_file" >/dev/null 2>&1 || true
+            printf '%s' "${GITHUB_PAT:-}"
+        ) || pat=""
+        [[ -n "$pat" ]] || continue
+        _NOTIFY_ORG_PATS+="${pat}"$'\n'
+    done
+    return 0
+}
+
 # Strip anything credential-shaped out of text that is about to leave the host
 # or land in a log. Two layers: the exact values of the secrets this platform
 # holds, then the shapes a credential takes when it arrives embedded in
-# somebody else's error message — a GitHub API body, a git remote, a curl error.
+# somebody else's error message — a GitHub API body, a git remote, a curl -v
+# trace, a .netrc line.
 #
-# Bare 40-hex strings are deliberately left alone. Legacy GitHub tokens had
-# that shape, but so do git SHAs and sha1 checksums, which is most of what a
-# bake or drift detail is made of. A legacy-shaped PAT this platform actually
-# holds is still caught by the exact-value pass.
+# The shape rules are deliberately greedy about what follows an auth keyword:
+# they will flatten prose like "token authentication" into "token [REDACTED]".
+# A mangled word is a cheaper failure than a leaked credential.
+#
+# Bare 40-hex strings are still left alone. Legacy GitHub tokens had that
+# shape, but so do git SHAs and sha1 checksums, which is most of what a bake or
+# drift detail is made of; a legacy-shaped PAT this platform holds is caught by
+# the exact-value pass instead. A credential this platform does *not* hold, in
+# a shape none of the rules below match, can still get through — this is a
+# chokepoint, not a proof.
 redact_secrets() {
     local text="${1-}" secret
 
+    _notify_load_org_secrets
     for secret in "${GITHUB_PAT:-}" "${CANARY_PAT:-}" "${NOTIFY_WEBHOOK_URL:-}"; do
         [[ -n "$secret" ]] || continue
         text="${text//"$secret"/[REDACTED]}"
     done
+    while IFS= read -r secret; do
+        [[ -n "$secret" ]] || continue
+        text="${text//"$secret"/[REDACTED]}"
+    done <<< "${_NOTIFY_ORG_PATS:-}"
 
     [[ -n "$text" ]] || return 0
 
-    printf '%s' "$text" | sed -E \
+    # sed exits non-zero on a locale-illegal byte sequence, and is not there at
+    # all in a broken environment. Either way the text is unscrubbed, so it is
+    # withheld — but say so, rather than silently delivering an empty field.
+    local scrubbed
+    scrubbed=$(printf '%s' "$text" | sed -E \
         -e 's/gh[pousr]_[A-Za-z0-9]{16,}/[REDACTED]/g' \
         -e 's/github_pat_[A-Za-z0-9_]{16,}/[REDACTED]/g' \
-        -e 's#https?://hooks\.slack\.com/[^[:space:]"]*#[REDACTED]#g' \
+        -e 's#https?://(hooks\.slack\.com|discord(app)?\.com/api/webhooks|[^/[:space:]"]*webhook\.office\.com)/[^[:space:]"]*#[REDACTED]#g' \
         -e 's#(://)[^/[:space:]@]+:[^/[:space:]@]+@#\1[REDACTED]@#g' \
-        -e 's/(^|[[:space:]])((token|Bearer)[[:space:]]+)[A-Za-z0-9._~+=-]{12,}/\1\2[REDACTED]/g'
+        -e 's#(^|[[:space:]])(token|bearer|basic)([[:space:]:=]+)[A-Za-z0-9._~+/=-]{16,}#\1\2\3[REDACTED]#gI' \
+        -e 's#(password[[:space:]:=]+)[^[:space:]]{6,}#\1[REDACTED]#gI' \
+        -e 's#(^|[[:space:]])(-u|--user)([[:space:]=]+)[^[:space:]]+#\1\2\3[REDACTED]#g' \
+        -e 's#([?&](access_token|token|api_key|apikey)=)[^&[:space:]"]*#\1[REDACTED]#gI' \
+        2>/dev/null) || {
+        printf '%s' "[REDACTION FAILED - content withheld]"
+        return 0
+    }
+    printf '%s' "$scrubbed"
 }
 
 # Severity as a comparable number. -1 means "not a severity we recognize".
+# Whitespace and case are forgiven: a config key with a stray space is a
+# misconfiguration, not a reason to change what gets delivered.
 _notify_rank() {
-    local level
-    level=$(printf '%s' "${1-}" | tr '[:upper:]' '[:lower:]')
+    local level="${1-}"
+    level="${level//[[:space:]]/}"
+    level=$(printf '%s' "$level" | tr '[:upper:]' '[:lower:]')
     case "$level" in
         info)  printf '0' ;;
         warn)  printf '1' ;;
@@ -113,6 +163,14 @@ _notify_load_config() {
     NOTIFY_WEBHOOK_URL="$url"
     [[ -n "${NOTIFY_MIN_SEVERITY+set}" ]] || NOTIFY_MIN_SEVERITY="$min"
     [[ -n "${NOTIFY_FORMAT+set}" ]] || NOTIFY_FORMAT="$fmt"
+
+    # A host that never opted in stays silent. A config carrying the other
+    # NOTIFY_* keys with no URL is half-configured, and worth one line: the
+    # setup wizard rewrites this file from its own prompts and drops keys it
+    # never asked about, which silently turns alerting off.
+    if [[ -z "$url" && ( -n "$min" || -n "$fmt" ) ]]; then
+        _notify_log "notify: $conf has NOTIFY_* settings but no NOTIFY_WEBHOOK_URL — notifications are off"
+    fi
     return 0
 }
 
@@ -151,6 +209,11 @@ _notify_body() {
 # curl config syntax quotes the value; backslash and double quote are the only
 # characters inside it that need escaping.
 _notify_curl_config() {
+    # This only ever runs in the <( ) subshell below, which inherits the
+    # caller's lock fds. Drop them so this child cannot extend a flock hold,
+    # the same discipline common.sh applies to its qm calls.
+    exec 200>&- 201>&- 202>&- 203>&- 204>&-
+
     local url="${NOTIFY_WEBHOOK_URL:-}"
     url="${url//\\/\\\\}"
     url="${url//\"/\\\"}"
@@ -160,7 +223,8 @@ _notify_curl_config() {
 # The webhook URL is itself a secret, so it reaches curl through a config file
 # on a process-substitution fd rather than argv — the same discipline
 # deregister_runner uses for a PAT. The body goes in on stdin for the same
-# reason.
+# reason, as a here-string rather than a pipe so that a curl exiting without
+# draining stdin cannot turn into a SIGPIPE and a bogus retry.
 #
 # Worst case is one attempt plus two retries at 10s each plus 3s of backoff, so
 # a black-holed webhook can hold the caller for ~33s and no longer.
@@ -170,11 +234,13 @@ _notify_post() {
 
     local attempt delay=1
     for attempt in 1 2 3; do
-        if printf '%s' "$body" | curl -sS -f -X POST \
+        if curl -sS -f -X POST \
             --max-time 10 \
             -H "Content-Type: $content_type" \
             --config <(_notify_curl_config) \
-            --data-binary @- >/dev/null 2>&1
+            --data-binary @- \
+            >/dev/null 2>&1 \
+            200>&- 201>&- 202>&- 203>&- 204>&- <<< "$body"
         then
             return 0
         fi
@@ -198,17 +264,21 @@ _notify_dispatch() {
         return 0
     fi
 
+    # Neither an unrecognized severity nor an unrecognized minimum may swallow
+    # an alert, so both fail open — loudly, because both mean someone's config
+    # or call site is wrong.
     local rank min_rank
     rank=$(_notify_rank "$severity")
     if [[ "$rank" -lt 0 ]]; then
-        # A typo in a severity must not be able to silence an alert, so an
-        # unrecognized one is treated as the loudest.
         _notify_log "notify: unknown severity '$severity' for '$event', treating as error"
         severity="error"
         rank=2
     fi
     min_rank=$(_notify_rank "${NOTIFY_MIN_SEVERITY:-warn}")
-    [[ "$min_rank" -ge 0 ]] || min_rank=1
+    if [[ "$min_rank" -lt 0 ]]; then
+        _notify_log "notify: unknown NOTIFY_MIN_SEVERITY '${NOTIFY_MIN_SEVERITY:-}', sending everything"
+        min_rank=0
+    fi
     [[ "$rank" -ge "$min_rank" ]] || return 0
 
     local host body

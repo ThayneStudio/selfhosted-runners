@@ -109,6 +109,10 @@ if clone_runner "$NAME" "$ORG" >/dev/null; then
     log_info "reclone: re-cloned $NAME for org $ORG"
 else
     log_error "reclone: failed to re-clone $NAME for org $ORG"
+    # Drop the per-slot lock before notifying. The work is over either way, and
+    # a black-holed webhook would otherwise hold it for another ~33s, costing
+    # the watcher a refill cycle on a slot that is already empty.
+    exec 200>&-
     notify error clone.failed \
         "re-clone of runner $NAME failed, slot left empty for the watcher" \
         "org=$ORG, previous vmid=$VMID"
