@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-INSTALL_DIR="/opt/selfhosted-runners"
+INSTALL_DIR="${INSTALL_DIR:-/opt/selfhosted-runners}"
 # Which ref to install. Overridable so a branch can be deployed to a staging
 # host before it reaches master -- the integration pass on pve-test has no other
 # way to get the code onto a host, since this script IS the deploy mechanism:

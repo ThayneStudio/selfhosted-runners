@@ -47,3 +47,20 @@ HOST_PATH_RE='"(/run/|/var/lib/|/etc/pve/|/etc/github-runners)'
         return 1
     fi
 }
+
+@test "sourcing common.sh does not clobber a caller's INSTALL_DIR" {
+    # install.sh sets INSTALL_DIR before sourcing us -- it extracts the tarball
+    # we come out of -- and reads it back afterwards. An unconditional
+    # assignment in common.sh would relocate the installer mid-run.
+    run env INSTALL_DIR=/opt/elsewhere bash -c \
+        'source "$1/lib/common.sh"; printf "%s" "$INSTALL_DIR"' _ "$REPO_ROOT"
+    [ "$status" -eq 0 ]
+    [ "$output" = "/opt/elsewhere" ]
+}
+
+@test "common.sh still defaults INSTALL_DIR when the caller sets nothing" {
+    run env -u INSTALL_DIR bash -c \
+        'source "$1/lib/common.sh"; printf "%s" "$INSTALL_DIR"' _ "$REPO_ROOT"
+    [ "$status" -eq 0 ]
+    [ "$output" = "/opt/selfhosted-runners" ]
+}

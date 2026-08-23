@@ -38,8 +38,13 @@ ORG_CONFIG_DIR="/etc/github-runners.d"
 # Where Proxmox keeps per-VM configs; the node name is a wildcard.
 PVE_NODES_DIR="/etc/pve/nodes"
 SNIPPETS_DIR="/var/lib/vz/snippets"
+# Honours a value already set by the caller. install.sh sets this BEFORE it
+# sources us -- it has to, since it uses it to extract the tarball we come out
+# of -- and everything it does afterwards reads it back. An unconditional
+# assignment here would silently relocate the installer mid-run the moment
+# anyone made its INSTALL_DIR overridable.
 # shellcheck disable=SC2034  # consumed by sourcing scripts (lib/setup.sh, lib/add-org.sh)
-INSTALL_DIR="/opt/selfhosted-runners"
+INSTALL_DIR="${INSTALL_DIR:-/opt/selfhosted-runners}"
 # Persistent platform state, as opposed to the /run/lock files below, which are
 # tmpfs and clear on reboot. This is the ONLY place the directory is spelled:
 # everything persistent derives from it, so relocating the platform's state is a
