@@ -266,41 +266,112 @@ else
     mkdir -p "$IMG_CACHE_DIR"
     chmod 700 "$IMG_CACHE_DIR"
 
-    if [[ ! -f "$IMG_CACHE_DIR/$CLOUD_IMG" ]]; then
-        log_info "Downloading Ubuntu 24.04 cloud image..."
-        if ! wget -q --show-progress -O "$IMG_CACHE_DIR/$CLOUD_IMG" "$CLOUD_IMG_URL"; then
-            log_error "Failed to download cloud image"
-            rm -f "$IMG_CACHE_DIR/$CLOUD_IMG"
-            exit 1
-        fi
-    else
-        log_info "Using cached cloud image from $IMG_CACHE_DIR/$CLOUD_IMG"
-    fi
-
-    # Verify image is valid (basic check)
-    if [[ ! -s "$IMG_CACHE_DIR/$CLOUD_IMG" ]]; then
-        log_error "Cloud image is empty or missing"
-        rm -f "$IMG_CACHE_DIR/$CLOUD_IMG"
-        exit 1
-    fi
-
-    # Verify SHA256 checksum
-    log_info "Verifying cloud image checksum..."
+    CLOUD_IMG_PATH="$IMG_CACHE_DIR/$CLOUD_IMG"
     CHECKSUM_URL="https://cloud-images.ubuntu.com/noble/current/SHA256SUMS"
-    EXPECTED_SHA256=$(wget -q -O - "$CHECKSUM_URL" | grep -F "$CLOUD_IMG" | head -1 | awk '{print $1}')
-    if [[ -n "$EXPECTED_SHA256" ]]; then
-        ACTUAL_SHA256=$(sha256sum "$IMG_CACHE_DIR/$CLOUD_IMG" | awk '{print $1}')
-        if [[ "$ACTUAL_SHA256" != "$EXPECTED_SHA256" ]]; then
-            log_error "Checksum verification failed!"
-            log_error "Expected: $EXPECTED_SHA256"
-            log_error "Got:      $ACTUAL_SHA256"
-            rm -f "$IMG_CACHE_DIR/$CLOUD_IMG"
+    # A real noble cloud image is ~600 MB. Anything far below that is a captive
+    # portal, proxy error page or truncated transfer; hashing it would report a
+    # checksum failure that reads like tampering instead of a broken download.
+    MIN_CLOUD_IMG_BYTES=$((100 * 1024 * 1024))
+
+    # $1 is the attempt number. The retry adds revalidation headers because a
+    # repeat mismatch has been an intermediate proxy or mirror handing back its
+    # own cached copy of noble/current, not a bad transfer — pve-test kept
+    # receiving the 20260615 build while SHA256SUMS had already moved on.
+    download_cloud_img() {
+        local -a wget_args=(-q --show-progress)
+        if (( $1 > 1 )); then
+            wget_args+=(--no-cache)
+            log_info "Downloading Ubuntu 24.04 cloud image (bypassing HTTP caches)..."
+        else
+            log_info "Downloading Ubuntu 24.04 cloud image..."
+        fi
+        if ! wget "${wget_args[@]}" -O "$CLOUD_IMG_PATH" "$CLOUD_IMG_URL"; then
+            log_error "Failed to download cloud image"
+            return 1
+        fi
+    }
+
+    # Confirms the file is actually a disk image before it is hashed, so a
+    # non-image response reports itself rather than masquerading as corruption.
+    # The qcow2 magic is read directly instead of shelling out to qemu-img so
+    # the check holds anywhere, including hosts without qemu-utils.
+    check_cloud_img_is_image() {
+        local size magic head_bytes
+        size=$(wc -c < "$CLOUD_IMG_PATH")
+        size=${size//[[:space:]]/}
+        if (( size < MIN_CLOUD_IMG_BYTES )); then
+            log_error "Cloud image is only ${size:-0} bytes, expected at least $MIN_CLOUD_IMG_BYTES"
+            log_error "The download did not return an image — check for a proxy, captive portal or 404 page"
+            head_bytes=$(head -c 200 "$CLOUD_IMG_PATH" | tr -cd '[:print:]' | tr -s ' ')
+            [[ -n "$head_bytes" ]] && log_error "Response began: $head_bytes"
+            return 1
+        fi
+        magic=$(od -An -N4 -tx1 "$CLOUD_IMG_PATH" | tr -cd '[:xdigit:]')
+        if [[ "$magic" != "514649fb" ]]; then
+            log_error "Cloud image is $size bytes but is not a qcow2 image"
+            log_error "Leading bytes: ${magic:-none} (expected 514649fb)"
+            return 1
+        fi
+        return 0
+    }
+
+    # Ubuntu rotates noble/current every 2-4 weeks, so a cached image that no
+    # longer matches SHA256SUMS is far more often stale than tampered with.
+    # Discard it and re-download once before treating the mismatch as fatal.
+    # SHA256SUMS is re-fetched each attempt so a rotation that lands mid-run
+    # recovers too, rather than pairing a new image against the old sums.
+    for attempt in 1 2; do
+        if [[ -f "$CLOUD_IMG_PATH" ]]; then
+            log_info "Using cached cloud image from $CLOUD_IMG_PATH"
+        elif ! download_cloud_img "$attempt"; then
+            rm -f "$CLOUD_IMG_PATH"
             exit 1
         fi
-        log_info "Checksum verified"
-    else
-        log_warn "Could not fetch checksum from Ubuntu — skipping verification"
-    fi
+
+        if ! check_cloud_img_is_image; then
+            rm -f "$CLOUD_IMG_PATH"
+            if (( attempt == 1 )); then
+                log_warn "Discarding it and downloading again (attempt 2 of 2)..."
+                continue
+            fi
+            log_error "A freshly downloaded file was still not a valid image — aborting"
+            exit 1
+        fi
+
+        # Verify SHA256 checksum
+        log_info "Verifying cloud image checksum..."
+        EXPECTED_SHA256=$(wget -q -O - "$CHECKSUM_URL" | grep -F "$CLOUD_IMG" | head -1 | awk '{print $1}')
+        if [[ -z "$EXPECTED_SHA256" ]]; then
+            log_warn "Could not fetch checksum from Ubuntu — skipping verification"
+            break
+        fi
+
+        ACTUAL_SHA256=$(sha256sum "$CLOUD_IMG_PATH" | awk '{print $1}')
+        if [[ "$ACTUAL_SHA256" == "$EXPECTED_SHA256" ]]; then
+            log_info "Checksum verified"
+            (( attempt == 1 )) || log_warn "Bake recovered after re-downloading a stale cloud image"
+            break
+        fi
+
+        rm -f "$CLOUD_IMG_PATH"
+        if (( attempt == 1 )); then
+            log_warn "Cloud image does not match upstream SHA256SUMS"
+            log_warn "Expected: $EXPECTED_SHA256"
+            log_warn "Got:      $ACTUAL_SHA256"
+            log_warn "Upstream rotates noble/current every few weeks, so the cached image is most likely stale."
+            log_warn "Re-downloading and re-verifying (attempt 2 of 2)..."
+            continue
+        fi
+
+        log_error "Checksum verification failed on a freshly downloaded image!"
+        log_error "Expected: $EXPECTED_SHA256"
+        log_error "Got:      $ACTUAL_SHA256"
+        log_error "A cache-bypassing re-download still disagreed, so this is not a stale local cache."
+        log_error "Check http_proxy/wgetrc and DNS for cloud-images.ubuntu.com — an upstream proxy or"
+        log_error "mirror may be pinned to an older noble build. Compare the hash above against"
+        log_error "https://cloud-images.ubuntu.com/noble/<date>/SHA256SUMS to identify which build it is."
+        exit 1
+    done
 
     log_info "Creating VM template..."
     NET_CONFIG="virtio,bridge=$NETWORK_BRIDGE"
