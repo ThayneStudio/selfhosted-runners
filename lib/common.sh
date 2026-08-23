@@ -21,7 +21,13 @@ CONFIG_FILE="/etc/github-runners.conf"
 ORG_CONFIG_DIR="/etc/github-runners.d"
 SNIPPETS_DIR="/var/lib/vz/snippets"
 INSTALL_DIR="/opt/selfhosted-runners"
-POOL_DRAIN_FILE="/run/lock/github-runner-drain"
+# Maintenance flag. Lives under /var/lib so it survives a host reboot: the
+# watcher timer stays enabled across a reboot, so a tmpfs flag meant rebooting
+# between `runner stop` and `runner start` silently resumed runner creation.
+POOL_DRAIN_FILE="/var/lib/github-runners/drain"
+# Pre-upgrade tmpfs location, still honored so upgrading during a maintenance
+# window does not drop an active drain. disable_pool_drain clears both.
+POOL_DRAIN_FILE_LEGACY="/run/lock/github-runner-drain"
 # Shared/exclusive lock coordinating maintenance mode with in-flight clones.
 # clone_runner holds a shared lock for its full lifecycle; runner stop takes an
 # exclusive lock so it can wait until all clone activity is quiesced.
@@ -83,7 +89,7 @@ load_org_config() {
 }
 
 pool_is_draining() {
-    [[ -e "$POOL_DRAIN_FILE" ]]
+    [[ -e "$POOL_DRAIN_FILE" || -e "$POOL_DRAIN_FILE_LEGACY" ]]
 }
 
 enable_pool_drain() {
@@ -92,7 +98,9 @@ enable_pool_drain() {
 }
 
 disable_pool_drain() {
-    rm -f "$POOL_DRAIN_FILE"
+    # The legacy flag must go too — a drain set before the upgrade would
+    # otherwise survive `runner start` with nothing left to clear it.
+    rm -f "$POOL_DRAIN_FILE" "$POOL_DRAIN_FILE_LEGACY"
 }
 
 list_orgs() {

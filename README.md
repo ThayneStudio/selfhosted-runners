@@ -331,10 +331,12 @@ can still see the evidence on any long-lived clone: versioned `bin.<version>` an
 only by the self-update path, never by a fresh install.
 
 `runner stop` leaves the pool in maintenance mode until you run `runner start`.
-The maintenance flag lives in `/run/lock/`, which is tmpfs -- it does **not**
-survive a host reboot, and the watcher timer is still enabled, so rebooting
-mid-maintenance silently resumes runner creation. Do not reboot the Proxmox host
-between `runner stop` and `runner start`.
+The maintenance flag is `/var/lib/github-runners/drain`, which survives a host
+reboot, so rebooting between `runner stop` and `runner start` is safe -- the
+watcher, the shutdown hookscript, and `runner create` all keep refusing to clone
+until you resume. A drain set by an older version still lives on tmpfs at
+`/run/lock/github-runner-drain`; that path is still honored, and `runner start`
+clears both.
 On full stops, it also frees orphaned linked-clone child volumes for the current
 template when those volumes no longer have a VM config anywhere in the cluster.
 If any child volumes still belong to live VM/template configs, `runner stop`

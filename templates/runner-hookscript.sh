@@ -6,10 +6,20 @@
 
 VMID="$1"
 PHASE="$2"
-POOL_DRAIN_FILE="/run/lock/github-runner-drain"
+COMMON_LIB="/opt/selfhosted-runners/lib/common.sh"
 
 if [[ "$PHASE" == "post-stop" ]]; then
-    if [[ -e "$POOL_DRAIN_FILE" ]]; then
+    # Proxmox runs this script standalone, so the drain check has to reach into
+    # the install tree for pool_is_draining(). Hardcoding the flag path here is
+    # what let this script drift from lib/common.sh when the flag moved off
+    # tmpfs. The subshell keeps common.sh's `set -euo pipefail` out of here.
+    if [[ ! -r "$COMMON_LIB" ]]; then
+        # reclone.sh sources the same file, so it could not run either.
+        logger -t github-runner "VM $VMID stopped but $COMMON_LIB is unreadable, skipping reclone"
+        exit 0
+    fi
+    # shellcheck source=/dev/null
+    if ( . "$COMMON_LIB" >/dev/null 2>&1 && pool_is_draining ); then
         logger -t github-runner "VM $VMID stopped during pool drain, skipping reclone"
         exit 0
     fi
