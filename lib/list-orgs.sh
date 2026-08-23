@@ -1,6 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
+# shellcheck source=common.sh
 source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/common.sh"
 
 require_root "list-orgs"
@@ -27,6 +28,7 @@ fi
 # Load template ID to filter it out
 TEMPLATE_ID=""
 if [[ -f "$CONFIG_FILE" ]]; then
+    # shellcheck source=/dev/null  # host config, written by setup at runtime
     source "$CONFIG_FILE"
 fi
 

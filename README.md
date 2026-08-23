@@ -461,6 +461,106 @@ The runner VM might not have network connectivity. Check:
 
 Plus ~30GB for the template VM.
 
+## Development
+
+Everything here runs on a laptop. No Proxmox host is involved: `qm`, `pvesm`,
+`pvesh`, `zfs`, `curl`, `jq` and `logger` are fake executables placed ahead of
+the real ones on `PATH`. Needs bash 4+ (`brew install bash` on macOS).
+
+```bash
+./tests/run.sh          # everything CI runs: shellcheck, yamllint, bats
+./tests/run.sh lint     # shellcheck + yamllint only
+./tests/run.sh unit     # bats only
+```
+
+`tests/run.sh` fetches `bats-core` into `tests/.bats/` (gitignored) the first
+time it runs, unless a recent enough `bats` is already installed. With bats on
+your `PATH`, `bats tests/unit` works directly. `shellcheck` and `yamllint` are
+skipped with a notice if you do not have them; in CI a missing linter is a
+failure. The same gates run on every pull request
+(`.github/workflows/ci.yml`).
+
+### Writing a test
+
+Test files are `tests/unit/*.bats`. Read `tests/unit/harness_smoke.bats`
+first — it is the worked example for the whole stub API.
+
+```bash
+load test_helper
+
+setup() {
+    load_lib                      # sources lib/common.sh
+}
+
+@test "get_vm_org reads the org out of cicustom" {
+    stub_out qm 'config 501' <<'EOF'
+cicustom: user=local:snippets/runner-user-data-acme.yaml
+EOF
+
+    run get_vm_org 501
+    [ "$output" = "acme" ]
+    assert_called qm 'config 501'
+}
+```
+
+`load test_helper` (`tests/test_helper.bash`) is what makes a test file safe to
+run anywhere:
+
+- `tests/stubs/bin` goes first on `PATH`, so the Proxmox CLI, `curl`, `jq` and
+  `logger` are fakes that record every call.
+- `tests/compat/bin` goes last, filling in GNU tools missing on macOS. Real
+  coreutils always win.
+- `load_lib` sources `lib/common.sh`, repoints its host path constants into a
+  per-test temp directory, and only then sources the file you asked for.
+
+| Helper | Purpose |
+|---|---|
+| `stub_out <cmd> <pattern> [rc]` | stdout (from stdin) for calls whose arguments glob-match `<pattern>` |
+| `stub_status <cmd> <pattern> <rc>` | same, no output — "this call fails" |
+| `stub_lenient` / `stub_strict` | opt out of / back into strict stubbing |
+| `stub_calls <cmd>` | every invocation, one argument list per line |
+| `call_count <cmd> [pattern]` | how many times it was called |
+| `assert_called` / `refute_called` | assert on the call log |
+| `write_infra_config` | write `$CONFIG_FILE` and set `VM_STORAGE`/`TEMPLATE_ID`/… |
+| `write_org_config <org>` | drop an org config into the sandbox |
+
+The newest matching rule wins, so a test can override something registered in
+`setup()`. For behavior a canned response cannot express — output that changes
+between calls — define a `<cmd>_stub` function and `export -f` it; the fake
+command calls it instead.
+
+**Strict by default.** A call no rule matches fails with exit 97 and prints the
+call log. Real `qm` and `pvesm` exit non-zero on a bad subcommand or a missing
+volume, so a stub that returned 0 for everything would make every error path
+unreachable and let a test pass while asserting nothing. `stub_lenient` turns
+that off where the calls genuinely do not matter — except for `qm destroy`,
+`qm stop`, `pvesm free` and `zfs destroy`, which always need an explicit rule.
+
+**What isolation covers.** `load_lib` rewrites the host path constants in
+`lib/common.sh` — `CONFIG_FILE`, `ORG_CONFIG_DIR`, `SNIPPETS_DIR`,
+`PVE_NODES_DIR` and the `/run/lock` paths — plus any later constant whose value
+points at `/etc`, `/run`, `/var/lib`, `/var/log` or `/var/spool`, including one
+derived from another at source time. Demonstrated by the three isolation tests
+in `tests/unit/harness_smoke.bats`. It covers **shell constants only**: a host
+path written as a literal inside a function body is invisible to it and would
+be used for real, so keep host paths in the constants block at the top of
+`lib/common.sh`. Renaming one of them fails the suite rather than silently
+un-sandboxing it.
+
+Faking another command is one symlink:
+
+```bash
+ln -s _stub tests/stubs/bin/systemctl
+```
+
+Do not fake `flock`. `reserve_vmid` and the clone-slot allocator are contention
+loops; a `flock` that always succeeds would validate them against semantics
+that cannot occur on a real host. Every lock path is inside the sandbox
+already, so real `flock` calls are harmless.
+
+Unit tests cover pure shell logic only. Anything that just shells out to `qm`
+with no logic of its own is validated on the test host, not here.
+
 ## License
 
 MIT License - see [LICENSE](LICENSE) file.

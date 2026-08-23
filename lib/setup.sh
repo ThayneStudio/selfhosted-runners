@@ -1,6 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
+# shellcheck source=common.sh
 source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/common.sh"
 
 require_root "setup"
@@ -41,6 +42,7 @@ BRIDGES=$(ip -br link | grep -E '^vmbr' | awk '{print $1}' || true)
 if [[ -z "$BRIDGES" ]]; then
     log_warn "No bridges found (vmbr*). Using default vmbr0."
 else
+    # shellcheck disable=SC2001  # indents every line of a multi-line list
     echo "$BRIDGES" | sed 's/^/  /'
 fi
 read -rp "Network bridge [vmbr0]: " NETWORK_BRIDGE
@@ -155,7 +157,13 @@ echo ""
 log_info "[1/5] Installing to $INSTALL_DIR..."
 if [[ "$REPO_DIR" != "$INSTALL_DIR" ]]; then
     mkdir -p "$INSTALL_DIR"
-    cp -r "$REPO_DIR"/* "$INSTALL_DIR/"
+    # tests/ is skipped on purpose: it contains executables named qm, pvesm,
+    # pvesh and zfs that fake the Proxmox CLI, and they have no business on a
+    # host that manages real VMs.
+    for repo_item in "$REPO_DIR"/*; do
+        [[ "$(basename "$repo_item")" == "tests" ]] && continue
+        cp -r "$repo_item" "$INSTALL_DIR/"
+    done
     cp -r "$REPO_DIR"/.gitignore "$INSTALL_DIR/" 2>/dev/null || true
     chmod +x "$INSTALL_DIR/runner" "$INSTALL_DIR/lib/"*.sh
     log_info "Copied files to $INSTALL_DIR"
@@ -454,6 +462,7 @@ else
         log_warn "Graceful shutdown failed, forcing..."
         qm stop "$TEMPLATE_ID" --skiplock 2>/dev/null || true
     }
+    # shellcheck disable=SC2034  # loop counter is unused; this is a bounded poll
     for i in {1..60}; do
         VM_STATUS=$(qm status "$TEMPLATE_ID" 2>/dev/null | awk '{print $2}') || true
         [[ "$VM_STATUS" == "stopped" ]] && break

@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# GNU coreutils shim for hosts that ship BSD userland (macOS). This directory
+# is appended to PATH, never prepended, so a real md5sum is always preferred —
+# it only fills in where coreutils is absent. Proxmox is Debian, so CI and the
+# production host use the real thing.
+set -euo pipefail
+
+if [[ $# -eq 0 || $1 == "-" ]]; then
+    printf '%s  -\n' "$(md5 -q)"
+else
+    for f in "$@"; do
+        printf '%s  %s\n' "$(md5 -q "$f")" "$f"
+    done
+fi

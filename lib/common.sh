@@ -2,10 +2,23 @@
 set -euo pipefail
 # Common functions and constants shared across all runner scripts
 
+# Sourcing twice in one process is a no-op. In production nothing does that —
+# every `runner` subcommand is its own process — so this guard never fires on
+# the host. The unit harness relies on it: it sources this file, repoints the
+# host paths below at a sandbox, and then sources a lib script that would
+# otherwise re-source this file and reset them to the real /etc and /run.
+# Demonstrated by "sourcing a lib script keeps the sandbox in force" in
+# tests/unit/harness_smoke.bats.
+if [[ -n "${RUNNER_COMMON_LOADED:-}" ]]; then
+    return 0
+fi
+RUNNER_COMMON_LOADED=1
+
 # Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
+# shellcheck disable=SC2034  # consumed by sourcing scripts (lib/list-orgs.sh)
 CYAN='\033[0;36m'
 NC='\033[0m'
 
@@ -14,12 +27,18 @@ log_warn() { printf '%b[WARN]%b %s\n' "$YELLOW" "$NC" "$1" >&2; }
 log_error() { printf '%b[ERROR]%b %s\n' "$RED" "$NC" "$1" >&2; }
 
 LIB_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+# shellcheck disable=SC2034  # consumed by sourcing scripts (lib/setup.sh)
 REPO_DIR="$(cd "$LIB_DIR/.." && pwd)"
 
-# Path constants
+# Path constants. Every host path the scripts touch belongs here rather than
+# inline: the unit harness repoints these at a sandbox, and a literal path in
+# a lib script would take a real lock or read real config during a test run.
 CONFIG_FILE="/etc/github-runners.conf"
 ORG_CONFIG_DIR="/etc/github-runners.d"
+# Where Proxmox keeps per-VM configs; the node name is a wildcard.
+PVE_NODES_DIR="/etc/pve/nodes"
 SNIPPETS_DIR="/var/lib/vz/snippets"
+# shellcheck disable=SC2034  # consumed by sourcing scripts (lib/setup.sh, lib/add-org.sh)
 INSTALL_DIR="/opt/selfhosted-runners"
 POOL_DRAIN_FILE="/run/lock/github-runner-drain"
 # Shared/exclusive lock coordinating maintenance mode with in-flight clones.
@@ -35,6 +54,12 @@ POOL_ACTIVITY_LOCK_FILE="/run/lock/github-runner-pool.lock"
 VMID_LOCK_FILE="/run/lock/runner-vmid.lock"
 VMID_RESERVATION_LOCK_PREFIX="/run/lock/runner-vmid-reserve"
 CLONE_SLOT_LOCK_PREFIX="/run/lock/runner-clone-slot"
+# Per-slot lock keeping lib/reclone.sh and lib/watch.sh off the same runner name.
+# shellcheck disable=SC2034  # consumed by sourcing scripts (lib/reclone.sh, lib/watch.sh)
+RUNNER_SLOT_LOCK_PREFIX="/run/lock/runner"
+# Per-slot reclone bookkeeping (last-processed timestamp, rapid-death streak).
+# shellcheck disable=SC2034  # consumed by sourcing scripts (lib/reclone.sh)
+RECLONE_STATE_PREFIX="/run/runner"
 DEFAULT_CLONE_MAX_PARALLEL=2
 
 require_root() {
@@ -55,6 +80,7 @@ load_infra_config() {
         log_error "Run 'runner setup' first."
         exit 1
     fi
+    # shellcheck source=/dev/null  # host config, written by setup at runtime
     source "$CONFIG_FILE"
     for var in NETWORK_BRIDGE VM_STORAGE TEMPLATE_ID; do
         if [[ -z "${!var:-}" ]]; then
@@ -75,6 +101,7 @@ load_org_config() {
         log_error "Organization '$org_name' not configured. Run 'runner add-org'."
         exit 1
     fi
+    # shellcheck source=/dev/null  # per-org config, written by add-org at runtime
     source "$org_file"
     if [[ -z "${GITHUB_ORG:-}" || -z "${GITHUB_PAT:-}" ]]; then
         log_error "Invalid org config for '$org_name' — missing GITHUB_ORG or GITHUB_PAT"
@@ -165,7 +192,7 @@ get_vm_org() {
 
 vm_config_path() {
     local vmid="$1"
-    compgen -G "/etc/pve/nodes/*/qemu-server/${vmid}.conf" | head -n 1
+    compgen -G "$PVE_NODES_DIR/*/qemu-server/${vmid}.conf" | head -n 1
 }
 
 vmid_in_use() {
@@ -295,7 +322,7 @@ list_template_linked_clone_volids() {
 
         while read -r volid _; do
             [[ "$volid" == "$prefix"* ]] || continue
-            child_name="${volid#$prefix}"
+            child_name="${volid#"$prefix"}"
             [[ "$child_name" =~ ^vm-[0-9]+-disk- ]] || continue
             [[ -n "${seen[$volid]:-}" ]] && continue
             seen["$volid"]=1
@@ -414,7 +441,9 @@ deregister_runner() {
     [[ -f "$org_file" ]] || return 0
 
     local pat="" github_org=""
+    # shellcheck source=/dev/null  # per-org config, written by add-org at runtime
     pat=$(source "$org_file" && echo "$GITHUB_PAT") || return 0
+    # shellcheck source=/dev/null  # per-org config, written by add-org at runtime
     github_org=$(source "$org_file" && echo "$GITHUB_ORG") || return 0
     [[ -n "$pat" && -n "$github_org" ]] || return 0
 
@@ -585,6 +614,7 @@ clone_runner() {
     mac=$(generate_mac "$name")
     net0=$(qm config "$vmid" 200>&- 201>&- 202>&- 203>&- 204>&- | grep '^net0:' | sed 's/^net0: //') || true
     if [[ -n "$net0" ]]; then
+        # shellcheck disable=SC2001  # pattern is a regex; ${//} only does literals
         net0=$(echo "$net0" | sed "s/virtio=[^,]*/virtio=$mac/")
         qm set "$vmid" --net0 "$net0" 200>&- 201>&- 202>&- 203>&- 204>&- || { _fail; exec 202>&-; return 1; }
     fi

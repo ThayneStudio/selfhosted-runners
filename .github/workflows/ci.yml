@@ -1,0 +1,52 @@
+---
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Pinned so a linter release cannot turn an unrelated PR red. Bump
+  # deliberately, and re-run tests/run.sh lint locally when you do.
+  SHELLCHECK_VERSION: v0.11.0
+  YAMLLINT_VERSION: 1.38.0
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install shellcheck
+        run: |
+          set -euo pipefail
+          tmp=$(mktemp -d)
+          url="https://github.com/koalaman/shellcheck/releases/download"
+          curl -fsSL "$url/${SHELLCHECK_VERSION}/shellcheck-${SHELLCHECK_VERSION}.linux.x86_64.tar.xz" \
+            | tar -xJ -C "$tmp" --strip-components=1
+          sudo install -m 0755 "$tmp/shellcheck" /usr/local/bin/shellcheck
+          shellcheck --version
+
+      - name: Install yamllint
+        run: pipx install "yamllint==${YAMLLINT_VERSION}"
+
+      - name: Lint
+        run: ./tests/run.sh lint
+
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # No Proxmox here by design: qm/pvesm/zfs are faked on PATH by
+      # tests/stubs/bin. See tests/test_helper.bash.
+      - name: Unit tests
+        run: ./tests/run.sh unit

@@ -2,6 +2,7 @@
 set -euo pipefail
 # Manually create a single runner VM.
 
+# shellcheck source=common.sh
 source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/common.sh"
 
 require_root "create"

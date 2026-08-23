@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+# Fake Proxmox CLI. Every executable in this directory is a symlink to this
+# file; the symlink name is the command being faked (qm, pvesm, pvesh, zfs,
+# curl, jq, logger). tests/test_helper.bash puts this directory first on PATH,
+# so anything the code under test shells out to lands here instead of on a
+# real host.
+#
+# Behavior is driven entirely by state under $STUB_DIR, written by the
+# stub_out/stub_status helpers in tests/test_helper.bash:
+#
+#   $STUB_DIR/<cmd>/calls              one line per invocation ("$*")
+#   $STUB_DIR/<cmd>/rules/<seq>/pattern  glob matched against "$*"
+#   $STUB_DIR/<cmd>/rules/<seq>/out      stdout to emit (may be absent/empty)
+#   $STUB_DIR/<cmd>/rules/<seq>/rc       exit status (default 0)
+#
+# The newest matching rule wins, so a test can override a rule registered in
+# setup().
+#
+# A call no rule matches fails (exit 97) rather than succeeding silently. Real
+# qm and pvesm exit non-zero on a bad subcommand or a missing volume; a stub
+# that returned 0 for everything would make every error path in the code under
+# test unreachable, and a test could pass while asserting nothing. stub_lenient
+# turns that off for a test that genuinely does not care — except for the
+# destructive verbs below, which always require an explicit rule, because
+# "destroy succeeded" is never a safe thing to assume by default.
+set -uo pipefail
+
+cmd=${0##*/}
+
+if [[ -z ${STUB_DIR:-} ]]; then
+    printf 'stub %s: STUB_DIR is unset — load tests/test_helper.bash first\n' "$cmd" >&2
+    exit 99
+fi
+
+state="$STUB_DIR/$cmd"
+mkdir -p "$state/rules"
+printf '%s\n' "$*" >> "$state/calls"
+
+# Escape hatch for cases a canned response cannot express (state that changes
+# between calls, argument-dependent output). Define <cmd>_stub in the test and
+# `export -f` it; exported functions are inherited by this child shell.
+if [[ $(type -t "${cmd}_stub") == function ]]; then
+    "${cmd}_stub" "$@"
+    exit $?
+fi
+
+args="$*"
+rules=("$state"/rules/*/)
+for (( i = ${#rules[@]} - 1; i >= 0; i-- )); do
+    rule="${rules[i]}"
+    [[ -f "${rule}pattern" ]] || continue
+    pattern=$(cat "${rule}pattern")
+    # Unquoted on purpose: the pattern is a glob, and an exact string is a
+    # glob that matches only itself.
+    # shellcheck disable=SC2053
+    [[ $args == $pattern ]] || continue
+    [[ -f "${rule}out" ]] && cat "${rule}out"
+    if [[ -f "${rule}rc" ]]; then
+        exit "$(cat "${rule}rc")"
+    fi
+    exit 0
+done
+
+destructive=0
+case "$cmd $args" in
+    "qm destroy"*|"qm stop"*|"pvesm free"*|"zfs destroy"*) destructive=1 ;;
+esac
+
+if [[ "$destructive" -eq 1 || "${STUB_STRICT:-1}" -eq 1 ]]; then
+    {
+        printf 'stub %s: no rule matches: %s %s\n' "$cmd" "$cmd" "$args"
+        if [[ "$destructive" -eq 1 && "${STUB_STRICT:-1}" -ne 1 ]]; then
+            printf 'stub %s: destructive calls need an explicit rule even in lenient mode\n' "$cmd"
+        fi
+        printf 'calls to %s so far:\n' "$cmd"
+        sed 's/^/  /' "$state/calls"
+        printf 'register one with: stub_out %s %q <<EOF ... EOF\n' "$cmd" "$args"
+    } >&2
+    exit 97
+fi
+
+exit 0

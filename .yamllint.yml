@@ -1,0 +1,20 @@
+---
+# Lint rules for templates/*.yaml. These are cloud-init user-data documents,
+# not hand-authored config: the relaxations below are about what cloud-init
+# and embedded shell require, not about taste.
+extends: default
+
+rules:
+  # cloud-init dispatches on a literal `#cloud-config` first line. A space
+  # after the `#` changes the file's meaning, so this rule can never pass.
+  comments:
+    require-starting-space: false
+  # Same reason: `---` cannot precede the `#cloud-config` marker.
+  document-start: disable
+  # write_files/runcmd bodies carry shell one-liners, URLs, and checksums that
+  # cannot be wrapped without changing what runs on the guest.
+  line-length: disable
+  # GitHub Actions spells its trigger block `on:`, which YAML 1.1 reads as the
+  # boolean true. Values are still checked; only the key is exempt.
+  truthy:
+    check-keys: false

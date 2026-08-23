@@ -4,6 +4,7 @@ set -euo pipefail
 # Called by the hookscript AFTER it exits (runs detached from Proxmox task).
 # Usage: reclone.sh <vmid>
 
+# shellcheck source=common.sh
 source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/common.sh"
 
 VMID="${1:-}"
@@ -26,7 +27,7 @@ if [[ -z "$NAME" || -z "$ORG" || "$ORG" == "unknown" ]]; then
 fi
 
 # Per-runner lock prevents races with watch.sh cloning the same slot
-exec 200>"/run/lock/runner-${NAME}.lock"
+exec 200>"${RUNNER_SLOT_LOCK_PREFIX}-${NAME}.lock"
 flock -n 200 || { log_info "reclone: another process is handling $NAME"; exit 0; }
 
 if pool_is_draining; then
@@ -39,8 +40,8 @@ fi
 # inside any time-based window, so the old 120s blanket backoff misfired on
 # every short job. A *streak* of rapid deaths is what indicates a real
 # config error (bad PAT, network, cloud-init failure) worth deferring.
-RECLONE_TS="/run/runner-${NAME}.reclone-ts"
-FAIL_STREAK_FILE="/run/runner-${NAME}.fail-streak"
+RECLONE_TS="${RECLONE_STATE_PREFIX}-${NAME}.reclone-ts"
+FAIL_STREAK_FILE="${RECLONE_STATE_PREFIX}-${NAME}.fail-streak"
 FAIL_THRESHOLD=3
 
 NOW=$(date +%s)

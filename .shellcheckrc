@@ -1,0 +1,10 @@
+# Mirrors the flags tests/run.sh passes, so a bare `shellcheck lib/foo.sh` and
+# an editor integration agree with CI.
+#
+# Following `source .../common.sh` lets checks that depend on knowing a
+# variable exists work across files. It does NOT verify that a called function
+# is defined — ShellCheck has no undefined-function check — so a rename that
+# misses a call site is only caught by running the code or a test.
+# SCRIPTDIR resolves a sourced path relative to the sourcing file.
+external-sources=true
+source-path=SCRIPTDIR
