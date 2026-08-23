@@ -37,6 +37,11 @@ VMID_RESERVATION_LOCK_PREFIX="/run/lock/runner-vmid-reserve"
 CLONE_SLOT_LOCK_PREFIX="/run/lock/runner-clone-slot"
 DEFAULT_CLONE_MAX_PARALLEL=2
 
+# Webhook notifications. Sourced here so every script that already sources
+# common.sh can call `notify` (and `redact_secrets`) without extra wiring.
+# shellcheck source=notify.sh
+source "$LIB_DIR/notify.sh"
+
 require_root() {
     if [[ $EUID -ne 0 ]]; then
         log_error "This command must be run as root"

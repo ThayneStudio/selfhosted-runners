@@ -109,5 +109,8 @@ if clone_runner "$NAME" "$ORG" >/dev/null; then
     log_info "reclone: re-cloned $NAME for org $ORG"
 else
     log_error "reclone: failed to re-clone $NAME for org $ORG"
+    notify error clone.failed \
+        "re-clone of runner $NAME failed, slot left empty for the watcher" \
+        "org=$ORG, previous vmid=$VMID"
     exit 1
 fi
