@@ -215,6 +215,9 @@ gen_unescape_value() {
     # clipped-but-still-long reason would otherwise cost quadratic time on
     # every parse of the store.
     while [[ -n "$raw" ]]; do
+        # shellcheck disable=SC1003  # the '\' branch below matches a literal
+        # backslash, which is exactly what an unescaper does — not a
+        # mis-escaped single quote.
         case "$raw" in
             '\'*)
                 [[ ${#raw} -ge 2 ]] || return 1
