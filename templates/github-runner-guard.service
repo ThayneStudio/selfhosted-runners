@@ -1,0 +1,12 @@
+[Unit]
+Description=GitHub Actions runner lifetime guard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/runner guard
+TimeoutStartSec=900
+MemoryMax=512M
+CPUQuota=200%
+SyslogIdentifier=github-runner-guard

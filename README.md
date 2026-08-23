@@ -127,7 +127,46 @@ After setup, the `runner` command is available globally:
 | `runner start` | Exit maintenance mode and resume watcher |
 | `runner stop [options]` | Enter maintenance mode and stop managed runners |
 | `runner list` | List all runner VMs |
+| `runner guard` | Reap stopped and over-age runner VMs (normally run by timer) |
 | `runner help` | Show available commands |
+
+## Runner Lifetime and Reaping
+
+Runners are ephemeral: one job, shutdown, auto-destroy, watcher recreates. Two
+things break that cycle and silently kill a pool slot, so `setup` installs
+`github-runner-guard.timer` (5 minute interval) to enforce it from the host:
+
+- **A managed VM stuck in `stopped`.** The hookscript skips its re-clone while
+  maintenance mode is active, and a host reboot brings VMs back stopped with
+  any in-flight re-clone long dead. The watcher still sees the name in
+  `qm list`, so it counts the slot as filled and never refills it. A stopped
+  ephemeral runner is always garbage — it either finished its job or crashed.
+- **A managed VM that outlives its ceiling.** The guest arms
+  `shutdown -h +360` itself, but the `runner` user has passwordless sudo so a
+  job can cancel it, and a wedged guest never runs it at all.
+
+`runner start` also reaps stopped runner VMs before resuming the watcher, so a
+slot that died during maintenance comes back on its own.
+
+| Setting in `/etc/github-runners.conf` | Default | Meaning |
+|---|---|---|
+| `MAX_VM_LIFETIME_HOURS` | `8` | Destroy a managed runner VM whose uptime exceeds this. Keep it above the guest's own 6h ceiling so the cooperative shutdown normally wins. |
+| `STOPPED_REAP_MINUTES` | `10` | Destroy a managed runner VM seen `stopped` for this long. Keep it comfortably above normal destroy-and-re-clone turnaround. |
+
+A missing or non-numeric value falls back to the default — the guard is never
+disabled by a typo, because the failure mode is a dead pool slot.
+
+The guard only ever considers VMs it can prove it owns: the cloud-init snippet
+must identify a configured org (the same check `runner destroy` uses), the VMID
+must be at or above `MIN_VMID`, and it must be neither `TEMPLATE_ID` nor any
+other template. Unrelated VMs on the same host are never touched.
+
+Every run and every forced destroy is logged:
+
+```bash
+journalctl -t github-runner | grep '\[guard\]'
+systemctl list-timers github-runner-guard.timer
+```
 
 ## Installed Software
 
@@ -271,7 +310,8 @@ To update prebaked software in the base VM template:
    > `DOCKER_MIRROR_URL` and `VLAN_TAG`, for the bake and for every future clone.
    > Run `cat /etc/github-runners.conf` beforehand and retype every
    > non-default value. Your PAT and org configs are not touched -- `add-org` only
-   > runs when no orgs exist yet.
+   > runs when no orgs exist yet, and the unprompted guard thresholds
+   > (`MAX_VM_LIFETIME_HOURS`, `STOPPED_REAP_MINUTES`) are read back and kept.
 5. Resume the pool and refill it:
    ```bash
    runner start

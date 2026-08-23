@@ -200,6 +200,18 @@ chmod 755 "$SNIPPETS_DIR/runner-hookscript.sh"
 log_info "[3/5] Saving configuration..."
 mkdir -p "$ORG_CONFIG_DIR"
 chmod 700 "$ORG_CONFIG_DIR"
+# The termination guard thresholds have no wizard prompt, so read back whatever
+# is already configured and fall back to the defaults on a fresh install.
+# Sourcing the file here would clobber the answers collected above.
+existing_conf_value() {
+    [[ -f "$CONFIG_FILE" ]] || return 0
+    sed -n "s/^${1}=//p" "$CONFIG_FILE" | tail -n 1 | tr -d "\"'"
+}
+MAX_VM_LIFETIME_HOURS=$(existing_conf_value MAX_VM_LIFETIME_HOURS)
+MAX_VM_LIFETIME_HOURS=${MAX_VM_LIFETIME_HOURS:-$DEFAULT_MAX_VM_LIFETIME_HOURS}
+STOPPED_REAP_MINUTES=$(existing_conf_value STOPPED_REAP_MINUTES)
+STOPPED_REAP_MINUTES=${STOPPED_REAP_MINUTES:-$DEFAULT_STOPPED_REAP_MINUTES}
+
 CONF_TMP=$(mktemp "${CONFIG_FILE}.XXXXXX")
 {
     printf 'NETWORK_BRIDGE=%q\n' "$NETWORK_BRIDGE"
@@ -210,6 +222,8 @@ CONF_TMP=$(mktemp "${CONFIG_FILE}.XXXXXX")
     printf 'BALLOON=%q\n' "$BALLOON"
     printf 'DNS_SERVERS=%q\n' "$DNS_SERVERS"
     printf 'DOCKER_MIRROR_URL=%q\n' "${DOCKER_MIRROR_URL:-}"
+    printf 'MAX_VM_LIFETIME_HOURS=%q\n' "$MAX_VM_LIFETIME_HOURS"
+    printf 'STOPPED_REAP_MINUTES=%q\n' "$STOPPED_REAP_MINUTES"
 } > "$CONF_TMP"
 chmod 600 "$CONF_TMP"
 mv "$CONF_TMP" "$CONFIG_FILE"
@@ -480,12 +494,16 @@ else
     log_info "Template created successfully (tools baked in)"
 fi
 
-log_info "[5/5] Installing pool watcher timer..."
+log_info "[5/5] Installing pool watcher and lifetime guard timers..."
 cp "$INSTALL_DIR/templates/github-runner-watch.service" /etc/systemd/system/
 cp "$INSTALL_DIR/templates/github-runner-watch.timer" /etc/systemd/system/
+cp "$INSTALL_DIR/templates/github-runner-guard.service" /etc/systemd/system/
+cp "$INSTALL_DIR/templates/github-runner-guard.timer" /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable --now github-runner-watch.timer 2>/dev/null || true
+systemctl enable --now github-runner-guard.timer 2>/dev/null || true
 log_info "Pool watcher timer installed (30s interval)"
+log_info "Lifetime guard timer installed (5m interval, ${MAX_VM_LIFETIME_HOURS}h VM ceiling, ${STOPPED_REAP_MINUTES}m stopped reap)"
 
 echo ""
 echo "========================================"

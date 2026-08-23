@@ -22,6 +22,10 @@ ORG_CONFIG_DIR="/etc/github-runners.d"
 SNIPPETS_DIR="/var/lib/vz/snippets"
 INSTALL_DIR="/opt/selfhosted-runners"
 POOL_DRAIN_FILE="/run/lock/github-runner-drain"
+# Where the lifetime guard records when it first saw a VM stopped. A stopped VM
+# reports no uptime, so the observation has to come from the host. Per-boot
+# state on purpose: after a host reboot every VM is freshly observed.
+GUARD_STATE_DIR="/run/github-runner-guard"
 # Shared/exclusive lock coordinating maintenance mode with in-flight clones.
 # clone_runner holds a shared lock for its full lifecycle; runner stop takes an
 # exclusive lock so it can wait until all clone activity is quiesced.
@@ -36,6 +40,10 @@ VMID_LOCK_FILE="/run/lock/runner-vmid.lock"
 VMID_RESERVATION_LOCK_PREFIX="/run/lock/runner-vmid-reserve"
 CLONE_SLOT_LOCK_PREFIX="/run/lock/runner-clone-slot"
 DEFAULT_CLONE_MAX_PARALLEL=2
+# Host-side termination guard (lib/guard.sh). The lifetime ceiling sits above
+# the guest's own 6h `shutdown -h +360` so the cooperative path normally wins.
+DEFAULT_MAX_VM_LIFETIME_HOURS=8
+DEFAULT_STOPPED_REAP_MINUTES=10
 
 require_root() {
     if [[ $EUID -ne 0 ]]; then

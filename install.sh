@@ -42,8 +42,27 @@ if [[ -f /etc/github-runners.conf ]]; then
     if [[ -f /etc/systemd/system/github-runner-watch.timer ]]; then
         cp "$INSTALL_DIR/templates/github-runner-watch.service" /etc/systemd/system/
         cp "$INSTALL_DIR/templates/github-runner-watch.timer" /etc/systemd/system/
+        cp "$INSTALL_DIR/templates/github-runner-guard.service" /etc/systemd/system/
+        cp "$INSTALL_DIR/templates/github-runner-guard.timer" /etc/systemd/system/
         systemctl daemon-reload
+        # New in this release, so an existing install has it disabled.
+        systemctl enable --now github-runner-guard.timer 2>/dev/null || true
     fi
+    # Backfill settings added after this host was set up. The guard falls back
+    # to the same defaults, but an operator can only tune what they can see.
+    guard_default() {
+        sed -n "s/^DEFAULT_${1}=//p" "$INSTALL_DIR/lib/common.sh" | tail -n 1 | tr -d "\"'"
+    }
+    for key in MAX_VM_LIFETIME_HOURS STOPPED_REAP_MINUTES; do
+        grep -q "^${key}=" /etc/github-runners.conf && continue
+        value=$(guard_default "$key")
+        [[ -n "$value" ]] || continue
+        conf_tmp=$(mktemp /etc/github-runners.conf.XXXXXX)
+        chmod 600 "$conf_tmp"
+        { cat /etc/github-runners.conf; printf '%s=%s\n' "$key" "$value"; } > "$conf_tmp"
+        mv "$conf_tmp" /etc/github-runners.conf
+        echo "  Added ${key}=${value} to /etc/github-runners.conf"
+    done
     # Regenerate per-org cloud-init snippets from updated template
     if [[ -d /etc/github-runners.d ]]; then
         for org_conf in /etc/github-runners.d/*.conf; do
