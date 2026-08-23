@@ -4,9 +4,9 @@
 # CANONICAL COPY. This file lives in ThayneStudio/selfhosted-runners as
 # templates/canary-workflow.yml. The operator installs it into CANARY_REPO
 # as .github/workflows/runner-canary.yml (the CANARY_WORKFLOW default) --
-# see "Canary workflow" in that repo's README. Edit it here and reinstall;
-# a copy edited only in CANARY_REPO drifts away from the bake it exists to
-# validate.
+# see "Canary workflow" in that repo's README. Edit it here, bump
+# CANARY_WORKFLOW_REVISION, and reinstall: a stale installed copy fails an
+# image for a reason that reads exactly like a bad image.
 #
 # The canary gate clones canary-gen<GEN_ID> from a candidate generation,
 # waits for it to register, then dispatches this workflow with
@@ -24,6 +24,11 @@
 # make the canary eligible for real production jobs: it would run one on an
 # unvalidated image and then destroy itself (it is --ephemeral), leaving
 # this dispatch with no runner and timing out a good generation.
+#
+# The label decides who MAY answer, never who did. Every toolchain
+# assertion below passes on any healthy runner of any generation, because
+# the pins are identical across generations by design, so the first step
+# binds the run to the image under test and fails when it cannot.
 
 name: Runner canary
 run-name: Runner canary gen-${{ inputs.generation }}
@@ -40,6 +45,14 @@ run-name: Runner canary gen-${{ inputs.generation }}
           carries.
         required: true
         type: string
+      strict:
+        description: >-
+          Require evidence that the job ran on that generation's own canary
+          clone. Leave true for the gate; set false only to hand-test this
+          workflow on a runner you labelled yourself.
+        required: false
+        default: true
+        type: boolean
 
 # Nothing here reads the repository -- there is deliberately no checkout,
 # so the gate cannot be broken by an unrelated change in CANARY_REPO.
@@ -54,25 +67,34 @@ defaults:
     shell: bash
 
 env:
+  # Bump on every change to this file, and reinstall into CANARY_REPO. The
+  # gate compares this stamp with its own copy before dispatching, which is
+  # the only way to tell "the image is wrong" from "the installed workflow
+  # is old" -- in a job log the two read identically.
+  CANARY_WORKFLOW_REVISION: "2026-08-23.1"
+
   # Each expectation mirrors a variable set at the top of
   # templates/template-setup.yaml. They are duplicated rather than derived:
   # this workflow runs in CANARY_REPO and cannot read the bake script.
   #
-  # KEEPING THEM IN SYNC IS PART OF BUMPING A VERSION. A bake that raises
-  # one of these must raise it here in the same change and reinstall this
-  # file, or the next canary blocks a perfectly good image. Every version
-  # assertion says exactly that in its failure message, because "wrong
-  # version installed" and "we bumped it and forgot this file" look
-  # identical in a job log.
+  # KEEPING THEM IN SYNC IS PART OF BUMPING A VERSION, and the cost of
+  # forgetting is not one red run. A canary failure retries, and the third
+  # failure marks the generation failed AND memoizes its digest, so the
+  # pipeline stops rebaking that image: a one-line omission here can
+  # blacklist a perfectly good template until someone clears the memo by
+  # hand, with the log naming a version that was never installed. Every
+  # version assertion says so in its failure message.
   EXPECTED_PSQL_MAJOR: "17"               # POSTGRES_CLIENT_VERSION
   EXPECTED_SUPABASE_VERSION: "2.115.0"    # SUPABASE_VERSION
+  # The bake installs browsers for this Playwright version; it does not
+  # install a CLI. See the Chromium step for why this is not a CLI pin.
   EXPECTED_PLAYWRIGHT_VERSION: "1.62.1"   # PLAYWRIGHT_VERSION
   # PLAYWRIGHT_BROWSERS_PATH from the bake. Set explicitly so the assertion
-  # is about the baked cache and not about whatever a default resolves to.
+  # names the baked cache rather than whatever a default resolves to; the
+  # step also re-resolves with it unset, which is how real jobs arrive.
   PLAYWRIGHT_BROWSERS_PATH: /home/runner/.cache/ms-playwright
-  # One image from the bake's warmed set (SUPABASE_PG_PROVE_IMAGE), pulled
-  # to exercise the public.ecr.aws path -- through DOCKER_MIRROR_URL when
-  # the template configured a mirror.
+  # One image from the bake's warmed set (SUPABASE_PG_PROVE_IMAGE). Pulled
+  # under its mirrored name when the runner has a mirror configured.
   CANARY_PROBE_IMAGE: public.ecr.aws/supabase/pg_prove:3.36
 
 jobs:
@@ -81,37 +103,20 @@ jobs:
     # That label, alone. See the header before adding anything to this.
     runs-on: ["gen-${{ inputs.generation }}-canary"]
     # CANARY_TIMEOUT (default 1800s) covers dispatch through conclusion,
-    # including Actions queue time. The assertions run in roughly three
-    # minutes on a warm template -- supabase start dominates -- so this
-    # ceiling fails the job loudly well inside that budget instead of
-    # letting the poller time out, which is indistinguishable from a runner
-    # that never picked the job up.
-    timeout-minutes: 15
+    # queue time included. This ceiling does not: job timeout-minutes
+    # starts when the job begins executing, so Actions queue latency sits
+    # outside it and inside CANARY_TIMEOUT. Ten minutes is roughly three
+    # times what the assertions cost on a warm template, which fails a hung
+    # job loudly here instead of leaving it to the poller -- a poller
+    # timeout is indistinguishable from a runner that never picked the job
+    # up.
+    timeout-minutes: 10
     steps:
-      - name: Report canary identity and prepare assertions
+      - name: Bind this run to the generation under test
         env:
           GENERATION: ${{ inputs.generation }}
+          STRICT: ${{ inputs.strict }}
         run: |
-          echo "generation:  $GENERATION"
-          echo "runner name: ${RUNNER_NAME:-unknown}"
-          echo "hostname:    $(hostname)"
-          echo "kernel:      $(uname -r)"
-          echo "job user:    $(id -un)"
-          # Reporting only: never fail the gate over a cosmetic line.
-          awk -F= '/^PRETTY_NAME=/ { gsub(/"/, "", $2)
-            print "os:          " $2 }' /etc/os-release || true
-
-          expected_name="canary-gen${GENERATION}"
-          if [[ "${RUNNER_NAME:-}" != "$expected_name" ]]; then
-            # A notice, not a failure: an operator testing this workflow by
-            # hand labels an ordinary runner, and that has to stay possible.
-            # Still worth surfacing -- under the canary gate the job must
-            # land on the clone named for the generation, and anything else
-            # means the canary label leaked onto another runner.
-            printf '::notice title=Canary runner name::%s\n' \
-              "expected $expected_name, got ${RUNNER_NAME:-unknown}"
-          fi
-
           # Assertion helpers. They live in a file because each run: step is
           # its own shell, and there is no other way to share a function.
           #
@@ -126,8 +131,17 @@ jobs:
           DRIFT_HINT="If the bake changed this deliberately, update the"
           DRIFT_HINT="$DRIFT_HINT matching EXPECTED_* value in"
           DRIFT_HINT="$DRIFT_HINT templates/canary-workflow.yml"
-          DRIFT_HINT="$DRIFT_HINT (ThayneStudio/selfhosted-runners) and"
-          DRIFT_HINT="$DRIFT_HINT reinstall it into this repo."
+          DRIFT_HINT="$DRIFT_HINT (ThayneStudio/selfhosted-runners), bump"
+          DRIFT_HINT="$DRIFT_HINT CANARY_WORKFLOW_REVISION and reinstall it"
+          DRIFT_HINT="$DRIFT_HINT here -- three of these blacklist a good"
+          DRIFT_HINT="$DRIFT_HINT image's digest."
+
+          # GitHub truncates an annotation at its first newline, and these
+          # messages are what the promotion-blocked notification quotes, so
+          # flatten multi-line tool output rather than losing it.
+          canary_detail() {
+            printf '%s' "$*" | tr '\n\r\t' '   '
+          }
 
           canary_row() {
             [[ -n "${GITHUB_STEP_SUMMARY:-}" ]] || return 0
@@ -140,8 +154,10 @@ jobs:
           fail() {
             local check="$1"
             shift
-            printf '::error title=Canary: %s::%s\n' "$check" "$*"
-            canary_row "$check" "FAILED" "$*"
+            local detail
+            detail=$(canary_detail "$@")
+            printf '::error title=Canary: %s::%s\n' "$check" "$detail"
+            canary_row "$check" "FAILED" "$detail"
             exit 1
           }
 
@@ -149,34 +165,115 @@ jobs:
           ok() {
             local check="$1"
             shift
-            printf 'ok: %s -- %s\n' "$check" "$*"
-            canary_row "$check" "ok" "$*"
+            local detail
+            detail=$(canary_detail "$@")
+            printf 'ok: %s -- %s\n' "$check" "$detail"
+            canary_row "$check" "ok" "$detail"
           }
           ASSERT
+          # shellcheck source=/dev/null
+          . "$RUNNER_TEMP/canary-assert.sh"
+
+          echo "generation:   $GENERATION"
+          echo "strict:       $STRICT"
+          echo "runner name:  ${RUNNER_NAME:-unknown}"
+          echo "hostname:     $(hostname)"
+          echo "kernel:       $(uname -r)"
+          echo "job user:     $(id -un)"
+          # Greppable for the gate, which compares it with its own copy.
+          echo "canary-workflow-revision=$CANARY_WORKFLOW_REVISION"
+          # Reporting only: never fail the gate over a cosmetic line.
+          awk -F= '/^PRETTY_NAME=/ { gsub(/"/, "", $2)
+            print "os:           " $2 }' /etc/os-release || true
 
           {
             echo "## Canary gen-${GENERATION} on ${RUNNER_NAME:-unknown}"
             echo ""
+            echo "Workflow revision \`${CANARY_WORKFLOW_REVISION}\`."
+            echo ""
             echo "| Check | Result | Detail |"
             echo "| --- | --- | --- |"
           } >> "$GITHUB_STEP_SUMMARY"
+          ok "canary workflow revision" "$CANARY_WORKFLOW_REVISION"
 
-      - name: Assert baked toolchain is present
+          # Bind the run to the image under test. Everything below passes on
+          # any healthy runner of any generation, so a run that cannot be
+          # tied to the candidate proves nothing -- and the gate would
+          # promote an image that never ran a job. Two ways a foreign runner
+          # answers this dispatch: an operator hand-labels one, or the
+          # canary's vendor-data snippet survives onto a production clone.
+          #
+          # Prefer a generation stamp written by the bake, which survives any
+          # label mix-up. Until the bake writes one, fall back to the clone
+          # name the gate assigns.
+          stamp=/etc/github-runner/generation
+          if [[ -r "$stamp" ]]; then
+            baked=$(tr -d '[:space:]' < "$stamp" || true)
+            evidence="$stamp says '${baked:-empty}'"
+            if [[ "$baked" == "$GENERATION" ]]; then
+              bound=yes
+            else
+              bound=no
+            fi
+          else
+            evidence="no $stamp; runner name '${RUNNER_NAME:-unknown}'"
+            if [[ "${RUNNER_NAME:-}" == "canary-gen${GENERATION}" ]]; then
+              bound=yes
+            else
+              bound=no
+            fi
+          fi
+
+          if [[ "$bound" == "yes" ]]; then
+            ok "runs on generation $GENERATION" "$evidence"
+          elif [[ "$STRICT" == "true" ]]; then
+            fail "runs on generation $GENERATION" \
+              "this job is the promotion gate for generation $GENERATION," \
+              "but $evidence." \
+              "Every assertion below passes on any healthy runner, so a run" \
+              "that cannot be tied to the candidate image is not evidence." \
+              "Dispatch with strict=false only to hand-test this workflow."
+          else
+            printf '::notice title=Canary binding::%s %s\n' \
+              "strict=false: $evidence --" \
+              "this run proves nothing about generation $GENERATION."
+            ok "runs on generation $GENERATION" \
+              "NOT VERIFIED (strict=false): $evidence"
+          fi
+
+      - name: Assert baked toolchain runs
         run: |
           # shellcheck source=/dev/null
           . "$RUNNER_TEMP/canary-assert.sh"
-          # The bake installs all of these and checks unzip and zstd by
-          # name. A missing one here is an image every job would trip over,
-          # so catch it before the slower version assertions.
-          missing=""
-          for tool in docker node npm npx gh git jq unzip zstd \
-              psql pg_dump supabase aws; do
-            command -v "$tool" > /dev/null 2>&1 || missing="$missing $tool"
+          # Run each one rather than looking it up with command -v: the bake
+          # clears caches and truncates logs on its way out, and a binary
+          # whose runtime was pruned still resolves on PATH but exits
+          # non-zero the first time a job calls it. unzip and zstd earn
+          # their place here -- actions/cache shells out to both.
+          probes=(
+            "docker --version"
+            "node --version"
+            "npm --version"
+            "npx --version"
+            "gh --version"
+            "git --version"
+            "jq --version"
+            "unzip -v"
+            "zstd --version"
+            "psql --version"
+            "pg_dump --version"
+            "supabase --version"
+            "aws --version"
+          )
+          broken=""
+          for probe in "${probes[@]}"; do
+            read -r bin flag <<< "$probe"
+            "$bin" "$flag" > /dev/null 2>&1 || broken="$broken $bin"
           done
-          [[ -z "$missing" ]] || fail "baked toolchain present" \
-            "not on PATH for $(id -un):$missing"
-          ok "baked toolchain present" \
-            "node $(node --version), $(docker --version)"
+          [[ -z "$broken" ]] || fail "baked toolchain runs" \
+            "these did not run for $(id -un):$broken." \
+            "Either the bake never installed them or the image is damaged."
+          ok "baked toolchain runs" "${#probes[@]} tools, $(node --version)"
 
       - name: Assert PostgreSQL client major version
         run: |
@@ -200,13 +297,23 @@ jobs:
         run: |
           # shellcheck source=/dev/null
           . "$RUNNER_TEMP/canary-assert.sh"
-          raw=$(supabase --version 2>&1 || true)
-          got=$(printf '%s\n' "$raw" | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+' \
-            | head -1 || true)
+          # stdout only, and only its first line. The CLI writes "A new
+          # version of Supabase CLI is available: v2.x (currently installed
+          # v2.y)" to stderr, so merging the streams means that the day
+          # upstream ships a release this parse can pick up THEIR version
+          # and fail a perfectly good image -- flakily, depending on which
+          # stream flushes first. Three such failures blacklist the digest.
+          # The bake reads stdout only for the same reason; stderr is kept
+          # for the failure message, not for the match.
+          err="$RUNNER_TEMP/supabase-version.err"
+          raw=$(supabase --version 2> "$err" || true)
+          got=$(printf '%s\n' "$raw" | head -1 \
+            | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)
           [[ "$got" == "$EXPECTED_SUPABASE_VERSION" ]] || fail \
             "supabase CLI version" \
             "expected $EXPECTED_SUPABASE_VERSION, got ${got:-none}." \
-            "supabase --version said: ${raw:-no output}." "$DRIFT_HINT"
+            "stdout: ${raw:-empty}; stderr: $(tail -2 "$err")." \
+            "$DRIFT_HINT"
           ok "supabase CLI version" "$got"
 
       - name: Assert AWS CLI is v2
@@ -222,45 +329,38 @@ jobs:
           esac
           ok "AWS CLI major version" "$raw"
 
-      - name: Assert Playwright CLI and prebaked Chromium
+      - name: Assert prebaked Chromium resolves without downloading
         run: |
           # shellcheck source=/dev/null
           . "$RUNNER_TEMP/canary-assert.sh"
           want="$EXPECTED_PLAYWRIGHT_VERSION"
           browsers="$PLAYWRIGHT_BROWSERS_PATH"
+          err="$RUNNER_TEMP/playwright-dry-run.err"
 
-          # Pin the CLI by package version the way the bake does, rather
-          # than trusting whatever a bare npx resolves to. This fetches the
-          # npm package only -- browsers are never downloaded by --version.
-          cli=$(npm exec --yes --package="playwright@${want}" -- \
-            playwright --version 2>&1 || true)
-          case "$cli" in
-            *"$want"*) ;;
-            *) fail "playwright CLI version" \
-                 "expected $want, got ${cli:-no output}." "$DRIFT_HINT" ;;
-          esac
-
-          # Chromium has to come from the template's cache. A job that
-          # quietly downloads its own pays ~150 MB every run and means the
-          # bake's browser install never took.
+          # There is no baked Playwright CLI to version-check. The bake
+          # resolves the CLI from npm and installs only browsers, exactly as
+          # a consuming job does, so asking npm for playwright@$want and
+          # then asserting it reports $want is a tautology -- npm just
+          # fetched that version. What is baked, and what a job actually
+          # depends on, is the browser revision the pinned CLI resolves to.
+          #
+          # --dry-run resolves browsers exactly as a real install would but
+          # downloads nothing, so a revision this image lacks is caught
+          # without paying for the download that would prove it.
+          #
+          # stdout only: npm's own "will be installed: playwright@..." goes
+          # to stderr, and merging it makes any string match vacuous.
           [[ -d "$browsers" ]] || fail "prebaked Chromium present" \
             "PLAYWRIGHT_BROWSERS_PATH $browsers does not exist."
-          dir=$(find "$browsers" -maxdepth 1 -type d -name 'chromium-*' \
-            | head -1 || true)
-          [[ -n "$dir" ]] || fail "prebaked Chromium present" \
-            "no chromium-* directory under $browsers; it holds:" \
-            "$(find "$browsers" -maxdepth 1 -printf '%f ' || true)"
-
-          # --dry-run resolves browsers exactly as a real install would but
-          # downloads nothing, so a wrong revision is caught without paying
-          # for the download that proves it.
           plan=$(npm exec --yes --package="playwright@${want}" -- \
-            playwright install --dry-run chromium 2>&1 || true)
+            playwright install --dry-run chromium 2> "$err" || true)
           locs=$(printf '%s\n' "$plan" | grep -i 'install location' || true)
           [[ -n "$locs" ]] || fail "Chromium resolves from prebaked cache" \
-            "playwright install --dry-run named no install location." \
-            "It printed: $(printf '%s' "$plan" | tr '\n' ' ')"
+            "playwright@$want install --dry-run named no install location." \
+            "stdout: ${plan:-empty}; stderr: $(tail -3 "$err")"
+
           # Herestring, not a pipe: fail must exit this shell, not a subshell.
+          chromium_dir=""
           while read -r line; do
             path="${line##* }"
             case "$path" in
@@ -273,14 +373,48 @@ jobs:
               "Chromium resolves from prebaked cache" \
               "Playwright would install into $path, which does not exist," \
               "so this job would have downloaded Chromium."
+            case "${path##*/}" in
+              chromium-*) chromium_dir="${chromium_dir:-$path}" ;;
+            esac
           done <<< "$locs"
+          [[ -n "$chromium_dir" ]] || fail \
+            "Chromium resolves from prebaked cache" \
+            "no chromium-<revision> among the resolved locations: $locs"
 
-          # Executing it proves the --with-deps system libraries survived
-          # the bake's cleanup, which a directory check alone does not.
-          exe=$(find "$dir" -maxdepth 3 -type f \
+          # The bake never exports PLAYWRIGHT_BROWSERS_PATH to the runner
+          # process, so real jobs reach the cache through Playwright's
+          # default ($HOME/.cache/ms-playwright for the runner user).
+          # Re-resolve with the variable unset, or this workflow only
+          # asserts a path it set for itself.
+          plan_default=$(env -u PLAYWRIGHT_BROWSERS_PATH \
+            npm exec --yes --package="playwright@${want}" -- \
+            playwright install --dry-run chromium 2>> "$err" || true)
+          locs_default=$(printf '%s\n' "$plan_default" \
+            | grep -i 'install location' || true)
+          [[ -n "$locs_default" ]] || fail "Chromium resolves by default" \
+            "with PLAYWRIGHT_BROWSERS_PATH unset, --dry-run named no" \
+            "install location. stdout: ${plan_default:-empty}"
+          while read -r line; do
+            path="${line##* }"
+            case "$path" in
+              "$browsers"/*) ;;
+              *) fail "Chromium resolves by default" \
+                   "with PLAYWRIGHT_BROWSERS_PATH unset Playwright would" \
+                   "use $path, outside the baked cache $browsers." \
+                   "A job that does not set it downloads its own." ;;
+            esac
+            [[ -d "$path" ]] || fail "Chromium resolves by default" \
+              "default resolution names $path, which does not exist."
+          done <<< "$locs_default"
+
+          # Execute the revision the plan named -- not whatever a directory
+          # listing returns first, which with two cached revisions can be
+          # one no job will ever launch. Running it proves the --with-deps
+          # system libraries survived the bake's cleanup.
+          exe=$(find "$chromium_dir" -maxdepth 3 -type f \
             \( -name chrome -o -name headless_shell \) | head -1 || true)
           [[ -n "$exe" && -x "$exe" ]] || fail "prebaked Chromium runs" \
-            "no executable chrome or headless_shell under $dir."
+            "no executable chrome or headless_shell under $chromium_dir."
           ver=$("$exe" --version 2>&1 || true)
           case "$ver" in
             *Chrom*) ;;
@@ -288,8 +422,9 @@ jobs:
                  "$exe --version printed '${ver:-no output}'." \
                  "Missing system libraries are the usual cause." ;;
           esac
-          ok "playwright CLI version" "$cli"
-          ok "prebaked Chromium runs" "$ver from $dir"
+          ok "Chromium resolves from prebaked cache" \
+            "playwright@$want resolves $chromium_dir, set and unset"
+          ok "prebaked Chromium runs" "$ver"
 
       - name: Assert Supabase image pull resolves
         run: |
@@ -298,26 +433,38 @@ jobs:
           docker info > /dev/null 2>&1 || fail "docker daemon reachable" \
             "docker info failed as $(id -un); check the docker group."
 
-          # The mirror is transparent: containerd rewrites public.ecr.aws
-          # per this hosts.toml, so a successful pull on a mirror-configured
-          # template IS the evidence that the mirror resolves. Name it in
-          # the log so a pull failure points at the right suspect.
-          hosts=/etc/containerd/certs.d/public.ecr.aws/hosts.toml
-          route="$CANARY_PROBE_IMAGE direct from public.ecr.aws"
-          if [[ -f "$hosts" ]]; then
-            mirror=$(grep -Eo 'host\."[^"]+"' "$hosts" | head -1 \
-              | sed 's/.*"\(.*\)"/\1/' || true)
-            route="$CANARY_PROBE_IMAGE via ${mirror:-unparsed $hosts}"
+          # A real job reaches the mirror by REWRITTEN IMAGE NAME:
+          # register-runner.sh exports SUPABASE_INTERNAL_IMAGE_REGISTRY into
+          # the runner process and the Supabase CLI prefixes its images with
+          # it. Pull that exact name, because it has no upstream fallback --
+          # a dead mirror fails here rather than silently working.
+          #
+          # Deliberately not inferred from /etc/containerd/certs.d: that
+          # hosts.toml carries server = "https://public.ecr.aws", which IS
+          # an upstream fallback, and on the http:// mirror branch the bake
+          # leaves the containerd image store off, so docker pull never
+          # reads it at all. Pulling the upstream name proves nothing about
+          # a mirror, however confidently a log line claims otherwise.
+          image="$CANARY_PROBE_IMAGE"
+          route="upstream $image"
+          if [[ -n "${SUPABASE_INTERNAL_IMAGE_REGISTRY:-}" ]]; then
+            bare="${CANARY_PROBE_IMAGE#public.ecr.aws/}"
+            image="${SUPABASE_INTERNAL_IMAGE_REGISTRY}/${bare}"
+            route="mirror $image"
           fi
           echo "pulling $route"
 
-          if ! out=$(docker pull "$CANARY_PROBE_IMAGE" 2>&1); then
+          if ! out=$(docker pull "$image" 2>&1); then
             fail "Supabase image pull" "docker pull failed for $route:" \
-              "$(printf '%s' "$out" | tr '\n' ' ')"
+              "$out"
           fi
           ok "Supabase image pull" "$route"
 
       - name: Supabase start/stop round trip
+        # The one slow step, and the one that can hang on an unhealthy
+        # container. Cap it under the job ceiling so a hung stack reports as
+        # this step rather than as the whole job.
+        timeout-minutes: 8
         run: |
           # shellcheck source=/dev/null
           . "$RUNNER_TEMP/canary-assert.sh"
@@ -330,8 +477,7 @@ jobs:
           # supabase init prompts about editor settings; the bake feeds it
           # /dev/null for the same reason.
           if ! out=$(supabase init < /dev/null 2>&1); then
-            fail "supabase init" \
-              "$(printf '%s' "$out" | tr '\n' ' ')"
+            fail "supabase init" "$out"
           fi
 
           # Stop even when a later assertion fails, so a failed canary does
@@ -345,7 +491,7 @@ jobs:
           log="$RUNNER_TEMP/supabase-start.log"
           if ! supabase start 2>&1 | tee "$log"; then
             fail "supabase start" "supabase start failed; it last said:" \
-              "$(tail -5 "$log" | tr '\n' ' ')"
+              "$(tail -5 "$log")"
           fi
 
           # The 17 client pin exists so psql and pg_dump can talk to
@@ -355,16 +501,14 @@ jobs:
           url="postgresql://postgres:postgres@127.0.0.1:54322/postgres"
           server=$(psql -X -A -t "$url" -c 'show server_version' 2>&1) || \
             fail "psql reaches Supabase Postgres" \
-              "psql could not query $url after supabase start:" \
-              "$(printf '%s' "$server" | tr '\n' ' ')"
+              "psql could not query $url after supabase start:" "$server"
           dump=$(pg_dump --schema-only --file=/dev/null "$url" 2>&1) || fail \
             "pg_dump against Supabase Postgres" \
             "client major $EXPECTED_PSQL_MAJOR versus server $server:" \
-            "$(printf '%s' "$dump" | tr '\n' ' ')"
+            "$dump"
 
           if ! stopped=$(supabase stop --no-backup 2>&1); then
-            fail "supabase stop" \
-              "$(printf '%s' "$stopped" | tr '\n' ' ')"
+            fail "supabase stop" "$stopped"
           fi
           trap - EXIT
           ok "supabase start/stop round trip" \
@@ -377,4 +521,5 @@ jobs:
           # shellcheck source=/dev/null
           . "$RUNNER_TEMP/canary-assert.sh"
           ok "canary verdict" \
-            "generation $GENERATION accepted on ${RUNNER_NAME:-unknown}"
+            "generation $GENERATION accepted on ${RUNNER_NAME:-unknown}" \
+            "by workflow revision $CANARY_WORKFLOW_REVISION"
