@@ -32,7 +32,7 @@ case "$COMMAND" in
         echo "  stop [options]              Enter maintenance mode and stop managed runners"
         echo "  list                        List all runner VMs"
         echo "  watch                       Fill runner pools (run by timer)"
-        echo "  guard                       Reap stopped and over-age runner VMs (run by timer)"
+        echo "  guard [--dry-run]           Reap stopped and over-age runner VMs (run by timer)"
         echo ""
         echo "Runners are ephemeral: one job, shutdown, auto-destroy, watcher recreates."
         ;;

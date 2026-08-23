@@ -24,7 +24,9 @@ INSTALL_DIR="/opt/selfhosted-runners"
 POOL_DRAIN_FILE="/run/lock/github-runner-drain"
 # Where the lifetime guard records when it first saw a VM stopped. A stopped VM
 # reports no uptime, so the observation has to come from the host. Per-boot
-# state on purpose: after a host reboot every VM is freshly observed.
+# state on purpose, unlike the rest of the platform's state: a reboot makes
+# every VM freshly observed, which is exactly what it is.
+# shellcheck disable=SC2034  # consumed by lib/guard.sh via this shared file
 GUARD_STATE_DIR="/run/github-runner-guard"
 # Shared/exclusive lock coordinating maintenance mode with in-flight clones.
 # clone_runner holds a shared lock for its full lifecycle; runner stop takes an
@@ -40,10 +42,28 @@ VMID_LOCK_FILE="/run/lock/runner-vmid.lock"
 VMID_RESERVATION_LOCK_PREFIX="/run/lock/runner-vmid-reserve"
 CLONE_SLOT_LOCK_PREFIX="/run/lock/runner-clone-slot"
 DEFAULT_CLONE_MAX_PARALLEL=2
+# Per-runner slot lock, held across a clone by reclone.sh and watch.sh and
+# around a single destroy by guard.sh. Those two build the path inline; the
+# constant exists so the guard cannot drift away from the lock they take.
+# shellcheck disable=SC2034  # consumed by lib/guard.sh via this shared file
+RUNNER_SLOT_LOCK_PREFIX="/run/lock/runner"
 # Host-side termination guard (lib/guard.sh). The lifetime ceiling sits above
 # the guest's own 6h `shutdown -h +360` so the cooperative path normally wins.
+# shellcheck disable=SC2034  # consumed by lib/guard.sh and lib/setup.sh
 DEFAULT_MAX_VM_LIFETIME_HOURS=8
+# shellcheck disable=SC2034  # consumed by lib/guard.sh and lib/setup.sh
 DEFAULT_STOPPED_REAP_MINUTES=10
+# shellcheck disable=SC2034  # consumed by lib/setup.sh; empty = exclude nothing
+DEFAULT_GUARD_EXCLUDE_VMIDS=""
+# Floor under the guard's structural freshness check. A VM whose config was
+# written this recently may be a clone still in flight, so it is never reaped —
+# this is what lets the guard skip the global pool lock entirely.
+# shellcheck disable=SC2034  # consumed by lib/guard.sh via this shared file
+GUARD_MIN_CONFIG_AGE_SECONDS=60
+# Consecutive runs a VM may be deferred on a busy slot lock before the guard
+# stops treating it as normal churn and says so.
+# shellcheck disable=SC2034  # consumed by lib/guard.sh via this shared file
+GUARD_DEFER_WARN_RUNS=3
 
 require_root() {
     if [[ $EUID -ne 0 ]]; then

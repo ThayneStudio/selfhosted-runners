@@ -200,17 +200,25 @@ chmod 755 "$SNIPPETS_DIR/runner-hookscript.sh"
 log_info "[3/5] Saving configuration..."
 mkdir -p "$ORG_CONFIG_DIR"
 chmod 700 "$ORG_CONFIG_DIR"
-# The termination guard thresholds have no wizard prompt, so read back whatever
+# The termination guard settings have no wizard prompt, so read back whatever
 # is already configured and fall back to the defaults on a fresh install.
-# Sourcing the file here would clobber the answers collected above.
+# Sourcing the file here would clobber the answers collected above. Trailing
+# comments and whitespace are stripped: `MAX_VM_LIFETIME_HOURS=12 # long builds`
+# would otherwise be written back verbatim and then silently rejected as
+# non-numeric by the guard.
 existing_conf_value() {
     [[ -f "$CONFIG_FILE" ]] || return 0
-    sed -n "s/^${1}=//p" "$CONFIG_FILE" | tail -n 1 | tr -d "\"'"
+    sed -n "s/^${1}=//p" "$CONFIG_FILE" \
+        | tail -n 1 \
+        | sed -e 's/[[:space:]]*#.*$//' -e 's/[[:space:]]*$//' \
+        | tr -d "\"'"
 }
 MAX_VM_LIFETIME_HOURS=$(existing_conf_value MAX_VM_LIFETIME_HOURS)
 MAX_VM_LIFETIME_HOURS=${MAX_VM_LIFETIME_HOURS:-$DEFAULT_MAX_VM_LIFETIME_HOURS}
 STOPPED_REAP_MINUTES=$(existing_conf_value STOPPED_REAP_MINUTES)
 STOPPED_REAP_MINUTES=${STOPPED_REAP_MINUTES:-$DEFAULT_STOPPED_REAP_MINUTES}
+GUARD_EXCLUDE_VMIDS=$(existing_conf_value GUARD_EXCLUDE_VMIDS)
+GUARD_EXCLUDE_VMIDS=${GUARD_EXCLUDE_VMIDS:-$DEFAULT_GUARD_EXCLUDE_VMIDS}
 
 CONF_TMP=$(mktemp "${CONFIG_FILE}.XXXXXX")
 {
@@ -224,6 +232,7 @@ CONF_TMP=$(mktemp "${CONFIG_FILE}.XXXXXX")
     printf 'DOCKER_MIRROR_URL=%q\n' "${DOCKER_MIRROR_URL:-}"
     printf 'MAX_VM_LIFETIME_HOURS=%q\n' "$MAX_VM_LIFETIME_HOURS"
     printf 'STOPPED_REAP_MINUTES=%q\n' "$STOPPED_REAP_MINUTES"
+    printf 'GUARD_EXCLUDE_VMIDS=%q\n' "$GUARD_EXCLUDE_VMIDS"
 } > "$CONF_TMP"
 chmod 600 "$CONF_TMP"
 mv "$CONF_TMP" "$CONFIG_FILE"
@@ -504,6 +513,8 @@ systemctl enable --now github-runner-watch.timer 2>/dev/null || true
 systemctl enable --now github-runner-guard.timer 2>/dev/null || true
 log_info "Pool watcher timer installed (30s interval)"
 log_info "Lifetime guard timer installed (5m interval, ${MAX_VM_LIFETIME_HOURS}h VM ceiling, ${STOPPED_REAP_MINUTES}m stopped reap)"
+echo "  Preview what it would destroy:  runner guard --dry-run"
+echo "  Turn it off:                    systemctl disable --now github-runner-guard.timer"
 
 echo ""
 echo "========================================"

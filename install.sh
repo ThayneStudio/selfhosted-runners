@@ -53,16 +53,26 @@ if [[ -f /etc/github-runners.conf ]]; then
     guard_default() {
         sed -n "s/^DEFAULT_${1}=//p" "$INSTALL_DIR/lib/common.sh" | tail -n 1 | tr -d "\"'"
     }
-    for key in MAX_VM_LIFETIME_HOURS STOPPED_REAP_MINUTES; do
+    conf_value() {
+        sed -n "s/^${1}=//p" /etc/github-runners.conf | tail -n 1 \
+            | sed -e 's/[[:space:]]*#.*$//' -e 's/[[:space:]]*$//' | tr -d "\"'"
+    }
+    for key in MAX_VM_LIFETIME_HOURS STOPPED_REAP_MINUTES GUARD_EXCLUDE_VMIDS; do
         grep -q "^${key}=" /etc/github-runners.conf && continue
+        grep -q "^DEFAULT_${key}=" "$INSTALL_DIR/lib/common.sh" || continue
         value=$(guard_default "$key")
-        [[ -n "$value" ]] || continue
         conf_tmp=$(mktemp /etc/github-runners.conf.XXXXXX)
         chmod 600 "$conf_tmp"
         { cat /etc/github-runners.conf; printf '%s=%s\n' "$key" "$value"; } > "$conf_tmp"
         mv "$conf_tmp" /etc/github-runners.conf
         echo "  Added ${key}=${value} to /etc/github-runners.conf"
     done
+    # This install enables a timer that destroys VMs unattended. Say so, and
+    # say how to look before it leaps and how to turn it off.
+    echo "  Lifetime guard active: destroys managed runner VMs running longer than" \
+         "$(conf_value MAX_VM_LIFETIME_HOURS)h, and ones stopped longer than" \
+         "$(conf_value STOPPED_REAP_MINUTES)m."
+    echo "    Preview: runner guard --dry-run   Disable: systemctl disable --now github-runner-guard.timer"
     # Regenerate per-org cloud-init snippets from updated template
     if [[ -d /etc/github-runners.d ]]; then
         for org_conf in /etc/github-runners.d/*.conf; do
