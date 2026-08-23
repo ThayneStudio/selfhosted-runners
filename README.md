@@ -234,6 +234,129 @@ jobs:
       - run: npm test
 ```
 
+## Canary workflow
+
+A newly baked template is promoted only after a runner cloned from it
+**completes a real GitHub Actions job**. Registering is not evidence: a runner
+that registers, shows Online/Idle and is never assigned work is the exact
+failure this platform exists to catch, and no local smoke test sees it. The job
+that supplies that evidence is `templates/canary-workflow.yml`, which doubles as
+the acceptance test for everything the bake installs.
+
+### Installing it into `CANARY_REPO`
+
+The copy in this repo is canonical; it has to be installed into whichever repo
+hosts the canary (`CANARY_REPO`):
+
+```bash
+# in a clone of CANARY_REPO
+mkdir -p .github/workflows
+cp /opt/selfhosted-runners/templates/canary-workflow.yml \
+   .github/workflows/runner-canary.yml
+git add .github/workflows/runner-canary.yml
+git commit -m "Add runner canary workflow"
+git push
+```
+
+The filename must match `CANARY_WORKFLOW` (default `runner-canary.yml`), and
+`workflow_dispatch` only becomes dispatchable once the file is on the repo's
+default branch. Dispatching it needs `repo` scope on a classic PAT or
+`actions:write` on a fine-grained one -- the org PAT collected by `runner setup`
+only needs `admin:org`, so a separate `CANARY_PAT` may be required.
+
+Edit the copy in this repo and reinstall it, **bumping
+`CANARY_WORKFLOW_REVISION` in the same change**. A stale installed copy fails
+an image for a reason that reads, in the log, exactly like a bad image; the
+revision is echoed into the job log and step summary so the gate can compare it
+with the canonical copy before dispatching and refuse the run instead.
+
+### The label contract
+
+The canary gate dispatches the workflow with the generation id as the
+`generation` input, and the job targets `gen-<generation>-canary` -- **that label
+alone, with no `self-hosted`**. The canary registers with `--no-default-labels`
+so it carries nothing else. GitHub assigns a queued job to any idle runner whose
+labels are a superset of `runs-on`, so adding `self-hosted` here would make the
+canary eligible for real production jobs: it would run one on an unvalidated
+image and then destroy itself (it is `--ephemeral`), leaving the canary dispatch
+with no runner and rejecting a good image.
+
+The label decides who *may* answer the dispatch, not who did. Every toolchain
+assertion below passes on any healthy runner of any generation, because the
+pins are identical across generations by design -- so a stale `gen-N-canary`
+label left on a production clone would absorb the dispatch, pass everything
+trivially, and promote a candidate that never ran a job. The first step
+therefore binds the run to the image under test and **fails** when it cannot:
+it prefers a generation stamp at `/etc/github-runner/generation` and falls back
+to the `canary-gen<N>` clone name. Nothing writes that stamp yet; when the bake
+does, the binding survives any label mix-up.
+
+Hand-dispatching against a runner you labelled yourself therefore needs
+`strict=false`, which downgrades the binding to a notice and marks the summary
+row NOT VERIFIED:
+
+```bash
+gh workflow run runner-canary.yml --repo <org>/<canary-repo> \
+  -f generation=1 -f strict=false
+```
+
+### What it asserts
+
+Roughly three minutes on a warm template, against `CANARY_TIMEOUT`'s 1800s
+budget for dispatch through conclusion. (The job's own `timeout-minutes` starts
+when the job begins executing, so queue latency counts against `CANARY_TIMEOUT`
+only.)
+
+- every baked tool actually **runs** -- `--version` on each, not `command -v`,
+  since a binary whose runtime the bake pruned still resolves on `PATH`
+- `psql` reports major `17`, and `pg_dump` completes a schema dump against the
+  Supabase database it starts -- the version string alone would not catch the
+  client/server mismatch the `17` pin exists to prevent
+- `supabase --version` is `2.115.0`, parsed from stdout only so the CLI's
+  "a new version is available" notice on stderr cannot be mistaken for the
+  installed version
+- `playwright install --dry-run` resolves Chromium into the prebaked
+  `/home/runner/.cache/ms-playwright` rather than planning a download, both
+  with `PLAYWRIGHT_BROWSERS_PATH` set and with it unset (which is how real jobs
+  arrive, since the bake never exports it), and the resolved binary executes.
+  There is no Playwright *CLI* version assertion: the bake installs browsers
+  only and resolves the CLI from npm per invocation, so asking npm for
+  `playwright@1.62.1` and checking that it reports `1.62.1` would assert
+  nothing
+- `aws --version` reports v2
+- `docker pull` of the `pg_prove` image succeeds. When the runner has a mirror,
+  it pulls the **rewritten** name from `SUPABASE_INTERNAL_IMAGE_REGISTRY`, the
+  same way a Supabase job reaches the mirror, because that name has no upstream
+  fallback -- pulling `public.ecr.aws/...` would succeed through the fallback in
+  the bake's `hosts.toml` even with the mirror dead
+- a `supabase start` / `supabase stop` round trip
+
+Each assertion emits a GitHub `::error::` annotation naming what was expected and
+what was found, because that annotation is what an operator sees quoted in the
+promotion-blocked notification.
+
+### Keeping version expectations in sync
+
+The workflow runs in `CANARY_REPO` and cannot read this repo, so its expectations
+are duplicated in the `env:` block at the top of the file rather than derived:
+
+| `templates/template-setup.yaml` | `templates/canary-workflow.yml` |
+|---|---|
+| `POSTGRES_CLIENT_VERSION` | `EXPECTED_PSQL_MAJOR` |
+| `SUPABASE_VERSION` | `EXPECTED_SUPABASE_VERSION` |
+| `PLAYWRIGHT_VERSION` | `EXPECTED_PLAYWRIGHT_VERSION` |
+| `PLAYWRIGHT_BROWSERS_PATH` | `PLAYWRIGHT_BROWSERS_PATH` |
+| `SUPABASE_PG_PROVE_IMAGE` | `CANARY_PROBE_IMAGE` |
+
+**Bumping a version on the left means bumping it on the right in the same
+change, bumping `CANARY_WORKFLOW_REVISION`, and reinstalling the workflow.** The
+cost of forgetting is not one red run: a canary failure is retried, and the
+third failure marks the generation `failed` *and* memoizes its digest, so the
+pipeline stops rebaking that image. A forgotten one-line `env:` bump can
+blacklist a perfectly good template until someone clears the memo by hand, with
+the log naming a version that was never installed. The failure messages name the
+mapping for that reason.
+
 ## Updating Runners
 
 To update runner registration/bootstrap behavior (cloud-init that runs on every
