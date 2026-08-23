@@ -40,7 +40,15 @@ PVE_NODES_DIR="/etc/pve/nodes"
 SNIPPETS_DIR="/var/lib/vz/snippets"
 # shellcheck disable=SC2034  # consumed by sourcing scripts (lib/setup.sh, lib/add-org.sh)
 INSTALL_DIR="/opt/selfhosted-runners"
-POOL_DRAIN_FILE="/run/lock/github-runner-drain"
+# Maintenance flag. Lives under /var/lib so it survives a host reboot: the
+# watcher timer stays enabled across a reboot, so a tmpfs flag meant rebooting
+# between `runner stop` and `runner start` silently resumed runner creation.
+POOL_DRAIN_FILE="/var/lib/github-runners/drain"
+# Pre-upgrade tmpfs location. Read so upgrading mid-maintenance does not drop an
+# active drain, and still written so a rollback to a release that only knows this
+# path can both see and clear the drain. install.sh migrates it to the
+# persistent path on upgrade; disable_pool_drain clears both.
+POOL_DRAIN_FILE_LEGACY="/run/lock/github-runner-drain"
 # Shared/exclusive lock coordinating maintenance mode with in-flight clones.
 # clone_runner holds a shared lock for its full lifecycle; runner stop takes an
 # exclusive lock so it can wait until all clone activity is quiesced.
@@ -151,16 +159,39 @@ load_org_config() {
 }
 
 pool_is_draining() {
-    [[ -e "$POOL_DRAIN_FILE" ]]
+    [[ -e "$POOL_DRAIN_FILE" || -e "$POOL_DRAIN_FILE_LEGACY" ]]
 }
 
 enable_pool_drain() {
-    install -d -m 755 "$(dirname "$POOL_DRAIN_FILE")"
-    : > "$POOL_DRAIN_FILE"
+    local state_dir
+    state_dir="$(dirname "$POOL_DRAIN_FILE")"
+
+    # This writes the root filesystem, not tmpfs, so it can genuinely fail on a
+    # full host. Say so — the caller aborts before stopping the watcher, and a
+    # bare `install:` error would leave the operator thinking the pool is
+    # drained when the watcher is still cloning.
+    if ! install -d -m 700 "$state_dir"; then
+        log_error "Failed to create $state_dir — maintenance mode NOT entered"
+        return 1
+    fi
+    if ! : > "$POOL_DRAIN_FILE"; then
+        log_error "Failed to write $POOL_DRAIN_FILE — maintenance mode NOT entered"
+        return 1
+    fi
+
+    # Write the legacy path too so every version ordering agrees on the drain:
+    # a rollback to a release that only knows the tmpfs path can still see this
+    # drain and still clear it. Best effort — the persistent flag above is the
+    # authoritative one.
+    if ! : > "$POOL_DRAIN_FILE_LEGACY" 2>/dev/null; then
+        log_warn "Could not write $POOL_DRAIN_FILE_LEGACY — a rollback to an older release would not see this drain"
+    fi
 }
 
 disable_pool_drain() {
-    rm -f "$POOL_DRAIN_FILE"
+    # The legacy flag must go too — a drain set before the upgrade would
+    # otherwise survive `runner start` with nothing left to clear it.
+    rm -f "$POOL_DRAIN_FILE" "$POOL_DRAIN_FILE_LEGACY"
 }
 
 list_orgs() {
