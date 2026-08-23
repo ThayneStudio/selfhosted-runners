@@ -62,6 +62,28 @@ RUNNER_SLOT_LOCK_PREFIX="/run/lock/runner"
 RECLONE_STATE_PREFIX="/run/runner"
 DEFAULT_CLONE_MAX_PARALLEL=2
 
+# Webhook notifications. Sourced here so every script that already sources
+# common.sh can call `notify` (and `redact_secrets`) without extra wiring.
+#
+# Guarded, and tolerant of a source that fails halfway: install.sh unpacks the
+# tarball file by file, so there is a window where this file exists and
+# notify.sh does not, or exists half-written. Everything that sources common.sh
+# in that window — including the hookscript's drain check, which fails *open*
+# and re-clones during maintenance if it cannot source us — would otherwise
+# break. A library whose whole premise is "never break the caller" does not get
+# to take the CLI down on its way in. Both fallbacks degrade to silence rather
+# than to leaking: notify does nothing, redact_secrets withholds.
+if [[ -r "$LIB_DIR/notify.sh" ]]; then
+    # shellcheck source=notify.sh
+    source "$LIB_DIR/notify.sh" || true
+fi
+if ! declare -F notify >/dev/null 2>&1; then
+    notify() { :; }
+fi
+if ! declare -F redact_secrets >/dev/null 2>&1; then
+    redact_secrets() { printf '%s' "[REDACTION UNAVAILABLE]"; }
+fi
+
 require_root() {
     if [[ $EUID -ne 0 ]]; then
         log_error "This command must be run as root"

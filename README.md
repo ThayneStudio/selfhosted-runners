@@ -345,6 +345,75 @@ Do not use a VMID-limited stop immediately before destroying a linked-clone
 template, because every dependent clone must be removed before `qm destroy`
 will succeed.
 
+## Notifications
+
+Failures that need a human are pushed to a webhook instead of being left in
+journald. Notifications are **off until you configure a webhook URL** -- with
+none set, nothing changes anywhere in the platform.
+
+Add these keys to `/etc/github-runners.conf`:
+
+```sh
+NOTIFY_WEBHOOK_URL="https://hooks.slack.com/services/T000/B000/xxxx"
+NOTIFY_MIN_SEVERITY="warn"   # info|warn|error -- anything below this is dropped
+NOTIFY_FORMAT="slack"        # slack|text
+```
+
+> `runner setup` rewrites `/etc/github-runners.conf` from its own prompts and
+> does not preserve keys it did not ask about. Re-add the `NOTIFY_*` lines after
+> re-running the wizard.
+
+For Slack, create an **incoming webhook** for the channel you want alerts in and
+paste its URL. The body is a Slack incoming-webhook payload:
+
+```json
+{
+  "text": "[pve] bake failed for generation 8: image checksum mismatch after retry",
+  "severity": "error",
+  "event": "bake.failed",
+  "host": "pve",
+  "generation": 8,
+  "detail": "expected 5fa5b05e... got ..."
+}
+```
+
+Slack renders `text` and ignores the rest, so the same body also serves a
+generic consumer that wants the structured fields. `NOTIFY_FORMAT="text"` sends
+the `text` field alone as a plain body, for ntfy-style consumers.
+
+What this is designed to do, and not do:
+
+- **A notification never fails or blocks a runner operation.** A webhook that is
+  down, wrong, or unset is treated exactly like one that was never configured:
+  the failure is logged and the operation continues.
+- **Delivery is bounded.** One attempt plus at most two retries, 10 seconds each
+  with 3 seconds of backoff, so a black-holed webhook can hold an operation for
+  about 33 seconds and no longer.
+- **Secrets are scrubbed, within limits.** Every payload and every log line goes
+  through a redaction pass. It strips this platform's own secrets verbatim --
+  the org PATs from `/etc/github-runners.d/*.conf` and `NOTIFY_WEBHOOK_URL` --
+  plus known credential shapes that arrive embedded in someone else's error
+  text: `ghp_...`, `github_pat_...`, `https://user:token@host/...`,
+  `Authorization: Bearer|Basic ...`, `password ...`, `-u user:pass`,
+  `?access_token=...`, and Slack/Discord/Teams webhook URLs. This is a
+  chokepoint, not a proof -- a third-party credential in a shape none of those
+  rules match can still get through, so prefer a summary over raw command
+  output when you build a `detail` string.
+- **No history, no dedup, no email.** This is a push to one webhook.
+
+Currently emitted: `clone.failed`, when the watcher cannot fill runner slots
+and when a re-clone leaves a slot empty. The watcher sends one notification per
+run rather than one per slot, at `error` when every slot it attempted failed
+(a pool-wide problem: bad template, revoked PAT, full storage) and at `warn`
+when only some did.
+
+To try it without waiting for a real failure:
+
+```bash
+bash -c 'source /opt/selfhosted-runners/lib/common.sh
+         notify warn test.notification "test from $(hostname -s)" "no action needed"'
+```
+
 ## Troubleshooting
 
 ### Runner doesn't appear in GitHub after 5 minutes
@@ -439,7 +508,8 @@ The runner VM might not have network connectivity. Check:
 
 ## Security Notes
 
-- **PAT storage**: PATs are stored per-org in `/etc/github-runners.d/<org>.conf` with mode 600 (root only readable). `/etc/github-runners.conf` holds infrastructure settings only and contains no secrets.
+- **PAT storage**: PATs are stored per-org in `/etc/github-runners.d/<org>.conf` with mode 600 (root only readable). `/etc/github-runners.conf` holds infrastructure settings, and — if you configure notifications — `NOTIFY_WEBHOOK_URL`, which is itself a credential; it is written mode 600 for that reason.
+- **Secrets in notifications**: notification payloads and log lines are scrubbed of the configured org PATs, the webhook URL, and known credential shapes (see [Notifications](#notifications) for what that does and does not cover), and the URL is handed to `curl` through a config file rather than argv so it never shows up in `ps`.
 - **Runner user**: VMs run as user `runner` with sudo access (required for Docker)
 - **Docker access**: The `runner` user is in the `docker` group
 - **Rotate PAT**: Edit config, re-run `runner setup`, recreate runners
