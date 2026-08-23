@@ -6,9 +6,12 @@ REPO_URL="https://github.com/ThayneStudio/selfhosted-runners/archive/refs/heads/
 
 echo "Installing selfhosted-runners..."
 
-# Download and extract
+# Download and extract. tests/ is excluded on purpose: it contains executables
+# named qm, pvesm, pvesh and zfs that fake the Proxmox CLI, and they have no
+# business on a host that manages real VMs.
 mkdir -p "$INSTALL_DIR"
-curl -fsSL "$REPO_URL" | tar xz --strip-components=1 -C "$INSTALL_DIR"
+curl -fsSL "$REPO_URL" | tar xz --strip-components=1 -C "$INSTALL_DIR" \
+    --exclude='*/tests' --exclude='*/tests/*'
 chmod +x "$INSTALL_DIR/runner" "$INSTALL_DIR/lib/"*.sh
 
 # Symlink to /usr/local/bin

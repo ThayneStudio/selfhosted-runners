@@ -9,12 +9,6 @@ load test_helper
     [ "$output" = "$REPO_ROOT/tests/stubs/bin/qm" ]
 }
 
-@test "an unprogrammed stub succeeds silently" {
-    run pvesm list local-zfs
-    [ "$status" -eq 0 ]
-    [ "$output" = "" ]
-}
-
 @test "stub_out matches an exact argument list" {
     stub_out zfs 'get -H -o value origin tank/vm-501-disk-0' <<'EOF'
 tank/base-9000-disk-0@__base__
@@ -22,9 +16,6 @@ EOF
 
     run zfs get -H -o value origin tank/vm-501-disk-0
     [ "$output" = "tank/base-9000-disk-0@__base__" ]
-
-    run zfs get -H -o value origin tank/vm-502-disk-0
-    [ "$output" = "" ]
 }
 
 @test "stub_out patterns are globs" {
@@ -70,7 +61,48 @@ EOF
     [ "$output" = "volume is busy" ]
 }
 
+# --- Strict stubbing ------------------------------------------------------
+
+@test "an unmatched call fails loudly instead of succeeding silently" {
+    run pvesm list local-zfs
+    [ "$status" -eq 97 ]
+    [[ "$output" == *"no rule matches"* ]]
+    [[ "$output" == *"pvesm list local-zfs"* ]]
+}
+
+@test "stub_lenient opts out for calls that do not matter" {
+    stub_lenient
+
+    run pvesm list local-zfs
+    [ "$status" -eq 0 ]
+    [ "$output" = "" ]
+}
+
+@test "destructive verbs need an explicit rule even when lenient" {
+    stub_lenient
+
+    for destructive in "qm destroy 501 --purge" "qm stop 501" \
+                       "pvesm free local-zfs:vm-501-disk-0" \
+                       "zfs destroy tank/vm-501-disk-0"; do
+        run $destructive
+        [ "$status" -eq 97 ]
+        [[ "$output" == *"destructive calls need an explicit rule"* ]]
+    done
+}
+
+@test "a destructive call with a rule behaves like any other" {
+    stub_status qm 'destroy 501 --purge' 0
+
+    run qm destroy 501 --purge
+    [ "$status" -eq 0 ]
+}
+
+# --- Inspecting calls -----------------------------------------------------
+
 @test "calls are recorded in order and can be asserted on" {
+    stub_out qm 'clone *' < /dev/null
+    stub_out qm 'start *' < /dev/null
+
     qm clone 9000 501 --name runner-acme-a1b2
     qm start 501
 
@@ -104,11 +136,61 @@ start 501" ]
     [ "$output" = "status: stopped" ]
 }
 
-@test "host paths point at the sandbox, never at /etc or /run" {
+# --- Isolation ------------------------------------------------------------
+
+@test "every known host path constant is sandboxed" {
     load_lib
 
-    [ "${CONFIG_FILE#"$STUB_DIR"}" != "$CONFIG_FILE" ]
-    [ "${POOL_DRAIN_FILE#"$STUB_DIR"}" != "$POOL_DRAIN_FILE" ]
+    local name
+    for name in "${HARNESS_SANDBOXED_CONSTANTS[@]}"; do
+        [[ -n "${!name:-}" ]] || {
+            printf 'constant %s is empty after load_lib\n' "$name" >&2
+            return 1
+        }
+        [[ "${!name}" == "$STUB_DIR"/* ]] || {
+            printf 'constant %s escaped the sandbox: %s\n' "$name" "${!name}" >&2
+            return 1
+        }
+    done
+}
+
+@test "a host path a later commit adds is sandboxed by value, not by name" {
+    load_lib
+
+    # Stands in for a constant this harness has never heard of, including one
+    # derived from another constant at source time.
+    GENERATIONS_DIR="/var/lib/github-runners/generations"
+    sandbox_host_paths
+
+    [[ "$GENERATIONS_DIR" == "$STUB_DIR"/* ]]
+    [ -d "$GENERATIONS_DIR" ]
+}
+
+@test "the sandbox fails loudly if a constant it moves is renamed away" {
+    load_lib
+    HARNESS_SANDBOXED_CONSTANTS+=(NOT_A_REAL_CONSTANT)
+
+    run sandbox_host_paths
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"NOT_A_REAL_CONSTANT"* ]]
+}
+
+@test "sourcing a lib script keeps the sandbox in force" {
+    load_lib
+    write_infra_config
+
+    # list.sh sources $CONFIG_FILE at source time. If its own `source
+    # common.sh` had reset the sandbox, this would read the host's real
+    # /etc/github-runners.conf — absent here — and TEMPLATE_ID would be empty.
+    stub_lenient
+    load_lib list.sh
+
+    [[ "$CONFIG_FILE" == "$STUB_DIR"/* ]]
+    [ "$TEMPLATE_ID" = "9000" ]
+}
+
+@test "org config lands in the sandbox" {
+    load_lib
 
     write_org_config acme
     run list_orgs

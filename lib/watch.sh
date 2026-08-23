@@ -67,7 +67,7 @@ for entry in "${MISSING[@]}"; do
     org="${entry##* }"
     (
         # Per-runner lock prevents races with reclone.sh on the same slot
-        exec 200>"/run/lock/runner-${slot}.lock"
+        exec 200>"${RUNNER_SLOT_LOCK_PREFIX}-${slot}.lock"
         flock -n 200 || exit 0
 
         # Re-check: another process may have filled this slot

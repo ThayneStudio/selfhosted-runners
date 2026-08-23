@@ -2,6 +2,18 @@
 set -euo pipefail
 # Common functions and constants shared across all runner scripts
 
+# Sourcing twice in one process is a no-op. In production nothing does that —
+# every `runner` subcommand is its own process — so this guard never fires on
+# the host. The unit harness relies on it: it sources this file, repoints the
+# host paths below at a sandbox, and then sources a lib script that would
+# otherwise re-source this file and reset them to the real /etc and /run.
+# Demonstrated by "sourcing a lib script keeps the sandbox in force" in
+# tests/unit/harness_smoke.bats.
+if [[ -n "${RUNNER_COMMON_LOADED:-}" ]]; then
+    return 0
+fi
+RUNNER_COMMON_LOADED=1
+
 # Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -18,9 +30,13 @@ LIB_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 # shellcheck disable=SC2034  # consumed by sourcing scripts (lib/setup.sh)
 REPO_DIR="$(cd "$LIB_DIR/.." && pwd)"
 
-# Path constants
+# Path constants. Every host path the scripts touch belongs here rather than
+# inline: the unit harness repoints these at a sandbox, and a literal path in
+# a lib script would take a real lock or read real config during a test run.
 CONFIG_FILE="/etc/github-runners.conf"
 ORG_CONFIG_DIR="/etc/github-runners.d"
+# Where Proxmox keeps per-VM configs; the node name is a wildcard.
+PVE_NODES_DIR="/etc/pve/nodes"
 SNIPPETS_DIR="/var/lib/vz/snippets"
 # shellcheck disable=SC2034  # consumed by sourcing scripts (lib/setup.sh, lib/add-org.sh)
 INSTALL_DIR="/opt/selfhosted-runners"
@@ -38,6 +54,12 @@ POOL_ACTIVITY_LOCK_FILE="/run/lock/github-runner-pool.lock"
 VMID_LOCK_FILE="/run/lock/runner-vmid.lock"
 VMID_RESERVATION_LOCK_PREFIX="/run/lock/runner-vmid-reserve"
 CLONE_SLOT_LOCK_PREFIX="/run/lock/runner-clone-slot"
+# Per-slot lock keeping lib/reclone.sh and lib/watch.sh off the same runner name.
+# shellcheck disable=SC2034  # consumed by sourcing scripts (lib/reclone.sh, lib/watch.sh)
+RUNNER_SLOT_LOCK_PREFIX="/run/lock/runner"
+# Per-slot reclone bookkeeping (last-processed timestamp, rapid-death streak).
+# shellcheck disable=SC2034  # consumed by sourcing scripts (lib/reclone.sh)
+RECLONE_STATE_PREFIX="/run/runner"
 DEFAULT_CLONE_MAX_PARALLEL=2
 
 require_root() {
@@ -170,7 +192,7 @@ get_vm_org() {
 
 vm_config_path() {
     local vmid="$1"
-    compgen -G "/etc/pve/nodes/*/qemu-server/${vmid}.conf" | head -n 1
+    compgen -G "$PVE_NODES_DIR/*/qemu-server/${vmid}.conf" | head -n 1
 }
 
 vmid_in_use() {

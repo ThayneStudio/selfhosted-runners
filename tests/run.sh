@@ -9,6 +9,14 @@
 # already installed. Keep the commands here in step with .github/workflows/ci.yml.
 set -uo pipefail
 
+# The code under test uses mapfile and associative arrays, and so does this
+# script. macOS still ships bash 3.2 as /bin/bash.
+if (( BASH_VERSINFO[0] < 4 )); then
+    printf 'tests/run.sh needs bash 4 or newer (found %s).\n' "$BASH_VERSION" >&2
+    printf 'On macOS: brew install bash\n' >&2
+    exit 2
+fi
+
 TESTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$TESTS_DIR/.." && pwd)"
 BATS_VERSION="v1.11.0"
@@ -41,22 +49,44 @@ missing_tool() {
     fi
 }
 
+# Expand globs, dropping the ones that matched nothing. Passing an unmatched
+# glob straight to a linter reads as a missing file and fails the gate.
+existing_files() {
+    local candidate
+    for candidate in "$@"; do
+        [[ -f "$candidate" ]] && printf '%s\n' "$candidate"
+    done
+}
+
 lint_shell() {
-    # -x plus SCRIPTDIR lets shellcheck follow `source .../common.sh`, so a
-    # typo in a shared helper name is caught at lint time.
-    shellcheck -x --source-path=SCRIPTDIR --format=gcc \
+    local -a files
+    mapfile -t files < <(existing_files \
         "$REPO_ROOT/runner" \
         "$REPO_ROOT/install.sh" \
         "$REPO_ROOT"/lib/*.sh \
+        "$REPO_ROOT"/templates/*.sh \
         "$REPO_ROOT"/tests/run.sh \
         "$REPO_ROOT"/tests/test_helper.bash \
         "$REPO_ROOT"/tests/unit/test_helper.bash \
         "$REPO_ROOT"/tests/stubs/bin/_stub \
-        "$REPO_ROOT"/tests/compat/bin/md5sum
+        "$REPO_ROOT"/tests/compat/bin/md5sum)
+
+    # -x plus SCRIPTDIR makes shellcheck read lib/common.sh when it is sourced,
+    # so checks that depend on knowing a variable exists work across files.
+    # It does not check that a called function is defined anywhere; ShellCheck
+    # has no such check, so a renamed helper still has to be caught by a test.
+    shellcheck -x --source-path=SCRIPTDIR --format=gcc "${files[@]}"
 }
 
 lint_yaml() {
-    yamllint -c "$REPO_ROOT/.yamllint.yml" "$REPO_ROOT"/templates/*.yaml
+    local -a files
+    mapfile -t files < <(existing_files \
+        "$REPO_ROOT"/templates/*.yaml \
+        "$REPO_ROOT"/templates/*.yml \
+        "$REPO_ROOT"/.github/workflows/*.yml \
+        "$REPO_ROOT"/.github/workflows/*.yaml)
+
+    yamllint -c "$REPO_ROOT/.yamllint.yml" "${files[@]}"
 }
 
 # Prefer an installed bats, but only one new enough for BATS_TEST_TMPDIR and

@@ -14,3 +14,7 @@ rules:
   # write_files/runcmd bodies carry shell one-liners, URLs, and checksums that
   # cannot be wrapped without changing what runs on the guest.
   line-length: disable
+  # GitHub Actions spells its trigger block `on:`, which YAML 1.1 reads as the
+  # boolean true. Values are still checked; only the key is exempt.
+  truthy:
+    check-keys: false

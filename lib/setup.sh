@@ -157,7 +157,13 @@ echo ""
 log_info "[1/5] Installing to $INSTALL_DIR..."
 if [[ "$REPO_DIR" != "$INSTALL_DIR" ]]; then
     mkdir -p "$INSTALL_DIR"
-    cp -r "$REPO_DIR"/* "$INSTALL_DIR/"
+    # tests/ is skipped on purpose: it contains executables named qm, pvesm,
+    # pvesh and zfs that fake the Proxmox CLI, and they have no business on a
+    # host that manages real VMs.
+    for repo_item in "$REPO_DIR"/*; do
+        [[ "$(basename "$repo_item")" == "tests" ]] && continue
+        cp -r "$repo_item" "$INSTALL_DIR/"
+    done
     cp -r "$REPO_DIR"/.gitignore "$INSTALL_DIR/" 2>/dev/null || true
     chmod +x "$INSTALL_DIR/runner" "$INSTALL_DIR/lib/"*.sh
     log_info "Copied files to $INSTALL_DIR"
