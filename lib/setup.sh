@@ -284,7 +284,11 @@ fi
 # Check if template already exists
 if qm status "$TEMPLATE_ID" &> /dev/null; then
     log_info "[4/5] Template VM $TEMPLATE_ID already exists. Skipping creation."
-    log_warn "To recreate: qm destroy $TEMPLATE_ID && runner setup"
+    # Adopt as generation 1 when the store is empty (spec 8). No-op otherwise;
+    # never destroys. Fresh-host bake is Task 7.
+    # shellcheck source=generations.sh
+    source "$LIB_DIR/generations.sh"
+    adopt_deployed_template
 else
     # Download and create template
     log_info "[4/5] Creating baked Ubuntu cloud template..."
