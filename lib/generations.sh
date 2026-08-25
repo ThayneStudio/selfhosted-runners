@@ -825,3 +825,61 @@ gen_archive_append() {
     # umask so the log is created root-only without a chmod race on every append.
     ( umask 077; printf '%s\n' "$line" >> "$GENERATION_ARCHIVE_LOG" )
 }
+
+# ---------------------------------------------------------------------------
+# Generation VMID allocation (spec 4.2)
+#
+# Newly baked generations take the lowest free VMID in TEMPLATE_BAND_MIN..MAX.
+# This is a different pool from reserve_vmid / VMID_LOCK_FILE; taking that lock
+# would serialize template allocation against clone allocation. Proven by
+# "allocate_generation_vmid returns the lowest free band VMID".
+#
+# A config in the band that is not a generation record is a hard error, not a
+# hole to skip — otherwise a leftover VM is silently stranded next to templates
+# and the next bake still proceeds. Proven by "foreign config inside the band
+# is a hard error before allocation".
+#
+# flock -n on GENERATION_VMID_LOCK_FILE fd 206 serializes the scan. The
+# function is not a subshell so the caller can keep the lock held while it
+# gen_create's the record; command substitution still works because exclusive
+# create is the race-free backstop. Proven by "allocate_generation_vmid is busy
+# when the generation VMID lock is held".
+# ---------------------------------------------------------------------------
+
+# Walks the band and refuses any VMID whose qemu-server config exists without a
+# matching generation record. Not called from load_infra_config: config load
+# must stay qm-free (and this probe is the file equivalent of that inventory).
+validate_band_inventory() {
+    local vmid
+    for vmid in $(seq "$TEMPLATE_BAND_MIN" "$TEMPLATE_BAND_MAX"); do
+        if vmid_in_use "$vmid" && ! gen_exists "$vmid"; then
+            log_error "VMID $vmid has a config in the generation band ${TEMPLATE_BAND_MIN}-${TEMPLATE_BAND_MAX} but is not a known generation"
+            return 1
+        fi
+    done
+    return 0
+}
+
+# Lowest free band VMID on stdout. Exit 1 if the band is exhausted, invalid, or
+# contains a foreign config, or if another allocator holds the lock.
+allocate_generation_vmid() {
+    local vmid
+
+    validate_generation_band || return 1
+    validate_band_inventory || return 1
+
+    exec 206>"$GENERATION_VMID_LOCK_FILE"
+    if ! flock -n 206; then
+        log_error "generation VMID allocator is busy"
+        return 1
+    fi
+
+    for vmid in $(seq "$TEMPLATE_BAND_MIN" "$TEMPLATE_BAND_MAX"); do
+        if ! vmid_in_use "$vmid" && ! gen_exists "$vmid"; then
+            printf '%s\n' "$vmid"
+            return 0
+        fi
+    done
+    log_error "generation VMID band ${TEMPLATE_BAND_MIN}-${TEMPLATE_BAND_MAX} is exhausted"
+    return 1
+}
