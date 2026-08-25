@@ -31,6 +31,11 @@ ln -sf "$INSTALL_DIR/runner" /usr/local/bin/runner
 
 echo "Installed to $INSTALL_DIR"
 
+if [[ -f "$INSTALL_DIR/templates/github-runners.logrotate" ]]; then
+    mkdir -p /etc/logrotate.d
+    cp "$INSTALL_DIR/templates/github-runners.logrotate" /etc/logrotate.d/github-runners
+fi
+
 # Carry an active maintenance drain over to the persistent flag. Releases before
 # this one kept it on tmpfs, so upgrading mid-maintenance and then rebooting --
 # which is usually the whole reason the pool was stopped -- would wipe the flag
@@ -56,20 +61,11 @@ if [[ -f /etc/github-runners.conf ]]; then
     if [[ -d /var/lib/vz/snippets ]]; then
         cp "$INSTALL_DIR/templates/runner-hookscript.sh" /var/lib/vz/snippets/runner-hookscript.sh
         chmod 755 /var/lib/vz/snippets/runner-hookscript.sh
-        DOCKER_MIRROR_URL="${DOCKER_MIRROR_URL:-}" awk '
-        function lreplace(str, old, new,    i, result) {
-            result = ""
-            while ((i = index(str, old)) > 0) {
-                result = result substr(str, 1, i - 1) new
-                str = substr(str, i + length(old))
-            }
-            return result str
-        }
-        {
-            $0 = lreplace($0, "{{DOCKER_MIRROR_URL}}", ENVIRON["DOCKER_MIRROR_URL"])
-            print
-        }' "$INSTALL_DIR/templates/template-setup.yaml" > /var/lib/vz/snippets/template-setup.yaml
-        chmod 600 /var/lib/vz/snippets/template-setup.yaml
+        # shellcheck source=lib/bake.sh
+        source "$INSTALL_DIR/lib/bake.sh"
+        if render_template_setup > "$SNIPPETS_DIR/template-setup.yaml"; then
+            chmod 600 "$SNIPPETS_DIR/template-setup.yaml"
+        fi
     fi
     if [[ -f /etc/systemd/system/github-runner-watch.timer ]]; then
         cp "$INSTALL_DIR/templates/github-runner-watch.service" /etc/systemd/system/
