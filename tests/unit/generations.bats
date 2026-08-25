@@ -865,6 +865,13 @@ create_full_record() {
     [ "$GENERATION_RETAIN" = "1" ]
     [ "$FAILED_GEN_RETAIN_DAYS" = "7" ]
     [ "$CANDIDATE_MAX_AGE_DAYS" = "3" ]
+    [ "$REBAKE_ENABLED" = "true" ]
+    [ "$REBAKE_MAX_AGE_DAYS" = "7" ]
+    [ "$REBAKE_WINDOW" = "02:00-06:00" ]
+    [ "$BAKE_TIMEOUT" = "5400" ]
+    [ "$BAKE_MIN_FREE_GB" = "60" ]
+    [ "$CANARY_ENABLED" = "false" ]
+    [ "$DETECT_FAIL_WARN_HOURS" = "24" ]
 }
 
 @test "a value already in the config file wins over the default" {

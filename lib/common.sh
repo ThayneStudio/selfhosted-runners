@@ -119,6 +119,32 @@ GUARD_MIN_CONFIG_AGE_SECONDS=60
 # shellcheck disable=SC2034  # consumed by lib/guard.sh via this shared file
 GUARD_DEFER_WARN_RUNS=3
 
+# Bake / maintain host paths and cloud-image identity. Lock and cache paths
+# are absolute so the unit harness sandboxes them by value. Persistent files
+# hang off RUNNER_STATE_DIR so relocating state relocates them too.
+# shellcheck disable=SC2034  # consumed by bake, detect, promote, maintain
+BAKE_LOCK_FILE="/run/lock/github-runner-bake.lock"
+# shellcheck disable=SC2034  # consumed by bake, detect, promote, maintain
+PROMOTION_PAUSE_FILE="/run/lock/github-runner-promote.pause"
+IMG_CACHE_DIR="/var/cache/github-runners"
+# shellcheck disable=SC2034  # consumed by bake, detect, promote, maintain
+BAKE_LOG_DIR="/var/log/github-runners"
+# shellcheck disable=SC2034  # consumed by bake, detect, promote, maintain
+FAILED_DIGESTS_FILE="$RUNNER_STATE_DIR/failed-digests"
+# shellcheck disable=SC2034  # consumed by bake, detect, promote, maintain
+DETECT_FAIL_FILE="$RUNNER_STATE_DIR/detect-fail"
+CLOUD_IMG="noble-server-cloudimg-amd64.img"
+# shellcheck disable=SC2034  # consumed by bake, detect, promote, maintain
+CLOUD_IMG_URL="https://cloud-images.ubuntu.com/noble/current/${CLOUD_IMG}"
+# shellcheck disable=SC2034  # consumed by bake, detect, promote, maintain
+CLOUD_IMG_CHECKSUM_URL="https://cloud-images.ubuntu.com/noble/current/SHA256SUMS"
+# shellcheck disable=SC2034  # consumed by bake, detect, promote, maintain
+CLOUD_IMG_PATH="$IMG_CACHE_DIR/$CLOUD_IMG"
+# shellcheck disable=SC2034  # consumed by bake, detect, promote, maintain
+MIN_CLOUD_IMG_BYTES=$((400 * 1024 * 1024))
+# shellcheck disable=SC2034  # consumed by bake, detect, promote, maintain
+GENERATION_VMID_LOCK_FILE="/run/lock/github-runner-gen-vmid.lock"
+
 # Webhook notifications. Sourced here so every script that already sources
 # common.sh can call `notify` (and `redact_secrets`) without extra wiring.
 #
@@ -168,6 +194,7 @@ load_infra_config() {
         fi
     done
     apply_generation_defaults
+    validate_generation_band
 }
 
 # Generation-model settings (spec 14). Defaulting them here rather than writing
@@ -180,6 +207,37 @@ apply_generation_defaults() {
     GENERATION_RETAIN="${GENERATION_RETAIN:-1}"
     FAILED_GEN_RETAIN_DAYS="${FAILED_GEN_RETAIN_DAYS:-7}"
     CANDIDATE_MAX_AGE_DAYS="${CANDIDATE_MAX_AGE_DAYS:-3}"
+    REBAKE_ENABLED="${REBAKE_ENABLED:-true}"
+    REBAKE_MAX_AGE_DAYS="${REBAKE_MAX_AGE_DAYS:-7}"
+    REBAKE_WINDOW="${REBAKE_WINDOW:-02:00-06:00}"
+    BAKE_TIMEOUT="${BAKE_TIMEOUT:-5400}"
+    BAKE_MIN_FREE_GB="${BAKE_MIN_FREE_GB:-60}"
+    CANARY_ENABLED="${CANARY_ENABLED:-false}"
+    DETECT_FAIL_WARN_HOURS="${DETECT_FAIL_WARN_HOURS:-24}"
+}
+
+validate_generation_band() {
+    local min_vmid="${MIN_VMID:-0}"
+    local band_min="${TEMPLATE_BAND_MIN}"
+    local band_max="${TEMPLATE_BAND_MAX}"
+
+    if [[ ! "$band_min" =~ ^[0-9]+$ || ! "$band_max" =~ ^[0-9]+$ ]]; then
+        log_error "TEMPLATE_BAND_MIN/MAX must be unsigned integers (got ${band_min:-<empty>}, ${band_max:-<empty>})"
+        return 1
+    fi
+    if [[ "$band_min" -gt "$band_max" ]]; then
+        log_error "TEMPLATE_BAND_MIN ($band_min) is greater than TEMPLATE_BAND_MAX ($band_max)"
+        return 1
+    fi
+    if [[ "$min_vmid" -eq 0 ]]; then
+        log_error "MIN_VMID=0 (auto) is incompatible with generations; set MIN_VMID to $((band_max + 1)) or higher"
+        return 1
+    fi
+    if [[ "$band_max" -ge "$min_vmid" ]]; then
+        log_error "Generation VMID band ${band_min}-${band_max} overlaps [MIN_VMID, ∞) (MIN_VMID=${min_vmid})"
+        return 1
+    fi
+    return 0
 }
 
 load_org_config() {
