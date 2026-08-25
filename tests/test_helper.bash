@@ -143,7 +143,7 @@ _sandbox_one_path() {
     value="${!name}"
     [[ "$value" == "$HOST_SANDBOX"* ]] && return 0
     case "$value" in
-        /etc/*|/run/*|/var/lib/*|/var/log/*|/var/spool/*) ;;
+        /etc/*|/run/*|/var/lib/*|/var/log/*|/var/cache/*|/var/spool/*) ;;
         *) return 0 ;;
     esac
 
