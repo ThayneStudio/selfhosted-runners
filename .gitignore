@@ -25,3 +25,7 @@ Thumbs.db
 
 # Vendored test runner (fetched by tests/run.sh)
 tests/.bats/
+
+# Isolated git worktrees and SDD scratch
+.worktrees/
+.superpowers/
