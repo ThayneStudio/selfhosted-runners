@@ -168,6 +168,11 @@ bake_qm_stub() {
                 echo '{"exitcode":0,"exited":1,"out-data":"guest setup still running\n"}'
                 return 0
             fi
+            if [[ -f "$STUB_DIR/qm-stamp-write-fail" ]] && [[ "$*" == *github-runner/generation* ]]; then
+                # Agent call succeeds; guest command fails. qm's process status is 0.
+                echo '{"exitcode":1,"exited":1}'
+                return 0
+            fi
             echo '{"exitcode":0,"exited":1}'
             return 0
             ;;
@@ -191,6 +196,13 @@ bake_qm_stub() {
             return 0
             ;;
         destroy)
+            local vmid="$1"
+            # Proxmox refuses to delete a running VM. bake_fail must stop first.
+            if [[ -f "$STUB_DIR/qm-running-$vmid" ]]; then
+                printf "VM %s is running - not destroying\n" "$vmid" >&2
+                return 1
+            fi
+            rm -f "$STUB_DIR/qm-created-$vmid" "$STUB_DIR/qm-running-$vmid"
             return 0
             ;;
         *)
@@ -271,6 +283,36 @@ bake_qm_stub() {
     [ "$status" -ne 0 ]
     assert_called qm 'create *'
     refute_called qm 'template *'
+}
+
+@test "failed bake after start stops then destroys the new VMID, never TEMPLATE_ID" {
+    : > "$STUB_DIR/qm-marker-absent"
+    BAKE_TIMEOUT=0
+    run bake_main --force
+    [ "$status" -ne 0 ]
+    assert_called qm 'start 8900'
+    assert_called qm 'stop 8900*'
+    assert_called qm 'destroy 8900*'
+    local calls stop_at destroy_at
+    calls=$(stub_calls qm)
+    stop_at=$(printf '%s\n' "$calls" | grep -n '^stop 8900' | head -1 | cut -d: -f1)
+    destroy_at=$(printf '%s\n' "$calls" | grep -n '^destroy 8900' | head -1 | cut -d: -f1)
+    [ -n "$stop_at" ]
+    [ -n "$destroy_at" ]
+    [ "$stop_at" -lt "$destroy_at" ]
+    [ ! -f "$STUB_DIR/qm-running-8900" ]
+    [ ! -f "$STUB_DIR/qm-created-8900" ]
+    refute_called qm "destroy ${TEMPLATE_ID}*"
+    refute_called qm "stop ${TEMPLATE_ID}*"
+}
+
+@test "stamp write with non-zero guest exitcode fails the bake" {
+    : > "$STUB_DIR/qm-stamp-write-fail"
+    run bake_main --force
+    [ "$status" -ne 0 ]
+    refute_called qm 'template *'
+    refute_called qm 'shutdown *'
+    assert_called qm 'start 8900'
 }
 
 @test "matching digest without --force exits 0 and does not create" {

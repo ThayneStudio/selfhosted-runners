@@ -342,7 +342,13 @@ bake_fail() {
 
     if [[ -n "$vmid" && "$vmid" != "${TEMPLATE_ID:-}" ]]; then
         if qm status "$vmid" >/dev/null 2>&1; then
-            qm destroy "$vmid" --purge 2>/dev/null || true
+            # Proxmox refuses destroy of a running VM. Match setup cleanup_bake:
+            # stop then destroy. Proven by "failed bake after start stops then
+            # destroys the new VMID, never TEMPLATE_ID".
+            qm stop "$vmid" --timeout 30 2>/dev/null || true
+            if ! qm destroy "$vmid" --purge; then
+                log_error "Failed to destroy bake VM $vmid"
+            fi
         fi
         bake_free_vmid_volumes "$vmid"
         if gen_exists "$vmid"; then
@@ -504,7 +510,7 @@ bake_poll_setup_complete() {
 # Read /opt/.runner-version and stamp /etc/github-runner/generation over the
 # guest agent, then record GEN_RUNNER_VERSION. Must run before shutdown.
 bake_stamp_generation() {
-    local vmid="$1" gen_id="$2" raw version
+    local vmid="$1" gen_id="$2" raw version write_json write_exit
 
     raw=$(qm guest exec "$vmid" -- cat /opt/.runner-version) || {
         log_error "Failed to read /opt/.runner-version"
@@ -520,9 +526,17 @@ bake_stamp_generation() {
     fi
     log_info "Baked runner version: $version"
 
-    if ! qm guest exec "$vmid" -- /bin/bash -c \
-        "mkdir -p /etc/github-runner && printf '%s\n' '$gen_id' > /etc/github-runner/generation"; then
+    # Guest outcome is JSON exitcode, not qm's process status (the agent call
+    # succeeds even when bash in the guest fails). Same as the poll loop.
+    # Proven by "stamp write with non-zero guest exitcode fails the bake".
+    write_json=$(qm guest exec "$vmid" -- /bin/bash -c \
+        "mkdir -p /etc/github-runner && printf '%s\n' '$gen_id' > /etc/github-runner/generation") || {
         log_error "Failed to write /etc/github-runner/generation"
+        return 1
+    }
+    write_exit=$(printf '%s\n' "$write_json" | jq -r '.exitcode // "1"' 2>/dev/null) || write_exit="1"
+    if [[ "$write_exit" != "0" ]]; then
+        log_error "Failed to write /etc/github-runner/generation (guest exitcode $write_exit)"
         return 1
     fi
 
@@ -738,9 +752,13 @@ bake_locked() {
         return 1
     fi
 
+    # New VMID is candidate. An EXIT bake_fail during ruling-6 cleanup must
+    # not destroy it. INT/TERM stay until process exit.
+    trap - EXIT
+
     bake_fail_other_candidates "$vmid"
 
-    trap - EXIT INT TERM
+    trap - INT TERM
     log_info "Bake finished: generation $gen_id is candidate (VMID $vmid)"
     _bake_tee "bake finished gen=$gen_id vmid=$vmid state=candidate"
     return 0
