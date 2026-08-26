@@ -15,6 +15,11 @@
 # shellcheck disable=SC2030,SC2031,SC2034
 set -euo pipefail
 
+if [[ -n "${RUNNER_BAKE_LOADED:-}" ]]; then
+    return 0
+fi
+RUNNER_BAKE_LOADED=1
+
 # shellcheck source=common.sh
 source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/common.sh"
 # shellcheck source=generations.sh
@@ -295,6 +300,22 @@ bake_matching_generation() {
         printf '%s\n' "$vmid"
         return 0
     done < <(gen_list)
+    return 1
+}
+
+# Candidate with this digest. Active matches must not skip — weekly floor
+# rebakes the same digest. Proven by "matching digest past weekly floor
+# without --force still bakes".
+bake_matching_candidate() {
+    local digest="${1:-}" vmid
+    [[ -n "$digest" ]] || return 1
+    while read -r vmid; do
+        [[ -n "$vmid" ]] || continue
+        gen_read "$vmid" || return 1
+        [[ "$GEN_TEMPLATE_DIGEST" == "$digest" ]] || continue
+        printf '%s\n' "$vmid"
+        return 0
+    done < <(gen_list candidate)
     return 1
 }
 
@@ -596,16 +617,19 @@ bake_fail_other_candidates() {
 }
 
 bake_dry_run() {
-    local force="$1" digest planned reason="digest-changed" match=""
+    local force="$1" digest planned reason="digest-changed" match="" decision
 
     digest=$(compute_template_digest) || return 1
     planned=$(bake_planned_vmid) || planned="none"
     if [[ "$force" -eq 1 ]]; then
         reason=force
-    elif digest_is_memoed "$digest"; then
-        reason=memoed-digest
-    elif match=$(bake_matching_generation "$digest"); then
-        reason=up-to-date
+    else
+        decision=$(detect_should_bake) || return 1
+        case "$decision" in
+            yes\ *|no\ *) reason="${decision#* }" ;;
+            *) reason="$decision" ;;
+        esac
+        match=$(bake_matching_generation "$digest") || match=""
     fi
     printf 'planned_vmid=%s\n' "$planned"
     printf 'digest=%s\n' "$digest"
@@ -655,8 +679,10 @@ bake_locked() {
             log_info "nothing to do: digest is memoed as failed (use --force to retry)"
             return 0
         fi
-        if match=$(bake_matching_generation "$digest"); then
-            log_info "nothing to do: digest matches generation VMID $match"
+        # Do not skip on an active digest match: weekly floor rebakes the
+        # same digest. A candidate with this digest is already the bake.
+        if match=$(bake_matching_candidate "$digest"); then
+            log_info "nothing to do: digest matches candidate VMID $match"
             return 0
         fi
     fi
@@ -765,7 +791,7 @@ bake_locked() {
 }
 
 bake_main() {
-    local force=0 dry_run=0 rc=0
+    local force=0 dry_run=0 rc=0 decision
 
     apply_generation_defaults
     BALLOON="${BALLOON:-0}"
@@ -791,6 +817,28 @@ bake_main() {
         return $?
     fi
 
+    # --force ignores digest equality, weekly floor, memo, and REBAKE_ENABLED.
+    # Default path is detect_should_bake; a `no` decision is exit 0.
+    if [[ "$force" -eq 0 ]]; then
+        decision=$(detect_should_bake) || {
+            log_error "detect_should_bake failed"
+            return 1
+        }
+        case "$decision" in
+            yes\ *)
+                log_info "bake needed: ${decision#yes }"
+                ;;
+            no\ *)
+                log_info "nothing to do: ${decision#no }"
+                return 0
+                ;;
+            *)
+                log_error "detect_should_bake produced an unreadable decision: ${decision:-<empty>}"
+                return 1
+                ;;
+        esac
+    fi
+
     mkdir -p "$(dirname "$BAKE_LOCK_FILE")" || {
         log_error "Cannot create bake lock directory"
         return 1
@@ -812,6 +860,12 @@ bake_main() {
     exec 207>&- || true
     return "$rc"
 }
+
+# detect.sh may source bake.sh when loaded first. The next directive
+# stops the linter following this reverse edge (cycle). Runtime is
+# guarded by RUNNER_DETECT_LOADED.
+# shellcheck source=/dev/null
+source "$LIB_DIR/detect.sh"
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     require_root bake

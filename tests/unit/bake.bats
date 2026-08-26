@@ -315,6 +315,26 @@ bake_qm_stub() {
     assert_called qm 'start 8900'
 }
 
+@test "matching digest past weekly floor without --force still bakes" {
+    local digest
+    digest=$(compute_template_digest)
+    gen_now() { printf '%s\n' '2026-08-25T00:00:00Z'; }
+    gen_store_init
+    gen_create 9000 \
+        GEN_ID=1 \
+        GEN_STATE=active \
+        GEN_TEMPLATE_DIGEST="$digest" \
+        GEN_IMAGE_SHA256=abc \
+        GEN_RUNNER_VERSION=2.336.0 \
+        GEN_CREATED_AT=2026-08-15T00:00:00Z
+
+    run bake_main
+    [ "$status" -eq 0 ]
+    assert_called qm 'create 8900 *'
+    gen_read 8900
+    [ "$GEN_STATE" = "candidate" ]
+}
+
 @test "matching digest without --force exits 0 and does not create" {
     local digest
     digest=$(compute_template_digest)
