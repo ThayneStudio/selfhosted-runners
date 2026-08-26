@@ -64,7 +64,8 @@ EOF
 
     make_cached_image
     stub_sums_for_cache
-    stub_pvesm_space 200000000000
+    # pvesm status Avail is KiB. 200 GiB = 200 * 1024 * 1024 KiB.
+    stub_pvesm_space $((200 * 1024 * 1024))
 
     qm_stub() {
         bake_qm_stub "$@"
@@ -251,10 +252,25 @@ bake_qm_stub() {
 }
 
 @test "insufficient free space fails before qm create" {
-    stub_pvesm_space 1000
+    # 10 GiB in KiB is below BAKE_MIN_FREE_GB=60.
+    stub_pvesm_space $((10 * 1024 * 1024))
     run bake_main --force
     [ "$status" -eq 1 ]
     refute_called qm 'create *'
+}
+
+@test "storage_avail_gb treats pvesm Avail as KiB" {
+    stub_pvesm_space $((200 * 1024 * 1024))
+    run storage_avail_gb
+    [ "$status" -eq 0 ]
+    [ "$output" -eq 200 ]
+    [ "$output" -ge "$BAKE_MIN_FREE_GB" ]
+
+    stub_pvesm_space $((10 * 1024 * 1024))
+    run storage_avail_gb
+    [ "$status" -eq 0 ]
+    [ "$output" -eq 10 ]
+    [ "$output" -lt "$BAKE_MIN_FREE_GB" ]
 }
 
 @test "failed bake does not qm destroy the active TEMPLATE_ID" {
@@ -360,6 +376,21 @@ bake_qm_stub() {
     [ "$status" -eq 0 ]
     [[ "$output" == *"memo"* || "$output" == *"nothing to do"* ]]
     refute_called qm 'create *'
+}
+
+@test "successful --force bake un-memos a previously failed digest" {
+    local digest
+    digest=$(compute_template_digest)
+    memo_failed_digest "$digest"
+    digest_is_memoed "$digest"
+
+    run bake_main --force
+    [ "$status" -eq 0 ]
+    gen_read 8900
+    [ "$GEN_STATE" = "candidate" ]
+
+    run digest_is_memoed "$digest"
+    [ "$status" -eq 1 ]
 }
 
 @test "--dry-run prints plan and does not lock or create" {

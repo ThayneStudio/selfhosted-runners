@@ -139,6 +139,23 @@ EOF
     [ -d "$RUNNER_STATE_DIR" ]
 }
 
+@test "unmemo_failed_digest is success when the file is missing" {
+    [ ! -f "$FAILED_DIGESTS_FILE" ]
+    unmemo_failed_digest abc
+}
+
+@test "unmemo_failed_digest removes only that digest and keeps mode 600" {
+    memo_failed_digest abc
+    memo_failed_digest def
+    unmemo_failed_digest abc
+    run digest_is_memoed abc
+    [ "$status" -eq 1 ]
+    digest_is_memoed def
+    local mode
+    mode=$(stat -c '%a' "$FAILED_DIGESTS_FILE" 2>/dev/null || stat -f '%OLp' "$FAILED_DIGESTS_FILE")
+    [ "$mode" = "600" ]
+}
+
 @test "render_template_setup substitutes DOCKER_MIRROR_URL" {
     run render_template_setup
     [ "$status" -eq 0 ]

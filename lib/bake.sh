@@ -110,6 +110,22 @@ memo_failed_digest() {
     chmod 600 "$FAILED_DIGESTS_FILE" || return 1
 }
 
+# Missing file is success: there is nothing to clear. I/O errors fail closed.
+unmemo_failed_digest() {
+    local digest="${1:-}" tmp rc=0
+    [[ -n "$digest" ]] || return 1
+    [[ -f "$FAILED_DIGESTS_FILE" ]] || return 0
+
+    tmp=$(mktemp "${FAILED_DIGESTS_FILE}.XXXXXX") || return 1
+    grep -vxF "$digest" "$FAILED_DIGESTS_FILE" > "$tmp" || rc=$?
+    if (( rc > 1 )); then
+        rm -f "$tmp"
+        return 1
+    fi
+    chmod 600 "$tmp" || { rm -f "$tmp"; return 1; }
+    mv "$tmp" "$FAILED_DIGESTS_FILE" || { rm -f "$tmp"; return 1; }
+}
+
 bake_download_image() {
     mkdir -p "$IMG_CACHE_DIR" || return 1
     chmod 700 "$IMG_CACHE_DIR" || return 1
@@ -263,8 +279,9 @@ bake_download_image() {
 # Bake orchestration (spec 6.2)
 # ---------------------------------------------------------------------------
 
-# pvesm status Avail is treated as bytes (plan Task 5; stub-friendly). Convert
-# to GiB with integer division: bytes / 1024 / 1024 / 1024. Fail closed.
+# pvesm status Avail is KiB (Proxmox CLI converts API bytes / 1024 for
+# display). Convert to GiB with integer division: KiB / 1024 / 1024.
+# Fail closed.
 storage_avail_gb() {
     local row avail
     [[ -n "${VM_STORAGE:-}" ]] || return 1
@@ -272,7 +289,7 @@ storage_avail_gb() {
     [[ -n "$row" ]] || return 1
     avail=$(awk '{ print $6 }' <<< "$row")
     [[ "$avail" =~ ^[0-9]+$ ]] || return 1
-    printf '%s\n' $((avail / 1024 / 1024 / 1024))
+    printf '%s\n' $((avail / 1024 / 1024))
 }
 
 # Lowest free band VMID without taking the allocator lock. Dry-run only.
@@ -780,6 +797,9 @@ bake_locked() {
     # New VMID is candidate. Disarm EXIT/INT/TERM before ruling-6 leftover
     # destroy so a signal cannot bake_fail the successful new VMID.
     trap - EXIT INT TERM
+
+    # --force of a previously memoed digest must not keep blocking detect.
+    unmemo_failed_digest "$digest" || true
 
     bake_fail_other_candidates "$vmid"
 
