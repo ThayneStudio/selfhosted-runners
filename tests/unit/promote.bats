@@ -150,3 +150,25 @@ seed_active_and_candidate() {
     [ "$GEN_STATE" = "baking" ]
     grep -q 'TEMPLATE_ID="9000"' "$CONFIG_FILE"
 }
+
+@test "promote_generation traps EXIT to clear PROMOTION_PAUSE_FILE before flock waits" {
+    # Write pause, then trap EXIT, then exclusive flock. A trap after flock
+    # misses Ctrl-C during the 120s wait. Proven against source order because
+    # a live SIGINT during flock -w 120 is too slow/flaky for the suite.
+    awk '
+        /: > "\$PROMOTION_PAUSE_FILE"/ { pause = NR }
+        /trap '\''_promote_release'\'' EXIT/ { trapline = NR }
+        /flock -w 120 -x 202/ { flock = NR }
+        END {
+            if (!pause || !trapline || !flock) exit 1
+            if (!(pause < trapline && trapline < flock)) exit 1
+        }
+    ' "$REPO_ROOT/lib/promote.sh"
+}
+
+@test "_promote_release clears the EXIT trap" {
+    # A leftover EXIT trap would re-run _promote_release when the process
+    # later exits (setup after bootstrap promote, or bats run subshell).
+    grep -A8 '^_promote_release()' "$REPO_ROOT/lib/promote.sh" \
+        | grep -qE "^[[:space:]]*trap - EXIT"
+}
