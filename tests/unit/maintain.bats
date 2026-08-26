@@ -352,6 +352,35 @@ EOF
     notify_log | grep -q 'bake.failed'
 }
 
+@test "dead baking with no VM still frees leftover volumes" {
+    gen_store_init
+    gen_create 8900 \
+        GEN_ID=2 \
+        GEN_STATE=baking \
+        GEN_TEMPLATE_DIGEST=deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef \
+        GEN_IMAGE_SHA256=abc
+    stub_status qm 'status 8900' 1
+    stub_out pvesm 'list *' <<EOF
+Volid Format
+${VM_STORAGE}:vm-8900-disk-0 raw
+${VM_STORAGE}:vm-8900-cloudinit raw
+EOF
+    stub_out pvesm "free ${VM_STORAGE}:vm-8900-disk-0" < /dev/null
+    stub_out pvesm "free ${VM_STORAGE}:vm-8900-cloudinit" < /dev/null
+
+    run maintain_reconcile_baking
+    [ "$status" -eq 0 ]
+    gen_read 8900
+    [ "$GEN_STATE" = "failed" ]
+    [[ "$GEN_FAILED_REASON" == *"host reboot or interrupted bake"* ]]
+    refute_called qm 'stop *'
+    refute_called qm 'destroy *'
+    assert_called pvesm "list ${VM_STORAGE}"
+    assert_called pvesm "free ${VM_STORAGE}:vm-8900-disk-0"
+    assert_called pvesm "free ${VM_STORAGE}:vm-8900-cloudinit"
+    notify_log | grep -q 'bake.failed'
+}
+
 # ---------------------------------------------------------------------------
 # Two actives
 # ---------------------------------------------------------------------------

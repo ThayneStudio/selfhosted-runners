@@ -85,8 +85,9 @@ in_rebake_window() {
 }
 
 # Fail a leftover baking generation. Never qm destroy TEMPLATE_ID. Proven by
-# "dead baking record with free bake lock is failed and the VM destroyed" and
-# "dead baking at TEMPLATE_ID is failed but the VM is not destroyed".
+# "dead baking record with free bake lock is failed and the VM destroyed",
+# "dead baking at TEMPLATE_ID is failed but the VM is not destroyed", and
+# "dead baking with no VM still frees leftover volumes".
 maintain_fail_dead_bake() {
     local vmid="${1:-}"
     local digest="" gen_id=""
@@ -98,14 +99,18 @@ maintain_fail_dead_bake() {
 
     if [[ "$vmid" == "${TEMPLATE_ID:-}" ]]; then
         log_error "Refusing to destroy TEMPLATE_ID $TEMPLATE_ID on dead-bake reconcile"
-    elif qm status "$vmid" >/dev/null 2>&1; then
-        # Proxmox refuses destroy of a running VM. Match bake_fail: stop then
-        # destroy. Proven by "dead baking record with free bake lock is failed
-        # and the VM destroyed".
-        qm stop "$vmid" --timeout 30 2>/dev/null || true
-        if ! qm destroy "$vmid" --purge; then
-            log_error "Failed to destroy interrupted-bake VM $vmid"
+    else
+        if qm status "$vmid" >/dev/null 2>&1; then
+            # Proxmox refuses destroy of a running VM. Match bake_fail: stop
+            # then destroy. Proven by "dead baking record with free bake lock
+            # is failed and the VM destroyed".
+            qm stop "$vmid" --timeout 30 2>/dev/null || true
+            if ! qm destroy "$vmid" --purge; then
+                log_error "Failed to destroy interrupted-bake VM $vmid"
+            fi
         fi
+        # Config can be gone after a reboot while vm-${vmid}-disk-* remains.
+        # Proven by "dead baking with no VM still frees leftover volumes".
         bake_free_vmid_volumes "$vmid"
     fi
 
