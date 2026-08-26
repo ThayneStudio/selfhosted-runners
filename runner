@@ -21,6 +21,7 @@ case "$COMMAND" in
     bake)      exec "$SCRIPT_DIR/lib/bake.sh" "$@" ;;
     promote)   exec "$SCRIPT_DIR/lib/promote.sh" "$@" ;;
     maintain)  exec "$SCRIPT_DIR/lib/maintain.sh" "$@" ;;
+    upgrade)   exec "$SCRIPT_DIR/lib/upgrade.sh" "$@" ;;
     help|--help|-h)
         echo "Usage: runner <command> [args]"
         echo ""
@@ -39,6 +40,7 @@ case "$COMMAND" in
         echo "  bake [--force] [--dry-run]  Bake a new candidate generation"
         echo "  promote <id> [--skip-canary] Promote a candidate generation to active"
         echo "  maintain                    Unattended adopt/detect/bake cycle (run by timer)"
+        echo "  upgrade [--dry-run] [--force]  Bake a candidate if needed and promote it"
         echo ""
         echo "Runners are ephemeral: one job, shutdown, auto-destroy, watcher recreates."
         ;;

@@ -98,6 +98,7 @@ if [[ -f /etc/github-runners.conf ]]; then
         cp "$INSTALL_DIR/templates/github-runner-guard.timer" "$SYSTEMD_UNIT_DIR/"
         cp "$INSTALL_DIR/templates/github-runner-maintain.service" "$SYSTEMD_UNIT_DIR/"
         cp "$INSTALL_DIR/templates/github-runner-maintain.timer" "$SYSTEMD_UNIT_DIR/"
+        cp "$INSTALL_DIR/templates/github-runner-upgrade.service" "$SYSTEMD_UNIT_DIR/"
         systemctl daemon-reload
         # New in this release, so an existing install has it disabled.
         systemctl enable --now github-runner-guard.timer 2>/dev/null || true
@@ -130,6 +131,9 @@ if [[ -f /etc/github-runners.conf ]]; then
     echo "    Preview: runner guard --dry-run   Disable: systemctl disable --now github-runner-guard.timer"
     echo "  Daily maintain timer: 02:30 (detect + rebake inside REBAKE_WINDOW)."
     echo "    Disable: systemctl disable --now github-runner-maintain.timer"
+    echo "  To bake a new generation and start cloning it (does not destroy TEMPLATE_ID):"
+    echo "    runner upgrade --dry-run"
+    echo "    runner upgrade"
     # Regenerate per-org cloud-init snippets from updated template
     if [[ -d /etc/github-runners.d ]]; then
         for org_conf in /etc/github-runners.d/*.conf; do

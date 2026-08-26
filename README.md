@@ -438,33 +438,25 @@ cloned runner VM):
    runner create runner-01
    ```
 
-To update prebaked software in the base VM template:
+To update prebaked software in the base VM template (does **not** destroy
+the live clone target):
 
-1. Edit `/opt/selfhosted-runners/templates/template-setup.yaml`
-2. Stop the watcher, remove managed runners, and free any orphaned linked-clone child volumes that still point at the current template:
-   ```bash
-   runner stop
-   ```
-3. Destroy the existing template VM (default ID `9000`, or your configured template ID):
-   ```bash
-   qm destroy 9000
-   ```
-4. Re-run setup to bake a fresh template:
-   ```bash
-   runner setup
-   ```
-   > **Record your config first.** The wizard re-prompts all eight infrastructure
-   > questions with *hardcoded* defaults -- it does not read your existing
-   > `/etc/github-runners.conf`. Pressing Enter through it silently clears
-   > `DOCKER_MIRROR_URL` and `VLAN_TAG`, for the bake and for every future clone.
-   > Run `cat /etc/github-runners.conf` beforehand and retype every
-   > non-default value. Your PAT and org configs are not touched -- `add-org` only
-   > runs when no orgs exist yet, and the unprompted guard thresholds
-   > (`MAX_VM_LIFETIME_HOURS`, `STOPPED_REAP_MINUTES`) are read back and kept.
-5. Resume the pool and refill it:
-   ```bash
-   runner start
-   ```
+```bash
+runner upgrade --dry-run
+runner upgrade
+```
+
+That bakes a new generation in the 8900–8999 band and promotes it. Existing
+clones keep running on the previous template until they recycle. Preview first
+with `--dry-run`. If the active template is older than `REBAKE_MAX_AGE_DAYS`
+(default 7), `--dry-run` shows `reason=weekly-floor` and upgrade rebakes even
+when the digest is unchanged.
+
+If a previous bake failed and the digest is memoed:
+
+```bash
+runner bake --force && runner upgrade
+```
 
 ### If the bake fails or appears stuck
 
@@ -475,7 +467,7 @@ shuts the VM down itself and only then converts it to a template.
 
 - **Timeout**: the bake aborts after 90 minutes and prints the last 40 lines from
   the guest log. A healthy bake runs 30-45 minutes. Override with
-  `BAKE_TIMEOUT=<seconds> runner setup`.
+  `BAKE_TIMEOUT=<seconds> runner upgrade --foreground`.
 - **`qm stop` on a stuck bake is safe.** The VM stopping without a confirmed
   marker is treated as failure -- setup aborts and the cleanup trap destroys the
   partial VM rather than publishing it.

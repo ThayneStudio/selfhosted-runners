@@ -7,8 +7,8 @@
 # require_root, load_infra_config, then promote_generation. Do not require_root
 # at source time.
 #
-# --yes is for setup bootstrap and tests. It is not documented as a way to
-# bypass canary in production unattended maintain.
+# --yes is for setup bootstrap, tests, and `runner upgrade` (an operator-invoked
+# verb). It is not a way to bypass canary from unattended maintain.
 #
 # GEN_* fields are loaded via gen_read in this shell; gen_transition is a
 # subshell, so SC2030/SC2031 are false positives here as in generations.sh.
