@@ -72,9 +72,12 @@ if [[ -f /etc/github-runners.conf ]]; then
         cp "$INSTALL_DIR/templates/github-runner-watch.timer" /etc/systemd/system/
         cp "$INSTALL_DIR/templates/github-runner-guard.service" /etc/systemd/system/
         cp "$INSTALL_DIR/templates/github-runner-guard.timer" /etc/systemd/system/
+        cp "$INSTALL_DIR/templates/github-runner-maintain.service" /etc/systemd/system/
+        cp "$INSTALL_DIR/templates/github-runner-maintain.timer" /etc/systemd/system/
         systemctl daemon-reload
         # New in this release, so an existing install has it disabled.
         systemctl enable --now github-runner-guard.timer 2>/dev/null || true
+        systemctl enable --now github-runner-maintain.timer 2>/dev/null || true
     fi
     # Backfill settings added after this host was set up. The guard falls back
     # to the same defaults, but an operator can only tune what they can see.
@@ -101,6 +104,15 @@ if [[ -f /etc/github-runners.conf ]]; then
          "$(conf_value MAX_VM_LIFETIME_HOURS)h, and ones stopped longer than" \
          "$(conf_value STOPPED_REAP_MINUTES)m."
     echo "    Preview: runner guard --dry-run   Disable: systemctl disable --now github-runner-guard.timer"
+    echo "  Daily maintain timer: 02:30 (detect + rebake inside REBAKE_WINDOW)."
+    echo "    Disable: systemctl disable --now github-runner-maintain.timer"
+    # Adopt the deployed template as generation 1 when the store is empty.
+    # Never bakes on upgrade.
+    if command -v qm >/dev/null 2>&1; then
+        # shellcheck source=lib/generations.sh
+        source "$INSTALL_DIR/lib/generations.sh"
+        adopt_deployed_template
+    fi
     # Regenerate per-org cloud-init snippets from updated template
     if [[ -d /etc/github-runners.d ]]; then
         for org_conf in /etc/github-runners.d/*.conf; do

@@ -227,6 +227,9 @@ STOPPED_REAP_MINUTES=$(existing_conf_value STOPPED_REAP_MINUTES)
 STOPPED_REAP_MINUTES=${STOPPED_REAP_MINUTES:-$DEFAULT_STOPPED_REAP_MINUTES}
 GUARD_EXCLUDE_VMIDS=$(existing_conf_value GUARD_EXCLUDE_VMIDS)
 GUARD_EXCLUDE_VMIDS=${GUARD_EXCLUDE_VMIDS:-$DEFAULT_GUARD_EXCLUDE_VMIDS}
+NOTIFY_WEBHOOK_URL=$(existing_conf_value NOTIFY_WEBHOOK_URL)
+NOTIFY_MIN_SEVERITY=$(existing_conf_value NOTIFY_MIN_SEVERITY)
+NOTIFY_FORMAT=$(existing_conf_value NOTIFY_FORMAT)
 
 CONF_TMP=$(mktemp "${CONFIG_FILE}.XXXXXX")
 {
@@ -241,6 +244,9 @@ CONF_TMP=$(mktemp "${CONFIG_FILE}.XXXXXX")
     printf 'MAX_VM_LIFETIME_HOURS=%q\n' "$MAX_VM_LIFETIME_HOURS"
     printf 'STOPPED_REAP_MINUTES=%q\n' "$STOPPED_REAP_MINUTES"
     printf 'GUARD_EXCLUDE_VMIDS=%q\n' "$GUARD_EXCLUDE_VMIDS"
+    printf 'NOTIFY_WEBHOOK_URL=%q\n' "${NOTIFY_WEBHOOK_URL:-}"
+    printf 'NOTIFY_MIN_SEVERITY=%q\n' "${NOTIFY_MIN_SEVERITY:-}"
+    printf 'NOTIFY_FORMAT=%q\n' "${NOTIFY_FORMAT:-}"
 } > "$CONF_TMP"
 chmod 600 "$CONF_TMP"
 mv "$CONF_TMP" "$CONFIG_FILE"
@@ -341,20 +347,25 @@ else
     fi
 fi
 
-log_info "[5/5] Installing pool watcher and lifetime guard timers..."
+log_info "[5/5] Installing pool watcher, lifetime guard, and maintain timers..."
 cp "$INSTALL_DIR/templates/github-runner-watch.service" /etc/systemd/system/
 cp "$INSTALL_DIR/templates/github-runner-watch.timer" /etc/systemd/system/
 cp "$INSTALL_DIR/templates/github-runner-guard.service" /etc/systemd/system/
 cp "$INSTALL_DIR/templates/github-runner-guard.timer" /etc/systemd/system/
+cp "$INSTALL_DIR/templates/github-runner-maintain.service" /etc/systemd/system/
+cp "$INSTALL_DIR/templates/github-runner-maintain.timer" /etc/systemd/system/
 mkdir -p /etc/logrotate.d
 cp "$INSTALL_DIR/templates/github-runners.logrotate" /etc/logrotate.d/github-runners
 systemctl daemon-reload
 systemctl enable --now github-runner-watch.timer 2>/dev/null || true
 systemctl enable --now github-runner-guard.timer 2>/dev/null || true
+systemctl enable --now github-runner-maintain.timer 2>/dev/null || true
 log_info "Pool watcher timer installed (30s interval)"
 log_info "Lifetime guard timer installed (5m interval, ${MAX_VM_LIFETIME_HOURS}h VM ceiling, ${STOPPED_REAP_MINUTES}m stopped reap)"
+log_info "Maintain timer installed (daily 02:30, rebake inside REBAKE_WINDOW)"
 echo "  Preview what it would destroy:  runner guard --dry-run"
 echo "  Turn it off:                    systemctl disable --now github-runner-guard.timer"
+echo "  Disable daily maintain:         systemctl disable --now github-runner-maintain.timer"
 
 echo ""
 echo "========================================"
