@@ -19,6 +19,7 @@ case "$COMMAND" in
     watch)     exec "$SCRIPT_DIR/lib/watch.sh" "$@" ;;
     guard)     exec "$SCRIPT_DIR/lib/guard.sh" "$@" ;;
     bake)      exec "$SCRIPT_DIR/lib/bake.sh" "$@" ;;
+    promote)   exec "$SCRIPT_DIR/lib/promote.sh" "$@" ;;
     help|--help|-h)
         echo "Usage: runner <command> [args]"
         echo ""
@@ -35,6 +36,7 @@ case "$COMMAND" in
         echo "  watch                       Fill runner pools (run by timer)"
         echo "  guard [--dry-run]           Reap stopped and over-age runner VMs (run by timer)"
         echo "  bake [--force] [--dry-run]  Bake a new candidate generation"
+        echo "  promote <id> [--skip-canary] Promote a candidate generation to active"
         echo ""
         echo "Runners are ephemeral: one job, shutdown, auto-destroy, watcher recreates."
         ;;

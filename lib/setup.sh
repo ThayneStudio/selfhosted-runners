@@ -285,47 +285,60 @@ fi
 if qm status "$TEMPLATE_ID" &> /dev/null; then
     log_info "[4/5] Template VM $TEMPLATE_ID already exists. Skipping creation."
     # Adopt as generation 1 when the store is empty (spec 8). No-op otherwise;
-    # never destroys. Fresh-host bake is Task 7.
+    # never destroys.
     # shellcheck source=generations.sh
     source "$LIB_DIR/generations.sh"
     adopt_deployed_template
 else
-    # First-run still bakes into TEMPLATE_ID until Task 7 promotes a band
-    # candidate. Create/poll/publish live in bake.sh (one implementation).
-    log_info "[4/5] Creating baked Ubuntu cloud template..."
+    # Bootstrap (ruling 2): no template at TEMPLATE_ID. Bake a band candidate
+    # and promote it with skip-canary --yes only when the store had no active
+    # generation before the bake. --yes is not a production maintain bypass.
+    log_info "[4/5] No template at VMID $TEMPLATE_ID — baking the first generation..."
     # shellcheck source=bake.sh
     source "$LIB_DIR/bake.sh"
-    if ! bake_download_image; then
+    # shellcheck source=promote.sh
+    source "$LIB_DIR/promote.sh"
+
+    had_active=0
+    if [[ -n "$(gen_list active)" ]]; then
+        had_active=1
+    fi
+
+    if ! bake_main --force; then
+        log_error "First-run bake failed"
         exit 1
     fi
 
-    cleanup_bake() {
-        log_warn "Baking failed, cleaning up template VM..."
-        qm stop "$TEMPLATE_ID" --timeout 30 2>/dev/null || true
-        qm destroy "$TEMPLATE_ID" --purge 2>/dev/null || true
-    }
-    trap cleanup_bake EXIT
-
-    if ! bake_create_template_vm "$TEMPLATE_ID" "ubuntu-cloud-template" "template-setup.yaml"; then
-        log_error "Failed to create VM"
-        exit 1
+    if [[ "$had_active" -eq 0 ]]; then
+        cand_vmid=""
+        cand_count=0
+        while read -r cand_line; do
+            [[ -n "$cand_line" ]] || continue
+            cand_vmid="$cand_line"
+            cand_count=$((cand_count + 1))
+        done < <(gen_list candidate)
+        if [[ "$cand_count" -ne 1 || -z "$cand_vmid" ]]; then
+            log_error "Bake finished but could not find a single candidate to promote"
+            exit 1
+        fi
+        # gen_read publishes GEN_* into its caller. Capture in a subshell so
+        # we do not depend on the parent seeing those assignments.
+        # shellcheck disable=SC2031
+        bootstrap_gen_id=$(
+            gen_read "$cand_vmid" || exit 1
+            printf '%s' "$GEN_ID"
+        ) || exit 1
+        if [[ -z "$bootstrap_gen_id" ]]; then
+            log_error "Candidate VMID $cand_vmid has no GEN_ID"
+            exit 1
+        fi
+        if ! promote_generation "$bootstrap_gen_id" --skip-canary --yes; then
+            log_error "Failed to promote generation $bootstrap_gen_id"
+            exit 1
+        fi
+        TEMPLATE_ID=$(reload_active_template_id) || exit 1
+        log_info "Promoted generation $bootstrap_gen_id (VMID $TEMPLATE_ID) as the active template"
     fi
-
-    log_info "Starting VM to install tools (this can take a while on cold caches)..."
-    if ! qm start "$TEMPLATE_ID"; then
-        log_error "Failed to start template VM"
-        exit 1
-    fi
-
-    if ! bake_poll_setup_complete "$TEMPLATE_ID"; then
-        exit 1
-    fi
-    if ! bake_shutdown_convert "$TEMPLATE_ID"; then
-        exit 1
-    fi
-
-    trap - EXIT
-    log_info "Template created successfully (tools baked in)"
 fi
 
 log_info "[5/5] Installing pool watcher and lifetime guard timers..."

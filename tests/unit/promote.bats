@@ -1,0 +1,152 @@
+#!/usr/bin/env bats
+# Thin promote: rewrite TEMPLATE_ID, skip-canary confirm, candidate → active.
+#
+# write_infra_config still defaults MIN_VMID=500, which overlaps the
+# generation band, so tests set 9001.
+
+load test_helper
+bats_require_minimum_version 1.5.0
+
+setup() {
+    load_lib promote.sh
+    MIN_VMID=9001
+    TEMPLATE_ID=9000
+    write_infra_config
+    MIN_VMID=9001
+    TEMPLATE_ID=9000
+    apply_generation_defaults
+    notify() {
+        printf '%s\n' "$*" >> "$STUB_DIR/notify.log"
+    }
+}
+
+file_mode() {
+    stat -c '%a' "$1" 2>/dev/null || stat -f '%OLp' "$1"
+}
+
+seed_active_and_candidate() {
+    gen_store_init
+    gen_create 9000 \
+        GEN_ID=1 \
+        GEN_STATE=active \
+        GEN_TEMPLATE_DIGEST=olddigest \
+        GEN_IMAGE_SHA256=abc \
+        GEN_RUNNER_VERSION=2.335.0
+    gen_create 8900 \
+        GEN_ID=2 \
+        GEN_STATE=candidate \
+        GEN_TEMPLATE_DIGEST=newdigest \
+        GEN_IMAGE_SHA256=def \
+        GEN_RUNNER_VERSION=2.336.0
+}
+
+@test "lib/promote.sh is syntactically valid" {
+    bash -n "$REPO_ROOT/lib/promote.sh"
+}
+
+@test "runner dispatches the promote verb" {
+    grep -Eq '^[[:space:]]*promote\)' "$REPO_ROOT/runner"
+}
+
+@test "rewrite_template_id changes only TEMPLATE_ID and preserves DOCKER_MIRROR_URL" {
+    {
+        printf 'NETWORK_BRIDGE="vmbr0"\n'
+        printf 'VM_STORAGE="local-zfs"\n'
+        printf 'TEMPLATE_ID="9000"\n'
+        printf 'MIN_VMID="9001"\n'
+        printf 'DOCKER_MIRROR_URL="http://mirror.example:8080"\n'
+        printf 'VLAN_TAG="20"\n'
+    } > "$CONFIG_FILE"
+
+    run rewrite_template_id 8900
+    [ "$status" -eq 0 ]
+
+    grep -qE '^TEMPLATE_ID=["'\'']?8900["'\'']?$' "$CONFIG_FILE"
+    grep -q 'DOCKER_MIRROR_URL="http://mirror.example:8080"' "$CONFIG_FILE"
+    grep -q 'NETWORK_BRIDGE="vmbr0"' "$CONFIG_FILE"
+    grep -q 'VM_STORAGE="local-zfs"' "$CONFIG_FILE"
+    grep -q 'MIN_VMID="9001"' "$CONFIG_FILE"
+    grep -q 'VLAN_TAG="20"' "$CONFIG_FILE"
+    ! grep -qE '^TEMPLATE_ID=["'\'']?9000["'\'']?$' "$CONFIG_FILE"
+    [ "$(file_mode "$CONFIG_FILE")" = "600" ]
+}
+
+@test "rewrite_template_id fails closed when CONFIG_FILE has no TEMPLATE_ID line" {
+    printf 'DOCKER_MIRROR_URL="http://mirror.example:8080"\n' > "$CONFIG_FILE"
+    run rewrite_template_id 8900
+    [ "$status" -ne 0 ]
+    grep -q 'DOCKER_MIRROR_URL="http://mirror.example:8080"' "$CONFIG_FILE"
+    ! grep -q 'TEMPLATE_ID=' "$CONFIG_FILE"
+}
+
+@test "promote --skip-canary without --yes on a non-tty fails" {
+    seed_active_and_candidate
+
+    run --separate-stderr promote_generation 2 --skip-canary </dev/null
+    [ "$status" -ne 0 ]
+
+    gen_read 8900
+    [ "$GEN_STATE" = "candidate" ]
+    gen_read 9000
+    [ "$GEN_STATE" = "active" ]
+    grep -q 'TEMPLATE_ID="9000"' "$CONFIG_FILE"
+    [ ! -e "$PROMOTION_PAUSE_FILE" ]
+}
+
+@test "promote --skip-canary --yes moves candidate to active and previous active to superseded" {
+    seed_active_and_candidate
+
+    run --separate-stderr promote_generation 2 --skip-canary --yes
+    [ "$status" -eq 0 ]
+
+    gen_read 8900
+    [ "$GEN_STATE" = "active" ]
+    [ -n "$GEN_PROMOTED_AT" ]
+    gen_read 9000
+    [ "$GEN_STATE" = "superseded" ]
+    [ -n "$GEN_SUPERSEDED_AT" ]
+    [ ! -e "$PROMOTION_PAUSE_FILE" ]
+
+    grep -q 'generation.promoted' "$STUB_DIR/notify.log"
+}
+
+@test "promote does not leave TEMPLATE_ID pointing at the old VMID" {
+    seed_active_and_candidate
+    printf 'DOCKER_MIRROR_URL="http://mirror.example:8080"\n' >> "$CONFIG_FILE"
+
+    run --separate-stderr promote_generation 2 --skip-canary --yes
+    [ "$status" -eq 0 ]
+
+    grep -qE '^TEMPLATE_ID=["'\'']?8900["'\'']?$' "$CONFIG_FILE"
+    ! grep -qE '^TEMPLATE_ID=["'\'']?9000["'\'']?$' "$CONFIG_FILE"
+    grep -q 'DOCKER_MIRROR_URL="http://mirror.example:8080"' "$CONFIG_FILE"
+
+    run --separate-stderr reload_active_template_id
+    [ "$status" -eq 0 ]
+    [ "$output" = "8900" ]
+}
+
+@test "promote of an already-active generation is a no-op success" {
+    seed_active_and_candidate
+
+    run --separate-stderr promote_generation 1 --skip-canary --yes
+    [ "$status" -eq 0 ]
+
+    gen_read 9000
+    [ "$GEN_STATE" = "active" ]
+    gen_read 8900
+    [ "$GEN_STATE" = "candidate" ]
+    grep -q 'TEMPLATE_ID="9000"' "$CONFIG_FILE"
+    [ ! -f "$STUB_DIR/notify.log" ] || ! grep -q 'generation.promoted' "$STUB_DIR/notify.log"
+}
+
+@test "promote refuses a non-candidate generation" {
+    gen_store_init
+    gen_create 8900 GEN_ID=2 GEN_STATE=baking
+
+    run --separate-stderr promote_generation 2 --skip-canary --yes
+    [ "$status" -ne 0 ]
+    gen_read 8900
+    [ "$GEN_STATE" = "baking" ]
+    grep -q 'TEMPLATE_ID="9000"' "$CONFIG_FILE"
+}

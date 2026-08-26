@@ -390,8 +390,7 @@ bake_fail() {
 }
 
 # Create and configure a bake VM. Name and snippet basename are parameterized
-# so first-run setup can still use ubuntu-cloud-template / template-setup.yaml
-# until Task 7 promotes a band candidate.
+# so bake_main can use github-runner-gen-N with a per-VMID snippet.
 # Usage: bake_create_template_vm <vmid> <name> <snippet-basename>
 bake_create_template_vm() {
     local vmid="$1" name="$2" snippet_base="$3"
