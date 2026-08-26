@@ -766,7 +766,7 @@ bake_dry_run() {
 bake_locked() {
     local force="$1"
     local avail digest image_sha vmid gen_id snippet_base
-    local match=""
+    local match="" unmemo_rc=0
 
     avail=$(storage_avail_gb) || {
         log_error "Could not parse free space for $VM_STORAGE"
@@ -903,13 +903,17 @@ bake_locked() {
     trap - EXIT INT TERM
 
     # --force of a previously memoed digest must not keep blocking detect.
-    # Trap is already disarmed: failing here leaves the candidate in place.
+    # Trap is already disarmed: leftover destroy cannot bake_fail this VMID.
     if ! unmemo_failed_digest "$digest"; then
         log_error "Failed to clear failed-digest memo after candidate VMID $vmid"
-        return 1
+        unmemo_rc=1
     fi
 
     bake_fail_other_candidates "$vmid"
+
+    if (( unmemo_rc != 0 )); then
+        return 1
+    fi
 
     log_info "Bake finished: generation $gen_id is candidate (VMID $vmid)"
     _bake_tee "bake finished gen=$gen_id vmid=$vmid state=candidate"

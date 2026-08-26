@@ -72,11 +72,12 @@ setup() {
         /apply_generation_defaults/ { if (src && !d) d = NR }
         /validate_generation_band/ { if (d && !v) v = NR }
         /enable --now github-runner-maintain.timer/ { if (!e) e = NR }
+        /adopt_deployed_template/ { if (!a) a = NR }
         /Install aborted/ { abort = NR }
         /exit 1/ { if (v && !x) x = NR }
         END {
-            if (!src || !d || !v || !e || !abort || !x) exit 1
-            if (!(src < d && d <= v && v < x && x < e && abort < e)) exit 1
+            if (!src || !d || !v || !e || !abort || !x || !a) exit 1
+            if (!(src < d && d <= v && v < x && x < a && a < e && abort < e)) exit 1
         }
     ' "$REPO_ROOT/install.sh"
 }

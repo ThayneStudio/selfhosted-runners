@@ -145,6 +145,17 @@ notify_log() {
     ! grep -q 'bake_main' "$REPO_ROOT/install.sh"
 }
 
+@test "install.sh adopts before enabling maintain.timer" {
+    awk '
+        /adopt_deployed_template/ { a = NR }
+        /enable --now github-runner-maintain.timer/ { e = NR }
+        END {
+            if (!a || !e) exit 1
+            if (!(a < e)) exit 1
+        }
+    ' "$REPO_ROOT/install.sh"
+}
+
 # ---------------------------------------------------------------------------
 # Window helper (MAINTAIN_NOW_HHMM is test-only)
 # ---------------------------------------------------------------------------
@@ -505,6 +516,81 @@ EOF
     [ "$GEN_STATE" = "failed" ]
     [ ! -f "$STUB_DIR/notify.log" ] || ! grep -q 'generation.reconciled' "$STUB_DIR/notify.log"
     [[ "$output" == *"not forcing"* ]]
+}
+
+@test "zero actives with TEMPLATE_ID pointing at a candidate record → it becomes active" {
+    gen_store_init
+    TEMPLATE_ID=9000
+    gen_create 9000 \
+        GEN_ID=1 \
+        GEN_STATE=candidate \
+        GEN_TEMPLATE_DIGEST=old \
+        GEN_IMAGE_SHA256=abc \
+        GEN_RUNNER_VERSION=2.335.0
+
+    run maintain_reconcile_two_actives
+    [ "$status" -eq 0 ]
+    gen_read 9000
+    [ "$GEN_STATE" = "active" ]
+    notify_log | grep -q 'generation.reconciled'
+}
+
+@test "zero actives with TEMPLATE_ID pointing at a rejected record stays rejected" {
+    gen_store_init
+    TEMPLATE_ID=9000
+    gen_create 9000 \
+        GEN_ID=1 \
+        GEN_STATE=rejected \
+        GEN_TEMPLATE_DIGEST=old \
+        GEN_IMAGE_SHA256=abc \
+        GEN_RUNNER_VERSION=2.335.0
+
+    run maintain_reconcile_two_actives
+    [ "$status" -eq 0 ]
+    gen_read 9000
+    [ "$GEN_STATE" = "rejected" ]
+    [ ! -f "$STUB_DIR/notify.log" ] || ! grep -q 'generation.reconciled' "$STUB_DIR/notify.log"
+    [[ "$output" == *"not forcing"* ]]
+}
+
+@test "zero actives with TEMPLATE_ID pointing at a baking record stays baking" {
+    gen_store_init
+    TEMPLATE_ID=9000
+    gen_create 9000 \
+        GEN_ID=1 \
+        GEN_STATE=baking \
+        GEN_TEMPLATE_DIGEST=old \
+        GEN_IMAGE_SHA256=abc \
+        GEN_RUNNER_VERSION=2.335.0
+
+    run maintain_reconcile_two_actives
+    [ "$status" -eq 0 ]
+    gen_read 9000
+    [ "$GEN_STATE" = "baking" ]
+    [ ! -f "$STUB_DIR/notify.log" ] || ! grep -q 'generation.reconciled' "$STUB_DIR/notify.log"
+    [[ "$output" == *"not forcing"* ]]
+}
+
+@test "dead-bake reconcile does not memo a generation that is no longer baking" {
+    gen_store_init
+    gen_create 8900 \
+        GEN_ID=2 \
+        GEN_STATE=candidate \
+        GEN_TEMPLATE_DIGEST=deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef \
+        GEN_IMAGE_SHA256=abc
+    stub_out qm 'config 8900' <<'EOF'
+name: github-runner-gen-2
+template: 1
+EOF
+
+    run maintain_fail_dead_bake 8900
+    [ "$status" -eq 0 ]
+    gen_read 8900
+    [ "$GEN_STATE" = "candidate" ]
+    run digest_is_memoed deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef
+    [ "$status" -eq 1 ]
+    [ ! -f "$STUB_DIR/notify.log" ] || ! grep -q 'bake.failed' "$STUB_DIR/notify.log"
+    refute_called qm 'destroy *'
 }
 
 @test "stale promotion pause is cleared when the pool lock is free" {

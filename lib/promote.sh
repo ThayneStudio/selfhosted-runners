@@ -134,8 +134,8 @@ promote_generation() {
     [[ "$lock_wait" =~ ^[0-9]+$ ]] || lock_wait=120
     if ! flock -w "$lock_wait" -x 202; then
         log_warn "Timed out waiting for the pool activity lock — promotion abandoned"
-        notify warn promote.timeout "Timed out waiting for the pool activity lock — promotion abandoned"
         _promote_release
+        notify warn promote.timeout "Timed out waiting for the pool activity lock — promotion abandoned"
         return 1
     fi
 

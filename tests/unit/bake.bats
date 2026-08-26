@@ -569,6 +569,7 @@ EOF
     ! grep -q 'releases/latest' "$snippet"
     grep -q 'releases/download' "$snippet"
     grep -q 'releases/latest' "$INSTALL_DIR/templates/template-setup.yaml"
+    grep -q 'releases/latest' "$REPO_ROOT/templates/template-setup.yaml"
 }
 
 @test "bake_pin_snippet_runner_version fails closed when releases/latest is absent" {
@@ -617,6 +618,14 @@ EOF
 }
 
 @test "unmemo failure after candidate does not destroy the new template" {
+    gen_store_init
+    gen_create 8901 \
+        GEN_ID=1 \
+        GEN_STATE=candidate \
+        GEN_TEMPLATE_DIGEST=old \
+        GEN_IMAGE_SHA256=abc \
+        GEN_RUNNER_VERSION=2.0.0
+    : > "$STUB_DIR/qm-created-8901"
     unmemo_failed_digest() { return 1; }
 
     run bake_main --force
@@ -624,6 +633,9 @@ EOF
     gen_read 8900
     [ "$GEN_STATE" = "candidate" ]
     refute_called qm 'destroy 8900*'
+    gen_read 8901
+    [ "$GEN_STATE" = "failed" ]
+    assert_called qm 'destroy 8901*'
 }
 
 @test "failed bake notifies bake.failed with NOTIFY_GENERATION" {

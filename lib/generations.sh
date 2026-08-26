@@ -1053,7 +1053,10 @@ adopt_deployed_template() {
     done <<< "$linked"
 
     if ((${#traced[@]} > 0)); then
-        all_vms=$(qm list 2>/dev/null </dev/null) || all_vms=""
+        all_vms=$(qm list </dev/null) || {
+            log_error "Failed to list VMs for adoption tagging"
+            return 1
+        }
         while read -r vmid vm_name status _; do
             [[ "$vmid" =~ ^[0-9]+$ ]] || continue
             [[ "$vmid" != "$TEMPLATE_ID" ]] || continue

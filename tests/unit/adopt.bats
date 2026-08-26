@@ -260,6 +260,16 @@ EOF
     [ "$count" = "2" ]
 }
 
+@test "adopt fails closed when qm list fails after origin tracing" {
+    stub_adopt_fleet
+    stub_status qm 'list' 1
+
+    run adopt_deployed_template
+    [ "$status" -ne 0 ]
+    [ "$(gen_list)" = "" ]
+    refute_called qm 'destroy *'
+}
+
 @test "adopt records a probed runner version from a running clone" {
     stub_adopt_fleet
     stub_out qm 'guest exec 9001 -- /home/runner/actions-runner/bin/Runner.Listener --version' <<'EOF'

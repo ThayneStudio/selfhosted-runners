@@ -79,6 +79,18 @@ if [[ -f /etc/github-runners.conf ]]; then
             chmod 600 "$SNIPPETS_DIR/template-setup.yaml"
         fi
     fi
+    # Adopt before enabling maintain.timer so a pvesm/inventory failure cannot
+    # leave the timer running on a host that did not finish adoption.
+    if command -v qm >/dev/null 2>&1; then
+        # shellcheck source=lib/generations.sh
+        source "$INSTALL_DIR/lib/generations.sh"
+        if ! adopt_deployed_template; then
+            echo "" >&2
+            echo "ERROR: adoption of TEMPLATE_ID failed." >&2
+            echo "Install aborted; github-runner-maintain.timer was not enabled." >&2
+            exit 1
+        fi
+    fi
     if [[ -f "$SYSTEMD_UNIT_DIR/github-runner-watch.timer" ]]; then
         cp "$INSTALL_DIR/templates/github-runner-watch.service" "$SYSTEMD_UNIT_DIR/"
         cp "$INSTALL_DIR/templates/github-runner-watch.timer" "$SYSTEMD_UNIT_DIR/"
@@ -118,13 +130,6 @@ if [[ -f /etc/github-runners.conf ]]; then
     echo "    Preview: runner guard --dry-run   Disable: systemctl disable --now github-runner-guard.timer"
     echo "  Daily maintain timer: 02:30 (detect + rebake inside REBAKE_WINDOW)."
     echo "    Disable: systemctl disable --now github-runner-maintain.timer"
-    # Adopt the deployed template as generation 1 when the store is empty.
-    # Never bakes on upgrade.
-    if command -v qm >/dev/null 2>&1; then
-        # shellcheck source=lib/generations.sh
-        source "$INSTALL_DIR/lib/generations.sh"
-        adopt_deployed_template
-    fi
     # Regenerate per-org cloud-init snippets from updated template
     if [[ -d /etc/github-runners.d ]]; then
         for org_conf in /etc/github-runners.d/*.conf; do

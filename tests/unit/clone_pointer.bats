@@ -206,6 +206,13 @@ EOF
     assert_called qm 'destroy *'
 }
 
+@test "create.sh treats clone_runner rc=3 as retry not Clone failed" {
+    grep -A20 'clone_runner' "$REPO_ROOT/lib/create.sh" | grep -q 'clone_rc'
+    grep -A20 'clone_runner' "$REPO_ROOT/lib/create.sh" | grep -q -- '-eq 3'
+    grep -A20 'clone_runner' "$REPO_ROOT/lib/create.sh" | grep -q 'will retry'
+    ! grep -A25 'clone_runner' "$REPO_ROOT/lib/create.sh" | grep -q 'clone.failed'
+}
+
 @test "watch records a failed slot when clone_runner returns 1" {
     clone_runner() { return 1; }
     slot="runner-1"

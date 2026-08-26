@@ -111,6 +111,11 @@ maintain_fail_dead_bake() {
         fi
     fi
 
+    # Do not memo/notify a generation that finished (candidate/active) between
+    # the baking snapshot and this reap — that would block the weekly floor.
+    state=$(gen_state_of "$vmid" 2>/dev/null) || state=""
+    [[ "$state" == "failed" ]] || return 0
+
     if [[ -n "$digest" && "$digest" != "unknown" ]]; then
         memo_failed_digest "$digest" || log_error "Failed to memo failed digest $digest"
     fi

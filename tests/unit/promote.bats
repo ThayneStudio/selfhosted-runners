@@ -88,6 +88,22 @@ seed_active_and_candidate() {
     ! grep -q 'TEMPLATE_ID="8900"' "$CONFIG_FILE"
 }
 
+@test "rewrite_template_id preserves a single-quoted TEMPLATE_ID line" {
+    {
+        printf 'NETWORK_BRIDGE="vmbr0"\n'
+        printf 'VM_STORAGE="local-zfs"\n'
+        printf "TEMPLATE_ID='9000'\n"
+        printf 'MIN_VMID="9001"\n'
+        printf 'DOCKER_MIRROR_URL="http://mirror.example:8080"\n'
+    } > "$CONFIG_FILE"
+
+    run rewrite_template_id 8900
+    [ "$status" -eq 0 ]
+    grep -q "^TEMPLATE_ID='8900'$" "$CONFIG_FILE"
+    grep -q 'DOCKER_MIRROR_URL="http://mirror.example:8080"' "$CONFIG_FILE"
+    ! grep -q "TEMPLATE_ID='9000'" "$CONFIG_FILE"
+}
+
 @test "rewrite_template_id fails closed when CONFIG_FILE has no TEMPLATE_ID line" {
     printf 'DOCKER_MIRROR_URL="http://mirror.example:8080"\n' > "$CONFIG_FILE"
     run rewrite_template_id 8900
@@ -131,8 +147,25 @@ seed_active_and_candidate() {
     [ "$status" -ne 0 ]
     grep -q 'warn promote.timeout' "$STUB_DIR/notify.log"
     grep -q 'TEMPLATE_ID="9000"' "$CONFIG_FILE"
+    [ ! -e "$PROMOTION_PAUSE_FILE" ]
     gen_read 8900
     [ "$GEN_STATE" = "candidate" ]
+}
+
+@test "promote lock wait defaults to 120 seconds" {
+    grep -q 'PROMOTE_LOCK_WAIT_SECONDS:-120' "$REPO_ROOT/lib/promote.sh"
+}
+
+@test "promote lock-timeout notify runs after pause is released" {
+    awk '
+        /Timed out waiting for the pool activity lock/ { t = NR }
+        t && /_promote_release/ && !r { r = NR }
+        t && /notify warn promote.timeout/ { n = NR }
+        END {
+            if (!t || !r || !n) exit 1
+            if (!(r < n)) exit 1
+        }
+    ' "$REPO_ROOT/lib/promote.sh"
 }
 
 @test "promote --skip-canary --yes moves candidate to active and previous active to superseded" {
