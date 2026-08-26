@@ -64,7 +64,7 @@ seed_active_and_candidate() {
     run rewrite_template_id 8900
     [ "$status" -eq 0 ]
 
-    grep -qE '^TEMPLATE_ID=["'\'']?8900["'\'']?$' "$CONFIG_FILE"
+    grep -q '^TEMPLATE_ID="8900"$' "$CONFIG_FILE"
     grep -q 'DOCKER_MIRROR_URL="http://mirror.example:8080"' "$CONFIG_FILE"
     grep -q 'NETWORK_BRIDGE="vmbr0"' "$CONFIG_FILE"
     grep -q 'VM_STORAGE="local-zfs"' "$CONFIG_FILE"
@@ -72,6 +72,20 @@ seed_active_and_candidate() {
     grep -q 'VLAN_TAG="20"' "$CONFIG_FILE"
     ! grep -qE '^TEMPLATE_ID=["'\'']?9000["'\'']?$' "$CONFIG_FILE"
     [ "$(file_mode "$CONFIG_FILE")" = "600" ]
+}
+
+@test "rewrite_template_id preserves an unquoted TEMPLATE_ID line" {
+    {
+        printf 'NETWORK_BRIDGE="vmbr0"\n'
+        printf 'VM_STORAGE="local-zfs"\n'
+        printf 'TEMPLATE_ID=9000\n'
+        printf 'MIN_VMID="9001"\n'
+    } > "$CONFIG_FILE"
+
+    run rewrite_template_id 8900
+    [ "$status" -eq 0 ]
+    grep -q '^TEMPLATE_ID=8900$' "$CONFIG_FILE"
+    ! grep -q 'TEMPLATE_ID="8900"' "$CONFIG_FILE"
 }
 
 @test "rewrite_template_id fails closed when CONFIG_FILE has no TEMPLATE_ID line" {
@@ -94,6 +108,31 @@ seed_active_and_candidate() {
     [ "$GEN_STATE" = "active" ]
     grep -q 'TEMPLATE_ID="9000"' "$CONFIG_FILE"
     [ ! -e "$PROMOTION_PAUSE_FILE" ]
+}
+
+@test "promote --skip-canary without --yes refuses a piped y on a non-tty" {
+    seed_active_and_candidate
+
+    run --separate-stderr promote_generation 2 --skip-canary <<<'y'
+    [ "$status" -ne 0 ]
+    gen_read 8900
+    [ "$GEN_STATE" = "candidate" ]
+    grep -q 'TEMPLATE_ID="9000"' "$CONFIG_FILE"
+}
+
+@test "promote lock timeout notifies warn and does not rewrite TEMPLATE_ID" {
+    seed_active_and_candidate
+    PROMOTE_LOCK_WAIT_SECONDS=0
+    mkdir -p "$(dirname "$POOL_ACTIVITY_LOCK_FILE")"
+    exec 202>"$POOL_ACTIVITY_LOCK_FILE"
+    flock -n -x 202
+
+    run --separate-stderr promote_generation 2 --skip-canary --yes
+    [ "$status" -ne 0 ]
+    grep -q 'warn promote.timeout' "$STUB_DIR/notify.log"
+    grep -q 'TEMPLATE_ID="9000"' "$CONFIG_FILE"
+    gen_read 8900
+    [ "$GEN_STATE" = "candidate" ]
 }
 
 @test "promote --skip-canary --yes moves candidate to active and previous active to superseded" {
@@ -223,7 +262,7 @@ EOF
     awk '
         /: > "\$PROMOTION_PAUSE_FILE"/ { pause = NR }
         /trap '\''_promote_release'\'' EXIT[[:space:]]*$/ { trapline = NR }
-        /flock -w 120 -x 202/ { flock = NR }
+        /flock -w .* -x 202/ { flock = NR }
         END {
             if (!pause || !trapline || !flock) exit 1
             if (!(pause < trapline && trapline < flock)) exit 1

@@ -88,6 +88,27 @@ write_pointer() {
     refute_called qm 'start *'
 }
 
+@test "acquire_clone_slot returns 3 when promotion pause file exists" {
+    : > "$PROMOTION_PAUSE_FILE"
+    run acquire_clone_slot
+    [ "$status" -eq 3 ]
+}
+
+@test "clone_runner returns 3 when acquire_clone_slot sees a pause" {
+    acquire_clone_slot() { return 3; }
+    run --separate-stderr clone_runner runner-acme-1 acme
+    [ "$status" -eq 3 ]
+    refute_called qm 'clone *'
+    refute_called qm 'start *'
+}
+
+@test "clone_runner starts when the cloned VMID has no generation record" {
+    run --separate-stderr clone_runner runner-acme-1 acme
+    [ "$status" -eq 0 ]
+    assert_called qm 'start *'
+    refute_called qm 'set * --tags *'
+}
+
 @test "clone_runner clones the re-read TEMPLATE_ID when the pause file clears mid-wait" {
     : > "$PROMOTION_PAUSE_FILE"
     [ "$TEMPLATE_ID" = "9000" ]

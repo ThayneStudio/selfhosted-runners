@@ -130,8 +130,11 @@ promote_generation() {
         log_error "Cannot open $POOL_ACTIVITY_LOCK_FILE"
         return 1
     }
-    if ! flock -w 120 -x 202; then
+    local lock_wait="${PROMOTE_LOCK_WAIT_SECONDS:-120}"
+    [[ "$lock_wait" =~ ^[0-9]+$ ]] || lock_wait=120
+    if ! flock -w "$lock_wait" -x 202; then
         log_warn "Timed out waiting for the pool activity lock — promotion abandoned"
+        notify warn promote.timeout "Timed out waiting for the pool activity lock — promotion abandoned"
         _promote_release
         return 1
     fi

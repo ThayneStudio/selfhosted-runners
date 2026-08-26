@@ -86,8 +86,14 @@ bake_pin_inputs() {
 bake_pin_snippet_runner_version() {
     local snippet="${1:-}" version="${_BAKE_PINNED_RUNNER_VERSION:-}" tmp
     [[ -n "$snippet" && -f "$snippet" ]] || return 1
-    [[ -n "$version" ]] || return 0
-    grep -q 'releases/latest' "$snippet" || return 0
+    if [[ -z "$version" ]]; then
+        log_error "Cannot pin runner version in $snippet: pin is empty"
+        return 1
+    fi
+    if ! grep -q 'releases/latest' "$snippet"; then
+        log_error "Cannot pin runner version in $snippet: no releases/latest line"
+        return 1
+    fi
     tmp=$(mktemp "${snippet}.XXXXXX") || return 1
     if ! awk -v ver="$version" '
         /releases\/latest/ {
@@ -243,8 +249,9 @@ bake_download_image() {
     # Ubuntu rotates noble/current every 2-4 weeks, so a cached image that no
     # longer matches SHA256SUMS is far more often stale than tampered with.
     # Discard it and download once more before treating the mismatch as fatal.
-    # SHA256SUMS is re-fetched each attempt so a rotation that lands mid-run
-    # recovers too, rather than pairing a new image against the old sums.
+    # When bake_pin_inputs has run, both attempts reuse the pinned SUMS entry
+    # so digest, GEN_IMAGE_SHA256, and verify stay one input set. Unpinned
+    # callers still fetch SHA256SUMS per attempt.
     local FIRST_ATTEMPT_NOTE="" attempt sums_entry EXPECTED_SHA256 ACTUAL_SHA256
     for attempt in 1 2; do
         if [[ -f "$CLOUD_IMG_PATH" ]]; then
@@ -494,9 +501,10 @@ bake_fail() {
     fi
 
     if [[ -n "${_BAKE_DIGEST:-}" ]]; then
-        memo_failed_digest "$_BAKE_DIGEST" || true
+        memo_failed_digest "$_BAKE_DIGEST" || log_error "Failed to memo failed digest"
     fi
-    notify error bake.failed "$reason"
+    local gen_id="${_BAKE_GEN_ID:-}"
+    NOTIFY_GENERATION="$gen_id" notify error bake.failed "$reason"
     return 1
 }
 
@@ -651,6 +659,12 @@ bake_stamp_generation() {
         log_error "Failed to read /opt/.runner-version"
         return 1
     }
+    local read_exit
+    read_exit=$(printf '%s\n' "$raw" | jq -r '.exitcode // "1"' 2>/dev/null) || read_exit="1"
+    if [[ "$read_exit" != "0" ]]; then
+        log_error "Failed to read /opt/.runner-version (guest exitcode $read_exit)"
+        return 1
+    fi
     version=$(printf '%s\n' "$raw" | jq -r '."out-data" // empty' 2>/dev/null) || version=""
     version="${version//$'\r'/}"
     version="${version%%$'\n'*}"
@@ -761,7 +775,7 @@ bake_locked() {
     }
     if (( avail < BAKE_MIN_FREE_GB )); then
         log_error "Insufficient free space on $VM_STORAGE: ${avail}G available, ${BAKE_MIN_FREE_GB}G required"
-        notify error bake.failed "Insufficient free space on $VM_STORAGE: ${avail}G < ${BAKE_MIN_FREE_GB}G"
+        notify warn bake.failed "Insufficient free space on $VM_STORAGE: ${avail}G < ${BAKE_MIN_FREE_GB}G"
         return 1
     fi
 
@@ -838,6 +852,7 @@ bake_locked() {
     }
 
     _BAKE_VMID="$vmid"
+    _BAKE_GEN_ID="$gen_id"
     _BAKE_FAILING=0
     trap 'bake_fail "interrupted"' EXIT
     trap 'bake_fail "interrupted"; exit 1' INT TERM
@@ -888,7 +903,11 @@ bake_locked() {
     trap - EXIT INT TERM
 
     # --force of a previously memoed digest must not keep blocking detect.
-    unmemo_failed_digest "$digest" || true
+    # Trap is already disarmed: failing here leaves the candidate in place.
+    if ! unmemo_failed_digest "$digest"; then
+        log_error "Failed to clear failed-digest memo after candidate VMID $vmid"
+        return 1
+    fi
 
     bake_fail_other_candidates "$vmid"
 

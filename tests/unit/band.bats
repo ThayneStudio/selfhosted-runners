@@ -47,14 +47,23 @@ setup() {
     ! grep -q '0 = auto' "$REPO_ROOT/lib/setup.sh"
     awk '
         /read -rp .*Minimum VM ID/ { r = NR }
-        /MIN_VMID" -eq 0/ { z = NR }
-        /TEMPLATE_BAND_MAX/ { if (z && !t) t = NR }
+        /validate_generation_band/ { z = NR }
         /printf '\''MIN_VMID=%q/ { w = NR }
         END {
-            if (!r || !z || !t || !w) exit 1
-            if (!(r < z && z <= t && t < w)) exit 1
+            if (!r || !z || !w) exit 1
+            if (!(r < z && z < w)) exit 1
         }
     ' "$REPO_ROOT/lib/setup.sh"
+}
+
+@test "non-numeric MIN_VMID is a hard error" {
+    MIN_VMID=abc
+    TEMPLATE_BAND_MIN=8900
+    TEMPLATE_BAND_MAX=8999
+    run validate_generation_band
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"MIN_VMID"* ]]
+    [[ "$output" == *"abc"* ]]
 }
 
 @test "install.sh validates the generation band after sourcing conf and before enabling maintain.timer" {

@@ -144,6 +144,11 @@ CLOUD_IMG_PATH="$IMG_CACHE_DIR/$CLOUD_IMG"
 MIN_CLOUD_IMG_BYTES=$((400 * 1024 * 1024))
 # shellcheck disable=SC2034  # consumed by bake, detect, promote, maintain
 GENERATION_VMID_LOCK_FILE="/run/lock/github-runner-gen-vmid.lock"
+# Host unit/logrotate directories. Overridable so tests can sandbox them.
+# shellcheck disable=SC2034
+SYSTEMD_UNIT_DIR="/etc/systemd/system"
+# shellcheck disable=SC2034
+LOGROTATE_DIR="/etc/logrotate.d"
 
 # Webhook notifications. Sourced here so every script that already sources
 # common.sh can call `notify` (and `redact_secrets`) without extra wiring.
@@ -260,6 +265,10 @@ validate_generation_band() {
         log_error "TEMPLATE_BAND_MIN/MAX must be unsigned integers (got ${band_min:-<empty>}, ${band_max:-<empty>})"
         return 1
     fi
+    if [[ ! "$min_vmid" =~ ^[0-9]+$ ]]; then
+        log_error "MIN_VMID must be an unsigned integer (got ${min_vmid:-<empty>})"
+        return 1
+    fi
     if [[ "$band_min" -gt "$band_max" ]]; then
         log_error "TEMPLATE_BAND_MIN ($band_min) is greater than TEMPLATE_BAND_MAX ($band_max)"
         return 1
@@ -299,6 +308,8 @@ rewrite_template_id() {
     tmp=$(mktemp "${CONFIG_FILE}.XXXXXX") || return 1
     if ! awk -v vmid="$vmid" '
         BEGIN { found = 0 }
+        /^TEMPLATE_ID="/ { print "TEMPLATE_ID=\"" vmid "\""; found = 1; next }
+        /^TEMPLATE_ID='\''/ { print "TEMPLATE_ID='\''" vmid "'\''"; found = 1; next }
         /^TEMPLATE_ID=/ { print "TEMPLATE_ID=" vmid; found = 1; next }
         { print }
         END { if (!found) exit 1 }
@@ -532,6 +543,7 @@ acquire_clone_slot() {
 
     while true; do
         pool_is_draining && return 1
+        [[ -e "$PROMOTION_PAUSE_FILE" ]] && return 3
         for ((slot = 1; slot <= max; slot++)); do
             exec 204>"${CLONE_SLOT_LOCK_PREFIX}-${slot}.lock"
             if flock -n 204; then
@@ -936,7 +948,15 @@ clone_runner() {
     # clone different VMIDs while this clone runs.
     exec 201>&-
 
-    if ! acquire_clone_slot; then
+    local slot_rc=0
+    acquire_clone_slot || slot_rc=$?
+    if (( slot_rc == 3 )); then
+        log_info "clone_runner: promotion in progress, will retry"
+        release_vmid_reservation "$vmid"
+        exec 202>&-
+        return 3
+    fi
+    if (( slot_rc != 0 )); then
         log_warn "clone_runner: pool drain became active before cloning $name"
         release_vmid_reservation "$vmid"
         exec 202>&-

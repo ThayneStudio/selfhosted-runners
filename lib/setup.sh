@@ -90,8 +90,7 @@ if [[ ! "$MIN_VMID" =~ ^[0-9]+$ ]]; then
     exit 1
 fi
 apply_generation_defaults
-if [[ "$MIN_VMID" -eq 0 ]]; then
-    log_error "MIN_VMID=0 (auto) is incompatible with generations; set MIN_VMID to $((TEMPLATE_BAND_MAX + 1)) or higher"
+if ! validate_generation_band; then
     exit 1
 fi
 if [[ "$MIN_VMID" -lt 100 ]]; then
@@ -355,14 +354,14 @@ else
 fi
 
 log_info "[5/5] Installing pool watcher, lifetime guard, and maintain timers..."
-cp "$INSTALL_DIR/templates/github-runner-watch.service" /etc/systemd/system/
-cp "$INSTALL_DIR/templates/github-runner-watch.timer" /etc/systemd/system/
-cp "$INSTALL_DIR/templates/github-runner-guard.service" /etc/systemd/system/
-cp "$INSTALL_DIR/templates/github-runner-guard.timer" /etc/systemd/system/
-cp "$INSTALL_DIR/templates/github-runner-maintain.service" /etc/systemd/system/
-cp "$INSTALL_DIR/templates/github-runner-maintain.timer" /etc/systemd/system/
-mkdir -p /etc/logrotate.d
-cp "$INSTALL_DIR/templates/github-runners.logrotate" /etc/logrotate.d/github-runners
+cp "$INSTALL_DIR/templates/github-runner-watch.service" "$SYSTEMD_UNIT_DIR/"
+cp "$INSTALL_DIR/templates/github-runner-watch.timer" "$SYSTEMD_UNIT_DIR/"
+cp "$INSTALL_DIR/templates/github-runner-guard.service" "$SYSTEMD_UNIT_DIR/"
+cp "$INSTALL_DIR/templates/github-runner-guard.timer" "$SYSTEMD_UNIT_DIR/"
+cp "$INSTALL_DIR/templates/github-runner-maintain.service" "$SYSTEMD_UNIT_DIR/"
+cp "$INSTALL_DIR/templates/github-runner-maintain.timer" "$SYSTEMD_UNIT_DIR/"
+mkdir -p "$LOGROTATE_DIR"
+cp "$INSTALL_DIR/templates/github-runners.logrotate" "$LOGROTATE_DIR/github-runners"
 systemctl daemon-reload
 systemctl enable --now github-runner-watch.timer 2>/dev/null || true
 systemctl enable --now github-runner-guard.timer 2>/dev/null || true

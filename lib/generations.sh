@@ -908,28 +908,34 @@ adopt_tags_have_gen() {
     return 1
 }
 
-# Comma-separated tags for `qm set --tags`: keep existing, ensure runner, append gen-1.
-adopt_tags_with_gen1() {
-    local current="${1:-}" tag has_runner=0
+# Comma-separated tags for `qm set --tags`: keep existing, ensure runner, append gen-N.
+adopt_tags_with_gen() {
+    local current="${1:-}" gen_id="${2:-}" tag has_runner=0 gen_tag
     local -a kept=() out=()
+    [[ "$gen_id" =~ ^[0-9]+$ ]] || return 1
+    gen_tag="gen-${gen_id}"
     IFS=';,' read -ra kept <<< "$current"
     local -a existing=()
     for tag in "${kept[@]}"; do
         tag="${tag//[[:space:]]/}"
         [[ -n "$tag" ]] || continue
-        [[ "$tag" == "gen-1" ]] && continue
+        [[ "$tag" == "$gen_tag" ]] && continue
         if [[ "$tag" == "runner" ]]; then
             has_runner=1
         fi
         existing+=("$tag")
     done
     if [[ "$has_runner" -eq 1 ]]; then
-        out=("${existing[@]}" "gen-1")
+        out=("${existing[@]}" "$gen_tag")
     else
-        out=("runner" "${existing[@]}" "gen-1")
+        out=("runner" "${existing[@]}" "$gen_tag")
     fi
     local IFS=','
     printf '%s' "${out[*]}"
+}
+
+adopt_tags_with_gen1() {
+    adopt_tags_with_gen "${1:-}" 1
 }
 
 # Clone VMIDs whose disk traces to TEMPLATE_ID (nested volid or ZFS origin).
@@ -937,7 +943,7 @@ adopt_tags_with_gen1() {
 # tagging every runner cicustom.
 adopt_linked_clone_vmids() {
     local child_list volid child
-    child_list=$(list_template_linked_clone_volids) || return 0
+    child_list=$(list_template_linked_clone_volids) || return 1
     [[ -n "$child_list" ]] || return 0
     while read -r volid; do
         [[ -n "$volid" ]] || continue
@@ -995,17 +1001,20 @@ adopt_deployed_template() {
             if [[ "$GEN_ID" == "1" && "$GEN_VMID" == "${TEMPLATE_ID:-}" ]]; then
                 resume=1
             else
-                log_info "Generation store already has records — skipping adoption"
-                return 0
+                resume=2
             fi
         else
-            log_info "Generation store already has records — skipping adoption"
-            return 0
+            resume=2
         fi
     fi
 
     if [[ -z "${TEMPLATE_ID:-}" ]]; then
         log_warn "TEMPLATE_ID is not set — nothing to adopt"
+        return 0
+    fi
+
+    if [[ "$resume" -ne 0 ]] && ! gen_exists "$TEMPLATE_ID"; then
+        log_info "Generation store already has records — skipping adoption"
         return 0
     fi
 
@@ -1019,12 +1028,25 @@ adopt_deployed_template() {
         return 0
     fi
 
+    validate_band_inventory || return 1
+
     min_vmid="${MIN_VMID:-}"
     if [[ ! "$min_vmid" =~ ^[0-9]+$ ]]; then
         min_vmid=$((TEMPLATE_ID + 1))
     fi
 
-    linked=$(adopt_linked_clone_vmids) || linked=""
+    local tag_gen_id=""
+    if [[ "$resume" -eq 0 ]]; then
+        tag_gen_id=1
+    elif gen_exists "$TEMPLATE_ID"; then
+        gen_read "$TEMPLATE_ID" || return 1
+        tag_gen_id="$GEN_ID"
+    else
+        log_info "Generation store already has records — skipping adoption"
+        return 0
+    fi
+
+    linked=$(adopt_linked_clone_vmids) || return 1
     while read -r vmid; do
         [[ -n "$vmid" ]] || continue
         traced["$vmid"]=1
@@ -1069,9 +1091,9 @@ adopt_deployed_template() {
     if [[ ${#tag_vmids[@]} -gt 0 ]]; then
         local i
         for i in "${!tag_vmids[@]}"; do
-            new_tags=$(adopt_tags_with_gen1 "${tag_values[$i]}")
+            new_tags=$(adopt_tags_with_gen "${tag_values[$i]}" "$tag_gen_id") || continue
             if ! qm set "${tag_vmids[$i]}" --tags "$new_tags" </dev/null; then
-                log_warn "Failed to tag VMID ${tag_vmids[$i]} as gen-1"
+                log_warn "Failed to tag VMID ${tag_vmids[$i]} as gen-${tag_gen_id}"
             fi
         done
     fi

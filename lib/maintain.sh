@@ -26,7 +26,8 @@ source "$LIB_DIR/bake.sh"
 
 # True (0) when local time is inside REBAKE_WINDOW (HH:MM-HH:MM, inclusive).
 # Invalid window, wrap-past-midnight, or an unreadable clock → log_error and
-# return 1 (outside): fail closed for bake starts. v1 does not wrap midnight.
+# return 2 (invalid). A valid window that does not contain now → return 1
+# (outside). Both fail closed for bake starts. v1 does not wrap midnight.
 in_rebake_window() {
     local window now
     local sh sm eh em nh nm
@@ -38,7 +39,7 @@ in_rebake_window() {
 
     if [[ ! "$window" =~ ^([0-9]{2}):([0-9]{2})-([0-9]{2}):([0-9]{2})$ ]]; then
         log_error "Invalid REBAKE_WINDOW '${REBAKE_WINDOW:-<empty>}' (expected HH:MM-HH:MM)"
-        return 1
+        return 2
     fi
     sh="${BASH_REMATCH[1]}"
     sm="${BASH_REMATCH[2]}"
@@ -47,18 +48,18 @@ in_rebake_window() {
 
     if ((10#$sh > 23 || 10#$eh > 23 || 10#$sm > 59 || 10#$em > 59)); then
         log_error "Invalid REBAKE_WINDOW '$window' (hour/minute out of range)"
-        return 1
+        return 2
     fi
 
     start_min=$((10#$sh * 60 + 10#$sm))
     end_min=$((10#$eh * 60 + 10#$em))
     if ((start_min > end_min)); then
         log_error "Invalid REBAKE_WINDOW '$window' (wrap-past-midnight is not supported)"
-        return 1
+        return 2
     fi
     if ((start_min == end_min)); then
         log_error "Invalid REBAKE_WINDOW '$window' (zero-width window)"
-        return 1
+        return 2
     fi
 
     if [[ -n "${MAINTAIN_NOW_HHMM:-}" ]]; then
@@ -66,19 +67,19 @@ in_rebake_window() {
     else
         now=$(date +%H:%M) || {
             log_error "Failed to read local time for REBAKE_WINDOW"
-            return 1
+            return 2
         }
     fi
     now="${now//[[:space:]]/}"
     if [[ ! "$now" =~ ^([0-9]{2}):([0-9]{2})$ ]]; then
         log_error "Invalid clock value for rebake window: ${now:-<empty>}"
-        return 1
+        return 2
     fi
     nh="${BASH_REMATCH[1]}"
     nm="${BASH_REMATCH[2]}"
     if ((10#$nh > 23 || 10#$nm > 59)); then
         log_error "Invalid clock value for rebake window: $now"
-        return 1
+        return 2
     fi
     now_min=$((10#$nh * 60 + 10#$nm))
     ((now_min >= start_min && now_min <= end_min))
@@ -90,35 +91,45 @@ in_rebake_window() {
 # "dead baking with no VM still frees leftover volumes".
 maintain_fail_dead_bake() {
     local vmid="${1:-}"
-    local digest="" gen_id=""
+    local digest="" gen_id="" pointer="" state=""
     local reason="host reboot or interrupted bake"
 
     gen_read "$vmid" || return 1
     digest="${GEN_TEMPLATE_DIGEST:-}"
     gen_id="${GEN_ID:-}"
 
-    if [[ "$vmid" == "${TEMPLATE_ID:-}" ]]; then
-        log_error "Refusing to destroy TEMPLATE_ID $TEMPLATE_ID on dead-bake reconcile"
-    else
-        if qm status "$vmid" >/dev/null 2>&1; then
-            # Proxmox refuses destroy of a running VM. Match bake_fail: stop
-            # then destroy. Proven by "dead baking record with free bake lock
-            # is failed and the VM destroyed".
-            qm stop "$vmid" --timeout 30 2>/dev/null || true
-            if ! qm destroy "$vmid" --purge; then
-                log_error "Failed to destroy interrupted-bake VM $vmid"
-            fi
+    bake_reap_vmid "$vmid" baking "$reason"
+
+    # Live pointer: bake_reap_vmid skips destroy *and* the failed transition.
+    # The record still has to leave baking or the next cycle retries forever.
+    state=$(gen_state_of "$vmid" 2>/dev/null) || state=""
+    if [[ "$state" == "baking" ]]; then
+        pointer=$(reload_active_template_id) || pointer=""
+        if [[ "$vmid" == "$pointer" ]]; then
+            log_error "Refusing to destroy TEMPLATE_ID $TEMPLATE_ID on dead-bake reconcile"
+            gen_transition "$vmid" failed "$reason" || true
         fi
-        # Config can be gone after a reboot while vm-${vmid}-disk-* remains.
-        # Proven by "dead baking with no VM still frees leftover volumes".
-        bake_free_vmid_volumes "$vmid"
     fi
 
-    gen_transition "$vmid" failed "$reason" || true
     if [[ -n "$digest" && "$digest" != "unknown" ]]; then
-        memo_failed_digest "$digest" || true
+        memo_failed_digest "$digest" || log_error "Failed to memo failed digest $digest"
     fi
     NOTIFY_GENERATION="$gen_id" notify error bake.failed "$reason"
+    return 0
+}
+
+# SIGKILL/OOM can leave PROMOTION_PAUSE_FILE on tmpfs. If nothing holds the
+# exclusive pool lock, the pause is stale — drop it so clones and two-actives
+# reconcile are not stuck until reboot.
+maintain_clear_stale_promotion_pause() {
+    [[ -e "$PROMOTION_PAUSE_FILE" ]] || return 0
+    mkdir -p "$(dirname "$POOL_ACTIVITY_LOCK_FILE")" || return 0
+    exec 209>"$POOL_ACTIVITY_LOCK_FILE" || return 0
+    if flock -n 209; then
+        rm -f "$PROMOTION_PAUSE_FILE"
+        log_warn "Removed stale promotion pause file (no exclusive pool-lock holder)"
+    fi
+    exec 209>&- || true
     return 0
 }
 
@@ -254,7 +265,7 @@ _canary_repo_configured() {
 
 # Ordered cycle. Does not canary, promote, or GC. bake_main is not --force.
 maintain_main() {
-    local decision
+    local decision win_rc=0
 
     apply_generation_defaults
 
@@ -262,6 +273,8 @@ maintain_main() {
         log_error "Adoption failed"
         return 1
     }
+
+    maintain_clear_stale_promotion_pause
 
     maintain_reconcile_two_actives || {
         log_error "Failed to reconcile multiple active generations"
@@ -279,18 +292,21 @@ maintain_main() {
     case "$decision" in
         yes\ *)
             log_info "bake needed: ${decision#yes }"
-            if ! in_rebake_window; then
-                log_info "deferring bake until REBAKE_WINDOW"
-                return 0
-            fi
-            if [[ "${REBAKE_ENABLED}" != "true" ]]; then
-                log_info "nothing to do: rebake-disabled"
-                return 0
-            fi
             if [[ "${CANARY_ENABLED}" == "true" ]] && ! _canary_repo_configured; then
                 notify warn canary.unconfigured \
                     "CANARY_ENABLED=true but CANARY_REPO is empty — refusing to bake"
                 log_warn "Refusing to start a bake: CANARY_ENABLED=true but CANARY_REPO is empty"
+                return 0
+            fi
+            in_rebake_window || win_rc=$?
+            if (( win_rc != 0 )); then
+                if (( win_rc == 1 )); then
+                    log_info "deferring bake until REBAKE_WINDOW"
+                fi
+                return 0
+            fi
+            if [[ "${REBAKE_ENABLED}" != "true" ]]; then
+                log_info "nothing to do: rebake-disabled"
                 return 0
             fi
             bake_main

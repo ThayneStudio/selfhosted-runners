@@ -24,7 +24,10 @@ setup() {
 
     INSTALL_DIR="$STUB_DIR/install"
     mkdir -p "$INSTALL_DIR/templates" "$IMG_CACHE_DIR" "$SNIPPETS_DIR" "$BAKE_LOG_DIR"
-    printf 'mirror: {{DOCKER_MIRROR_URL}}\n' > "$INSTALL_DIR/templates/template-setup.yaml"
+    cat > "$INSTALL_DIR/templates/template-setup.yaml" <<'EOF'
+mirror: {{DOCKER_MIRROR_URL}}
+      RUNNER_VERSION=$(curl -sf --retry 3 https://api.github.com/repos/actions/runner/releases/latest | jq -r .tag_name | sed 's/v//')
+EOF
 
     jq_stub() {
         local json=""
@@ -73,6 +76,10 @@ EOF
     export -f bake_qm_stub
     export -f qm_stub
     export STUB_DIR VM_STORAGE TEMPLATE_ID GENERATIONS_DIR
+
+    notify() {
+        printf 'NOTIFY_GENERATION=%s %s\n' "${NOTIFY_GENERATION:-}" "$*" >> "$STUB_DIR/notify.log"
+    }
 }
 
 make_cached_image() {
@@ -193,6 +200,16 @@ bake_qm_stub() {
             [[ "${1:-}" == -- ]] && shift
             if [[ -f "$STUB_DIR/qm-marker-absent" ]] && [[ "$*" == *template-setup-complete* ]]; then
                 echo '{"exitcode":1,"exited":1}'
+                # Marker-shaped tests drop running after the exitcode-1 probe so
+                # the loop cannot fall through to the timeout branch.
+                if [[ -f "$STUB_DIR/qm-marker-absent-stop" ]]; then
+                    rm -f "$STUB_DIR/qm-running-$vmid"
+                fi
+                return 0
+            fi
+            if [[ -f "$STUB_DIR/qm-stamp-read-fail" ]] && [[ "$*" == *runner-version* ]]; then
+                # Agent call succeeds; guest cat fails. out-data must not count.
+                echo '{"exitcode":1,"exited":1,"out-data":"2.336.0\n"}'
                 return 0
             fi
             if [[ "${1:-}" == test && "$*" == *template-setup-complete* ]]; then
@@ -295,6 +312,7 @@ bake_qm_stub() {
     run bake_main --force
     [ "$status" -eq 1 ]
     refute_called qm 'create *'
+    grep -q 'warn bake.failed' "$STUB_DIR/notify.log"
 }
 
 @test "storage_avail_gb treats pvesm Avail as KiB" {
@@ -332,11 +350,13 @@ bake_qm_stub() {
 
 @test "publish gate refuses qm template when the completion marker is absent" {
     : > "$STUB_DIR/qm-marker-absent"
-    BAKE_TIMEOUT=0
+    : > "$STUB_DIR/qm-marker-absent-stop"
     run bake_main --force
     [ "$status" -ne 0 ]
     assert_called qm 'create *'
+    assert_called qm 'guest exec * test -f /opt/.template-setup-complete'
     refute_called qm 'template *'
+    [[ "$output" == *"stopped before setup"* || "$output" == *"completion"* || "$output" == *"marker"* ]]
 }
 
 @test "failed bake after start stops then destroys the new VMID, never TEMPLATE_ID" {
@@ -362,6 +382,15 @@ bake_qm_stub() {
 
 @test "stamp write with non-zero guest exitcode fails the bake" {
     : > "$STUB_DIR/qm-stamp-write-fail"
+    run bake_main --force
+    [ "$status" -ne 0 ]
+    refute_called qm 'template *'
+    refute_called qm 'shutdown *'
+    assert_called qm 'start 8900'
+}
+
+@test "stamp read with non-zero guest exitcode fails the bake even when out-data is set" {
+    : > "$STUB_DIR/qm-stamp-read-fail"
     run bake_main --force
     [ "$status" -ne 0 ]
     refute_called qm 'template *'
@@ -540,4 +569,66 @@ EOF
     ! grep -q 'releases/latest' "$snippet"
     grep -q 'releases/download' "$snippet"
     grep -q 'releases/latest' "$INSTALL_DIR/templates/template-setup.yaml"
+}
+
+@test "bake_pin_snippet_runner_version fails closed when releases/latest is absent" {
+    _BAKE_PINNED_RUNNER_VERSION=2.336.0
+    printf 'RUNNER_VERSION=$(echo leftover)\n' > "$STUB_DIR/snip.yaml"
+    run bake_pin_snippet_runner_version "$STUB_DIR/snip.yaml"
+    [ "$status" -eq 1 ]
+    grep -q 'RUNNER_VERSION=$(echo leftover)' "$STUB_DIR/snip.yaml"
+}
+
+@test "bake_pin_snippet_runner_version fails closed when the pin is empty" {
+    _BAKE_PINNED_RUNNER_VERSION=""
+    printf '      RUNNER_VERSION=$(curl -sf https://api.github.com/repos/actions/runner/releases/latest | jq -r .tag_name)\n' \
+        > "$STUB_DIR/snip.yaml"
+    run bake_pin_snippet_runner_version "$STUB_DIR/snip.yaml"
+    [ "$status" -eq 1 ]
+    grep -q 'releases/latest' "$STUB_DIR/snip.yaml"
+}
+
+@test "leftover 8901 becomes on-disk pointer while still candidate → no qm destroy 8901" {
+    gen_store_init
+    gen_create 8901 \
+        GEN_ID=1 \
+        GEN_STATE=candidate \
+        GEN_TEMPLATE_DIGEST=old \
+        GEN_IMAGE_SHA256=abc \
+        GEN_RUNNER_VERSION=2.0.0
+    rewrite_template_id 8901
+    : > "$STUB_DIR/qm-created-8901"
+
+    gen_list() {
+        if [[ "${1:-}" == "candidate" ]]; then
+            printf '8901\n'
+            return 0
+        fi
+        printf '8901\n'
+    }
+
+    run bake_fail_other_candidates 8900
+    [ "$status" -eq 0 ]
+    refute_called qm 'destroy 8901*'
+    refute_called qm 'stop 8901*'
+    refute_called pvesm 'free *'
+    gen_read 8901
+    [ "$GEN_STATE" = "candidate" ]
+}
+
+@test "unmemo failure after candidate does not destroy the new template" {
+    unmemo_failed_digest() { return 1; }
+
+    run bake_main --force
+    [ "$status" -ne 0 ]
+    gen_read 8900
+    [ "$GEN_STATE" = "candidate" ]
+    refute_called qm 'destroy 8900*'
+}
+
+@test "failed bake notifies bake.failed with NOTIFY_GENERATION" {
+    : > "$STUB_DIR/qm-start-fail"
+    run bake_main --force
+    [ "$status" -ne 0 ]
+    grep -q 'NOTIFY_GENERATION=1 error bake.failed' "$STUB_DIR/notify.log"
 }

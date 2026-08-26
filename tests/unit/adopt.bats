@@ -210,6 +210,56 @@ EOF
     [ "$count" = "1" ]
 }
 
+@test "adopt fails closed when pvesm list fails" {
+    stub_out qm 'status 9000' <<'EOF'
+status: stopped
+EOF
+    stub_out qm 'config 9000' <<'EOF'
+name: ubuntu-cloud-template
+template: 1
+EOF
+    stub_status pvesm 'list *' 1
+
+    run adopt_deployed_template
+    [ "$status" -ne 0 ]
+    [ "$(gen_list)" = "" ]
+    refute_called qm 'destroy *'
+}
+
+@test "adopt fails closed when a foreign config occupies the generation band" {
+    stub_adopt_fleet
+    mkdir -p "$PVE_NODES_DIR/pve/qemu-server"
+    printf 'name: leftover\n' > "$PVE_NODES_DIR/pve/qemu-server/8900.conf"
+
+    run adopt_deployed_template
+    [ "$status" -ne 0 ]
+    [ "$(gen_list)" = "" ]
+    refute_called qm 'destroy *'
+}
+
+@test "adopt tags untagged clones of TEMPLATE_ID even when a candidate record exists" {
+    stub_adopt_fleet
+    gen_store_init
+    gen_create 9000 \
+        GEN_ID=1 \
+        GEN_STATE=active \
+        GEN_TEMPLATE_DIGEST=old \
+        GEN_IMAGE_SHA256=abc \
+        GEN_RUNNER_VERSION=2.335.0
+    gen_create 8900 \
+        GEN_ID=2 \
+        GEN_STATE=candidate \
+        GEN_TEMPLATE_DIGEST=new \
+        GEN_IMAGE_SHA256=def \
+        GEN_RUNNER_VERSION=2.336.0
+
+    run adopt_deployed_template
+    [ "$status" -eq 0 ]
+    assert_called qm 'set 9001 --tags runner,gen-1'
+    count=$(gen_list | wc -l | tr -d ' ')
+    [ "$count" = "2" ]
+}
+
 @test "adopt records a probed runner version from a running clone" {
     stub_adopt_fleet
     stub_out qm 'guest exec 9001 -- /home/runner/actions-runner/bin/Runner.Listener --version' <<'EOF'

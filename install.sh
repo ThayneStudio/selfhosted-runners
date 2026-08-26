@@ -31,26 +31,27 @@ ln -sf "$INSTALL_DIR/runner" /usr/local/bin/runner
 
 echo "Installed to $INSTALL_DIR"
 
-if [[ -f "$INSTALL_DIR/templates/github-runners.logrotate" ]]; then
-    mkdir -p /etc/logrotate.d
-    cp "$INSTALL_DIR/templates/github-runners.logrotate" /etc/logrotate.d/github-runners
-fi
-
-# Carry an active maintenance drain over to the persistent flag. Releases before
-# this one kept it on tmpfs, so upgrading mid-maintenance and then rebooting --
-# which is usually the whole reason the pool was stopped -- would wipe the flag
-# and let the watcher refill the pool on the next boot.
 # Paths come from the library we just extracted rather than being spelled again
 # here, so relocating the platform's state stays a one-line change in common.sh.
 # Safe to source: the tar above has completed, so the file is whole.
 # shellcheck source=lib/common.sh
 source "$INSTALL_DIR/lib/common.sh"
 
+# Carry an active maintenance drain over to the persistent flag. Releases before
+# this one kept it on tmpfs, so upgrading mid-maintenance and then rebooting --
+# which is usually the whole reason the pool was stopped -- would wipe the flag
+# and let the watcher refill the pool on the next boot.
+
 if [[ -e "$POOL_DRAIN_FILE_LEGACY" ]]; then
     ensure_state_dir
     : > "$POOL_DRAIN_FILE"
     echo "Migrated the active maintenance drain to $POOL_DRAIN_FILE"
     echo "The pool stays drained until you run 'runner start'."
+fi
+
+if [[ -f "$INSTALL_DIR/templates/github-runners.logrotate" ]]; then
+    mkdir -p "$LOGROTATE_DIR"
+    cp "$INSTALL_DIR/templates/github-runners.logrotate" "$LOGROTATE_DIR/github-runners"
 fi
 
 # If setup was already run, sync deployed files (hookscript, systemd units)
@@ -78,13 +79,13 @@ if [[ -f /etc/github-runners.conf ]]; then
             chmod 600 "$SNIPPETS_DIR/template-setup.yaml"
         fi
     fi
-    if [[ -f /etc/systemd/system/github-runner-watch.timer ]]; then
-        cp "$INSTALL_DIR/templates/github-runner-watch.service" /etc/systemd/system/
-        cp "$INSTALL_DIR/templates/github-runner-watch.timer" /etc/systemd/system/
-        cp "$INSTALL_DIR/templates/github-runner-guard.service" /etc/systemd/system/
-        cp "$INSTALL_DIR/templates/github-runner-guard.timer" /etc/systemd/system/
-        cp "$INSTALL_DIR/templates/github-runner-maintain.service" /etc/systemd/system/
-        cp "$INSTALL_DIR/templates/github-runner-maintain.timer" /etc/systemd/system/
+    if [[ -f "$SYSTEMD_UNIT_DIR/github-runner-watch.timer" ]]; then
+        cp "$INSTALL_DIR/templates/github-runner-watch.service" "$SYSTEMD_UNIT_DIR/"
+        cp "$INSTALL_DIR/templates/github-runner-watch.timer" "$SYSTEMD_UNIT_DIR/"
+        cp "$INSTALL_DIR/templates/github-runner-guard.service" "$SYSTEMD_UNIT_DIR/"
+        cp "$INSTALL_DIR/templates/github-runner-guard.timer" "$SYSTEMD_UNIT_DIR/"
+        cp "$INSTALL_DIR/templates/github-runner-maintain.service" "$SYSTEMD_UNIT_DIR/"
+        cp "$INSTALL_DIR/templates/github-runner-maintain.timer" "$SYSTEMD_UNIT_DIR/"
         systemctl daemon-reload
         # New in this release, so an existing install has it disabled.
         systemctl enable --now github-runner-guard.timer 2>/dev/null || true

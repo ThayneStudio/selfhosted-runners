@@ -67,6 +67,8 @@ HARNESS_SANDBOXED_CONSTANTS=(
     CLONE_SLOT_LOCK_PREFIX
     RUNNER_SLOT_LOCK_PREFIX
     RECLONE_STATE_PREFIX
+    SYSTEMD_UNIT_DIR
+    LOGROTATE_DIR
 )
 
 # --- Loading code under test ---------------------------------------------

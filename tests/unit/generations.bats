@@ -886,8 +886,9 @@ create_full_record() {
 
 @test "REBAKE_MAX_AGE_DAYS=nope after apply is 7" {
     REBAKE_MAX_AGE_DAYS=nope
-    apply_generation_defaults
+    apply_generation_defaults 2>"$GEN_TEST_DIR/apply.err"
     [ "$REBAKE_MAX_AGE_DAYS" = "7" ]
+    grep -q "Invalid REBAKE_MAX_AGE_DAYS='nope'" "$GEN_TEST_DIR/apply.err"
 }
 
 @test "CANARY_ENABLED=TRUE becomes true" {

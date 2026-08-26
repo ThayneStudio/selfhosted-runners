@@ -269,6 +269,35 @@ notify_log() {
     [[ "$output" == *"unknown-digest"* || "$(notify_log)" == *"canary.unconfigured"* ]]
 }
 
+@test "CANARY_ENABLED=true with empty CANARY_REPO notifies even outside REBAKE_WINDOW" {
+    stub_digest_ok
+    make_active unknown GEN_CREATED_AT=2026-08-24T00:00:00Z
+    MAINTAIN_NOW_HHMM=07:00
+    REBAKE_WINDOW=02:00-06:00
+    CANARY_ENABLED=true
+    CANARY_REPO=""
+
+    run maintain_main
+    [ "$status" -eq 0 ]
+    ! bake_main_called
+    notify_log | grep -q 'warn canary.unconfigured'
+    [[ "$output" != *"deferring bake until REBAKE_WINDOW"* ]]
+}
+
+@test "invalid REBAKE_WINDOW does not claim a later in-window bake" {
+    stub_digest_ok
+    make_active unknown GEN_CREATED_AT=2026-08-24T00:00:00Z
+    REBAKE_WINDOW=not-a-window
+    MAINTAIN_NOW_HHMM=03:00
+
+    run maintain_main
+    [ "$status" -eq 0 ]
+    ! bake_main_called
+    [[ "$output" == *"[ERROR]"* ]]
+    [[ "$output" == *"REBAKE_WINDOW"* ]]
+    [[ "$output" != *"deferring bake until REBAKE_WINDOW"* ]]
+}
+
 # ---------------------------------------------------------------------------
 # Dead baking / lock
 # ---------------------------------------------------------------------------
@@ -283,6 +312,9 @@ notify_log() {
         GEN_RUNNER_VERSION=unknown
     stub_out qm 'status 8900' <<'EOF'
 status: running
+EOF
+    stub_out qm 'config 8900' <<'EOF'
+name: github-runner-gen-2
 EOF
     stub_out qm 'stop 8900*' < /dev/null
     stub_out qm 'destroy 8900*' < /dev/null
@@ -360,6 +392,7 @@ EOF
         GEN_TEMPLATE_DIGEST=deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef \
         GEN_IMAGE_SHA256=abc
     stub_status qm 'status 8900' 1
+    stub_status qm 'config 8900' 1
     stub_out pvesm 'list *' <<EOF
 Volid Format
 ${VM_STORAGE}:vm-8900-disk-0 raw
@@ -379,6 +412,29 @@ EOF
     assert_called pvesm "free ${VM_STORAGE}:vm-8900-disk-0"
     assert_called pvesm "free ${VM_STORAGE}:vm-8900-cloudinit"
     notify_log | grep -q 'bake.failed'
+}
+
+@test "dead baking with a foreign name is failed but the VM is not destroyed" {
+    gen_store_init
+    gen_create 8900 \
+        GEN_ID=2 \
+        GEN_STATE=baking \
+        GEN_TEMPLATE_DIGEST=deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef \
+        GEN_IMAGE_SHA256=abc
+    stub_out qm 'status 8900' <<'EOF'
+status: running
+EOF
+    stub_out qm 'config 8900' <<'EOF'
+name: foreign-vm
+EOF
+
+    run maintain_reconcile_baking
+    [ "$status" -eq 0 ]
+    gen_read 8900
+    [ "$GEN_STATE" = "failed" ]
+    refute_called qm 'destroy *'
+    refute_called qm 'stop *'
+    refute_called pvesm 'free *'
 }
 
 # ---------------------------------------------------------------------------
@@ -430,6 +486,44 @@ EOF
     [ "$GEN_STATE" = "active" ]
     notify_log | grep -q 'warn'
     notify_log | grep -q 'generation.reconciled'
+}
+
+@test "zero actives with TEMPLATE_ID pointing at a failed record stays failed" {
+    gen_store_init
+    TEMPLATE_ID=9000
+    gen_create 9000 \
+        GEN_ID=1 \
+        GEN_STATE=failed \
+        GEN_TEMPLATE_DIGEST=old \
+        GEN_IMAGE_SHA256=abc \
+        GEN_RUNNER_VERSION=2.335.0 \
+        GEN_FAILED_REASON="bake failed"
+
+    run maintain_reconcile_two_actives
+    [ "$status" -eq 0 ]
+    gen_read 9000
+    [ "$GEN_STATE" = "failed" ]
+    [ ! -f "$STUB_DIR/notify.log" ] || ! grep -q 'generation.reconciled' "$STUB_DIR/notify.log"
+    [[ "$output" == *"not forcing"* ]]
+}
+
+@test "stale promotion pause is cleared when the pool lock is free" {
+    mkdir -p "$(dirname "$PROMOTION_PAUSE_FILE")"
+    : > "$PROMOTION_PAUSE_FILE"
+    run maintain_clear_stale_promotion_pause
+    [ "$status" -eq 0 ]
+    [ ! -e "$PROMOTION_PAUSE_FILE" ]
+    [[ "$output" == *"stale promotion pause"* ]]
+}
+
+@test "promotion pause is left when the exclusive pool lock is held" {
+    mkdir -p "$(dirname "$PROMOTION_PAUSE_FILE")" "$(dirname "$POOL_ACTIVITY_LOCK_FILE")"
+    : > "$PROMOTION_PAUSE_FILE"
+    exec 202>"$POOL_ACTIVITY_LOCK_FILE"
+    flock -n -x 202
+    run maintain_clear_stale_promotion_pause
+    [ "$status" -eq 0 ]
+    [ -e "$PROMOTION_PAUSE_FILE" ]
 }
 
 @test "two-actives skipped while pause file exists" {
