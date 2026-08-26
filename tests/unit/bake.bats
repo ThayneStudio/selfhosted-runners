@@ -397,3 +397,18 @@ bake_qm_stub() {
     assert_called qm 'destroy 8901*'
     refute_called qm "destroy ${TEMPLATE_ID}*"
 }
+
+@test "successful candidate transition disarms EXIT INT TERM before leftover-candidate destroy" {
+    # INT/TERM staying armed through bake_fail_other_candidates lets a signal
+    # during ruling-6 leftover destroy run bake_fail against the new candidate.
+    awk '
+        /^bake_locked\(\)/ { in_locked = 1 }
+        in_locked && /gen_transition "\$vmid" candidate/ { trans = NR }
+        in_locked && /trap - EXIT INT TERM/ { disarm = NR }
+        in_locked && /bake_fail_other_candidates/ { leftover = NR }
+        END {
+            if (!trans || !disarm || !leftover) exit 1
+            if (!(trans < disarm && disarm < leftover)) exit 1
+        }
+    ' "$REPO_ROOT/lib/bake.sh"
+}

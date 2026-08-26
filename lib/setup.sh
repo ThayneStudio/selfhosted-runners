@@ -79,15 +79,22 @@ fi
 read -rp "Template VM ID [9000]: " TEMPLATE_ID
 TEMPLATE_ID=${TEMPLATE_ID:-9000}
 
-# Minimum VM ID for runners (0 = use Proxmox default)
+# Minimum VM ID for runners. MIN_VMID=0 ("auto") is a hard error: nextid can
+# land in the generation band, and load_infra_config would then refuse the
+# written config (spec 4.2).
 DEFAULT_MIN_VMID=$((TEMPLATE_ID + 1))
-read -rp "Minimum VM ID for runners (0 = auto) [${DEFAULT_MIN_VMID}]: " MIN_VMID
+read -rp "Minimum VM ID for runners [${DEFAULT_MIN_VMID}]: " MIN_VMID
 MIN_VMID=${MIN_VMID:-$DEFAULT_MIN_VMID}
 if [[ ! "$MIN_VMID" =~ ^[0-9]+$ ]]; then
     log_error "Minimum VM ID must be a non-negative number"
     exit 1
 fi
-if [[ "$MIN_VMID" -ne 0 && "$MIN_VMID" -lt 100 ]]; then
+apply_generation_defaults
+if [[ "$MIN_VMID" -eq 0 ]]; then
+    log_error "MIN_VMID=0 (auto) is incompatible with generations; set MIN_VMID to $((TEMPLATE_BAND_MAX + 1)) or higher"
+    exit 1
+fi
+if [[ "$MIN_VMID" -lt 100 ]]; then
     log_error "Minimum VM ID must be at least 100"
     exit 1
 fi
@@ -144,7 +151,7 @@ echo "  Network Bridge: $NETWORK_BRIDGE"
 echo "  VLAN Tag:       ${VLAN_TAG:-none}"
 echo "  VM Storage:     $VM_STORAGE"
 echo "  Template ID:    $TEMPLATE_ID"
-echo "  Min VM ID:      $([ "${MIN_VMID:-0}" -eq 0 ] && echo "auto" || echo "$MIN_VMID")"
+echo "  Min VM ID:      $MIN_VMID"
 echo "  Balloon:        ${BALLOON:-0} MB ($([ "${BALLOON:-0}" -eq 0 ] && echo "disabled" || echo "enabled"))"
 echo "  DNS Servers:    ${DNS_SERVERS:-DHCP only}"
 echo "  Docker Mirror:  ${DOCKER_MIRROR_URL:-none}"

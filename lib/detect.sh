@@ -102,7 +102,7 @@ detect_note_failure() {
 # Reasons: digest-changed, unknown-digest, weekly-floor, up-to-date,
 # memoed-digest, rebake-disabled.
 detect_should_bake() {
-    local digest="" active_list="" active_vmid=""
+    local digest=""
 
     apply_generation_defaults
 
@@ -121,17 +121,14 @@ detect_should_bake() {
             return 0
         fi
 
-        if ! active_list=$(gen_list active); then
-            log_error "Failed to list active generations"
-            return 1
-        fi
-        active_vmid="${active_list%%$'\n'*}"
-
-        if [[ -z "$active_vmid" ]]; then
+        # Compare against the clone pointer, not gen_list active (lowest VMID).
+        # A promote-before-demote crash leaves two actives; TEMPLATE_ID is the
+        # generation the fleet clones. No record → unknown-digest.
+        if [[ -z "${TEMPLATE_ID:-}" ]] || ! gen_exists "$TEMPLATE_ID"; then
             printf 'yes unknown-digest\n'
             return 0
         fi
-        gen_read "$active_vmid" || return 1
+        gen_read "$TEMPLATE_ID" || return 1
 
         if [[ -z "${GEN_TEMPLATE_DIGEST:-}" || "$GEN_TEMPLATE_DIGEST" == "unknown" ]]; then
             printf 'yes unknown-digest\n'
@@ -159,13 +156,8 @@ detect_should_bake() {
     log_warn "Failed to compute template digest; not treating as digest-changed"
     detect_note_failure
 
-    if ! active_list=$(gen_list active); then
-        log_error "Failed to list active generations"
-        return 1
-    fi
-    active_vmid="${active_list%%$'\n'*}"
-    if [[ -n "$active_vmid" ]]; then
-        gen_read "$active_vmid" || return 1
+    if [[ -n "${TEMPLATE_ID:-}" ]] && gen_exists "$TEMPLATE_ID"; then
+        gen_read "$TEMPLATE_ID" || return 1
         if detect_past_floor; then
             printf 'yes weekly-floor\n'
             return 0

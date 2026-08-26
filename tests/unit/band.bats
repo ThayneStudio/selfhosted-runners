@@ -38,3 +38,20 @@ setup() {
     run load_infra_config
     [ "$status" -ne 0 ]
 }
+
+@test "setup wizard refuses MIN_VMID=0 with TEMPLATE_BAND_MAX+1 before writing config" {
+    # Operator typing 0 must log_error naming the suggested floor and exit 1
+    # after the read, before printf MIN_VMID= into CONFIG_FILE. "0 = auto" is
+    # no longer offered.
+    ! grep -q '0 = auto' "$REPO_ROOT/lib/setup.sh"
+    awk '
+        /read -rp .*Minimum VM ID/ { r = NR }
+        /MIN_VMID" -eq 0/ { z = NR }
+        /TEMPLATE_BAND_MAX/ { if (z && !t) t = NR }
+        /printf '\''MIN_VMID=%q/ { w = NR }
+        END {
+            if (!r || !z || !t || !w) exit 1
+            if (!(r < z && z <= t && t < w)) exit 1
+        }
+    ' "$REPO_ROOT/lib/setup.sh"
+}

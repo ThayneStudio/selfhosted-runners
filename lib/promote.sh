@@ -40,7 +40,7 @@ _promote_release() {
 # Usage: promote_generation <gen_id> [--skip-canary] [--yes]
 promote_generation() {
     local gen_id="" skip_canary=0 yes=0
-    local new_vmid state rc confirm=""
+    local new_vmid state rc confirm="" pointer=""
     local -a previous=()
     local prev
 
@@ -80,10 +80,15 @@ promote_generation() {
     state="$GEN_STATE"
 
     if [[ "$state" == "active" ]]; then
-        log_info "Generation $gen_id is already active"
-        return 0
-    fi
-    if [[ "$state" != "candidate" ]]; then
+        # Pointer may still name the previous VMID after a crash between
+        # gen_transition active and rewrite_template_id. Only no-op when
+        # record and pointer already agree.
+        pointer=$(reload_active_template_id) || return 1
+        if [[ "$pointer" == "$new_vmid" ]]; then
+            log_info "Generation $gen_id is already active"
+            return 0
+        fi
+    elif [[ "$state" != "candidate" ]]; then
         log_error "Generation $gen_id is $state, not candidate — refusing to promote"
         return 1
     fi
@@ -136,11 +141,16 @@ promote_generation() {
         return 1
     }
     if [[ "$GEN_STATE" == "active" ]]; then
-        log_info "Generation $gen_id is already active"
-        _promote_release
-        return 0
-    fi
-    if [[ "$GEN_STATE" != "candidate" ]]; then
+        pointer=$(reload_active_template_id) || {
+            _promote_release
+            return 1
+        }
+        if [[ "$pointer" == "$new_vmid" ]]; then
+            log_info "Generation $gen_id is already active"
+            _promote_release
+            return 0
+        fi
+    elif [[ "$GEN_STATE" != "candidate" ]]; then
         log_error "Generation $gen_id is $GEN_STATE, not candidate — refusing to promote"
         _promote_release
         return 1
@@ -155,12 +165,16 @@ promote_generation() {
     # Promote-before-demote: a crash after this transition leaves two actives
     # (Task 8 reconciles), never zero. Distinguish gen_transition code 4 (write
     # failed) from 1 (refused) so TEMPLATE_ID is not rewritten on a refusal.
-    rc=0
-    gen_transition "$new_vmid" active || rc=$?
-    if [[ "$rc" -ne 0 ]]; then
-        log_error "Failed to mark generation $gen_id active (exit $rc)"
-        _promote_release
-        return 1
+    # Already-active with a stale pointer skips the transition and still
+    # rewrites TEMPLATE_ID below.
+    if [[ "$GEN_STATE" != "active" ]]; then
+        rc=0
+        gen_transition "$new_vmid" active || rc=$?
+        if [[ "$rc" -ne 0 ]]; then
+            log_error "Failed to mark generation $gen_id active (exit $rc)"
+            _promote_release
+            return 1
+        fi
     fi
 
     if ! rewrite_template_id "$new_vmid"; then

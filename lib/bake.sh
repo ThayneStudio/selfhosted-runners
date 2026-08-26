@@ -777,13 +777,12 @@ bake_locked() {
         return 1
     fi
 
-    # New VMID is candidate. An EXIT bake_fail during ruling-6 cleanup must
-    # not destroy it. INT/TERM stay until process exit.
-    trap - EXIT
+    # New VMID is candidate. Disarm EXIT/INT/TERM before ruling-6 leftover
+    # destroy so a signal cannot bake_fail the successful new VMID.
+    trap - EXIT INT TERM
 
     bake_fail_other_candidates "$vmid"
 
-    trap - INT TERM
     log_info "Bake finished: generation $gen_id is candidate (VMID $vmid)"
     _bake_tee "bake finished gen=$gen_id vmid=$vmid state=candidate"
     return 0

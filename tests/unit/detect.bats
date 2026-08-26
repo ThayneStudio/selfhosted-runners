@@ -225,3 +225,53 @@ make_active() {
     [ "$(notify_count)" -eq 0 ]
     [ -f "$DETECT_FAIL_FILE" ]
 }
+
+@test "two actives: detect uses TEMPLATE_ID not the lowest active VMID" {
+    # Promote-before-demote crash: 8900 (matching digest) and 9000 (unknown).
+    # The fleet clones TEMPLATE_ID=9000, so this must be unknown-digest, not
+    # up-to-date from gen_list active | head (lowest VMID 8900).
+    stub_digest_ok
+    local digest
+    digest=$(compute_template_digest)
+    gen_now() { printf '%s\n' '2026-08-25T00:00:00Z'; }
+    gen_store_init
+    TEMPLATE_ID=9000
+    gen_create 8900 \
+        GEN_ID=99 \
+        GEN_STATE=active \
+        GEN_TEMPLATE_DIGEST="$digest" \
+        GEN_IMAGE_SHA256=abc \
+        GEN_RUNNER_VERSION=2.336.0 \
+        GEN_CREATED_AT=2026-08-24T00:00:00Z
+    gen_create 9000 \
+        GEN_ID=1 \
+        GEN_STATE=active \
+        GEN_TEMPLATE_DIGEST=unknown \
+        GEN_IMAGE_SHA256=abc \
+        GEN_RUNNER_VERSION=2.336.0 \
+        GEN_CREATED_AT=2026-08-24T00:00:00Z
+
+    run --separate-stderr detect_should_bake
+    [ "$status" -eq 0 ]
+    [ "$output" = "yes unknown-digest" ]
+}
+
+@test "TEMPLATE_ID with no record is unknown-digest even if another generation is active" {
+    stub_digest_ok
+    local digest
+    digest=$(compute_template_digest)
+    gen_now() { printf '%s\n' '2026-08-25T00:00:00Z'; }
+    gen_store_init
+    TEMPLATE_ID=9000
+    gen_create 8900 \
+        GEN_ID=99 \
+        GEN_STATE=active \
+        GEN_TEMPLATE_DIGEST="$digest" \
+        GEN_IMAGE_SHA256=abc \
+        GEN_RUNNER_VERSION=2.336.0 \
+        GEN_CREATED_AT=2026-08-24T00:00:00Z
+
+    run --separate-stderr detect_should_bake
+    [ "$status" -eq 0 ]
+    [ "$output" = "yes unknown-digest" ]
+}

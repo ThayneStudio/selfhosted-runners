@@ -140,6 +140,35 @@ seed_active_and_candidate() {
     [ ! -f "$STUB_DIR/notify.log" ] || ! grep -q 'generation.promoted' "$STUB_DIR/notify.log"
 }
 
+@test "promote of already-active generation with stale TEMPLATE_ID rewrites the pointer" {
+    # Crash after gen_transition active but before rewrite_template_id: both
+    # records are active, pointer still names the old VMID. Retry must not
+    # no-op — clones would keep the old image, and maintain would demote N.
+    gen_store_init
+    gen_create 8900 \
+        GEN_ID=2 \
+        GEN_STATE=active \
+        GEN_TEMPLATE_DIGEST=newdigest \
+        GEN_IMAGE_SHA256=def \
+        GEN_RUNNER_VERSION=2.336.0
+    gen_create 9000 \
+        GEN_ID=1 \
+        GEN_STATE=active \
+        GEN_TEMPLATE_DIGEST=olddigest \
+        GEN_IMAGE_SHA256=abc \
+        GEN_RUNNER_VERSION=2.335.0
+
+    run --separate-stderr promote_generation 2 --skip-canary --yes
+    [ "$status" -eq 0 ]
+
+    grep -qE '^TEMPLATE_ID=["'\'']?8900["'\'']?$' "$CONFIG_FILE"
+    ! grep -qE '^TEMPLATE_ID=["'\'']?9000["'\'']?$' "$CONFIG_FILE"
+    gen_read 8900
+    [ "$GEN_STATE" = "active" ]
+    gen_read 9000
+    [ "$GEN_STATE" = "superseded" ]
+}
+
 @test "promote refuses a non-candidate generation" {
     gen_store_init
     gen_create 8900 GEN_ID=2 GEN_STATE=baking
