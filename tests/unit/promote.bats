@@ -18,6 +18,9 @@ setup() {
     notify() {
         printf '%s\n' "$*" >> "$STUB_DIR/notify.log"
     }
+    stub_out qm 'config *' <<'EOF'
+template: 1
+EOF
 }
 
 file_mode() {
@@ -178,6 +181,25 @@ seed_active_and_candidate() {
     gen_read 8900
     [ "$GEN_STATE" = "baking" ]
     grep -q 'TEMPLATE_ID="9000"' "$CONFIG_FILE"
+}
+
+@test "promote refuses a VMID that is not a Proxmox template" {
+    seed_active_and_candidate
+    stub_out qm 'config *' <<'EOF'
+name: leftover-bake
+ostype: l26
+EOF
+
+    run --separate-stderr promote_generation 2 --skip-canary --yes
+    [ "$status" -eq 1 ]
+    [[ "$stderr" == *"not a template"* ]]
+    gen_read 8900
+    [ "$GEN_STATE" = "candidate" ]
+    gen_read 9000
+    [ "$GEN_STATE" = "active" ]
+    grep -q 'TEMPLATE_ID="9000"' "$CONFIG_FILE"
+    [ ! -e "$PROMOTION_PAUSE_FILE" ]
+    [ ! -f "$STUB_DIR/notify.log" ] || ! grep -q 'generation.promoted' "$STUB_DIR/notify.log"
 }
 
 @test "promote_generation traps EXIT to clear PROMOTION_PAUSE_FILE before flock waits" {

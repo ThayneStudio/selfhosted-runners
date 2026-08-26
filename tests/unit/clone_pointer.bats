@@ -1,6 +1,7 @@
 #!/usr/bin/env bats
 # clone_runner re-reads TEMPLATE_ID after the shared pool lock, honors the
-# promotion pause file, and tags from the cloned VMID's generation record.
+# promotion pause file (return 3, not clone.failed), and tags from the cloned
+# VMID's generation record.
 #
 # write_infra_config still defaults MIN_VMID=500, which overlaps the
 # generation band, so tests set 9001.
@@ -18,6 +19,8 @@ setup() {
     apply_generation_defaults
     VLAN_TAG="${VLAN_TAG:-}"
     DNS_SERVERS="${DNS_SERVERS:-}"
+    # Skip the ~130s pause wait unless a test is proving the retry itself.
+    CLONE_PAUSE_RETRY_MAX_SECONDS=0
     stub_clone_success
 }
 
@@ -75,12 +78,106 @@ write_pointer() {
     refute_called qm 'set * --tags runner,gen-9'
 }
 
-@test "clone_runner returns 1 without cloning when PROMOTION_PAUSE_FILE exists" {
+@test "clone_runner returns 3 without cloning when PROMOTION_PAUSE_FILE remains" {
     : > "$PROMOTION_PAUSE_FILE"
 
     run --separate-stderr clone_runner runner-acme-1 acme
-    [ "$status" -eq 1 ]
+    [ "$status" -eq 3 ]
     refute_called qm 'clone *'
     refute_called qm 'set *'
     refute_called qm 'start *'
+}
+
+@test "clone_runner clones the re-read TEMPLATE_ID when the pause file clears mid-wait" {
+    : > "$PROMOTION_PAUSE_FILE"
+    [ "$TEMPLATE_ID" = "9000" ]
+    write_pointer 9000
+    CLONE_PAUSE_RETRY_MAX_SECONDS=4
+    sleep() {
+        rm -f "$PROMOTION_PAUSE_FILE"
+        write_pointer 8900
+    }
+
+    run --separate-stderr clone_runner runner-acme-1 acme
+    [ "$status" -eq 0 ]
+    assert_called qm 'clone 8900 *'
+    refute_called qm 'clone 9000 *'
+}
+
+@test "reclone does not notify clone.failed when clone_runner returns 3" {
+    notify() { printf '%s\n' "$*" >> "$STUB_DIR/notify.log"; }
+    load_org_config() { :; }
+    clone_runner() { return 3; }
+    NAME="runner-1"
+    ORG="acme"
+    VMID="9001"
+    local block
+    block=$(awk '/^# Clone replacement/,0' "$REPO_ROOT/lib/reclone.sh")
+    [ -n "$block" ]
+
+    run --separate-stderr eval "set -euo pipefail
+$block"
+    [ "$status" -eq 0 ]
+    [ ! -f "$STUB_DIR/notify.log" ]
+    [[ "$stderr" == *"promotion in progress, will retry"* ]]
+}
+
+@test "reclone notifies clone.failed when clone_runner returns 1" {
+    notify() { printf '%s\n' "$*" >> "$STUB_DIR/notify.log"; }
+    load_org_config() { :; }
+    clone_runner() { return 1; }
+    NAME="runner-1"
+    ORG="acme"
+    VMID="9001"
+    local block
+    block=$(awk '/^# Clone replacement/,0' "$REPO_ROOT/lib/reclone.sh")
+    [ -n "$block" ]
+
+    run --separate-stderr eval "set -euo pipefail
+$block"
+    [ "$status" -eq 1 ]
+    grep -q 'error clone.failed' "$STUB_DIR/notify.log"
+}
+
+@test "watch does not record a failed slot when clone_runner returns 3" {
+    clone_runner() { return 3; }
+    slot="runner-1"
+    org="acme"
+    FAILED_SLOTS="$STUB_DIR/watch-failed"
+    rm -f "$FAILED_SLOTS"
+    local block
+    block=$(awk '
+        /clone_rc=0/ { p=1 }
+        p { print }
+        p && /^        fi$/ { exit }
+    ' "$REPO_ROOT/lib/watch.sh")
+    [ -n "$block" ]
+    [[ "$block" == *"clone_rc"* ]]
+
+    run --separate-stderr eval "set -euo pipefail
+$block"
+    [ "$status" -eq 0 ]
+    [ ! -s "$FAILED_SLOTS" ]
+    [[ "$stderr" == *"promotion in progress, will retry"* ]]
+}
+
+@test "watch records a failed slot when clone_runner returns 1" {
+    clone_runner() { return 1; }
+    slot="runner-1"
+    org="acme"
+    FAILED_SLOTS="$STUB_DIR/watch-failed"
+    rm -f "$FAILED_SLOTS"
+    local block
+    block=$(awk '
+        /clone_rc=0/ { p=1 }
+        p { print }
+        p && /^        fi$/ { exit }
+    ' "$REPO_ROOT/lib/watch.sh")
+    [ -n "$block" ]
+
+    run --separate-stderr eval "set -euo pipefail
+$block"
+    [ "$status" -eq 0 ]
+    [ -s "$FAILED_SLOTS" ]
+    grep -qx 'runner-1' "$FAILED_SLOTS"
 }

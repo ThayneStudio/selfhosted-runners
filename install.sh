@@ -58,6 +58,17 @@ if [[ -f /etc/github-runners.conf ]]; then
     echo "Updating deployed files..."
     # shellcheck source=/dev/null
     source /etc/github-runners.conf
+    # Fail closed on MIN_VMID=0 / band overlap so this upgrade cannot enable
+    # github-runner-maintain.timer on a host that can no longer clone.
+    apply_generation_defaults
+    if ! validate_generation_band; then
+        echo "" >&2
+        echo "ERROR: /etc/github-runners.conf is incompatible with generational templates." >&2
+        echo "  Set MIN_VMID=$((TEMPLATE_BAND_MAX + 1)) (or higher) in /etc/github-runners.conf" >&2
+        echo "  before the next watch tick; the runner pool will not refill until you do." >&2
+        echo "Install aborted; github-runner-maintain.timer was not enabled." >&2
+        exit 1
+    fi
     if [[ -d /var/lib/vz/snippets ]]; then
         cp "$INSTALL_DIR/templates/runner-hookscript.sh" /var/lib/vz/snippets/runner-hookscript.sh
         chmod 755 /var/lib/vz/snippets/runner-hookscript.sh

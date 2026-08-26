@@ -765,22 +765,46 @@ clone_tag_generation() {
 }
 
 # Clone template, configure cloud-init, set hookscript, start VM.
-# Returns VMID on stdout. Returns 1 on failure (cleans up partial clone).
+# Returns VMID on stdout.
+# Returns 1 on failure (cleans up partial clone).
+# Returns 3 when PROMOTION_PAUSE_FILE is still present after a bounded wait
+# (CLONE_PAUSE_RETRY_MAX_SECONDS, default 130 — longer than promote's 120s
+# exclusive-lock wait). Distinct from 1 so reclone.sh / watch.sh retry
+# without notifying clone.failed. Tests set the bound to 0 to skip the wait.
 clone_runner() {
     local name="$1" org="$2" vmid="${3:-}"
     local RESERVED_VMID=""
+    local pause_waited=0
+    local pause_max="${CLONE_PAUSE_RETRY_MAX_SECONDS:-130}"
 
     exec 202>"$POOL_ACTIVITY_LOCK_FILE"
     flock -s 202
 
     # Pause file lets promote acquire the exclusive lock: Linux flock has no
     # writer preference, so new shared holders would otherwise starve it.
-    # Proven by "clone_runner returns 1 without cloning when PROMOTION_PAUSE_FILE exists".
-    if [[ -e "$PROMOTION_PAUSE_FILE" ]]; then
-        log_warn "clone_runner: promotion in progress, refusing to create $name"
+    # Sleep 2, drop shared, re-acquire, re-check, up to pause_max seconds;
+    # then return 3 (not 1). Proven by "clone_runner returns 3 without cloning
+    # when PROMOTION_PAUSE_FILE remains" and "clone_runner clones the re-read
+    # TEMPLATE_ID when the pause file clears mid-wait".
+    [[ "$pause_max" =~ ^[0-9]+$ ]] || pause_max=130
+    while [[ -e "$PROMOTION_PAUSE_FILE" ]]; do
+        if (( pause_waited >= pause_max )); then
+            log_info "clone_runner: promotion in progress, will retry"
+            exec 202>&-
+            return 3
+        fi
+        if (( pause_waited == 0 )); then
+            log_info "clone_runner: promotion in progress, waiting to retry $name"
+        fi
         exec 202>&-
-        return 1
-    fi
+        sleep 2
+        pause_waited=$((pause_waited + 2))
+        exec 202>"$POOL_ACTIVITY_LOCK_FILE" || {
+            log_error "clone_runner: cannot reopen pool lock while waiting out promotion"
+            return 1
+        }
+        flock -s 202
+    done
 
     if pool_is_draining; then
         log_warn "clone_runner: pool drain active, refusing to create $name"

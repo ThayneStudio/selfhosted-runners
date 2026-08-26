@@ -169,10 +169,10 @@ runner guard --dry-run     # prints candidates and reasons, destroys nothing
   check `runner destroy` uses. Unrelated VMs on the same host are invisible to
   it.
 - `TEMPLATE_ID`, and any VM that is itself a template.
-- Any VM below the runner VMID floor. That floor is `MIN_VMID`; if the key is
-  absent from your config it is `TEMPLATE_ID + 1`, and an explicit `MIN_VMID=0`
-  ("let Proxmox pick") means no floor, since runner VMIDs can then land
-  anywhere.
+- Any VM below the runner VMID floor (`MIN_VMID`). `MIN_VMID` is required and
+  must sit above the generation template band (`TEMPLATE_BAND_MAX`, default
+  8999, so `9000` or higher). Absent or `MIN_VMID=0` is a hard error at
+  config load; `install.sh` aborts an upgrade until it is set.
 - Any VM with `protection: 1` or a `lock:` line — including one suspended to
   disk. **This is the escape hatch**: to keep a wedged runner for forensics,
   `qm set <vmid> --protection 1`. A copy taken with `qm clone`/`qm restore`

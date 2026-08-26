@@ -114,9 +114,16 @@ fi
 
 # Clone replacement. RECLONE_TS was already written at the top of this
 # script — no need to update it again on success.
+# clone_runner 3 = promotion pause after a bounded wait; the slot is empty and
+# the watcher (or the next death) retries. Must not notify clone.failed.
 load_org_config "$ORG"
-if clone_runner "$NAME" "$ORG" >/dev/null; then
+clone_rc=0
+clone_runner "$NAME" "$ORG" >/dev/null || clone_rc=$?
+if [[ "$clone_rc" -eq 0 ]]; then
     log_info "reclone: re-cloned $NAME for org $ORG"
+elif [[ "$clone_rc" -eq 3 ]]; then
+    log_info "reclone: promotion in progress, will retry"
+    exit 0
 else
     log_error "reclone: failed to re-clone $NAME for org $ORG"
     # Drop the per-slot lock before notifying. The work is over either way, and

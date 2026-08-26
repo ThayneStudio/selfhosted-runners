@@ -156,6 +156,15 @@ promote_generation() {
         return 1
     fi
 
+    # Record can say candidate/active after an out-of-band qm destroy. Never
+    # rewrite TEMPLATE_ID onto a VM that is not a Proxmox template.
+    # Proven by "promote refuses a VMID that is not a Proxmox template".
+    if ! qm config "$new_vmid" 2>/dev/null | grep -q '^template:[[:space:]]*1'; then
+        log_error "Generation $gen_id (VMID $new_vmid) is not a template in Proxmox — refusing to promote"
+        _promote_release
+        return 1
+    fi
+
     previous=()
     while read -r prev; do
         [[ -n "$prev" && "$prev" != "$new_vmid" ]] || continue
