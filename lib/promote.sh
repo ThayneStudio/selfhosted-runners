@@ -30,9 +30,9 @@ promote_usage() {
 }
 
 _promote_release() {
-    # Drop traps first so a later process EXIT cannot re-enter after a normal
-    # release. Proven by "_promote_release clears the EXIT trap".
-    trap - EXIT INT TERM
+    # Drop the EXIT trap first so a later process EXIT cannot re-enter after
+    # a normal release. Proven by "_promote_release clears the EXIT trap".
+    trap - EXIT
     rm -f "$PROMOTION_PAUSE_FILE"
     exec 202>&- 2>/dev/null || true
 }
@@ -114,11 +114,11 @@ promote_generation() {
         log_error "Failed to write $PROMOTION_PAUSE_FILE"
         return 1
     fi
-    # Ctrl-C / SSH drop during flock -w 120 would otherwise leave the pause
-    # file and stall every clone until reboot. INT/TERM also invoke this
-    # handler: EXIT alone is not run for an uncaught SIGTERM.
+    # Ctrl-C / SIGTERM abort the process; EXIT still runs. Do not trap
+    # INT/TERM here: a handler that returns would let promote continue
+    # with pause and lock already dropped.
     # Proven by "promote_generation traps EXIT to clear PROMOTION_PAUSE_FILE before flock waits".
-    trap '_promote_release' EXIT INT TERM
+    trap '_promote_release' EXIT
 
     exec 202>"$POOL_ACTIVITY_LOCK_FILE" || {
         _promote_release
