@@ -72,7 +72,7 @@ EOF
     }
     export -f bake_qm_stub
     export -f qm_stub
-    export STUB_DIR VM_STORAGE TEMPLATE_ID
+    export STUB_DIR VM_STORAGE TEMPLATE_ID GENERATIONS_DIR
 }
 
 make_cached_image() {
@@ -111,8 +111,42 @@ bake_qm_stub() {
         create)
             local vmid="$1"
             mkdir -p "$STUB_DIR"
+            if [[ -f "$STUB_DIR/qm-create-fail" ]]; then
+                return 1
+            fi
             : > "$STUB_DIR/qm-created-$vmid"
+            shift
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    --name)
+                        printf '%s' "$2" > "$STUB_DIR/qm-name-$vmid"
+                        shift 2
+                        ;;
+                    *)
+                        shift
+                        ;;
+                esac
+            done
             return 0
+            ;;
+        config)
+            local vmid="$1" gid
+            if [[ -f "$STUB_DIR/qm-foreign-$vmid" ]]; then
+                echo "name: foreign-vm"
+                return 0
+            fi
+            if [[ -f "$STUB_DIR/qm-name-$vmid" ]]; then
+                echo "name: $(cat "$STUB_DIR/qm-name-$vmid")"
+                return 0
+            fi
+            if [[ -f "$GENERATIONS_DIR/${vmid}.conf" ]]; then
+                gid=$(awk -F= '/^GEN_ID=/{gsub(/"/, "", $2); print $2; exit}' "$GENERATIONS_DIR/${vmid}.conf")
+                if [[ -n "$gid" ]]; then
+                    echo "name: github-runner-gen-${gid}"
+                    return 0
+                fi
+            fi
+            return 2
             ;;
         importdisk)
             local vmid="$1"
@@ -134,6 +168,10 @@ bake_qm_stub() {
             local vmid="$1"
             if [[ "$vmid" == "$TEMPLATE_ID" && ! -f "$STUB_DIR/template-present" ]]; then
                 return 2
+            fi
+            if [[ -f "$STUB_DIR/qm-foreign-$vmid" ]]; then
+                echo "status: stopped"
+                return 0
             fi
             if [[ -f "$STUB_DIR/qm-running-$vmid" ]]; then
                 echo "status: running"
@@ -442,4 +480,64 @@ bake_qm_stub() {
             if (!(trans < disarm && disarm < leftover)) exit 1
         }
     ' "$REPO_ROOT/lib/bake.sh"
+}
+
+@test "leftover 8901 becomes on-disk pointer / active after gen_list snapshot → no qm destroy 8901" {
+    gen_store_init
+    gen_create 8901 \
+        GEN_ID=1 \
+        GEN_STATE=candidate \
+        GEN_TEMPLATE_DIGEST=old \
+        GEN_IMAGE_SHA256=abc \
+        GEN_RUNNER_VERSION=2.0.0
+    rewrite_template_id 8901
+    gen_transition 8901 active
+    : > "$STUB_DIR/qm-created-8901"
+
+    gen_list() {
+        if [[ "${1:-}" == "candidate" ]]; then
+            printf '8901\n'
+            return 0
+        fi
+        printf '8901\n'
+    }
+
+    run bake_fail_other_candidates 8900
+    [ "$status" -eq 0 ]
+    refute_called qm 'destroy 8901*'
+    refute_called qm 'stop 8901*'
+    refute_called pvesm 'free *'
+    gen_read 8901
+    [ "$GEN_STATE" = "active" ]
+}
+
+@test "foreign name occupying _BAKE_VMID when qm create fails → no destroy of that VMID" {
+    : > "$STUB_DIR/qm-create-fail"
+    : > "$STUB_DIR/qm-foreign-8900"
+
+    run bake_main --force
+    [ "$status" -ne 0 ]
+    refute_called qm 'destroy 8900*'
+    refute_called qm 'stop 8900*'
+    refute_called pvesm 'free *'
+    gen_read 8900
+    [ "$GEN_STATE" = "failed" ]
+}
+
+@test "digest compute and download use the same stubbed SUMS and the guest snippet is pinned" {
+    cat > "$INSTALL_DIR/templates/template-setup.yaml" <<'EOF'
+mirror: {{DOCKER_MIRROR_URL}}
+      RUNNER_VERSION=$(curl -sf --retry 3 https://api.github.com/repos/actions/runner/releases/latest | jq -r .tag_name | sed 's/v//')
+      RUNNER_URL="https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-linux-x64-${RUNNER_VERSION}.tar.gz"
+EOF
+
+    run bake_main --force
+    [ "$status" -eq 0 ]
+    [ "$(call_count wget '*')" -eq 1 ]
+    local snippet="$SNIPPETS_DIR/template-setup-8900.yaml"
+    [ -f "$snippet" ]
+    grep -q 'RUNNER_VERSION=2.336.0' "$snippet"
+    ! grep -q 'releases/latest' "$snippet"
+    grep -q 'releases/download' "$snippet"
+    grep -q 'releases/latest' "$INSTALL_DIR/templates/template-setup.yaml"
 }

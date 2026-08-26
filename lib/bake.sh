@@ -69,11 +69,59 @@ fetch_image_checksum_entry() {
     printf '%s\n' "$line"
 }
 
+# Pin runner version + SHA256SUMS once under the bake lock. Digest, image
+# verify, and the per-VMID snippet all reuse these; detect/dry-run still fetch.
+bake_pin_inputs() {
+    _BAKE_PINNED_RUNNER_VERSION=""
+    _BAKE_PINNED_SUMS_ENTRY=""
+    _BAKE_PINNED_IMAGE_SHA=""
+    _BAKE_PINNED_RUNNER_VERSION=$(fetch_latest_runner_version) || return 1
+    _BAKE_PINNED_SUMS_ENTRY=$(fetch_image_checksum_entry) || return 1
+    _BAKE_PINNED_IMAGE_SHA=$(printf '%s\n' "$_BAKE_PINNED_SUMS_ENTRY" | awk '{ print $1; exit }')
+    [[ -n "$_BAKE_PINNED_RUNNER_VERSION" && -n "$_BAKE_PINNED_SUMS_ENTRY" && -n "$_BAKE_PINNED_IMAGE_SHA" ]] || return 1
+}
+
+# Replace the guest's releases/latest curl with the pinned version. Source
+# template-setup.yaml is left alone (digest input).
+bake_pin_snippet_runner_version() {
+    local snippet="${1:-}" version="${_BAKE_PINNED_RUNNER_VERSION:-}" tmp
+    [[ -n "$snippet" && -f "$snippet" ]] || return 1
+    [[ -n "$version" ]] || return 0
+    grep -q 'releases/latest' "$snippet" || return 0
+    tmp=$(mktemp "${snippet}.XXXXXX") || return 1
+    if ! awk -v ver="$version" '
+        /releases\/latest/ {
+            match($0, /^[[:space:]]*/)
+            print substr($0, 1, RLENGTH) "RUNNER_VERSION=" ver
+            next
+        }
+        { print }
+    ' "$snippet" > "$tmp"; then
+        rm -f "$tmp"
+        return 1
+    fi
+    chmod 600 "$tmp" || { rm -f "$tmp"; return 1; }
+    mv "$tmp" "$snippet" || { rm -f "$tmp"; return 1; }
+    if grep -q 'releases/latest' "$snippet"; then
+        log_error "Failed to pin runner version in $snippet"
+        return 1
+    fi
+    return 0
+}
+
 compute_template_digest() {
     local yaml version sums_entry digest
     yaml=$(render_template_setup) || return 1
-    version=$(fetch_latest_runner_version) || return 1
-    sums_entry=$(fetch_image_checksum_entry) || return 1
+    if [[ -n "${_BAKE_PINNED_RUNNER_VERSION:-}" ]]; then
+        version="$_BAKE_PINNED_RUNNER_VERSION"
+    else
+        version=$(fetch_latest_runner_version) || return 1
+    fi
+    if [[ -n "${_BAKE_PINNED_SUMS_ENTRY:-}" ]]; then
+        sums_entry="$_BAKE_PINNED_SUMS_ENTRY"
+    else
+        sums_entry=$(fetch_image_checksum_entry) || return 1
+    fi
     [[ -n "$yaml" && -n "$version" && -n "$sums_entry" ]] || return 1
     digest=$(
         {
@@ -223,7 +271,9 @@ bake_download_image() {
         # fetch_image_checksum_entry checks wget status before using the body,
         # so a failed SUMS fetch still returns 1 inside `if ! bake_download_image`.
         log_info "Verifying cloud image checksum..."
-        if ! sums_entry=$(fetch_image_checksum_entry); then
+        if [[ -n "${_BAKE_PINNED_SUMS_ENTRY:-}" ]]; then
+            sums_entry="$_BAKE_PINNED_SUMS_ENTRY"
+        elif ! sums_entry=$(fetch_image_checksum_entry); then
             return 1
         fi
         EXPECTED_SHA256=$(printf '%s\n' "$sums_entry" | awk '{ print $1; exit }')
@@ -365,7 +415,68 @@ bake_free_vmid_volumes() {
     return 0
 }
 
-# Failure path for the NEW band VMID only. Never qm destroy TEMPLATE_ID.
+# Reap a bake/leftover VMID only when it is still ours. Skip destroy and
+# gen_transition failed if it is the live clone pointer or no longer in
+# $expected_state (baking for bake_fail, candidate for leftover). Name
+# mismatch: skip destroy and volume free (disks belong to the occupant).
+# No config: skip destroy; volume sweep OK.
+# Usage: bake_reap_vmid <vmid> <expected_state> <reason>
+bake_reap_vmid() {
+    local vmid="${1:-}" expected="${2:-}" reason="${3:-bake failed}"
+    local pointer="" state="" cfg="" name="" gen_id="" expected_name=""
+
+    [[ -n "$vmid" && -n "$expected" ]] || return 0
+
+    pointer=$(reload_active_template_id) || {
+        log_error "Could not re-read TEMPLATE_ID — refusing to destroy VMID $vmid"
+        return 0
+    }
+    if [[ "$vmid" == "$pointer" ]]; then
+        log_error "Refusing to destroy live clone target VMID $vmid"
+        return 0
+    fi
+
+    state=$(gen_state_of "$vmid") || {
+        log_warn "No generation record for VMID $vmid — skipping destroy"
+        return 0
+    }
+    if [[ "$state" != "$expected" ]]; then
+        log_warn "Refusing to destroy VMID $vmid: state is $state, not $expected"
+        return 0
+    fi
+
+    gen_read "$vmid" || return 0
+    gen_id="${GEN_ID:-}"
+    expected_name="github-runner-gen-${gen_id}"
+
+    if ! cfg=$(qm config "$vmid" 2>/dev/null) || [[ -z "$cfg" ]]; then
+        bake_free_vmid_volumes "$vmid"
+        gen_transition "$vmid" failed "$reason" || true
+        return 0
+    fi
+
+    name=$(awk '/^name:/{print $2; exit}' <<< "$cfg")
+    if [[ "$name" != "$expected_name" ]]; then
+        log_warn "Refusing to destroy VMID $vmid: name is ${name:-<empty>}, expected $expected_name"
+        gen_transition "$vmid" failed "$reason" || true
+        return 0
+    fi
+
+    if qm status "$vmid" >/dev/null 2>&1; then
+        # Proxmox refuses destroy of a running VM. Match setup cleanup_bake:
+        # stop then destroy. Proven by "failed bake after start stops then
+        # destroys the new VMID, never TEMPLATE_ID".
+        qm stop "$vmid" --timeout 30 2>/dev/null || true
+        if ! qm destroy "$vmid" --purge; then
+            log_error "Failed to destroy bake VM $vmid"
+        fi
+    fi
+    bake_free_vmid_volumes "$vmid"
+    gen_transition "$vmid" failed "$reason" || true
+    return 0
+}
+
+# Failure path for the NEW band VMID only. Never qm destroy the live pointer.
 # Proven by "failed bake does not qm destroy the active TEMPLATE_ID".
 bake_fail() {
     local reason="${1:-bake failed}"
@@ -378,25 +489,8 @@ bake_fail() {
     log_error "$reason"
     _bake_tee "bake failed: $reason"
 
-    if [[ -n "$vmid" && "$vmid" != "${TEMPLATE_ID:-}" ]]; then
-        if qm status "$vmid" >/dev/null 2>&1; then
-            # Proxmox refuses destroy of a running VM. Match setup cleanup_bake:
-            # stop then destroy. Proven by "failed bake after start stops then
-            # destroys the new VMID, never TEMPLATE_ID".
-            qm stop "$vmid" --timeout 30 2>/dev/null || true
-            if ! qm destroy "$vmid" --purge; then
-                log_error "Failed to destroy bake VM $vmid"
-            fi
-        fi
-        bake_free_vmid_volumes "$vmid"
-        if gen_exists "$vmid"; then
-            gen_transition "$vmid" failed "$reason" || true
-        fi
-    elif [[ -n "$vmid" && "$vmid" == "${TEMPLATE_ID:-}" ]]; then
-        log_error "Refusing to destroy TEMPLATE_ID $TEMPLATE_ID on bake failure"
-        if gen_exists "$vmid"; then
-            gen_transition "$vmid" failed "$reason" || true
-        fi
+    if [[ -n "$vmid" ]]; then
+        bake_reap_vmid "$vmid" baking "$reason"
     fi
 
     if [[ -n "${_BAKE_DIGEST:-}" ]]; then
@@ -460,6 +554,10 @@ bake_create_template_vm() {
     log_info "Configuring template cloud-init ($snippet_base)..."
     if ! render_template_setup > "$snippet"; then
         log_error "Failed to render $snippet"
+        return 1
+    fi
+    if ! bake_pin_snippet_runner_version "$snippet"; then
+        log_error "Failed to pin runner version in $snippet"
         return 1
     fi
     chmod 600 "$snippet"
@@ -612,23 +710,19 @@ bake_shutdown_convert() {
 }
 
 # Ruling 6: after a successful bake, fail any other candidate and destroy it.
-# Never qm destroy TEMPLATE_ID.
+# Never qm destroy the live clone pointer. Snapshot gen_list first; re-check
+# pointer/state/name immediately before each destroy.
 bake_fail_other_candidates() {
-    local keep="$1" other
+    local keep="$1" other list
+    list=$(gen_list candidate) || {
+        log_error "Failed to list candidate generations for leftover cleanup"
+        return 0
+    }
     while read -r other; do
         [[ -n "$other" && "$other" != "$keep" ]] || continue
         log_info "Failing previous candidate VMID $other (superseded by newer candidate)"
-        if [[ "$other" == "${TEMPLATE_ID:-}" ]]; then
-            log_error "Refusing to destroy TEMPLATE_ID $TEMPLATE_ID (other candidate)"
-            gen_transition "$other" failed "superseded by newer candidate" || true
-            continue
-        fi
-        if qm status "$other" >/dev/null 2>&1; then
-            qm destroy "$other" --purge 2>/dev/null || true
-        fi
-        bake_free_vmid_volumes "$other"
-        gen_transition "$other" failed "superseded by newer candidate" || true
-    done < <(gen_list candidate)
+        bake_reap_vmid "$other" candidate "superseded by newer candidate"
+    done <<< "$list"
     return 0
 }
 
@@ -657,7 +751,7 @@ bake_dry_run() {
 # Held under exclusive flock on BAKE_LOCK_FILE fd 207.
 bake_locked() {
     local force="$1"
-    local avail digest image_sha sums_entry vmid gen_id snippet_base
+    local avail digest image_sha vmid gen_id snippet_base
     local match=""
 
     avail=$(storage_avail_gb) || {
@@ -671,24 +765,19 @@ bake_locked() {
         return 1
     fi
 
+    if ! bake_pin_inputs; then
+        log_error "Failed to pin bake inputs (runner version / image checksum)"
+        notify error bake.failed "Failed to pin bake inputs"
+        return 1
+    fi
+    image_sha="$_BAKE_PINNED_IMAGE_SHA"
+
     digest=$(compute_template_digest) || {
         log_error "Failed to compute template digest"
         notify error bake.failed "Failed to compute template digest"
         return 1
     }
     _BAKE_DIGEST="$digest"
-
-    sums_entry=$(fetch_image_checksum_entry) || {
-        log_error "Failed to fetch image checksum"
-        notify error bake.failed "Failed to fetch image checksum"
-        return 1
-    }
-    image_sha=$(printf '%s\n' "$sums_entry" | awk '{ print $1; exit }')
-    [[ -n "$image_sha" ]] || {
-        log_error "Failed to parse image checksum"
-        notify error bake.failed "Failed to parse image checksum"
-        return 1
-    }
 
     if [[ "$force" -eq 0 ]]; then
         if digest_is_memoed "$digest"; then

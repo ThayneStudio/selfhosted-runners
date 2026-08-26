@@ -172,6 +172,18 @@ seed_active_and_candidate() {
     [ "$GEN_STATE" = "superseded" ]
 }
 
+@test "promote fails closed when gen_list active cannot be read" {
+    seed_active_and_candidate
+    printf 'garbage\n' >> "$GENERATIONS_DIR/9000.conf"
+
+    run --separate-stderr promote_generation 2 --skip-canary --yes
+    [ "$status" -ne 0 ]
+    gen_read 8900
+    [ "$GEN_STATE" = "candidate" ]
+    grep -q 'TEMPLATE_ID="9000"' "$CONFIG_FILE"
+    [ ! -e "$PROMOTION_PAUSE_FILE" ]
+}
+
 @test "promote refuses a non-candidate generation" {
     gen_store_init
     gen_create 8900 GEN_ID=2 GEN_STATE=baking

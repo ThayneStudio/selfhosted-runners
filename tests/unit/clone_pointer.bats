@@ -161,6 +161,30 @@ $block"
     [[ "$stderr" == *"promotion in progress, will retry"* ]]
 }
 
+@test "clone_runner fails closed when qm set --tags fails for a known generation" {
+    gen_store_init
+    gen_create 9000 \
+        GEN_ID=7 \
+        GEN_STATE=active \
+        GEN_TEMPLATE_DIGEST=abc \
+        GEN_IMAGE_SHA256=abc \
+        GEN_RUNNER_VERSION=2.336.0
+
+    stub_out qm 'config *' <<'EOF'
+name: runner-acme-1
+EOF
+    stub_status qm 'set * --tags *' 1
+    stub_out qm 'destroy *' < /dev/null
+    stub_out pvesm 'list *' <<'EOF'
+Volid Format
+EOF
+
+    run --separate-stderr clone_runner runner-acme-1 acme
+    [ "$status" -eq 1 ]
+    refute_called qm 'start *'
+    assert_called qm 'destroy *'
+}
+
 @test "watch records a failed slot when clone_runner returns 1" {
     clone_runner() { return 1; }
     slot="runner-1"

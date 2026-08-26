@@ -40,7 +40,7 @@ _promote_release() {
 # Usage: promote_generation <gen_id> [--skip-canary] [--yes]
 promote_generation() {
     local gen_id="" skip_canary=0 yes=0
-    local new_vmid state rc confirm="" pointer=""
+    local new_vmid state rc confirm="" pointer="" prev_list
     local -a previous=()
     local prev
 
@@ -166,10 +166,15 @@ promote_generation() {
     fi
 
     previous=()
+    prev_list=$(gen_list active) || {
+        log_error "Failed to list active generations"
+        _promote_release
+        return 1
+    }
     while read -r prev; do
         [[ -n "$prev" && "$prev" != "$new_vmid" ]] || continue
         previous+=("$prev")
-    done < <(gen_list active)
+    done <<< "$prev_list"
 
     # Promote-before-demote: a crash after this transition leaves two actives
     # (Task 8 reconciles), never zero. Distinguish gen_transition code 4 (write

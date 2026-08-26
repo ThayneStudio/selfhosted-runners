@@ -201,19 +201,54 @@ load_infra_config() {
 # them into /etc/github-runners.conf keeps the upgrade a no-op: an existing
 # config file stays valid and unedited, and an operator only adds a key to
 # override it.
+# Unsigned integer: empty → default; set but not a uint → log_warn and default.
+_generation_uint_or_default() {
+    local var="$1" default="$2" value
+    value="${!var:-}"
+    if [[ -z "$value" ]]; then
+        printf -v "$var" '%s' "$default"
+        return 0
+    fi
+    if [[ ! "$value" =~ ^[0-9]+$ ]]; then
+        log_warn "Invalid $var='$value' — falling back to default $default"
+        printf -v "$var" '%s' "$default"
+    fi
+}
+
+# Boolean: empty → default; case-normalize true/false; unrecognized → default.
+_generation_bool_or_default() {
+    local var="$1" default="$2" raw folded
+    raw="${!var:-}"
+    if [[ -z "$raw" ]]; then
+        printf -v "$var" '%s' "$default"
+        return 0
+    fi
+    folded=$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]')
+    case "$folded" in
+        true|false)
+            printf -v "$var" '%s' "$folded"
+            ;;
+        *)
+            log_warn "Invalid $var='$raw' — falling back to default $default"
+            printf -v "$var" '%s' "$default"
+            ;;
+    esac
+}
+
 apply_generation_defaults() {
-    TEMPLATE_BAND_MIN="${TEMPLATE_BAND_MIN:-8900}"
-    TEMPLATE_BAND_MAX="${TEMPLATE_BAND_MAX:-8999}"
-    GENERATION_RETAIN="${GENERATION_RETAIN:-1}"
-    FAILED_GEN_RETAIN_DAYS="${FAILED_GEN_RETAIN_DAYS:-7}"
-    CANDIDATE_MAX_AGE_DAYS="${CANDIDATE_MAX_AGE_DAYS:-3}"
-    REBAKE_ENABLED="${REBAKE_ENABLED:-true}"
-    REBAKE_MAX_AGE_DAYS="${REBAKE_MAX_AGE_DAYS:-7}"
+    _generation_uint_or_default TEMPLATE_BAND_MIN 8900
+    _generation_uint_or_default TEMPLATE_BAND_MAX 8999
+    _generation_uint_or_default GENERATION_RETAIN 1
+    _generation_uint_or_default FAILED_GEN_RETAIN_DAYS 7
+    _generation_uint_or_default CANDIDATE_MAX_AGE_DAYS 3
+    _generation_bool_or_default REBAKE_ENABLED true
+    _generation_uint_or_default REBAKE_MAX_AGE_DAYS 7
+    # Invalid REBAKE_WINDOW is left for in_rebake_window (fail-closed).
     REBAKE_WINDOW="${REBAKE_WINDOW:-02:00-06:00}"
-    BAKE_TIMEOUT="${BAKE_TIMEOUT:-5400}"
-    BAKE_MIN_FREE_GB="${BAKE_MIN_FREE_GB:-60}"
-    CANARY_ENABLED="${CANARY_ENABLED:-false}"
-    DETECT_FAIL_WARN_HOURS="${DETECT_FAIL_WARN_HOURS:-24}"
+    _generation_uint_or_default BAKE_TIMEOUT 5400
+    _generation_uint_or_default BAKE_MIN_FREE_GB 60
+    _generation_bool_or_default CANARY_ENABLED false
+    _generation_uint_or_default DETECT_FAIL_WARN_HOURS 24
 }
 
 validate_generation_band() {
@@ -759,7 +794,8 @@ clone_tag_generation() {
         202>&- \
         203>&- \
         204>&-; then
-        log_warn "clone_runner: failed to tag $clone_vmid as gen-${gen_id}"
+        log_error "clone_runner: failed to tag $clone_vmid as gen-${gen_id}"
+        return 1
     fi
     return 0
 }
@@ -935,7 +971,12 @@ clone_runner() {
     rm -f "$clone_err"
     release_clone_slot
 
-    clone_tag_generation "$vmid" "$TEMPLATE_ID"
+    if ! clone_tag_generation "$vmid" "$TEMPLATE_ID"; then
+        _fail
+        release_vmid_reservation "$vmid"
+        exec 202>&-
+        return 1
+    fi
 
     if pool_is_draining; then
         log_warn "clone_runner: pool drain became active after cloning $name, cleaning up VM $vmid"

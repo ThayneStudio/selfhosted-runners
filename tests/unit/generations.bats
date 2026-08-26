@@ -884,6 +884,18 @@ create_full_record() {
     [ "$FAILED_GEN_RETAIN_DAYS" = "14" ]
 }
 
+@test "REBAKE_MAX_AGE_DAYS=nope after apply is 7" {
+    REBAKE_MAX_AGE_DAYS=nope
+    apply_generation_defaults
+    [ "$REBAKE_MAX_AGE_DAYS" = "7" ]
+}
+
+@test "CANARY_ENABLED=TRUE becomes true" {
+    CANARY_ENABLED=TRUE
+    apply_generation_defaults
+    [ "$CANARY_ENABLED" = "true" ]
+}
+
 # ---------------------------------------------------------------------------
 # Archive log
 # ---------------------------------------------------------------------------

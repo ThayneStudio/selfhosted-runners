@@ -15,12 +15,31 @@ setup() {
     apply_generation_defaults
 }
 
+# Nested linked-clone volid so tagging traces to TEMPLATE_ID (not cicustom).
+stub_origin_clone() {
+    local child="${1:-9001}"
+    stub_out qm "config ${TEMPLATE_ID}" <<EOF
+name: ubuntu-cloud-template
+scsi0: ${VM_STORAGE}:base-${TEMPLATE_ID}-disk-0,size=30G
+template: 1
+EOF
+    stub_out pvesm 'list *' <<EOF
+Volid Format
+${VM_STORAGE}:base-${TEMPLATE_ID}-disk-0 raw
+${VM_STORAGE}:base-${TEMPLATE_ID}-disk-0/vm-${child}-disk-0 raw
+EOF
+    stub_out pvesm 'path *' <<'EOF'
+/dev/dm-3
+EOF
+}
+
 # Default fleet: template 9000 plus one untagged running clone.
 stub_adopt_fleet() {
     stub_out qm 'status 9000' <<'EOF'
 status: stopped
 template: 1
 EOF
+    stub_origin_clone 9001
     stub_out qm 'list' <<'EOF'
       VMID NAME                 STATUS     MEM(MB)    BOOTDISK(GB) PID
       8999 leftover             running    8192              30.00 1
@@ -91,6 +110,7 @@ EOF
     stub_out qm 'status 9000' <<'EOF'
 status: stopped
 EOF
+    stub_origin_clone 9001
     stub_out qm 'list' <<'EOF'
       VMID NAME                 STATUS     MEM(MB)    BOOTDISK(GB) PID
       9000 ubuntu-cloud-template stopped   8192              30.00 0
@@ -111,6 +131,7 @@ EOF
     stub_out qm 'status 9000' <<'EOF'
 status: stopped
 EOF
+    stub_origin_clone 9001
     stub_out qm 'list' <<'EOF'
       VMID NAME                 STATUS     MEM(MB)    BOOTDISK(GB) PID
       9000 ubuntu-cloud-template stopped   8192              30.00 0
@@ -132,6 +153,7 @@ EOF
     stub_out qm 'status 9000' <<'EOF'
 status: stopped
 EOF
+    stub_origin_clone 9001
     stub_out qm 'list' <<'EOF'
       VMID NAME                 STATUS     MEM(MB)    BOOTDISK(GB) PID
       9000 ubuntu-cloud-template stopped   8192              30.00 0
@@ -146,6 +168,46 @@ EOF
     run adopt_deployed_template
     [ "$status" -eq 0 ]
     refute_called qm 'set *'
+}
+
+@test "non-template TEMPLATE_ID is not adopted" {
+    stub_out qm 'status 9000' <<'EOF'
+status: stopped
+EOF
+    stub_out qm 'config 9000' <<'EOF'
+name: leftover-vm
+ostype: l26
+EOF
+    stub_out qm 'list' <<'EOF'
+      VMID NAME                 STATUS     MEM(MB)    BOOTDISK(GB) PID
+      9000 leftover-vm          stopped    8192              30.00 0
+      9001 acme-1               running    8192              30.00 1234
+EOF
+    write_org_config acme
+    run adopt_deployed_template
+    [ "$status" -eq 0 ]
+    [ "$(gen_list)" = "" ]
+    refute_called qm 'set *'
+    refute_called qm 'destroy *'
+}
+
+@test "adopt resumes tagging untagged clones when the store is gen-1 only" {
+    stub_adopt_fleet
+    stub_status qm 'set 9001 --tags *' 1
+    run adopt_deployed_template
+    [ "$status" -eq 0 ]
+    gen_read 9000
+    [ "$GEN_ID" = "1" ]
+    local first
+    first=$(call_count qm 'set 9001 --tags *')
+    [ "$first" -ge 1 ]
+
+    stub_out qm 'set 9001 --tags runner,gen-1'
+    run adopt_deployed_template
+    [ "$status" -eq 0 ]
+    [ "$(call_count qm 'set 9001 --tags *')" -gt "$first" ]
+    count=$(gen_list | wc -l | tr -d ' ')
+    [ "$count" = "1" ]
 }
 
 @test "adopt records a probed runner version from a running clone" {

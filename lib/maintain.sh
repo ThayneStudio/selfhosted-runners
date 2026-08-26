@@ -126,13 +126,14 @@ maintain_fail_dead_bake() {
 # Proven by "baking record is left alone when the bake lock is held".
 # fd 208: 207 is bake_main's exclusive lock.
 maintain_reconcile_baking() {
-    local vmid
+    local vmid list
     local -a baking=()
 
+    list=$(gen_list baking) || return 1
     while read -r vmid; do
         [[ -n "$vmid" ]] || continue
         baking+=("$vmid")
-    done < <(gen_list baking)
+    done <<< "$list"
     ((${#baking[@]} > 0)) || return 0
 
     mkdir -p "$(dirname "$BAKE_LOCK_FILE")" || return 1
@@ -153,18 +154,58 @@ maintain_reconcile_baking() {
     return 0
 }
 
+# Zero actives: restore the generation TEMPLATE_ID names (superseded→active
+# is allowed). failed/rejected/baking: log_warn and do not force invalid edges.
+maintain_repair_zero_actives() {
+    local state
+
+    if [[ -z "${TEMPLATE_ID:-}" ]] || ! gen_exists "$TEMPLATE_ID"; then
+        log_warn "Zero active generations and TEMPLATE_ID is not a known generation"
+        return 0
+    fi
+    gen_read "$TEMPLATE_ID" || return 1
+    state="$GEN_STATE"
+    case "$state" in
+        active)
+            return 0
+            ;;
+        superseded|candidate)
+            gen_transition "$TEMPLATE_ID" active || return 1
+            notify warn generation.reconciled \
+                "Zero active generations; restored VMID $TEMPLATE_ID to active"
+            log_warn "Zero active generations; restored VMID $TEMPLATE_ID to active"
+            return 0
+            ;;
+        *)
+            log_warn "Zero active generations; TEMPLATE_ID $TEMPLATE_ID is $state — not forcing an invalid transition"
+            return 0
+            ;;
+    esac
+}
+
 # Split-brain active records: TEMPLATE_ID wins; if that is ambiguous, newest
 # GEN_PROMOTED_AT. Never the highest GEN_ID. Proven by "two actives:
-# TEMPLATE_ID wins, not the higher GEN_ID".
+# TEMPLATE_ID wins, not the higher GEN_ID". Skip while a promote holds the
+# pause file. Zero actives restore the pointer's generation.
 maintain_reconcile_two_actives() {
-    local vmid keep="" best_ts="" ts
+    local vmid keep="" best_ts="" ts list
     local -a actives=()
     local -a losers=()
 
+    if [[ -e "$PROMOTION_PAUSE_FILE" ]]; then
+        log_info "Promotion pause file present — skipping active-generation reconcile"
+        return 0
+    fi
+
+    list=$(gen_list active) || return 1
     while read -r vmid; do
         [[ -n "$vmid" ]] || continue
         actives+=("$vmid")
-    done < <(gen_list active)
+    done <<< "$list"
+    if ((${#actives[@]} == 0)); then
+        maintain_repair_zero_actives
+        return $?
+    fi
     ((${#actives[@]} > 1)) || return 0
 
     for vmid in "${actives[@]}"; do

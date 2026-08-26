@@ -412,6 +412,76 @@ EOF
     notify_log | grep -q 'warn'
 }
 
+@test "zero actives with TEMPLATE_ID pointing at a superseded record → it becomes active" {
+    gen_store_init
+    TEMPLATE_ID=9000
+    gen_create 9000 \
+        GEN_ID=1 \
+        GEN_STATE=superseded \
+        GEN_TEMPLATE_DIGEST=old \
+        GEN_IMAGE_SHA256=abc \
+        GEN_RUNNER_VERSION=2.335.0 \
+        GEN_PROMOTED_AT=2026-08-01T00:00:00Z \
+        GEN_SUPERSEDED_AT=2026-08-20T00:00:00Z
+
+    run maintain_reconcile_two_actives
+    [ "$status" -eq 0 ]
+    gen_read 9000
+    [ "$GEN_STATE" = "active" ]
+    notify_log | grep -q 'warn'
+    notify_log | grep -q 'generation.reconciled'
+}
+
+@test "two-actives skipped while pause file exists" {
+    gen_store_init
+    TEMPLATE_ID=9000
+    gen_create 9000 \
+        GEN_ID=1 \
+        GEN_STATE=active \
+        GEN_TEMPLATE_DIGEST=old \
+        GEN_IMAGE_SHA256=abc \
+        GEN_RUNNER_VERSION=2.335.0 \
+        GEN_PROMOTED_AT=2026-08-01T00:00:00Z
+    gen_create 8900 \
+        GEN_ID=2 \
+        GEN_STATE=active \
+        GEN_TEMPLATE_DIGEST=new \
+        GEN_IMAGE_SHA256=def \
+        GEN_RUNNER_VERSION=2.336.0 \
+        GEN_PROMOTED_AT=2026-08-20T00:00:00Z
+    mkdir -p "$(dirname "$PROMOTION_PAUSE_FILE")"
+    : > "$PROMOTION_PAUSE_FILE"
+
+    run maintain_reconcile_two_actives
+    [ "$status" -eq 0 ]
+    gen_read 9000
+    [ "$GEN_STATE" = "active" ]
+    gen_read 8900
+    [ "$GEN_STATE" = "active" ]
+    [ ! -f "$STUB_DIR/notify.log" ] || ! grep -q 'generation.reconciled' "$STUB_DIR/notify.log"
+}
+
+@test "unreadable gen_list fails maintain" {
+    gen_store_init
+    gen_create 9000 \
+        GEN_ID=1 \
+        GEN_STATE=active \
+        GEN_TEMPLATE_DIGEST=abc \
+        GEN_IMAGE_SHA256=abc \
+        GEN_RUNNER_VERSION=2.336.0
+    gen_create 8900 \
+        GEN_ID=2 \
+        GEN_STATE=baking \
+        GEN_TEMPLATE_DIGEST=deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef \
+        GEN_IMAGE_SHA256=abc
+    printf 'garbage\n' >> "$GENERATIONS_DIR/8900.conf"
+
+    run maintain_main
+    [ "$status" -ne 0 ]
+    refute_called qm 'destroy *'
+    refute_called qm 'stop *'
+}
+
 @test "two actives without a TEMPLATE_ID match keep newest GEN_PROMOTED_AT not highest GEN_ID" {
     gen_store_init
     TEMPLATE_ID=9000
