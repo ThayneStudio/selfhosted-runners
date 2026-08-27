@@ -199,7 +199,7 @@ upgrade_locked() {
         case "$decision" in
             no\ memoed-digest)
                 log_error "memoed digest: a previous bake failed and needs a person, not a retry"
-                log_error "run: runner bake --force && runner upgrade"
+                log_error "run: runner upgrade --force"
                 return 1
                 ;;
             no\ rebake-disabled)
@@ -388,6 +388,7 @@ upgrade_via_unit() {
     before_id=$(systemctl show -p InvocationID --value github-runner-upgrade.service 2>/dev/null || true)
     if ! systemctl start --no-block github-runner-upgrade.service; then
         log_error "Failed to start github-runner-upgrade.service"
+        rm -f "$(upgrade_force_flag)"
         return 1
     fi
     log_info "Upgrade running (bake can take up to 90 minutes)."

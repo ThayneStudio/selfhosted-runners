@@ -161,7 +161,7 @@ EOF
     [[ "$stderr" == *"REBAKE_ENABLED"* || "$stderr" == *"rebake-disabled"* ]]
 }
 
-@test "memoed digest exits non-zero and names bake --force" {
+@test "memoed digest exits non-zero and names upgrade --force" {
     gen_store_init
     local digest
     digest=$(compute_template_digest)
@@ -175,7 +175,7 @@ EOF
     run --separate-stderr upgrade_main --foreground
     [ "$status" -ne 0 ]
     [[ "$stderr" == *"memoed"* ]]
-    [[ "$stderr" == *"bake --force"* ]]
+    [[ "$stderr" == *"upgrade --force"* ]]
     refute_called qm 'create *'
 }
 

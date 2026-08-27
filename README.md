@@ -455,7 +455,7 @@ when the digest is unchanged.
 If a previous bake failed and the digest is memoed:
 
 ```bash
-runner bake --force && runner upgrade
+runner upgrade --force
 ```
 
 ### If the bake fails or appears stuck
