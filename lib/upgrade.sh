@@ -114,12 +114,41 @@ upgrade_print_status() {
     printf 'drain_bound_hours=%s\n' "${MAX_VM_LIFETIME_HOURS:-$DEFAULT_MAX_VM_LIFETIME_HOURS}"
 }
 
+# Newest matching active for $digest. If $2 is set, skip that VMID (the
+# pointer) so a leftover extra is visible. Newest GEN_PROMOTED_AT, never
+# lowest VMID. Proven by "same-digest two actives: pointer on higher VMID
+# is kept" and "same-digest two actives: pointer still on older VMID
+# promotes the newer".
+upgrade_matching_active() {
+    local digest="$1" skip="${2:-}" vmid="" keep="" best_ts="" ts
+    [[ -n "$digest" ]] || return 1
+    while read -r vmid; do
+        [[ -n "$vmid" && "$vmid" != "$skip" ]] || continue
+        gen_read "$vmid" || return 1
+        [[ "$GEN_TEMPLATE_DIGEST" == "$digest" ]] || continue
+        ts="${GEN_PROMOTED_AT:-}"
+        if [[ -z "$keep" ]]; then
+            keep="$vmid"
+            best_ts="$ts"
+            continue
+        fi
+        if [[ -n "$ts" && ( -z "$best_ts" || "$ts" > "$best_ts" ) ]]; then
+            keep="$vmid"
+            best_ts="$ts"
+        fi
+    done < <(gen_list active)
+    [[ -n "$keep" ]] || return 1
+    printf '%s\n' "$keep"
+}
+
 # Prefer a candidate so weekly-floor promotes the new bake, not the old
-# active with the same digest. Then any matching active (stale pointer).
+# active with the same digest. Then newest matching active (same-digest
+# split-brain), not the lowest VMID.
 upgrade_resolve_target() {
     local digest="$1" vmid=""
     [[ -n "$digest" ]] || return 1
     vmid=$(bake_matching_candidate "$digest") && { printf '%s\n' "$vmid"; return 0; }
+    vmid=$(upgrade_matching_active "$digest") && { printf '%s\n' "$vmid"; return 0; }
     vmid=$(bake_matching_generation "$digest") && { printf '%s\n' "$vmid"; return 0; }
     return 1
 }
@@ -146,8 +175,10 @@ upgrade_dry_run() {
     match=$(bake_matching_candidate "$digest") || match=""
     printf 'matching_candidate=%s\n' "$match"
     match_gen=""
-    match_gen=$(bake_matching_generation "$digest") || match_gen=""
+    match_gen=$(upgrade_matching_active "$digest") || match_gen=""
     printf 'matching_generation=%s\n' "$match_gen"
+    other=""
+    other=$(upgrade_matching_active "$digest" "$pointer") || other=""
     if [[ "$decision" == yes\ * ]]; then
         printf 'reason=%s\n' "${decision#yes }"
     else
@@ -156,7 +187,7 @@ upgrade_dry_run() {
     if [[ "$decision" == yes\ * ]]; then
         if [[ -n "$match" ]]; then
             printf 'bake_plan=skip (candidate exists)\n'
-        elif [[ -n "$match_gen" && "$match_gen" != "$pointer" ]]; then
+        elif [[ -n "$other" ]]; then
             printf 'bake_plan=skip (matching active, pointer stale)\n'
         else
             printf 'bake_plan=bake\n'
@@ -191,7 +222,7 @@ upgrade_dry_run() {
 upgrade_locked() {
     local force="$1"
     local decision digest cand pointer prev gid attempt sleep_s rc=0
-    local match_cand="" match_gen=""
+    local match_cand="" match_other=""
 
     decision=$(detect_should_bake) || return 1
 
@@ -220,19 +251,20 @@ upgrade_locked() {
     pointer=$(reload_active_template_id) || return 1
     prev="$pointer"
     match_cand=$(bake_matching_candidate "$digest") || match_cand=""
-    match_gen=$(bake_matching_generation "$digest") || match_gen=""
+    match_other=""
+    match_other=$(upgrade_matching_active "$digest" "$pointer") || match_other=""
 
     if [[ "$force" -eq 1 ]]; then
         bake_locked 1 || return 1
         digest="${_BAKE_DIGEST:-$digest}"
     elif [[ "$decision" == yes\ * ]]; then
-        # Candidate already matching → promote only. Matching active that is
-        # not the pointer is a promote-before-rewrite crash; do not bake N+1.
-        # Weekly floor: the pointer itself matches, so we still bake.
+        # Candidate already matching → promote only. Any matching active that
+        # is not the pointer is a promote crash; do not bake N+1. Weekly
+        # floor: the pointer is the sole match, so we still bake.
         if [[ -n "$match_cand" ]]; then
             log_info "nothing to bake: candidate VMID $match_cand already matches"
-        elif [[ -n "$match_gen" && "$match_gen" != "$pointer" ]]; then
-            log_info "nothing to bake: matching active VMID $match_gen, pointer is stale"
+        elif [[ -n "$match_other" ]]; then
+            log_info "nothing to bake: matching active VMID $match_other, pointer is stale"
         else
             log_info "bake needed: ${decision#yes }"
             bake_locked 0 || return 1
@@ -269,23 +301,27 @@ upgrade_locked() {
             log_error "Failed to promote generation $gid after 3 attempts"
             return 1
         }
-        # rewrite_template_id does not assign this shell's TEMPLATE_ID.
-        # Reconcile keeps in-memory TEMPLATE_ID when it is still in the
-        # active set. Proven by "reconcile after promote keeps the on-disk
-        # pointer, not in-shell TEMPLATE_ID".
-        TEMPLATE_ID=$(reload_active_template_id) || return 1
-        pointer="$TEMPLATE_ID"
-        maintain_reconcile_two_actives || {
-            log_error "Failed to reconcile split-brain active generations"
-            return 1
-        }
-        gen_read "$cand" || return 1
-        if [[ "$GEN_STATE" != "active" ]]; then
-            log_error "Promoted VMID $cand is $GEN_STATE, not active"
-            return 1
-        fi
-        pointer=$(reload_active_template_id) || return 1
     fi
+
+    # rewrite_template_id does not assign this shell's TEMPLATE_ID.
+    # Reconcile keeps in-memory TEMPLATE_ID when it is still in the
+    # active set. Always run so extras die even when pointer == cand.
+    # Proven by "reconcile after promote keeps the on-disk pointer, not
+    # in-shell TEMPLATE_ID" and "same-digest two actives: pointer on
+    # higher VMID is kept".
+    TEMPLATE_ID=$(reload_active_template_id) || return 1
+    pointer="$TEMPLATE_ID"
+    maintain_clear_stale_promotion_pause || true
+    maintain_reconcile_two_actives || {
+        log_error "Failed to reconcile split-brain active generations"
+        return 1
+    }
+    gen_read "$cand" || return 1
+    if [[ "$GEN_STATE" != "active" ]]; then
+        log_error "Promoted VMID $cand is $GEN_STATE, not active"
+        return 1
+    fi
+    pointer=$(reload_active_template_id) || return 1
 
     if [[ "$pointer" != "$cand" ]]; then
         log_error "TEMPLATE_ID is $pointer, expected candidate $cand"

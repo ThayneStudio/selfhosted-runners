@@ -116,7 +116,7 @@ write_files:
       # Verify runner binary exists (should be baked into template)
       if [[ ! -f "$RUNNER_HOME/config.sh" ]]; then
         log_error "Runner binary not found at $RUNNER_HOME/config.sh"
-        log_error "The VM template may not have been baked correctly. Re-run 'runner setup'."
+        log_error "The VM template may not have been baked correctly. Run 'runner upgrade'."
         exit 1
       fi
 

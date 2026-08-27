@@ -128,6 +128,7 @@ After setup, the `runner` command is available globally:
 | `runner stop [options]` | Enter maintenance mode and stop managed runners |
 | `runner list` | List all runner VMs |
 | `runner guard [--dry-run]` | Reap stopped and over-age runner VMs (normally run by timer) |
+| `runner upgrade [--dry-run] [--force]` | Bake a candidate if needed and promote it |
 | `runner help` | Show available commands |
 
 ## Runner Lifetime and Reaping
@@ -478,9 +479,10 @@ down itself and only then converts it to a template.
 - **`qm stop` on a stuck bake VM is safe.** The VM stopping without a confirmed
   marker is treated as failure — the cleanup trap destroys the partial band VM,
   never the live clone target, and memos the digest.
-- **Memoed digest** (previous bake failed): `runner upgrade --force`, or
-  `runner bake --force && runner upgrade`. Do not run `runner setup` — on a
-  host that already has a live template, setup adopts and skips the bake.
+- **Memoed digest** (previous bake failed): `runner upgrade --force`. Do not
+  run `runner setup` — on a host that already has a live template, setup
+  adopts and skips the bake. Do not run `runner bake --force` over SSH; that
+  is in-process and an SSH drop memos the digest again.
 - **Checksum verification failed?** The cached Ubuntu image at
   `/var/cache/github-runners/` goes stale whenever upstream rotates
   `noble/current/`, roughly every 2-4 weeks. Bake deletes the bad file on its
@@ -633,7 +635,14 @@ Run `runner setup` first to create the configuration.
 
 ### "Template VM does not exist" error
 
-The template was deleted. Re-run `runner setup` to recreate it.
+The live clone target is gone. Preview then bake a new generation:
+
+```bash
+runner upgrade --dry-run
+runner upgrade
+```
+
+Do not re-run `runner setup` if VM 9000 still exists — setup will adopt it and skip the bake.
 
 ### VM creation fails with "storage not found"
 

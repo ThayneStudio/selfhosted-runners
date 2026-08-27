@@ -446,10 +446,11 @@ EOF
 }
 
 @test "upgrade_wait_unit rejects leftover Result=success without a new InvocationID" {
-    stub_out systemctl 'show *' <<'EOF'
-InvocationID=oldid
-ActiveState=inactive
-Result=success
+    stub_out systemctl 'show -p InvocationID --value *' <<'EOF'
+oldid
+EOF
+    stub_out systemctl 'show -p Result --value *' <<'EOF'
+success
 EOF
     stub_out systemctl 'is-active *' <<'EOF'
 inactive
@@ -459,4 +460,78 @@ EOF
     run --separate-stderr upgrade_wait_unit oldid
     [ "$status" -ne 0 ]
     [[ "$stderr" == *"InvocationID"* ]]
+}
+
+@test "same-digest two actives: pointer on higher VMID is kept, extra superseded" {
+    gen_store_init
+    local digest
+    digest=$(compute_template_digest)
+    TEMPLATE_ID=8901
+    write_infra_config
+    MIN_VMID=9001
+    TEMPLATE_ID=8901
+    gen_create 8900 \
+        GEN_ID=1 \
+        GEN_STATE=active \
+        GEN_TEMPLATE_DIGEST="$digest" \
+        GEN_IMAGE_SHA256=abc \
+        GEN_RUNNER_VERSION=2.336.0 \
+        GEN_PROMOTED_AT=2026-08-01T00:00:00Z
+    gen_create 8901 \
+        GEN_ID=2 \
+        GEN_STATE=active \
+        GEN_TEMPLATE_DIGEST="$digest" \
+        GEN_IMAGE_SHA256=abc \
+        GEN_RUNNER_VERSION=2.336.0 \
+        GEN_PROMOTED_AT=2026-08-20T00:00:00Z
+    bake_locked() {
+        printf 'called\n' >> "$STUB_DIR/bake_locked.log"
+        return 0
+    }
+    run --separate-stderr upgrade_main --foreground
+    [ "$status" -eq 0 ]
+    [ ! -f "$STUB_DIR/bake_locked.log" ]
+    grep -q 'TEMPLATE_ID="8901"' "$CONFIG_FILE"
+    gen_read 8901
+    [ "$GEN_STATE" = "active" ]
+    gen_read 8900
+    [ "$GEN_STATE" = "superseded" ]
+}
+
+@test "same-digest two actives: pointer still on older VMID promotes the newer" {
+    gen_store_init
+    local digest
+    digest=$(compute_template_digest)
+    TEMPLATE_ID=8900
+    write_infra_config
+    MIN_VMID=9001
+    TEMPLATE_ID=8900
+    gen_now() { printf '%s\n' '2026-08-25T00:00:00Z'; }
+    gen_create 8900 \
+        GEN_ID=1 \
+        GEN_STATE=active \
+        GEN_TEMPLATE_DIGEST="$digest" \
+        GEN_IMAGE_SHA256=abc \
+        GEN_RUNNER_VERSION=2.336.0 \
+        GEN_CREATED_AT=2026-08-01T00:00:00Z \
+        GEN_PROMOTED_AT=2026-08-01T00:00:00Z
+    gen_create 8901 \
+        GEN_ID=2 \
+        GEN_STATE=active \
+        GEN_TEMPLATE_DIGEST="$digest" \
+        GEN_IMAGE_SHA256=abc \
+        GEN_RUNNER_VERSION=2.336.0 \
+        GEN_PROMOTED_AT=2026-08-20T00:00:00Z
+    bake_locked() {
+        printf 'called\n' >> "$STUB_DIR/bake_locked.log"
+        return 0
+    }
+    run --separate-stderr upgrade_main --foreground
+    [ "$status" -eq 0 ]
+    [ ! -f "$STUB_DIR/bake_locked.log" ]
+    grep -q 'TEMPLATE_ID="8901"' "$CONFIG_FILE"
+    gen_read 8901
+    [ "$GEN_STATE" = "active" ]
+    gen_read 8900
+    [ "$GEN_STATE" = "superseded" ]
 }

@@ -40,7 +40,7 @@ load_org_config "$SELECTED_ORG"
 
 # Verify template is ready
 qm config "$TEMPLATE_ID" 2>/dev/null | grep -q "^template: 1" || {
-    log_error "Template $TEMPLATE_ID not ready. Run 'runner setup'."; exit 1; }
+    log_error "Template $TEMPLATE_ID not ready. Run 'runner upgrade' (or 'runner setup' on a host with no template)."; exit 1; }
 
 # Verify snippet exists
 [[ -f "$SNIPPETS_DIR/runner-user-data-${SELECTED_ORG}.yaml" ]] || {
