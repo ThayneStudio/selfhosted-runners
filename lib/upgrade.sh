@@ -21,7 +21,7 @@
 #
 # fd 210: bake lock. Distinct from the bake CLI's fd 207 so we can hold the
 # lock across bake_locked then promote. Proven by "upgrade holds BAKE_LOCK_FILE
-# on fd 210 and calls bake_locked".
+# on fd 210 across promote" and "held bake lock makes upgrade --foreground exit 1".
 #
 # GEN_* fields are loaded via gen_read in this shell.
 # shellcheck disable=SC2030,SC2031,SC2034
@@ -154,7 +154,8 @@ upgrade_resolve_target() {
 }
 
 upgrade_dry_run() {
-    local digest planned decision match match_gen pointer promote_vmid=""
+    local force="${1:-0}"
+    local digest planned decision match match_gen pointer promote_vmid="" other=""
 
     upgrade_preflight || return 1
 
@@ -177,14 +178,21 @@ upgrade_dry_run() {
     match_gen=""
     match_gen=$(upgrade_matching_active "$digest") || match_gen=""
     printf 'matching_generation=%s\n' "$match_gen"
-    other=""
     other=$(upgrade_matching_active "$digest" "$pointer") || other=""
-    if [[ "$decision" == yes\ * ]]; then
+    if [[ "$force" -eq 1 ]]; then
+        printf 'reason=force\n'
+    elif [[ "$decision" == yes\ * ]]; then
         printf 'reason=%s\n' "${decision#yes }"
     else
         printf 'reason=%s\n' "${decision#no }"
     fi
-    if [[ "$decision" == yes\ * ]]; then
+    if [[ "$force" -eq 1 ]]; then
+        if [[ -n "$match" ]]; then
+            printf 'bake_plan=skip (candidate exists)\n'
+        else
+            printf 'bake_plan=bake\n'
+        fi
+    elif [[ "$decision" == yes\ * ]]; then
         if [[ -n "$match" ]]; then
             printf 'bake_plan=skip (candidate exists)\n'
         elif [[ -n "$other" ]]; then
@@ -200,14 +208,16 @@ upgrade_dry_run() {
     elif [[ -n "$match_gen" ]]; then
         promote_vmid="$match_gen"
     fi
-    if [[ "$decision" == no\ memoed-digest ]]; then
+    if [[ "$force" -eq 0 && "$decision" == no\ memoed-digest ]]; then
         printf 'promote_plan=refuse (memoed-digest)\n'
-    elif [[ "$decision" == no\ rebake-disabled ]]; then
+    elif [[ "$force" -eq 0 && "$decision" == no\ rebake-disabled ]]; then
         printf 'promote_plan=refuse (rebake-disabled)\n'
     elif [[ -n "$promote_vmid" && "$promote_vmid" != "$pointer" ]]; then
         gen_read "$promote_vmid" || true
         printf 'promote_plan=gen %s VMID %s -> TEMPLATE_ID (was %s)\n' \
             "${GEN_ID:-?}" "$promote_vmid" "$pointer"
+    elif [[ "$force" -eq 1 ]]; then
+        printf 'promote_plan=after bake\n'
     elif [[ "$decision" == no\ up-to-date ]]; then
         printf 'promote_plan=none (already current)\n'
     elif [[ "$decision" == yes\ * ]]; then
@@ -339,7 +349,7 @@ upgrade_force_flag() {
     printf '%s\n' "$RUNNER_STATE_DIR/upgrade.force"
 }
 
-# Oneshoot ExecStart cannot grow --force. The wrap writes this flag; the
+# Oneshot ExecStart cannot grow --force. The wrap writes this flag; the
 # unit consumes it. Proven by "runner upgrade --force writes the force flag
 # the oneshot consumes".
 upgrade_write_force_flag() {
@@ -408,17 +418,16 @@ upgrade_via_unit() {
     elif [[ -f "${INSTALL_DIR}/templates/github-runner-upgrade.service" ]]; then
         unit_src="${INSTALL_DIR}/templates/github-runner-upgrade.service"
     fi
-    if [[ -n "$unit_src" ]]; then
-        mkdir -p "$SYSTEMD_UNIT_DIR"
-        cp "$unit_src" "$unit_dst" || return 1
-    fi
-    if [[ ! -f "$unit_dst" ]]; then
-        log_error "github-runner-upgrade.service is not installed"
+    if [[ -z "$unit_src" ]]; then
+        log_error "github-runner-upgrade.service template is not in this install"
         return 1
     fi
+    mkdir -p "$SYSTEMD_UNIT_DIR"
+    cp "$unit_src" "$unit_dst" || return 1
     upgrade_write_force_flag "$force" || return 1
     systemctl daemon-reload || {
         log_error "systemctl daemon-reload failed — is github-runner-upgrade.service installed?"
+        rm -f "$(upgrade_force_flag)"
         return 1
     }
     before_id=$(systemctl show -p InvocationID --value github-runner-upgrade.service 2>/dev/null || true)
@@ -431,15 +440,20 @@ upgrade_via_unit() {
     log_info "Ctrl-C detaches; the unit keeps running (this CLI exits non-zero)."
     log_info "  journalctl -u github-runner-upgrade.service -f"
     # start was --no-block, so SIGINT here must not stop the unit.
-    # Proven by wrap test: start --no-block.
+    # Proven by "without --foreground, wrap wait status is the unit Result".
     upgrade_wait_unit "$before_id"
 }
 
 # Follow this oneshot until it leaves activating. SIGINT detaches non-zero.
-# Do not trust leftover Result=success without a new InvocationID.
+# A new InvocationID is required; leftover Result=success is not this run.
+# Proven by "upgrade_wait_unit rejects leftover Result=success without a new
+# InvocationID" and "without --foreground, wrap wait status is the unit Result".
 upgrade_wait_unit() {
     local before_id="${1:-}"
-    local after_id="" unit_state unit_result journal_pid="" poll saw_new=0
+    local after_id="" new_id="" unit_state unit_result journal_pid="" poll
+    local max_poll="${UPGRADE_WAIT_POLLS:-240}"
+    local sleep_s="${UPGRADE_WAIT_SLEEP:-0.25}"
+    local done_sleep="${UPGRADE_WAIT_DONE_SLEEP:-2}"
 
     _upgrade_wait_cleanup() {
         if [[ -n "${journal_pid:-}" ]]; then
@@ -455,38 +469,43 @@ upgrade_wait_unit() {
         journalctl -u github-runner-upgrade.service -f --no-pager --since now &
         journal_pid=$!
     fi
-    # UPGRADE_WAIT_POLLS / UPGRADE_WAIT_SLEEP are test-only overrides.
-    local max_poll="${UPGRADE_WAIT_POLLS:-40}"
-    local sleep_s="${UPGRADE_WAIT_SLEEP:-0.25}"
-    [[ "$max_poll" =~ ^[0-9]+$ ]] || max_poll=40
+    [[ "$max_poll" =~ ^[0-9]+$ ]] || max_poll=240
     poll=0
     while (( poll < max_poll )); do
         after_id=$(systemctl show -p InvocationID --value github-runner-upgrade.service 2>/dev/null || true)
-        unit_state=$(systemctl is-active github-runner-upgrade.service 2>/dev/null || true)
         if [[ -n "$after_id" && "$after_id" != "$before_id" ]]; then
-            saw_new=1
-            break
-        fi
-        if [[ "$unit_state" == "activating" || "$unit_state" == "active" ]]; then
-            saw_new=1
+            new_id="$after_id"
             break
         fi
         poll=$((poll + 1))
         sleep "$sleep_s"
     done
-    if [[ "$saw_new" -eq 0 ]]; then
+    if [[ -z "$new_id" ]]; then
         _upgrade_wait_cleanup
         log_error "Upgrade unit did not start (no new InvocationID)"
         return 1
     fi
     while true; do
+        after_id=$(systemctl show -p InvocationID --value github-runner-upgrade.service 2>/dev/null || true)
+        if [[ "$after_id" != "$new_id" ]]; then
+            _upgrade_wait_cleanup
+            log_error "Upgrade unit InvocationID changed during wait"
+            return 1
+        fi
         unit_state=$(systemctl is-active github-runner-upgrade.service 2>/dev/null || true)
         case "$unit_state" in
-            activating|active) sleep 2 ;;
+            activating|active) sleep "$done_sleep" ;;
+            inactive|failed) break ;;
+            "") sleep "$sleep_s" ;;
             *) break ;;
         esac
     done
     _upgrade_wait_cleanup
+    after_id=$(systemctl show -p InvocationID --value github-runner-upgrade.service 2>/dev/null || true)
+    if [[ "$after_id" != "$new_id" ]]; then
+        log_error "Upgrade unit InvocationID changed during wait"
+        return 1
+    fi
     unit_result=$(systemctl show -p Result --value github-runner-upgrade.service 2>/dev/null || true)
     if [[ "$unit_result" != "success" ]]; then
         log_error "Upgrade unit finished with Result=${unit_result:-unknown}"
@@ -519,7 +538,7 @@ upgrade_main() {
     done
 
     if [[ "$dry_run" -eq 1 ]]; then
-        upgrade_dry_run
+        upgrade_dry_run "$force"
         return $?
     fi
 

@@ -427,30 +427,39 @@ bake_free_vmid_volumes() {
 # $expected_state (baking for bake_fail, candidate for leftover). Name
 # mismatch: skip destroy and volume free (disks belong to the occupant).
 # No config: skip destroy; volume sweep OK.
-# Usage: bake_reap_vmid <vmid> <expected_state> <reason>
-bake_reap_vmid() {
-    local vmid="${1:-}" expected="${2:-}" reason="${3:-bake failed}"
-    local pointer="" state="" cfg="" name="" gen_id="" expected_name=""
-
-    [[ -n "$vmid" && -n "$expected" ]] || return 0
+# True (0) when $1 is still safe to destroy as $2. Re-reads the on-disk
+# pointer and record. Proven by "leftover destroy re-reads pointer
+# immediately before qm stop".
+_bake_reap_still_ours() {
+    local vmid="$1" expected="$2" pointer state
 
     pointer=$(reload_active_template_id) || {
         log_error "Could not re-read TEMPLATE_ID — refusing to destroy VMID $vmid"
-        return 0
+        return 1
     }
     if [[ "$vmid" == "$pointer" ]]; then
         log_error "Refusing to destroy live clone target VMID $vmid"
-        return 0
+        return 1
     fi
-
     state=$(gen_state_of "$vmid") || {
         log_warn "No generation record for VMID $vmid — skipping destroy"
-        return 0
+        return 1
     }
     if [[ "$state" != "$expected" ]]; then
         log_warn "Refusing to destroy VMID $vmid: state is $state, not $expected"
-        return 0
+        return 1
     fi
+    return 0
+}
+
+# Usage: bake_reap_vmid <vmid> <expected_state> <reason>
+bake_reap_vmid() {
+    local vmid="${1:-}" expected="${2:-}" reason="${3:-bake failed}"
+    local cfg="" name="" gen_id="" expected_name=""
+
+    [[ -n "$vmid" && -n "$expected" ]] || return 0
+
+    _bake_reap_still_ours "$vmid" "$expected" || return 0
 
     gen_read "$vmid" || return 0
     gen_id="${GEN_ID:-}"
@@ -473,7 +482,12 @@ bake_reap_vmid() {
         # Proxmox refuses destroy of a running VM. Match setup cleanup_bake:
         # stop then destroy. Proven by "failed bake after start stops then
         # destroys the new VMID, never TEMPLATE_ID".
+        # Pointer/state again immediately before stop and destroy: a promote
+        # can rewrite TEMPLATE_ID during qm status / qm stop --timeout 30.
+        # Proven by "leftover destroy re-reads pointer immediately before qm stop".
+        _bake_reap_still_ours "$vmid" "$expected" || return 0
         qm stop "$vmid" --timeout 30 2>/dev/null || true
+        _bake_reap_still_ours "$vmid" "$expected" || return 0
         if ! qm destroy "$vmid" --purge; then
             log_error "Failed to destroy bake VM $vmid"
         fi

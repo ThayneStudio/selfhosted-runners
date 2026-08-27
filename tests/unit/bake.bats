@@ -617,6 +617,38 @@ EOF
     [ "$GEN_STATE" = "candidate" ]
 }
 
+@test "leftover destroy re-reads pointer immediately before qm stop" {
+    gen_store_init
+    gen_create 8901 \
+        GEN_ID=1 \
+        GEN_STATE=candidate \
+        GEN_TEMPLATE_DIGEST=old \
+        GEN_IMAGE_SHA256=abc \
+        GEN_RUNNER_VERSION=2.0.0
+    : > "$STUB_DIR/qm-created-8901"
+    export CONFIG_FILE
+    qm_stub() {
+        if [[ "$1" == "status" && "$2" == "8901" ]]; then
+            local tmp
+            tmp=$(mktemp "${CONFIG_FILE}.XXXXXX")
+            awk -v vmid=8901 '
+                /^TEMPLATE_ID="/ { print "TEMPLATE_ID=\"" vmid "\""; next }
+                /^TEMPLATE_ID=/ { print "TEMPLATE_ID=" vmid; next }
+                { print }
+            ' "$CONFIG_FILE" > "$tmp"
+            mv "$tmp" "$CONFIG_FILE"
+            echo "status: stopped"
+            return 0
+        fi
+        bake_qm_stub "$@"
+    }
+    export -f qm_stub
+    run bake_reap_vmid 8901 candidate "leftover"
+    [ "$status" -eq 0 ]
+    refute_called qm 'destroy 8901*'
+    refute_called qm 'stop 8901*'
+}
+
 @test "unmemo failure after candidate does not destroy the new template" {
     gen_store_init
     gen_create 8901 \
