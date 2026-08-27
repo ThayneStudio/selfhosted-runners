@@ -40,7 +40,7 @@ case "$COMMAND" in
         echo "  bake [--force] [--dry-run]  Bake a new candidate generation"
         echo "  promote <id> [--skip-canary] Promote a candidate generation to active"
         echo "  maintain                    Unattended adopt/detect/bake cycle (run by timer)"
-        echo "  upgrade [--dry-run] [--force]  Bake a candidate if needed and promote it"
+        echo "  upgrade [--dry-run] [--force] [--foreground]  Bake if needed and promote"
         echo ""
         echo "Runners are ephemeral: one job, shutdown, auto-destroy, watcher recreates."
         ;;

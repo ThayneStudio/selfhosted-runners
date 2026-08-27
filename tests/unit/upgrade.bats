@@ -82,7 +82,7 @@ stub_digest_ok() { :; }
     local unit="$REPO_ROOT/templates/github-runner-upgrade.service"
     grep -q 'Type=oneshot' "$unit"
     grep -q 'ExecStart=/usr/local/bin/runner upgrade --foreground' "$unit"
-    grep -q 'TimeoutStartSec=' "$unit"
+    grep -q 'TimeoutStartSec=14400' "$unit"
     grep -q 'SyslogIdentifier=github-runner-upgrade' "$unit"
     grep -q 'After=.*pvedaemon.service' "$unit"
     ! grep -q 'WantedBy=' "$unit"
@@ -111,6 +111,7 @@ stub_digest_ok() { :; }
 
 @test "upgrade holds BAKE_LOCK_FILE on fd 210 and calls bake_locked not bake_main" {
     grep -q 'exec 210>' "$REPO_ROOT/lib/upgrade.sh"
+    grep -q 'flock -w' "$REPO_ROOT/lib/upgrade.sh"
     grep -q 'bake_locked' "$REPO_ROOT/lib/upgrade.sh"
     ! grep -q 'bake_main' "$REPO_ROOT/lib/upgrade.sh"
 }
@@ -190,6 +191,8 @@ EOF
     refute_called qm 'create *'
     refute_called qm 'clone *'
     [[ "$output" == *"unknown-digest"* || "$stderr" == *"unknown-digest"* || "$output" == *"detect="* ]]
+    [[ "$output" == *"bake_plan=bake"* ]]
+    [[ "$output" == *"promote_plan=after bake"* ]]
 }
 
 # ---------------------------------------------------------------------------
@@ -210,6 +213,8 @@ EOF
     [ "$status" -eq 0 ]
     refute_called qm 'create *'
     grep -q 'TEMPLATE_ID="9000"' "$CONFIG_FILE"
+    [[ "$output" == *"TEMPLATE_ID=9000"* ]]
+    [[ "$output" == *"drain_bound_hours="* ]]
 }
 
 @test "existing candidate for this digest is promoted without a second bake" {
@@ -243,6 +248,7 @@ EOF
     [ "$GEN_STATE" = "active" ]
     gen_read 9000
     [ "$GEN_STATE" = "superseded" ]
+    [[ "$output" == *"previous_vmid=9000"* ]]
 }
 
 @test "already-active matching digest with stale pointer is promoted without baking" {
@@ -281,8 +287,12 @@ EOF
     gen_store_init
     local digest
     digest=$(compute_template_digest)
+    TEMPLATE_ID=8900
+    write_infra_config
+    MIN_VMID=9001
+    TEMPLATE_ID=8900
     gen_now() { printf '%s\n' '2026-08-25T00:00:00Z'; }
-    gen_create 9000 \
+    gen_create 8900 \
         GEN_ID=1 \
         GEN_STATE=active \
         GEN_TEMPLATE_DIGEST="$digest" \
@@ -291,7 +301,8 @@ EOF
         GEN_CREATED_AT=2026-08-15T00:00:00Z
     bake_locked() {
         printf 'called\n' >> "$STUB_DIR/bake_locked.log"
-        # Pretend a new candidate appeared, as a real bake would.
+        # New candidate VMID is higher than the matching active so
+        # bake_matching_generation would pick 8900 if resolve were swapped.
         gen_create 8901 \
             GEN_ID=2 \
             GEN_STATE=candidate \
@@ -306,6 +317,10 @@ EOF
     [ "$status" -eq 0 ]
     [ -f "$STUB_DIR/bake_locked.log" ]
     grep -q 'TEMPLATE_ID="8901"' "$CONFIG_FILE"
+    gen_read 8900
+    [ "$GEN_STATE" = "superseded" ]
+    gen_read 8901
+    [ "$GEN_STATE" = "active" ]
 }
 
 @test "without --foreground and without INVOCATION_ID, upgrade starts the unit --no-block" {
@@ -317,6 +332,7 @@ ActiveState=inactive
 Result=success
 EOF
     unset INVOCATION_ID || true
+    upgrade_wait_unit() { return 0; }
     run --separate-stderr upgrade_main
     [ "$status" -eq 0 ]
     assert_called systemctl 'start --no-block github-runner-upgrade.service'
@@ -330,4 +346,117 @@ EOF
     [ "$status" -ne 0 ]
     [[ "$stderr" == *"CANARY_ENABLED"* ]]
     refute_called systemctl 'start *'
+}
+
+@test "runner upgrade --force writes the force flag the oneshot consumes" {
+    stub_out systemctl 'daemon-reload' < /dev/null
+    stub_out systemctl 'start --no-block github-runner-upgrade.service' < /dev/null
+    stub_out systemctl 'show *' <<'EOF'
+InvocationID=deadbeef
+ActiveState=inactive
+Result=success
+EOF
+    unset INVOCATION_ID || true
+    upgrade_wait_unit() { return 0; }
+    run --separate-stderr upgrade_main --force
+    [ "$status" -eq 0 ]
+    [ -f "$RUNNER_STATE_DIR/upgrade.force" ]
+    grep -qx '1' "$RUNNER_STATE_DIR/upgrade.force"
+}
+
+@test "--foreground --force calls bake_locked 1" {
+    gen_store_init
+    local digest
+    digest=$(compute_template_digest)
+    gen_create 9000 \
+        GEN_ID=1 \
+        GEN_STATE=active \
+        GEN_TEMPLATE_DIGEST="$digest" \
+        GEN_IMAGE_SHA256=abc \
+        GEN_RUNNER_VERSION=2.336.0
+    bake_locked() {
+        printf '%s\n' "${1:-}" >> "$STUB_DIR/bake_locked.log"
+        return 0
+    }
+    run --separate-stderr upgrade_main --foreground --force
+    [ "$status" -eq 0 ]
+    grep -qx '1' "$STUB_DIR/bake_locked.log"
+}
+
+@test "upgrade_foreground consumes the force flag without --force on argv" {
+    gen_store_init
+    local digest
+    digest=$(compute_template_digest)
+    gen_create 9000 \
+        GEN_ID=1 \
+        GEN_STATE=active \
+        GEN_TEMPLATE_DIGEST="$digest" \
+        GEN_IMAGE_SHA256=abc \
+        GEN_RUNNER_VERSION=2.336.0
+    ensure_state_dir "$RUNNER_STATE_DIR"
+    printf '1\n' > "$RUNNER_STATE_DIR/upgrade.force"
+    bake_locked() {
+        printf '%s\n' "${1:-}" >> "$STUB_DIR/bake_locked.log"
+        return 0
+    }
+    INVOCATION_ID=from-systemd
+    run --separate-stderr upgrade_main
+    [ "$status" -eq 0 ]
+    grep -qx '1' "$STUB_DIR/bake_locked.log"
+    [ ! -f "$RUNNER_STATE_DIR/upgrade.force" ]
+}
+
+@test "reconcile after promote keeps the on-disk pointer, not in-shell TEMPLATE_ID" {
+    gen_store_init
+    local digest
+    digest=$(compute_template_digest)
+    gen_create 9000 \
+        GEN_ID=1 \
+        GEN_STATE=active \
+        GEN_TEMPLATE_DIGEST=olddigest \
+        GEN_IMAGE_SHA256=old \
+        GEN_RUNNER_VERSION=2.335.0
+    gen_create 8900 \
+        GEN_ID=2 \
+        GEN_STATE=candidate \
+        GEN_TEMPLATE_DIGEST="$digest" \
+        GEN_IMAGE_SHA256=abc \
+        GEN_RUNNER_VERSION=2.336.0
+    bake_locked() { return 0; }
+    promote_generation() {
+        local n=0
+        [[ -f "$STUB_DIR/promote_n" ]] && n=$(cat "$STUB_DIR/promote_n")
+        n=$((n + 1))
+        printf '%s\n' "$n" > "$STUB_DIR/promote_n"
+        if [[ "$n" -eq 1 ]]; then
+            gen_transition 8900 active
+            rewrite_template_id 8900
+            return 1
+        fi
+        return 0
+    }
+    TEMPLATE_ID=9000
+    run --separate-stderr upgrade_main --foreground
+    [ "$status" -eq 0 ]
+    grep -q 'TEMPLATE_ID="8900"' "$CONFIG_FILE"
+    gen_read 8900
+    [ "$GEN_STATE" = "active" ]
+    gen_read 9000
+    [ "$GEN_STATE" = "superseded" ]
+}
+
+@test "upgrade_wait_unit rejects leftover Result=success without a new InvocationID" {
+    stub_out systemctl 'show *' <<'EOF'
+InvocationID=oldid
+ActiveState=inactive
+Result=success
+EOF
+    stub_out systemctl 'is-active *' <<'EOF'
+inactive
+EOF
+    UPGRADE_WAIT_POLLS=1
+    UPGRADE_WAIT_SLEEP=0
+    run --separate-stderr upgrade_wait_unit oldid
+    [ "$status" -ne 0 ]
+    [[ "$stderr" == *"InvocationID"* ]]
 }

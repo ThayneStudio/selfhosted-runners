@@ -460,28 +460,32 @@ runner bake --force && runner upgrade
 
 ### If the bake fails or appears stuck
 
-The bake is gated so a partial template can never be published. The guest writes
-its completion marker last and does **not** power itself off; `runner setup`
-confirms that marker over the guest agent while the VM is still running, then
-shuts the VM down itself and only then converts it to a template.
+`runner upgrade` bakes in `github-runner-upgrade.service`, not in the SSH
+session. Ctrl-C on the CLI detaches (non-zero) and the unit keeps running.
+A dropped SSH does **not** `bake_fail` or memo the digest.
 
-- **Timeout**: the bake aborts after 90 minutes and prints the last 40 lines from
-  the guest log. A healthy bake runs 30-45 minutes. Override with
-  `BAKE_TIMEOUT=<seconds> runner upgrade --foreground`.
-- **`qm stop` on a stuck bake is safe.** The VM stopping without a confirmed
-  marker is treated as failure -- setup aborts and the cleanup trap destroys the
-  partial VM rather than publishing it.
-- **Ctrl-C is also safe**, and does the same thing.
-- **Run `runner setup` under `tmux` or `screen`.** The wizard is interactive, so it
-  runs over SSH -- and a dropped connection fires the same cleanup trap, throwing
-  away an in-progress bake.
-- Watch progress with
-  `qm guest exec <TEMPLATE_ID> -- cat /var/log/template-setup.log`.
+The bake is gated so a partial template can never be published. The guest writes
+its completion marker last and does **not** power itself off. Bake confirms that
+marker over the guest agent while the VM is still running, then shuts the VM
+down itself and only then converts it to a template.
+
+- **Watch:** `journalctl -u github-runner-upgrade.service -f`. Guest log is on
+  the **band** VMID (`planned_vmid` from `--dry-run`, or `bake_log=` on success),
+  not on live `TEMPLATE_ID`:
+  `qm guest exec <vmid> -- cat /var/log/template-setup.log`.
+- **Timeout:** the bake aborts after 90 minutes. A healthy bake runs 30-45
+  minutes. Override with `BAKE_TIMEOUT=<seconds> runner upgrade`.
+- **`qm stop` on a stuck bake VM is safe.** The VM stopping without a confirmed
+  marker is treated as failure — the cleanup trap destroys the partial band VM,
+  never the live clone target, and memos the digest.
+- **Memoed digest** (previous bake failed): `runner upgrade --force`, or
+  `runner bake --force && runner upgrade`. Do not run `runner setup` — on a
+  host that already has a live template, setup adopts and skips the bake.
 - **Checksum verification failed?** The cached Ubuntu image at
   `/var/cache/github-runners/` goes stale whenever upstream rotates
-  `noble/current/`, roughly every 2-4 weeks. Setup deletes the bad file on its way
-  out, so just run `runner setup` again -- it downloads a fresh image. This is not
-  a supply-chain compromise, though the error reads like one.
+  `noble/current/`, roughly every 2-4 weeks. Bake deletes the bad file on its
+  way out; `--force` downloads a fresh image. This is not a supply-chain
+  compromise, though the error reads like one.
 
 ### The 30-day rebake deadline
 
