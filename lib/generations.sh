@@ -597,6 +597,65 @@ gen_vmid_for_id() (
     return 1
 )
 
+# VMID of the retained previous generation (spec 9, 15).
+#
+# Among `superseded` records that were once a clone target (GEN_PROMOTED_AT
+# set), pick the newest GEN_SUPERSEDED_AT, then newest GEN_PROMOTED_AT.
+# Never the highest GEN_ID: after a rollback that is the image the operator
+# just escaped. Optional <current-gen-id> skips leftovers with a higher id
+# (incomplete rollback after reconcile demoted instead of reject).
+# `rejected` is not in this list; it is never a rollback target.
+#
+# Usage: gen_rollback_target [current-gen-id]
+# stdout: VMID. Exit 1 if nothing retained.
+gen_rollback_target() (
+    local current_id="${1:-}" vmid id list
+    local keep="" keep_sup="" keep_prom=""
+    local sup prom
+
+    if [[ -n "$current_id" ]] && ! gen_is_uint "$current_id"; then
+        log_error "Invalid generation id: $current_id"
+        return 1
+    fi
+
+    list=$(gen_list superseded) || return 1
+    while read -r vmid; do
+        [[ -n "$vmid" ]] || continue
+        gen_read "$vmid" || return 1
+        [[ "$GEN_STATE" == "superseded" ]] || continue
+        [[ -n "$GEN_PROMOTED_AT" ]] || continue
+        id=$(gen_require_numeric_id "$vmid") || return 1
+        if [[ -n "$current_id" && "$id" -gt "$((10#$current_id))" ]]; then
+            continue
+        fi
+        sup="${GEN_SUPERSEDED_AT:-}"
+        prom="${GEN_PROMOTED_AT:-}"
+        if [[ -z "$keep" ]]; then
+            keep="$vmid"
+            keep_sup="$sup"
+            keep_prom="$prom"
+            continue
+        fi
+        if [[ -n "$sup" && ( -z "$keep_sup" || "$sup" > "$keep_sup" ) ]]; then
+            keep="$vmid"
+            keep_sup="$sup"
+            keep_prom="$prom"
+        elif [[ "$sup" == "$keep_sup" ]]; then
+            if [[ -n "$prom" && ( -z "$keep_prom" || "$prom" > "$keep_prom" ) ]]; then
+                keep="$vmid"
+                keep_sup="$sup"
+                keep_prom="$prom"
+            fi
+        fi
+    done <<< "$list"
+
+    if [[ -z "$keep" ]]; then
+        log_error "No retained previous generation to roll back to"
+        return 1
+    fi
+    printf '%s\n' "$keep"
+)
+
 # ---------------------------------------------------------------------------
 # Generation id counter
 # ---------------------------------------------------------------------------
@@ -685,7 +744,8 @@ gen_next_id() (
 #
 #   baking ──▶ candidate ──▶ active ──▶ superseded ──▶ (destroyed, archived)
 #      │           │            │            │
-#      │           │            │            └──▶ active     (rollback)
+#      │           │            │            ├──▶ active     (rollback)
+#      │           │            │            └──▶ rejected   (complete rollback)
 #      └──▶ failed ┘            └──▶ rejected
 #
 # `failed` and `rejected` have no outgoing edges, and that is load-bearing for
@@ -712,8 +772,9 @@ gen_transition_allowed() {
         # A newer generation took over, or an operator rolled away from this one.
         active:superseded|active:rejected) return 0 ;;
         # Rollback: the retained previous generation becomes the clone target
-        # again.
-        superseded:active) return 0 ;;
+        # again. superseded→rejected completes a rollback after reconcile
+        # demoted the escaped generation instead of rejecting it (spec 15).
+        superseded:active|superseded:rejected) return 0 ;;
         *) return 1 ;;
     esac
 }

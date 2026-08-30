@@ -124,7 +124,7 @@ GUARD_DEFER_WARN_RUNS=3
 # hang off RUNNER_STATE_DIR so relocating state relocates them too.
 # shellcheck disable=SC2034  # consumed by bake, detect, promote, maintain
 BAKE_LOCK_FILE="/run/lock/github-runner-bake.lock"
-# shellcheck disable=SC2034  # consumed by bake, detect, promote, maintain
+# shellcheck disable=SC2034  # consumed by bake, detect, promote, rollback, maintain
 PROMOTION_PAUSE_FILE="/run/lock/github-runner-promote.pause"
 IMG_CACHE_DIR="/var/cache/github-runners"
 # shellcheck disable=SC2034  # consumed by bake, detect, promote, maintain
