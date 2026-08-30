@@ -602,14 +602,54 @@ EOF
     [[ "$output" == *"stale promotion pause"* ]]
 }
 
-@test "promotion pause is left when the exclusive pool lock is held" {
+@test "promotion pause is left when the pause file is flocked" {
+    mkdir -p "$(dirname "$PROMOTION_PAUSE_FILE")"
+    exec 211>"$PROMOTION_PAUSE_FILE"
+    flock -n 211
+    run maintain_clear_stale_promotion_pause
+    [ "$status" -eq 0 ]
+    [ -e "$PROMOTION_PAUSE_FILE" ]
+    exec 211>&- 2>/dev/null || true
+}
+
+@test "stale promotion pause is cleared even when the pool lock is held" {
     mkdir -p "$(dirname "$PROMOTION_PAUSE_FILE")" "$(dirname "$POOL_ACTIVITY_LOCK_FILE")"
     : > "$PROMOTION_PAUSE_FILE"
     exec 202>"$POOL_ACTIVITY_LOCK_FILE"
     flock -n -x 202
     run maintain_clear_stale_promotion_pause
     [ "$status" -eq 0 ]
-    [ -e "$PROMOTION_PAUSE_FILE" ]
+    [ ! -e "$PROMOTION_PAUSE_FILE" ]
+    exec 202>&- 2>/dev/null || true
+}
+
+@test "two-actives skipped while the exclusive pool lock is held" {
+    gen_store_init
+    TEMPLATE_ID=9000
+    gen_create 9000 \
+        GEN_ID=1 \
+        GEN_STATE=active \
+        GEN_TEMPLATE_DIGEST=old \
+        GEN_IMAGE_SHA256=abc \
+        GEN_RUNNER_VERSION=2.335.0 \
+        GEN_PROMOTED_AT=2026-08-01T00:00:00Z
+    gen_create 8900 \
+        GEN_ID=2 \
+        GEN_STATE=active \
+        GEN_TEMPLATE_DIGEST=new \
+        GEN_IMAGE_SHA256=def \
+        GEN_RUNNER_VERSION=2.336.0 \
+        GEN_PROMOTED_AT=2026-08-20T00:00:00Z
+    mkdir -p "$(dirname "$POOL_ACTIVITY_LOCK_FILE")"
+    exec 202>"$POOL_ACTIVITY_LOCK_FILE"
+    flock -n -x 202
+    run maintain_reconcile_two_actives
+    [ "$status" -eq 0 ]
+    gen_read 9000
+    [ "$GEN_STATE" = "active" ]
+    gen_read 8900
+    [ "$GEN_STATE" = "active" ]
+    exec 202>&- 2>/dev/null || true
 }
 
 @test "two-actives skipped while pause file exists" {
@@ -666,23 +706,23 @@ EOF
     gen_store_init
     TEMPLATE_ID=9000
     gen_create 8900 \
-        GEN_ID=5 \
+        GEN_ID=9 \
         GEN_STATE=active \
         GEN_TEMPLATE_DIGEST=a \
         GEN_IMAGE_SHA256=abc \
-        GEN_PROMOTED_AT=2026-08-20T00:00:00Z
+        GEN_PROMOTED_AT=2026-08-01T00:00:00Z
     gen_create 8901 \
-        GEN_ID=9 \
+        GEN_ID=5 \
         GEN_STATE=active \
         GEN_TEMPLATE_DIGEST=b \
         GEN_IMAGE_SHA256=def \
-        GEN_PROMOTED_AT=2026-08-01T00:00:00Z
+        GEN_PROMOTED_AT=2026-08-20T00:00:00Z
 
     run maintain_reconcile_two_actives
     [ "$status" -eq 0 ]
-    gen_read 8900
-    [ "$GEN_STATE" = "active" ]
     gen_read 8901
+    [ "$GEN_STATE" = "active" ]
+    gen_read 8900
     [ "$GEN_STATE" = "superseded" ]
     notify_log | grep -q 'warn'
 }

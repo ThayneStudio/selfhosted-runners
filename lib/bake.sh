@@ -478,6 +478,7 @@ bake_reap_vmid() {
         return 0
     fi
 
+    local skip_volumes=0 pool_fd=""
     if qm status "$vmid" >/dev/null 2>&1; then
         # Proxmox refuses destroy of a running VM. Match setup cleanup_bake:
         # stop then destroy. Proven by "failed bake after start stops then
@@ -485,12 +486,39 @@ bake_reap_vmid() {
         # Pointer/state again immediately before stop and destroy: a promote
         # can rewrite TEMPLATE_ID during qm status / qm stop --timeout 30.
         # Proven by "leftover destroy re-reads pointer immediately before qm stop".
-        _bake_reap_still_ours "$vmid" "$expected" || return 0
+        # Leftover candidates also take exclusive pool lock for the destroy
+        # window so runner promote cannot rewrite TEMPLATE_ID onto this VMID
+        # between the last still-ours check and qm destroy. Baking VMIDs are
+        # not promotable; do not wait on the pool for bake_fail. Proven by
+        # "leftover candidate destroy skips when the pool lock is held".
+        if [[ "$expected" == "candidate" ]]; then
+            mkdir -p "$(dirname "$POOL_ACTIVITY_LOCK_FILE")" || return 0
+            exec {pool_fd}>"$POOL_ACTIVITY_LOCK_FILE" || return 0
+            if ! flock -n "$pool_fd"; then
+                log_warn "pool lock busy — skipping leftover destroy of VMID $vmid"
+                exec {pool_fd}>&-
+                return 0
+            fi
+        fi
+        _bake_reap_still_ours "$vmid" "$expected" || {
+            [[ -n "$pool_fd" ]] && exec {pool_fd}>&-
+            return 0
+        }
         qm stop "$vmid" --timeout 30 2>/dev/null || true
-        _bake_reap_still_ours "$vmid" "$expected" || return 0
+        _bake_reap_still_ours "$vmid" "$expected" || {
+            [[ -n "$pool_fd" ]] && exec {pool_fd}>&-
+            return 0
+        }
         if ! qm destroy "$vmid" --purge; then
             log_error "Failed to destroy bake VM $vmid"
+            if qm config "$vmid" >/dev/null 2>&1; then
+                skip_volumes=1
+            fi
         fi
+        [[ -n "$pool_fd" ]] && exec {pool_fd}>&-
+    fi
+    if (( skip_volumes == 1 )); then
+        return 0
     fi
     bake_free_vmid_volumes "$vmid"
     gen_transition "$vmid" failed "$reason" || true

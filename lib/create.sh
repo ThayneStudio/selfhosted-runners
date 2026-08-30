@@ -54,8 +54,8 @@ log_info "Creating $RUNNER_NAME for org $GITHUB_ORG..."
 clone_rc=0
 VMID=$(clone_runner "$RUNNER_NAME" "$SELECTED_ORG") || clone_rc=$?
 if [[ "$clone_rc" -eq 3 ]]; then
-    log_info "create: promotion in progress, will retry"
-    exit 0
+    log_info "create: promotion in progress; not creating $RUNNER_NAME"
+    exit 3
 fi
 if [[ "$clone_rc" -ne 0 ]]; then
     log_error "Clone failed"

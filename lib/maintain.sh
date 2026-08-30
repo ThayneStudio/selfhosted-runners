@@ -123,16 +123,18 @@ maintain_fail_dead_bake() {
     return 0
 }
 
-# SIGKILL/OOM can leave PROMOTION_PAUSE_FILE on tmpfs. If nothing holds the
-# exclusive pool lock, the pause is stale — drop it so clones and two-actives
-# reconcile are not stuck until reboot.
+# SIGKILL/OOM can leave PROMOTION_PAUSE_FILE on tmpfs. Stale means nothing
+# holds an exclusive flock on the pause file itself — not "exclusive 202 is
+# free". Promote writes the pause and flocks it *before* flock -w 202, so a
+# 202 probe would steal the pause from a live waiter. Proven by "promotion
+# pause is left when the pause file is flocked".
 maintain_clear_stale_promotion_pause() {
     [[ -e "$PROMOTION_PAUSE_FILE" ]] || return 0
-    mkdir -p "$(dirname "$POOL_ACTIVITY_LOCK_FILE")" || return 0
-    exec 209>"$POOL_ACTIVITY_LOCK_FILE" || return 0
+    mkdir -p "$(dirname "$PROMOTION_PAUSE_FILE")" || return 0
+    exec 209>>"$PROMOTION_PAUSE_FILE" || return 0
     if flock -n 209; then
         rm -f "$PROMOTION_PAUSE_FILE"
-        log_warn "Removed stale promotion pause file (no exclusive pool-lock holder)"
+        log_warn "Removed stale promotion pause file (no pause-file lock holder)"
     fi
     exec 209>&- || true
     return 0
@@ -204,7 +206,7 @@ maintain_repair_zero_actives() {
 # TEMPLATE_ID wins, not the higher GEN_ID". Skip while a promote holds the
 # pause file. Zero actives restore the pointer's generation.
 maintain_reconcile_two_actives() {
-    local vmid keep="" best_ts="" ts list
+    local vmid keep="" best_ts="" ts list rc=0 pool_fd
     local -a actives=()
     local -a losers=()
 
@@ -213,16 +215,38 @@ maintain_reconcile_two_actives() {
         return 0
     fi
 
-    list=$(gen_list active) || return 1
+    # Exclusive flock on the pool lock file so a live promote that lost the
+    # pause bit cannot gen_transition while we demote. Skip if the pool is busy.
+    # Proven by "two-actives skipped while the exclusive pool lock is held".
+    mkdir -p "$(dirname "$POOL_ACTIVITY_LOCK_FILE")" || return 1
+    # Dynamic fd: the same inode as promote's exclusive 202. Hard-coded 202/213
+    # collide with clone_runner and with bats `run` stderr capture.
+    # Proven by "two-actives skipped while the exclusive pool lock is held".
+    exec {pool_fd}>"$POOL_ACTIVITY_LOCK_FILE" || return 1
+    if ! flock -n "$pool_fd"; then
+        log_info "pool lock busy — skipping active-generation reconcile"
+        exec {pool_fd}>&-
+        return 0
+    fi
+
+    list=$(gen_list active) || {
+        exec {pool_fd}>&-
+        return 1
+    }
     while read -r vmid; do
         [[ -n "$vmid" ]] || continue
         actives+=("$vmid")
     done <<< "$list"
     if ((${#actives[@]} == 0)); then
         maintain_repair_zero_actives
-        return $?
+        rc=$?
+        exec {pool_fd}>&-
+        return "$rc"
     fi
-    ((${#actives[@]} > 1)) || return 0
+    if ((${#actives[@]} <= 1)); then
+        exec {pool_fd}>&-
+        return 0
+    fi
 
     for vmid in "${actives[@]}"; do
         if [[ -n "${TEMPLATE_ID:-}" && "$vmid" == "$TEMPLATE_ID" ]]; then
@@ -233,7 +257,10 @@ maintain_reconcile_two_actives() {
 
     if [[ -z "$keep" ]]; then
         for vmid in "${actives[@]}"; do
-            gen_read "$vmid" || return 1
+            gen_read "$vmid" || {
+                exec {pool_fd}>&-
+                return 1
+            }
             ts="${GEN_PROMOTED_AT:-}"
             if [[ -z "$keep" ]]; then
                 keep="$vmid"
@@ -246,19 +273,29 @@ maintain_reconcile_two_actives() {
             fi
         done
     fi
-    [[ -n "$keep" ]] || return 1
+    if [[ -z "$keep" ]]; then
+        exec {pool_fd}>&-
+        return 1
+    fi
 
     for vmid in "${actives[@]}"; do
         [[ "$vmid" != "$keep" ]] || continue
         losers+=("$vmid")
-        gen_transition "$vmid" superseded || return 1
+        gen_transition "$vmid" superseded || {
+            exec {pool_fd}>&-
+            return 1
+        }
     done
-    ((${#losers[@]} > 0)) || return 0
+    if ((${#losers[@]} == 0)); then
+        exec {pool_fd}>&-
+        return 0
+    fi
 
     notify warn generation.reconciled \
         "Multiple active generations; kept VMID $keep" \
         "demoted ${losers[*]} to superseded"
     log_warn "Reconciled $((${#actives[@]})) active generations; kept VMID $keep"
+    exec {pool_fd}>&-
     return 0
 }
 

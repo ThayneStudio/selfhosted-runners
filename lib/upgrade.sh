@@ -265,8 +265,16 @@ upgrade_locked() {
     match_other=$(upgrade_matching_active "$digest" "$pointer") || match_other=""
 
     if [[ "$force" -eq 1 ]]; then
-        bake_locked 1 || return 1
-        digest="${_BAKE_DIGEST:-$digest}"
+        # Match --dry-run --force: a digest-matching candidate is already the
+        # bake we would produce. Rebaking would destroy it via
+        # bake_fail_other_candidates. Proven by "--force with a matching
+        # candidate skips bake_locked".
+        if [[ -n "$match_cand" ]]; then
+            log_info "nothing to bake: candidate VMID $match_cand already matches"
+        else
+            bake_locked 1 || return 1
+            digest="${_BAKE_DIGEST:-$digest}"
+        fi
     elif [[ "$decision" == yes\ * ]]; then
         # Candidate already matching → promote only. Any matching active that
         # is not the pointer is a promote crash; do not bake N+1. Weekly
@@ -463,7 +471,7 @@ upgrade_wait_unit() {
         fi
         trap - INT
     }
-    trap '_upgrade_wait_cleanup; log_info "Detached. Unit continues: journalctl -u github-runner-upgrade.service -f"; return 1' INT
+    trap '_upgrade_wait_cleanup; log_info "Detached. Unit continues: journalctl -u github-runner-upgrade.service -f"; exit 1' INT
 
     if [[ -t 1 ]] && command -v journalctl >/dev/null 2>&1; then
         journalctl -u github-runner-upgrade.service -f --no-pager --since now &
@@ -481,9 +489,21 @@ upgrade_wait_unit() {
         sleep "$sleep_s"
     done
     if [[ -z "$new_id" ]]; then
-        _upgrade_wait_cleanup
-        log_error "Upgrade unit did not start (no new InvocationID)"
-        return 1
+        unit_state=$(systemctl is-active github-runner-upgrade.service 2>/dev/null || true)
+        after_id=$(systemctl show -p InvocationID --value github-runner-upgrade.service 2>/dev/null || true)
+        if [[ -n "$after_id" && ( "$unit_state" == "activating" || "$unit_state" == "active" ) ]]; then
+            # start --no-block on an already-running oneshot often returns 0
+            # and reuses InvocationID. Join that run instead of lying "did
+            # not start". Proven by "upgrade_wait_unit joins an activating
+            # unit with the same InvocationID".
+            new_id="$after_id"
+            log_info "Joining already-running upgrade unit"
+        else
+            _upgrade_wait_cleanup
+            rm -f "$(upgrade_force_flag)"
+            log_error "Upgrade unit did not start (no new InvocationID)"
+            return 1
+        fi
     fi
     while true; do
         after_id=$(systemctl show -p InvocationID --value github-runner-upgrade.service 2>/dev/null || true)
@@ -543,6 +563,7 @@ upgrade_main() {
     fi
 
     if upgrade_should_wrap "$foreground" "$dry_run"; then
+        upgrade_preflight || return 1
         upgrade_via_unit "$force"
         return $?
     fi

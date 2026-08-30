@@ -79,13 +79,16 @@ write_pointer() {
 }
 
 @test "clone_runner returns 3 without cloning when PROMOTION_PAUSE_FILE remains" {
-    : > "$PROMOTION_PAUSE_FILE"
+    mkdir -p "$(dirname "$PROMOTION_PAUSE_FILE")"
+    exec 211>"$PROMOTION_PAUSE_FILE"
+    flock -n 211
 
     run --separate-stderr clone_runner runner-acme-1 acme
     [ "$status" -eq 3 ]
     refute_called qm 'clone *'
     refute_called qm 'set *'
     refute_called qm 'start *'
+    exec 211>&- 2>/dev/null || true
 }
 
 @test "acquire_clone_slot returns 3 when promotion pause file exists" {
@@ -209,7 +212,8 @@ EOF
 @test "create.sh treats clone_runner rc=3 as retry not Clone failed" {
     grep -A20 'clone_runner' "$REPO_ROOT/lib/create.sh" | grep -q 'clone_rc'
     grep -A20 'clone_runner' "$REPO_ROOT/lib/create.sh" | grep -q -- '-eq 3'
-    grep -A20 'clone_runner' "$REPO_ROOT/lib/create.sh" | grep -q 'will retry'
+    grep -A20 'clone_runner' "$REPO_ROOT/lib/create.sh" | grep -q 'not creating'
+    grep -A20 'clone_runner' "$REPO_ROOT/lib/create.sh" | grep -q 'exit 3'
     ! grep -A25 'clone_runner' "$REPO_ROOT/lib/create.sh" | grep -q 'clone.failed'
 }
 

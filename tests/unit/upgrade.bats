@@ -70,7 +70,7 @@ stub_upgrade_unit() {
     export STUB_UNIT_RESULT="${STUB_UNIT_RESULT:-success}"
     export STUB_UNIT_ACTIVE="${STUB_UNIT_ACTIVE:-inactive}"
     export STUB_SYSTEMCTL_START_RC="${STUB_SYSTEMCTL_START_RC:-0}"
-    rm -f "$STUB_DIR/unit-started"
+    rm -f "$STUB_DIR/unit-started" "$STUB_DIR/is-active-seen"
     systemctl_stub() {
         case "$*" in
             daemon-reload) return 0 ;;
@@ -92,6 +92,13 @@ stub_upgrade_unit() {
                 return 0
                 ;;
             is-active*)
+                if [[ "${STUB_UNIT_ACTIVE:-inactive}" == "activating" && -f "$STUB_DIR/is-active-seen" ]]; then
+                    printf 'inactive\n'
+                    return 0
+                fi
+                if [[ "${STUB_UNIT_ACTIVE:-inactive}" == "activating" ]]; then
+                    : > "$STUB_DIR/is-active-seen"
+                fi
                 printf '%s\n' "${STUB_UNIT_ACTIVE:-inactive}"
                 return 0
                 ;;
@@ -378,6 +385,7 @@ EOF
     run --separate-stderr upgrade_main
     [ "$status" -eq 0 ]
     assert_called systemctl 'start --no-block github-runner-upgrade.service'
+    grep -q 'show -p Result' "$STUB_DIR/systemctl/calls"
     refute_called qm 'create *'
 }
 
@@ -413,6 +421,32 @@ EOF
     [ "$status" -eq 0 ]
     [ -f "$RUNNER_STATE_DIR/upgrade.force" ]
     grep -qx '1' "$RUNNER_STATE_DIR/upgrade.force"
+}
+
+@test "--force with a matching candidate skips bake_locked" {
+    gen_store_init
+    local digest
+    digest=$(compute_template_digest)
+    gen_create 9000 \
+        GEN_ID=1 \
+        GEN_STATE=active \
+        GEN_TEMPLATE_DIGEST=unknown \
+        GEN_IMAGE_SHA256=unknown \
+        GEN_RUNNER_VERSION=unknown
+    gen_create 8900 \
+        GEN_ID=2 \
+        GEN_STATE=candidate \
+        GEN_TEMPLATE_DIGEST="$digest" \
+        GEN_IMAGE_SHA256=abc \
+        GEN_RUNNER_VERSION=2.336.0
+    bake_locked() {
+        printf 'called\n' >> "$STUB_DIR/bake_locked.log"
+        return 0
+    }
+    run --separate-stderr upgrade_main --foreground --force
+    [ "$status" -eq 0 ]
+    [ ! -f "$STUB_DIR/bake_locked.log" ]
+    grep -q 'TEMPLATE_ID="8900"' "$CONFIG_FILE"
 }
 
 @test "--foreground --force calls bake_locked 1" {
@@ -503,10 +537,28 @@ EOF
     UPGRADE_WAIT_POLLS=1
     UPGRADE_WAIT_SLEEP=0
     UPGRADE_WAIT_DONE_SLEEP=0
+    ensure_state_dir "$RUNNER_STATE_DIR"
+    printf '1\n' > "$RUNNER_STATE_DIR/upgrade.force"
     run --separate-stderr upgrade_wait_unit oldid
     [ "$status" -ne 0 ]
     [[ "$stderr" == *"did not start"* ]]
     ! grep -q 'show -p Result' "$STUB_DIR/systemctl/calls"
+    [ ! -f "$RUNNER_STATE_DIR/upgrade.force" ]
+}
+
+@test "upgrade_wait_unit joins an activating unit with the same InvocationID" {
+    stub_upgrade_unit
+    export STUB_INVOCATION_AFTER=oldid
+    export STUB_UNIT_ACTIVE=activating
+    export STUB_UNIT_RESULT=success
+    printf '1\n' > "$STUB_DIR/unit-started"
+    UPGRADE_WAIT_POLLS=2
+    UPGRADE_WAIT_SLEEP=0
+    UPGRADE_WAIT_DONE_SLEEP=0
+    run --separate-stderr upgrade_wait_unit oldid
+    [ "$status" -eq 0 ]
+    [[ "$stderr" == *"Joining already-running"* ]]
+    grep -q 'show -p Result' "$STUB_DIR/systemctl/calls"
 }
 
 @test "same-digest two actives: pointer on higher VMID is kept, extra superseded" {
@@ -719,6 +771,30 @@ EOF
     [ "$status" -eq 0 ]
     grep -q 'TEMPLATE_ID="8901"' "$CONFIG_FILE"
     [[ "$output" == *"digest=pinneddigest"* ]]
+}
+
+@test "--dry-run --force with a matching candidate plans skip not bake" {
+    gen_store_init
+    local digest
+    digest=$(compute_template_digest)
+    gen_create 9000 \
+        GEN_ID=1 \
+        GEN_STATE=active \
+        GEN_TEMPLATE_DIGEST=unknown \
+        GEN_IMAGE_SHA256=unknown \
+        GEN_RUNNER_VERSION=unknown
+    gen_create 8900 \
+        GEN_ID=2 \
+        GEN_STATE=candidate \
+        GEN_TEMPLATE_DIGEST="$digest" \
+        GEN_IMAGE_SHA256=abc \
+        GEN_RUNNER_VERSION=2.336.0
+    run --separate-stderr upgrade_main --dry-run --force
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"reason=force"* ]]
+    [[ "$output" == *"bake_plan=skip (candidate exists)"* ]]
+    [ ! -f "$RUNNER_STATE_DIR/upgrade.force" ]
+    refute_called systemctl '*'
 }
 
 @test "--dry-run --force on a memoed digest plans a bake not a refuse" {

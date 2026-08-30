@@ -76,8 +76,13 @@ if ! pvesm status | awk '{print $1}' | grep -qxF "$VM_STORAGE"; then
     exit 1
 fi
 
-read -rp "Template VM ID [9000]: " TEMPLATE_ID
-TEMPLATE_ID=${TEMPLATE_ID:-9000}
+EXISTING_TEMPLATE_ID=""
+if [[ -f "$CONFIG_FILE" ]]; then
+    EXISTING_TEMPLATE_ID=$(sed -n 's/^TEMPLATE_ID=//p' "$CONFIG_FILE" | tail -n 1 | tr -d "\"'")
+fi
+DEFAULT_TEMPLATE_ID="${EXISTING_TEMPLATE_ID:-9000}"
+read -rp "Template VM ID [${DEFAULT_TEMPLATE_ID}]: " TEMPLATE_ID
+TEMPLATE_ID=${TEMPLATE_ID:-$DEFAULT_TEMPLATE_ID}
 
 # Minimum VM ID for runners. MIN_VMID=0 ("auto") is a hard error: nextid can
 # land in the generation band, and load_infra_config would then refuse the
@@ -250,9 +255,9 @@ CONF_TMP=$(mktemp "${CONFIG_FILE}.XXXXXX")
     printf 'MAX_VM_LIFETIME_HOURS=%q\n' "$MAX_VM_LIFETIME_HOURS"
     printf 'STOPPED_REAP_MINUTES=%q\n' "$STOPPED_REAP_MINUTES"
     printf 'GUARD_EXCLUDE_VMIDS=%q\n' "$GUARD_EXCLUDE_VMIDS"
-    printf 'NOTIFY_WEBHOOK_URL=%q\n' "${NOTIFY_WEBHOOK_URL:-}"
-    printf 'NOTIFY_MIN_SEVERITY=%q\n' "${NOTIFY_MIN_SEVERITY:-}"
-    printf 'NOTIFY_FORMAT=%q\n' "${NOTIFY_FORMAT:-}"
+    [[ -n "${NOTIFY_WEBHOOK_URL:-}" ]] && printf 'NOTIFY_WEBHOOK_URL=%q\n' "$NOTIFY_WEBHOOK_URL"
+    [[ -n "${NOTIFY_MIN_SEVERITY:-}" ]] && printf 'NOTIFY_MIN_SEVERITY=%q\n' "$NOTIFY_MIN_SEVERITY"
+    [[ -n "${NOTIFY_FORMAT:-}" ]] && printf 'NOTIFY_FORMAT=%q\n' "$NOTIFY_FORMAT"
 } > "$CONF_TMP"
 chmod 600 "$CONF_TMP"
 mv "$CONF_TMP" "$CONFIG_FILE"

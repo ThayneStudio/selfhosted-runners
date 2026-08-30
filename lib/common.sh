@@ -837,6 +837,20 @@ clone_runner() {
     [[ "$pause_max" =~ ^[0-9]+$ ]] || pause_max=130
     while [[ -e "$PROMOTION_PAUSE_FILE" ]]; do
         if (( pause_waited >= pause_max )); then
+            # Unflocked pause is leftover (SIGKILL). A live promote holds
+            # exclusive 211 on this file. Proven by "clone_runner returns 3
+            # without cloning when PROMOTION_PAUSE_FILE remains".
+            exec 211>>"$PROMOTION_PAUSE_FILE" || {
+                exec 202>&-
+                return 3
+            }
+            if flock -n 211; then
+                rm -f "$PROMOTION_PAUSE_FILE"
+                exec 211>&- 2>/dev/null || true
+                log_warn "clone_runner: removed stale promotion pause file"
+                break
+            fi
+            exec 211>&- 2>/dev/null || true
             log_info "clone_runner: promotion in progress, will retry"
             exec 202>&-
             return 3

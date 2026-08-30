@@ -33,6 +33,7 @@ _promote_release() {
     # Drop the EXIT trap first so a later process EXIT cannot re-enter after
     # a normal release. Proven by "_promote_release clears the EXIT trap".
     trap - EXIT
+    exec 211>&- 2>/dev/null || true
     rm -f "$PROMOTION_PAUSE_FILE"
     exec 202>&- 2>/dev/null || true
 }
@@ -115,8 +116,17 @@ promote_generation() {
         log_error "Cannot create lock directory"
         return 1
     }
-    if ! : > "$PROMOTION_PAUSE_FILE"; then
+    # fd 211: exclusive flock on the pause file itself. maintain used to treat
+    # "exclusive 202 is free" as stale, which is true while this process is
+    # still in flock -w 202. Proven by "promotion pause is left when the pause
+    # file is flocked".
+    exec 211>"$PROMOTION_PAUSE_FILE" || {
         log_error "Failed to write $PROMOTION_PAUSE_FILE"
+        return 1
+    }
+    if ! flock -n 211; then
+        exec 211>&- 2>/dev/null || true
+        log_error "Another promotion already holds $PROMOTION_PAUSE_FILE"
         return 1
     fi
     # Ctrl-C / SIGTERM abort the process; EXIT still runs. Do not trap

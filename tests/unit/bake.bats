@@ -617,6 +617,27 @@ EOF
     [ "$GEN_STATE" = "candidate" ]
 }
 
+@test "leftover candidate destroy skips when the pool lock is held" {
+    gen_store_init
+    gen_create 8901 \
+        GEN_ID=1 \
+        GEN_STATE=candidate \
+        GEN_TEMPLATE_DIGEST=old \
+        GEN_IMAGE_SHA256=abc \
+        GEN_RUNNER_VERSION=2.0.0
+    : > "$STUB_DIR/qm-created-8901"
+    mkdir -p "$(dirname "$POOL_ACTIVITY_LOCK_FILE")"
+    exec 202>"$POOL_ACTIVITY_LOCK_FILE"
+    flock -n -x 202
+    run bake_reap_vmid 8901 candidate "leftover"
+    [ "$status" -eq 0 ]
+    refute_called qm 'destroy 8901*'
+    refute_called qm 'stop 8901*'
+    gen_read 8901
+    [ "$GEN_STATE" = "candidate" ]
+    exec 202>&- 2>/dev/null || true
+}
+
 @test "leftover destroy re-reads pointer immediately before qm stop" {
     gen_store_init
     gen_create 8901 \

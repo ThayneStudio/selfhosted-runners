@@ -293,7 +293,7 @@ EOF
     # still run EXIT. Proven against source order because a live SIGINT
     # during flock -w 120 is too slow/flaky for the suite.
     awk '
-        /: > "\$PROMOTION_PAUSE_FILE"/ { pause = NR }
+        /exec 211>"\$PROMOTION_PAUSE_FILE"/ { pause = NR }
         /trap '\''_promote_release'\'' EXIT[[:space:]]*$/ { trapline = NR }
         /flock -w .* -x 202/ { flock = NR }
         END {
