@@ -133,6 +133,9 @@ BAKE_LOG_DIR="/var/log/github-runners"
 FAILED_DIGESTS_FILE="$RUNNER_STATE_DIR/failed-digests"
 # shellcheck disable=SC2034  # consumed by bake, detect, promote, maintain
 DETECT_FAIL_FILE="$RUNNER_STATE_DIR/detect-fail"
+# Consecutive GitHub API failures for the drift alarm (lib/drift.sh).
+# shellcheck disable=SC2034
+DRIFT_FAIL_FILE="$RUNNER_STATE_DIR/drift-fail"
 CLOUD_IMG="noble-server-cloudimg-amd64.img"
 # shellcheck disable=SC2034  # consumed by bake, detect, promote, maintain
 CLOUD_IMG_URL="https://cloud-images.ubuntu.com/noble/current/${CLOUD_IMG}"
