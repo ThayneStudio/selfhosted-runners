@@ -55,3 +55,45 @@ EOF
     [ "$status" -eq 0 ]
     [ "$output" = "unknown" ]
 }
+
+@test "get_vm_generation reads gen-N from semicolon tags" {
+    stub_out qm 'config 501' <<'EOF'
+name: runner-acme-1
+tags: runner;gen-1
+cicustom: user=local:snippets/runner-user-data-acme.yaml
+EOF
+
+    run get_vm_generation 501
+    [ "$status" -eq 0 ]
+    [ "$output" = "1" ]
+}
+
+@test "get_vm_generation reads gen-N from comma tags" {
+    stub_out qm 'config 502' <<'EOF'
+tags: runner,gen-7
+EOF
+
+    run get_vm_generation 502
+    [ "$status" -eq 0 ]
+    [ "$output" = "7" ]
+}
+
+@test "get_vm_generation is empty when tags have no gen-N" {
+    stub_out qm 'config 503' <<'EOF'
+name: runner-acme-1
+tags: runner
+cicustom: user=local:snippets/runner-user-data-acme.yaml
+EOF
+
+    run get_vm_generation 503
+    [ "$status" -eq 0 ]
+    [ "$output" = "" ]
+}
+
+@test "get_vm_generation is empty when the vmid does not exist" {
+    stub_status qm 'config 999' 2
+
+    run get_vm_generation 999
+    [ "$status" -eq 0 ]
+    [ "$output" = "" ]
+}

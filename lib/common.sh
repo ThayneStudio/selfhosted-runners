@@ -52,6 +52,10 @@ INSTALL_DIR="${INSTALL_DIR:-/opt/selfhosted-runners}"
 # production always uses the default.
 RUNNER_STATE_DIR="${RUNNER_STATE_DIR:-/var/lib/github-runners}"
 GENERATIONS_DIR="${GENERATIONS_DIR:-$RUNNER_STATE_DIR/generations}"
+# Optional last-sent notification line, written by notify if it ever records one.
+# status reads this; it never creates it.
+# shellcheck disable=SC2034  # consumed by lib/status.sh
+LAST_NOTIFY_FILE="$RUNNER_STATE_DIR/last-notify"
 # One mode for everything under RUNNER_STATE_DIR. `install -d -m` re-applies the
 # mode to an existing directory, so two callers disagreeing about it would flip
 # the permissions depending on which ran last.
@@ -474,6 +478,26 @@ get_vm_org() {
     else
         echo "unknown"
     fi
+}
+
+# GEN_ID from a VM's tags: line (gen-N). Empty when untagged or the VM has no
+# config. Always succeeds — a missing tag is data, not a hard error.
+# Proven by "get_vm_generation reads gen-N from tags".
+get_vm_generation() {
+    local cfg tags_line tag
+    local -a tags=()
+    cfg=$(qm config "$1" 2>/dev/null || true)
+    tags_line=$(printf '%s\n' "$cfg" | grep -m1 '^tags:' || true)
+    tags_line="${tags_line#tags:}"
+    IFS=';,' read -ra tags <<< "$tags_line"
+    for tag in "${tags[@]}"; do
+        tag="${tag//[[:space:]]/}"
+        if [[ "$tag" =~ ^gen-([0-9]+)$ ]]; then
+            printf '%s\n' "${BASH_REMATCH[1]}"
+            return 0
+        fi
+    done
+    return 0
 }
 
 vm_config_path() {

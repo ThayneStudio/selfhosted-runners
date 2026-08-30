@@ -3,10 +3,12 @@
 # monotonic id counter that numbers them, the lifecycle state machine, and the
 # append-only archive log.
 #
-# This is the data layer, plus adoption (spec 8). Record access, the state
-# machine, the archive log, and generation VMID allocation never talk to the
-# hypervisor. adopt_deployed_template is the exception: on an empty store it
-# inventories the already-deployed TEMPLATE_ID fleet. It never destroys.
+# This is the data layer, plus adoption (spec 8) and the read-only
+# `runner generations` CLI. Record access, the state machine, the archive log,
+# and generation VMID allocation never talk to the hypervisor.
+# adopt_deployed_template is the exception: on an empty store it inventories
+# the already-deployed TEMPLATE_ID fleet. It never destroys.
+# generations_main never writes config, VMs, or generation records.
 #
 # Two rules hold everywhere below, because GEN_ID is the identity that clone
 # attribution (spec 5), promotion, rollback and GC all key off:
@@ -23,6 +25,11 @@
 # unused-variable and lost-in-a-subshell heuristics do not apply here.
 # shellcheck disable=SC2034,SC2030,SC2031
 set -euo pipefail
+
+if [[ -n "${RUNNER_GENERATIONS_LOADED:-}" ]]; then
+    return 0
+fi
+RUNNER_GENERATIONS_LOADED=1
 
 source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/common.sh"
 
@@ -89,6 +96,33 @@ gen_is_field() {
 
 gen_now() {
     date -u +%Y-%m-%dT%H:%M:%SZ
+}
+
+# UTC ISO-8601 (YYYY-MM-DDTHH:MM:SSZ, optional fractional seconds) to epoch.
+# BSD date has no -d; python3 is on pve, Ubuntu CI, and macOS test hosts.
+# Proven by "gen_age_days is 10 for a stamp 10 days before gen_now".
+gen_iso_to_epoch() {
+    local ts="${1:-}"
+    [[ -n "$ts" ]] || return 1
+    python3 -c '
+import sys, datetime
+s = sys.argv[1].strip()
+if s.endswith("Z"):
+    s = s[:-1]
+if "." in s:
+    s = s.split(".", 1)[0]
+print(int(datetime.datetime.strptime(s, "%Y-%m-%dT%H:%M:%S").replace(tzinfo=datetime.timezone.utc).timestamp()))
+' "$ts"
+}
+
+# Integer days since <iso8601> UTC, using gen_now as "now".
+gen_age_days() {
+    local ts="${1:-}" now epoch_then epoch_now
+    [[ -n "$ts" ]] || return 1
+    now=$(gen_now)
+    epoch_now=$(gen_iso_to_epoch "$now") || return 1
+    epoch_then=$(gen_iso_to_epoch "$ts") || return 1
+    printf '%s\n' $(( (epoch_now - epoch_then) / 86400 ))
 }
 
 # ---------------------------------------------------------------------------
@@ -598,6 +632,159 @@ gen_vmid_for_id() (
 )
 
 # ---------------------------------------------------------------------------
+# Clone refcount (spec 5) — conservative tag-based count
+#
+# GC is out of scope. This does not walk ZFS origin, does not invent a
+# destroy path, and does not write. Untagged runner VMs (get_vm_org !=
+# unknown) are attributed to the active generation when one is known, and
+# always logged at warn — conservative, since it can only inflate the
+# active generation's count.
+# ---------------------------------------------------------------------------
+
+# Fills _GEN_REFCOUNTS[gen_id] and _GEN_UNTAGGED. Warns once when any
+# runner VM has no gen-* tag. Never writes.
+_generation_refcount_scan() {
+    unset _GEN_REFCOUNTS
+    declare -gA _GEN_REFCOUNTS
+    _GEN_REFCOUNTS=()
+    _GEN_UNTAGGED=()
+
+    local active_id="" vmid line org gid
+    local -A exclude=()
+
+    if [[ -n "${TEMPLATE_ID:-}" ]] && gen_exists "$TEMPLATE_ID"; then
+        active_id=$(
+            gen_read "$TEMPLATE_ID" || exit 1
+            printf '%s' "$GEN_ID"
+        ) || return 1
+    fi
+
+    [[ -n "${TEMPLATE_ID:-}" ]] && exclude["$TEMPLATE_ID"]=1
+    while read -r vmid; do
+        [[ -n "$vmid" ]] || continue
+        exclude["$vmid"]=1
+    done < <(gen_list)
+
+    while read -r line; do
+        [[ -z "$line" ]] && continue
+        vmid=$(awk '{print $1}' <<< "$line")
+        [[ "$vmid" =~ ^[0-9]+$ ]] || continue
+        [[ -n "${exclude[$vmid]:-}" ]] && continue
+
+        if qm config "$vmid" 2>/dev/null | grep -q '^template:[[:space:]]*1'; then
+            continue
+        fi
+
+        gid=$(get_vm_generation "$vmid")
+        org=$(get_vm_org "$vmid")
+
+        if [[ -n "$gid" ]]; then
+            _GEN_REFCOUNTS["$gid"]=$(( ${_GEN_REFCOUNTS[$gid]:-0} + 1 ))
+            continue
+        fi
+        if [[ "$org" != "unknown" ]]; then
+            _GEN_UNTAGGED+=("$vmid")
+            if [[ -n "$active_id" ]]; then
+                _GEN_REFCOUNTS["$active_id"]=$(( ${_GEN_REFCOUNTS[$active_id]:-0} + 1 ))
+            fi
+        fi
+    done < <(qm list 2>/dev/null | tail -n +2 || true)
+
+    if [[ ${#_GEN_UNTAGGED[@]} -gt 0 ]]; then
+        log_warn "runner VM(s) missing gen-* tag: ${_GEN_UNTAGGED[*]}"
+    fi
+    return 0
+}
+
+# Number of non-template VMs attributed to <gen_id> by tag (or, for
+# untagged runners, to the active generation). stdout is a non-negative
+# integer. Proven by "generation_refcount counts tagged clones and excludes
+# the template VMID".
+generation_refcount() {
+    local target="${1:-}"
+    if ! gen_is_uint "$target"; then
+        log_error "Invalid generation id: ${target:-<empty>}"
+        return 1
+    fi
+    _generation_refcount_scan || return 1
+    printf '%s\n' "${_GEN_REFCOUNTS[$target]:-0}"
+}
+
+# Human disk usage for a generation VMID, from pvesm Size (bytes). "-" when
+# storage is unknown or the list fails — display, not a hard error.
+generation_disk_usage() {
+    local vmid="${1:-}" total=0 size list=""
+    if [[ ! "$vmid" =~ ^[0-9]+$ ]]; then
+        printf '%s\n' '-'
+        return 0
+    fi
+    if [[ -z "${VM_STORAGE:-}" ]]; then
+        printf '%s\n' '-'
+        return 0
+    fi
+    # Capture first: a failing pvesm under pipefail must not abort display.
+    list=$(pvesm list "$VM_STORAGE" 2>/dev/null) || list=""
+    while read -r size; do
+        [[ "$size" =~ ^[0-9]+$ ]] || continue
+        total=$((total + size))
+    done < <(printf '%s\n' "$list" | awk -v vmid="$vmid" '
+        NR > 1 && $NF == vmid && $(NF-1) ~ /^[0-9]+$/ { print $(NF-1) }
+    ')
+    if (( total >= 1073741824 )); then
+        printf '%dG\n' $(( total / 1073741824 ))
+    elif (( total >= 1048576 )); then
+        printf '%dM\n' $(( total / 1048576 ))
+    elif (( total > 0 )); then
+        printf '%dB\n' "$total"
+    else
+        printf '%s\n' '-'
+    fi
+}
+
+# Table of live generations. Empty store prints "(no generations)" and
+# succeeds. Never writes. Proven by "generations_main degrades with no records".
+generations_print_table() {
+    local vmid id state version age clones disk d
+    local list
+
+    list=$(gen_list) || return 1
+    if [[ -z "$list" ]]; then
+        echo "(no generations)"
+        return 0
+    fi
+
+    _generation_refcount_scan || return 1
+
+    printf "%-4s %-8s %-12s %-12s %-6s %-6s %-8s\n" \
+        "ID" "VMID" "STATE" "RUNNER" "AGE" "CLONES" "DISK"
+    printf "%-4s %-8s %-12s %-12s %-6s %-6s %-8s\n" \
+        "--" "----" "-----" "------" "---" "------" "----"
+
+    while read -r vmid; do
+        [[ -n "$vmid" ]] || continue
+        gen_read "$vmid" || return 1
+        id="${GEN_ID:-?}"
+        state="${GEN_STATE:-?}"
+        version="${GEN_RUNNER_VERSION:-unknown}"
+        [[ -n "$version" ]] || version="unknown"
+        age="-"
+        if [[ -n "${GEN_CREATED_AT:-}" ]] && d=$(gen_age_days "$GEN_CREATED_AT"); then
+            age="${d}d"
+        fi
+        clones="${_GEN_REFCOUNTS[$id]:-0}"
+        disk=$(generation_disk_usage "$vmid")
+        printf "%-4s %-8s %-12s %-12s %-6s %-6s %-8s\n" \
+            "$id" "$vmid" "$state" "$version" "$age" "$clones" "$disk"
+    done <<< "$list"
+}
+
+generations_main() {
+    echo ""
+    generations_print_table || return 1
+    echo ""
+}
+
+# ---------------------------------------------------------------------------
 # Generation id counter
 # ---------------------------------------------------------------------------
 
@@ -1103,3 +1290,13 @@ adopt_deployed_template() {
 
     return 0
 }
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    require_root generations
+    if [[ -f "$CONFIG_FILE" ]]; then
+        load_infra_config
+    else
+        apply_generation_defaults
+    fi
+    generations_main "$@"
+fi

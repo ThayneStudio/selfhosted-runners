@@ -12,6 +12,8 @@ case "$COMMAND" in
     start)     exec "$SCRIPT_DIR/lib/start.sh" "$@" ;;
     stop)      exec "$SCRIPT_DIR/lib/stop.sh" "$@" ;;
     list)      exec "$SCRIPT_DIR/lib/list.sh" "$@" ;;
+    status)    exec "$SCRIPT_DIR/lib/status.sh" "$@" ;;
+    generations) exec "$SCRIPT_DIR/lib/generations.sh" "$@" ;;
     setup)     exec "$SCRIPT_DIR/lib/setup.sh" "$@" ;;
     add-org)   exec "$SCRIPT_DIR/lib/add-org.sh" "$@" ;;
     remove-org) exec "$SCRIPT_DIR/lib/remove-org.sh" "$@" ;;
@@ -35,6 +37,8 @@ case "$COMMAND" in
         echo "  start                       Exit maintenance mode and resume watcher"
         echo "  stop [options]              Enter maintenance mode and stop managed runners"
         echo "  list                        List all runner VMs"
+        echo "  status                      Fleet health overview"
+        echo "  generations                 List runner generations"
         echo "  watch                       Fill runner pools (run by timer)"
         echo "  guard [--dry-run]           Reap stopped and over-age runner VMs (run by timer)"
         echo "  bake [--force] [--dry-run]  Bake a new candidate generation"

@@ -945,3 +945,17 @@ after 5400s"
     [ "$status" -eq 1 ]
     [ ! -e "$GENERATION_ARCHIVE_LOG" ]
 }
+
+@test "gen_age_days is 10 for a stamp 10 days before gen_now" {
+    gen_now() { printf '%s\n' '2026-08-25T00:00:00Z'; }
+    run gen_age_days '2026-08-15T00:00:00Z'
+    [ "$status" -eq 0 ]
+    [ "$output" = "10" ]
+}
+
+@test "gen_age_days strips fractional seconds from GitHub timestamps" {
+    gen_now() { printf '%s\n' '2026-08-11T00:00:00Z'; }
+    run gen_age_days '2026-08-01T12:00:00.123Z'
+    [ "$status" -eq 0 ]
+    [ "$output" = "9" ]
+}
