@@ -94,8 +94,8 @@ fi
 log_info "Destroying $RUNNER_NAME (VMID $VMID)..."
 qm destroy "$VMID" --purge 200>&- 201>&- 202>&- || { log_error "Failed to destroy $VMID"; exit 1; }
 
-# Clean up snippets
-rm -f "${SNIPPETS_DIR}/runner-${VMID}-meta.yaml" "${SNIPPETS_DIR}/runner-${VMID}-vendor.yaml"
+# Clean up per-VM cloud-init snippets (meta + canary vendor-data).
+cleanup_clone_snippets "$VMID"
 
 log_info "$RUNNER_NAME destroyed."
 if systemctl is-active --quiet github-runner-watch.timer 2>/dev/null; then

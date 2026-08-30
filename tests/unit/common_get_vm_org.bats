@@ -29,6 +29,16 @@ EOF
     [ "$output" = "thayne-studio" ]
 }
 
+@test "get_vm_org still reads the org when cicustom includes vendor=" {
+    stub_out qm 'config 501' <<'EOF'
+name: canary-gen5
+cicustom: user=local:snippets/runner-user-data-acme.yaml,meta=local:snippets/runner-501-meta.yaml,vendor=local:snippets/runner-501-vendor.yaml
+EOF
+
+    run get_vm_org 501
+    [ "$output" = "acme" ]
+}
+
 @test "get_vm_org reports unknown for a VM with no cicustom" {
     stub_out qm 'config 700' <<'EOF'
 name: unrelated-vm

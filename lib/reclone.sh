@@ -81,13 +81,13 @@ if (( STREAK >= FAIL_THRESHOLD )); then
     # problem persists, we'll re-accumulate to threshold and defer again
     # (bounded-rate backoff). If it resolved, we proceed normally.
     echo 0 > "$FAIL_STREAK_FILE"
-    rm -f "${SNIPPETS_DIR}/runner-${VMID}-meta.yaml"
+    cleanup_clone_snippets "$VMID"
     qm destroy "$VMID" --purge 200>&- 2>/dev/null || true
     exit 0
 fi
 
 # Destroy the old VM (retry briefly in case Proxmox lock hasn't released)
-rm -f "${SNIPPETS_DIR}/runner-${VMID}-meta.yaml"
+cleanup_clone_snippets "$VMID"
 for attempt in 1 2 3; do
     destroy_output=$(qm destroy "$VMID" --purge 200>&- 2>&1) && destroy_rc=0 || destroy_rc=$?
     printf '%s\n' "$destroy_output" | logger -t github-runner || true

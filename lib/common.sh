@@ -756,6 +756,52 @@ generate_mac() {
     echo -n "$1" | md5sum | sed 's/\(..\)\(..\)\(..\)\(..\)\(..\).*/02:\1:\2:\3:\4:\5/'
 }
 
+# Per-VM cloud-init vendor-data for a canary clone. register-runner.sh sources
+# /etc/github-runner/labels.env when present, so the guest registers with only
+# gen-<id>-canary and --no-default-labels. Proven by "write_canary_vendor_snippet
+# emits labels.env for gen-N-canary".
+write_canary_vendor_snippet() {
+    local vmid="${1:-}" gen_id="${2:-}" snippet
+    if [[ ! "$vmid" =~ ^[0-9]+$ || ! "$gen_id" =~ ^[0-9]+$ ]]; then
+        log_error "write_canary_vendor_snippet: vmid and gen id must be numeric"
+        return 1
+    fi
+    snippet="${SNIPPETS_DIR}/runner-${vmid}-vendor.yaml"
+    cat > "$snippet" <<EOF || return 1
+#cloud-config
+write_files:
+  - path: /etc/github-runner/labels.env
+    permissions: '0600'
+    content: |
+      RUNNER_LABELS="gen-${gen_id}-canary"
+      RUNNER_NO_DEFAULT_LABELS=true
+EOF
+    chmod 600 "$snippet" || return 1
+}
+
+# Remove per-VM cloud-init snippets. Vendor is canary-only; rm -f both so a
+# later occupant of the same VMID cannot inherit gen-N-canary labels.
+# Proven by "cleanup_clone_snippets removes meta and vendor files".
+cleanup_clone_snippets() {
+    local vmid="${1:-}"
+    [[ "$vmid" =~ ^[0-9]+$ ]] || return 0
+    rm -f "${SNIPPETS_DIR}/runner-${vmid}-meta.yaml" \
+          "${SNIPPETS_DIR}/runner-${vmid}-vendor.yaml"
+}
+
+_ensure_generations_lib() {
+    if declare -F gen_list >/dev/null 2>&1; then
+        return 0
+    fi
+    if [[ -r "$LIB_DIR/generations.sh" ]]; then
+        # generations.sh sources common.sh; RUNNER_COMMON_LOADED makes that
+        # a no-op. source=/dev/null so shellcheck does not follow the cycle.
+        # shellcheck source=/dev/null
+        source "$LIB_DIR/generations.sh" || return 1
+    fi
+    declare -F gen_list >/dev/null 2>&1
+}
+
 # GEN_ID whose record names this template VMID. Scans every record matching
 # GEN_VMID rather than "the currently active generation": a promotion can land
 # between a caller reading the pointer and clone_runner running, and tagging
@@ -778,29 +824,33 @@ clone_generation_id_for_vmid() (
 )
 
 # Tag a fresh clone from the VMID actually cloned. Missing store or record is
-# a warning, not a failed clone.
+# a warning, not a failed clone — unless extra_tag is set (canary), which is
+# fail-closed so an untagged canary cannot register with production labels.
 clone_tag_generation() {
-    local clone_vmid="$1" template_vmid="$2" gen_id=""
+    local clone_vmid="$1" template_vmid="$2" extra_tag="${3:-}"
+    local gen_id="" tags
 
-    if ! declare -F gen_list >/dev/null 2>&1; then
-        if [[ -r "$LIB_DIR/generations.sh" ]]; then
-            # generations.sh sources common.sh; RUNNER_COMMON_LOADED makes that
-            # a no-op. source=/dev/null so shellcheck does not follow the cycle.
-            # shellcheck source=/dev/null
-            source "$LIB_DIR/generations.sh" || true
+    if ! _ensure_generations_lib; then
+        if [[ -n "$extra_tag" ]]; then
+            log_error "clone_runner: generation store unavailable — cannot tag $clone_vmid as $extra_tag"
+            return 1
         fi
-    fi
-    if ! declare -F gen_list >/dev/null 2>&1; then
         log_warn "clone_runner: generation store unavailable — clone $clone_vmid untagged"
         return 0
     fi
 
     gen_id=$(clone_generation_id_for_vmid "$template_vmid") || gen_id=""
     if [[ -z "$gen_id" ]]; then
+        if [[ -n "$extra_tag" ]]; then
+            log_error "clone_runner: no generation record for template VMID $template_vmid — cannot tag $clone_vmid as $extra_tag"
+            return 1
+        fi
         log_warn "clone_runner: no generation record for template VMID $template_vmid — clone $clone_vmid untagged"
         return 0
     fi
-    if ! qm set "$clone_vmid" --tags "runner,gen-${gen_id}" \
+    tags="runner,gen-${gen_id}"
+    [[ -n "$extra_tag" ]] && tags="${tags},${extra_tag}"
+    if ! qm set "$clone_vmid" --tags "$tags" \
         200>&- \
         201>&- \
         202>&- \
@@ -812,6 +862,26 @@ clone_tag_generation() {
     return 0
 }
 
+# Canary clone of a specific template VMID (typically a candidate). Production
+# callers stay on clone_runner name/org and never pass --canary.
+# Proven by "clone_canary_runner clones the candidate template not TEMPLATE_ID".
+clone_canary_runner() {
+    local name="${1:-}" org="${2:-}" template_vmid="${3:-}" vmid="${4:-}"
+    if [[ -z "$name" || -z "$org" || -z "$template_vmid" ]]; then
+        log_error "clone_canary_runner: usage: clone_canary_runner <name> <org> <template-vmid> [vmid]"
+        return 1
+    fi
+    if [[ ! "$template_vmid" =~ ^[0-9]+$ ]]; then
+        log_error "clone_canary_runner: invalid template VMID $template_vmid"
+        return 1
+    fi
+    if [[ -n "$vmid" ]]; then
+        clone_runner --canary --template "$template_vmid" "$name" "$org" "$vmid"
+    else
+        clone_runner --canary --template "$template_vmid" "$name" "$org"
+    fi
+}
+
 # Clone template, configure cloud-init, set hookscript, start VM.
 # Returns VMID on stdout.
 # Returns 1 on failure (cleans up partial clone).
@@ -819,11 +889,64 @@ clone_tag_generation() {
 # (CLONE_PAUSE_RETRY_MAX_SECONDS, default 130 — longer than promote's 120s
 # exclusive-lock wait). Distinct from 1 so reclone.sh / watch.sh retry
 # without notifying clone.failed. Tests set the bound to 0 to skip the wait.
+#
+# --canary writes vendor-data so the guest registers with only gen-N-canary
+# and --no-default-labels, and tags runner,gen-N,runner-canary. --template
+# clones that VMID instead of the active pointer; it is rejected without
+# --canary so production call sites stay byte-identical (user= + meta= only).
 clone_runner() {
-    local name="$1" org="$2" vmid="${3:-}"
+    local name="" org="" vmid=""
+    local canary=0 template_override="" clone_src="" canary_gen_id="" extra_tag="" cicustom=""
     local RESERVED_VMID=""
     local pause_waited=0
     local pause_max="${CLONE_PAUSE_RETRY_MAX_SECONDS:-130}"
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --canary)
+                canary=1
+                shift
+                ;;
+            --template)
+                if [[ $# -lt 2 || -z "$2" || "$2" == --* ]]; then
+                    log_error "clone_runner: --template requires a VMID"
+                    return 1
+                fi
+                template_override="$2"
+                shift 2
+                ;;
+            --template=*)
+                template_override="${1#--template=}"
+                shift
+                ;;
+            --)
+                shift
+                break
+                ;;
+            -*)
+                log_error "clone_runner: unknown option $1"
+                return 1
+                ;;
+            *)
+                break
+                ;;
+        esac
+    done
+    name="${1:-}"
+    org="${2:-}"
+    vmid="${3:-}"
+    if [[ -z "$name" || -z "$org" ]]; then
+        log_error "clone_runner: usage: clone_runner [--canary] [--template VMID] <name> <org> [vmid]"
+        return 1
+    fi
+    if [[ -n "$template_override" && "$canary" -ne 1 ]]; then
+        log_error "clone_runner: --template is only valid with --canary"
+        return 1
+    fi
+    if [[ -n "$template_override" && ! "$template_override" =~ ^[0-9]+$ ]]; then
+        log_error "clone_runner: invalid template VMID $template_override"
+        return 1
+    fi
 
     exec 202>"$POOL_ACTIVITY_LOCK_FILE"
     flock -s 202
@@ -877,11 +1000,35 @@ clone_runner() {
     # Re-read after the shared lock so a promotion that ran after the caller
     # sourced CONFIG_FILE is visible before qm clone.
     # Proven by "clone_runner re-reads TEMPLATE_ID after the shared lock".
-    TEMPLATE_ID=$(reload_active_template_id) || {
-        log_error "clone_runner: failed to re-read TEMPLATE_ID"
-        exec 202>&-
-        return 1
-    }
+    # --template (canary only) clones that VMID instead of the active pointer.
+    if [[ -n "$template_override" ]]; then
+        clone_src="$template_override"
+    else
+        TEMPLATE_ID=$(reload_active_template_id) || {
+            log_error "clone_runner: failed to re-read TEMPLATE_ID"
+            exec 202>&-
+            return 1
+        }
+        clone_src="$TEMPLATE_ID"
+    fi
+
+    # A canary without a generation id cannot isolate labels — refuse before
+    # allocating a VMID. Proven by "clone_runner --canary fails closed without
+    # a generation record".
+    if [[ "$canary" -eq 1 ]]; then
+        if ! _ensure_generations_lib; then
+            log_error "clone_runner: generation store unavailable — refusing canary clone"
+            exec 202>&-
+            return 1
+        fi
+        canary_gen_id=$(clone_generation_id_for_vmid "$clone_src") || canary_gen_id=""
+        if [[ -z "$canary_gen_id" ]]; then
+            log_error "clone_runner: canary clone requires a generation record for template $clone_src"
+            exec 202>&-
+            return 1
+        fi
+        extra_tag="runner-canary"
+    fi
 
     # Cleanup helper: destroy VM (only if it belongs to us), remove snippet, and
     # sweep orphan zvols at this VMID. The ownership check prevents touching
@@ -897,7 +1044,7 @@ clone_runner() {
             return 0
         fi
 
-        rm -f "${SNIPPETS_DIR}/runner-${vmid}-meta.yaml"
+        cleanup_clone_snippets "$vmid"
 
         if [[ "$owner" == "$name" ]]; then
             local destroy_err; destroy_err=$(mktemp)
@@ -991,7 +1138,7 @@ clone_runner() {
     # `journalctl -t github-runner` instead of being buried under the service
     # unit log (which the operator does not look at first).
     local clone_err; clone_err=$(mktemp)
-    if ! qm clone "$TEMPLATE_ID" "$vmid" --name "$name" 200>&- 201>&- 202>&- 203>&- 204>&- 2>"$clone_err"; then
+    if ! qm clone "$clone_src" "$vmid" --name "$name" 200>&- 201>&- 202>&- 203>&- 204>&- 2>"$clone_err"; then
         while IFS= read -r line; do
             [[ -n "$line" ]] && log_error "qm clone $vmid: $line"
         done < "$clone_err"
@@ -1005,7 +1152,7 @@ clone_runner() {
     rm -f "$clone_err"
     release_clone_slot
 
-    if ! clone_tag_generation "$vmid" "$TEMPLATE_ID"; then
+    if ! clone_tag_generation "$vmid" "$clone_src" "$extra_tag"; then
         _fail
         release_vmid_reservation "$vmid"
         exec 202>&-
@@ -1040,7 +1187,15 @@ local-hostname: "$name"
 EOF
     chmod 600 "${SNIPPETS_DIR}/runner-${vmid}-meta.yaml"
 
-    qm set "$vmid" --cicustom "user=local:snippets/runner-user-data-${org}.yaml,meta=local:snippets/runner-${vmid}-meta.yaml" \
+    if [[ "$canary" -eq 1 ]]; then
+        write_canary_vendor_snippet "$vmid" "$canary_gen_id" || { _fail; exec 202>&-; return 1; }
+    fi
+
+    cicustom="user=local:snippets/runner-user-data-${org}.yaml,meta=local:snippets/runner-${vmid}-meta.yaml"
+    if [[ "$canary" -eq 1 ]]; then
+        cicustom="${cicustom},vendor=local:snippets/runner-${vmid}-vendor.yaml"
+    fi
+    qm set "$vmid" --cicustom "$cicustom" \
         200>&- \
         201>&- \
         202>&- \

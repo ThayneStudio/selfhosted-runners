@@ -178,6 +178,15 @@ write_files:
       # to these runners. Registration still SUCCEEDS -- runners appear Online/Idle
       # while jobs queue forever, which reads like a GitHub outage rather than a
       # stale template. Keep the rebake schedule healthy.
+      #
+      # --no-default-labels when labels.env sets RUNNER_NO_DEFAULT_LABELS: config.sh
+      # otherwise adds self-hosted/Linux/X64, which would make a canary eligible
+      # for production jobs. Proven by "register-runner.sh passes --no-default-labels
+      # when RUNNER_NO_DEFAULT_LABELS=true".
+      extra=""
+      if [[ "${RUNNER_NO_DEFAULT_LABELS:-}" == "true" ]]; then
+        extra="--no-default-labels"
+      fi
       for attempt in 1 2 3; do
         if sudo -u $RUNNER_USER ./config.sh \
           --url "https://github.com/${GITHUB_ORG}" \
@@ -187,7 +196,8 @@ write_files:
           --unattended \
           --replace \
           --disableupdate \
-          --ephemeral; then
+          --ephemeral \
+          ${extra:+"$extra"}; then
           break
         fi
         if [[ $attempt -eq 3 ]]; then
