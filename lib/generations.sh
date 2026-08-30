@@ -3,10 +3,10 @@
 # monotonic id counter that numbers them, the lifecycle state machine, and the
 # append-only archive log.
 #
-# This is the data layer, plus adoption (spec 8). Record access, the state
-# machine, the archive log, and generation VMID allocation never talk to the
-# hypervisor. adopt_deployed_template is the exception: on an empty store it
-# inventories the already-deployed TEMPLATE_ID fleet. It never destroys.
+# This is the data layer, plus adoption (spec 8) and clone attribution
+# (spec 5). Record access, the state machine, the archive log, and generation
+# VMID allocation never talk to the hypervisor. adopt_deployed_template and
+# generation_refcount inventory the live fleet; they never destroy.
 #
 # Two rules hold everywhere below, because GEN_ID is the identity that clone
 # attribution (spec 5), promotion, rollback and GC all key off:
@@ -884,6 +884,140 @@ allocate_generation_vmid() {
     log_error "generation VMID band ${TEMPLATE_BAND_MIN}-${TEMPLATE_BAND_MAX} is exhausted"
     return 1
 }
+
+# ---------------------------------------------------------------------------
+# Clone attribution (spec 5)
+#
+# get_vm_generation (lib/common.sh) parses tags: from qm config.
+# generation_refcount counts live VM configs attributed to a generation by
+# that tag, cross-checked against ZFS/nested origin via
+# list_template_linked_clone_volids. Disagreement is a warning (manual VM
+# surgery). Untagged clones with no resolvable origin are attributed to the
+# active generation — that can only delay GC, never cause a premature
+# destroy. Never counts template VMIDs, never destroys TEMPLATE_ID.
+# ---------------------------------------------------------------------------
+
+# Child VMIDs whose disk traces to <template_vmid> (nested volid or ZFS
+# origin). Reuses list_template_linked_clone_volids with that VMID so
+# TEMPLATE_ID is never clobbered.
+generation_origin_child_vmids() {
+    local template_vmid="${1:-}" child_list volid child
+    child_list=$(list_template_linked_clone_volids "$template_vmid") || return 1
+    [[ -n "$child_list" ]] || return 0
+    while read -r volid; do
+        [[ -n "$volid" ]] || continue
+        child=$(linked_clone_child_vmid "$volid")
+        [[ -n "$child" ]] || continue
+        printf '%s\n' "$child"
+    done <<< "$child_list"
+}
+
+# True when a qm config body looks like a runner clone (cicustom snippet or
+# a `runner` tag). Untagged-no-origin fallback is restricted to these so a
+# leftover VM on the host cannot inflate every refcount.
+generation_cfg_is_runner() {
+    local cfg="${1:-}" tags_line tag
+    local -a tags=()
+    [[ "$cfg" =~ runner-user-data-[^.]+\.yaml ]] && return 0
+    tags_line=$(grep -m1 '^tags:' <<< "$cfg" || true)
+    tags_line="${tags_line#tags:}"
+    IFS=';,' read -ra tags <<< "$tags_line"
+    for tag in "${tags[@]}"; do
+        tag="${tag//[[:space:]]/}"
+        [[ "$tag" == "runner" ]] && return 0
+    done
+    return 1
+}
+
+# Number of live VM configs attributed to generation <gen_id>.
+# Usage: generation_refcount <gen_id>
+# stdout: integer count. Exit 1 if the generation is unknown or inventory
+# cannot be read — never report 0 on a failed listing.
+# Proven by "generation_refcount counts VMs tagged gen-N and excludes the
+# template", "generation_refcount counts an untagged clone via ZFS origin",
+# "untagged clone with no origin is attributed to the active generation with
+# a warning", and "tag vs origin disagreement warns and counts the VM for
+# both generations".
+generation_refcount() (
+    local target="${1:-}" rec_vmid rec_id child_list child
+    local all_vms vmid vm_name status cfg tags_line tag_id orig_id active_id=""
+    local count=0 attributed
+    local -A template_vmids=() origin_gen=()
+
+    if ! gen_is_uint "$target"; then
+        log_error "Invalid generation id: ${target:-<empty>}"
+        return 1
+    fi
+    target=$((10#$target))
+    # Resolve the id first so an unknown generation fails before inventory.
+    gen_vmid_for_id "$target" >/dev/null || return 1
+
+    if [[ -n "${TEMPLATE_ID:-}" ]] && gen_exists "$TEMPLATE_ID"; then
+        gen_read "$TEMPLATE_ID" || return 1
+        active_id=$(gen_require_numeric_id "$TEMPLATE_ID") || return 1
+    elif [[ -n "${TEMPLATE_ID:-}" ]]; then
+        active_id=$(clone_generation_id_for_vmid "$TEMPLATE_ID") || active_id=""
+        [[ -z "$active_id" ]] || active_id=$((10#$active_id))
+    fi
+
+    while read -r rec_vmid; do
+        [[ -n "$rec_vmid" ]] || continue
+        template_vmids["$rec_vmid"]=1
+        gen_read "$rec_vmid" || return 1
+        rec_id=$(gen_require_numeric_id "$rec_vmid") || return 1
+        child_list=$(generation_origin_child_vmids "$rec_vmid") || return 1
+        while read -r child; do
+            [[ -n "$child" ]] || continue
+            if [[ -n "${origin_gen[$child]:-}" && "${origin_gen[$child]}" -ne "$rec_id" ]]; then
+                log_warn "VMID $child origin matches multiple generations (${origin_gen[$child]} and $rec_id)"
+            fi
+            origin_gen["$child"]="$rec_id"
+        done <<< "$child_list"
+    done < <(gen_list)
+    [[ -n "${TEMPLATE_ID:-}" ]] && template_vmids["$TEMPLATE_ID"]=1
+
+    all_vms=$(qm list </dev/null) || {
+        log_error "Failed to list VMs for generation refcount"
+        return 1
+    }
+
+    while read -r vmid vm_name status _; do
+        [[ "$vmid" =~ ^[0-9]+$ ]] || continue
+        [[ -z "${template_vmids[$vmid]:-}" ]] || continue
+
+        cfg=$(qm config "$vmid" 2>/dev/null </dev/null) || cfg=""
+        if [[ -n "$cfg" ]] && grep -q '^template:[[:space:]]*1' <<< "$cfg"; then
+            continue
+        fi
+
+        tags_line=$(grep -m1 '^tags:' <<< "$cfg" || true)
+        tag_id=$(generation_id_from_tags "$tags_line" || true)
+        orig_id="${origin_gen[$vmid]:-}"
+
+        if [[ -n "$tag_id" && -n "$orig_id" && "$tag_id" -ne "$orig_id" ]]; then
+            log_warn "VMID $vmid generation tag gen-${tag_id} disagrees with origin gen-${orig_id}"
+        fi
+
+        attributed=0
+        if [[ -n "$tag_id" && "$tag_id" -eq "$target" ]]; then
+            attributed=1
+        fi
+        if [[ -n "$orig_id" && "$orig_id" -eq "$target" ]]; then
+            attributed=1
+        fi
+
+        if [[ -z "$tag_id" && -z "$orig_id" ]] && generation_cfg_is_runner "$cfg"; then
+            log_warn "VMID $vmid is untagged with no resolvable origin — attributing to the active generation${active_id:+ $active_id}"
+            if [[ -n "$active_id" && "$active_id" -eq "$target" ]]; then
+                attributed=1
+            fi
+        fi
+
+        [[ "$attributed" -eq 1 ]] && count=$((count + 1))
+    done <<< "$all_vms"
+
+    printf '%s\n' "$count"
+)
 
 # ---------------------------------------------------------------------------
 # Adoption (spec 8)

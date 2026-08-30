@@ -476,6 +476,43 @@ get_vm_org() {
     fi
 }
 
+# GEN_ID encoded in a Proxmox tags value (`runner;gen-5` or `runner,gen-5`).
+# First well-formed gen-<digits> tag wins. Proven by
+# "get_vm_generation reads gen-N from semicolon-separated tags" and
+# "get_vm_generation ignores a gen- prefix that is not a generation id".
+generation_id_from_tags() {
+    local current="${1:-}" tag id
+    local -a tags=()
+
+    current="${current#tags:}"
+    current="${current%$'\r'}"
+    IFS=';,' read -ra tags <<< "$current"
+    for tag in "${tags[@]}"; do
+        tag="${tag//[[:space:]]/}"
+        [[ -n "$tag" ]] || continue
+        if [[ "$tag" =~ ^gen-([0-9]+)$ ]]; then
+            id="${BASH_REMATCH[1]}"
+            # Same bound as gen_is_uint: keep the value inside arithmetic.
+            [[ ${#id} -le 18 ]] || continue
+            printf '%s\n' "$((10#$id))"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# GEN_ID from a VM's `tags:` line in `qm config`. Uniform across storage
+# backends; the ZFS origin cross-check lives in generation_refcount.
+# Proven by "get_vm_generation reads gen-N from semicolon-separated tags".
+get_vm_generation() {
+    local vmid="${1:-}" cfg tags_line
+
+    [[ -n "$vmid" ]] || return 1
+    cfg=$(qm config "$vmid" 2>/dev/null) || return 1
+    tags_line=$(grep -m1 '^tags:' <<< "$cfg" || true)
+    generation_id_from_tags "$tags_line"
+}
+
 vm_config_path() {
     local vmid="$1"
     compgen -G "$PVE_NODES_DIR/*/qemu-server/${vmid}.conf" | head -n 1
@@ -559,8 +596,12 @@ release_clone_slot() {
     exec 204>&- 2>/dev/null || true
 }
 
+# Base volume ids of a template VM. Defaults to the active TEMPLATE_ID so
+# existing GC callers stay unchanged; generation_refcount passes a generation
+# VMID to cross-check origin against a superseded template.
 list_template_base_volids() {
-    qm config "$TEMPLATE_ID" 2>/dev/null | awk -F': ' -v storage="$VM_STORAGE:" '
+    local vmid="${1:-$TEMPLATE_ID}"
+    qm config "$vmid" 2>/dev/null | awk -F': ' -v storage="$VM_STORAGE:" '
         $1 ~ /^(ide|sata|scsi|virtio)[0-9]+$/ {
             split($2, parts, ",")
             if (index(parts[1], storage "base-") == 1) {
@@ -593,6 +634,7 @@ zfs_dataset_from_volid() {
 }
 
 list_template_linked_clone_volids() {
+    local template_vmid="${1:-$TEMPLATE_ID}"
     local storage_list base_volid base_path prefix volid child_name base_dataset dataset origin
     local -A seen=()
 
@@ -615,7 +657,7 @@ list_template_linked_clone_volids() {
             seen["$volid"]=1
             printf '%s\n' "$volid"
         done <<< "$storage_list"
-    done < <(list_template_base_volids)
+    done < <(list_template_base_volids "$template_vmid")
 
     # ZFS linked clones are sibling zvols, not nested volids. They point at
     # the template base volume snapshot via the ZFS origin property.
@@ -634,7 +676,7 @@ list_template_linked_clone_volids() {
             seen["$volid"]=1
             printf '%s\n' "$volid"
         done <<< "$storage_list"
-    done < <(list_template_base_volids)
+    done < <(list_template_base_volids "$template_vmid")
 }
 
 cleanup_template_orphan_volumes() {
