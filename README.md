@@ -2,6 +2,12 @@
 
 Zero-touch setup for self-hosted GitHub Actions runners on Proxmox.
 
+Runners are ephemeral: one job, shutdown, auto-destroy, watcher recreates. The
+base image is a **generation** — a baked template plus provenance. The platform
+bakes a new candidate when inputs change (or once a week); **you** promote it
+with `runner upgrade`. Nothing in the normal path destroys the live clone
+target.
+
 ## Quick Start
 
 ```bash
@@ -21,13 +27,25 @@ The wizard will:
 1. Ask for GitHub org, PAT, network bridge, storage pool
 2. Install to `/opt/selfhosted-runners`
 3. Add `runner` command to `/usr/local/bin`
-4. Download Ubuntu cloud image and create VM template
+4. Adopt the existing template as generation 1, or bake and promote the first
+   generation if none exists
+5. Enable the watch, guard, and daily maintain timers
 
-Then create runners from anywhere:
+The watcher then fills each org's pool (`RUNNER_COUNT`). To add a spare by hand:
+
 ```bash
 runner create runner-01
-runner create runner-02
 ```
+
+After setup, preview and promote a new image with:
+
+```bash
+runner upgrade --dry-run
+runner upgrade
+```
+
+Do **not** `qm destroy` the live clone target (`TEMPLATE_ID`, often still 9000
+until the first promotion).
 
 ## Architecture
 
@@ -35,27 +53,86 @@ runner create runner-02
 ┌─────────────────────────────────────────────────────────────────┐
 │ Proxmox Host                                                    │
 │                                                                 │
-│  /etc/github-runners.conf          ← Infra config (no secrets)  │
-│  /var/lib/vz/snippets/             ← Cloud-init config         │
+│  /etc/github-runners.conf   TEMPLATE_ID ──► active generation   │
+│  /var/lib/github-runners/generations/<vmid>.conf                │
 │                                                                 │
-│  ┌──────────────────┐                                          │
-│  │ Template (9000)  │  ← Ubuntu 24.04 cloud image              │
-│  └──────────────────┘                                          │
-│           │                                                     │
-│           │ clone                                               │
-│           ▼                                                     │
-│  ┌─────────┐  ┌─────────┐  ┌─────────┐                        │
-│  │runner-01│  │runner-02│  │runner-03│  ...                   │
-│  │ 2c/8GB  │  │ 2c/8GB  │  │ 2c/8GB  │                        │
-│  │  30GB   │  │  30GB   │  │  30GB   │                        │
-│  └─────────┘  └─────────┘  └─────────┘                        │
-│       │            │            │                               │
-│       └────────────┼────────────┘                               │
-│                    │                                            │
-│                    ▼                                            │
-│         GitHub Organization                                     │
-│    (runners shared by all repos)                                │
+│  Band 8900–8999                 Clone target (TEMPLATE_ID)      │
+│  ┌────────────┐  runner upgrade  ┌────────────┐                 │
+│  │ candidate  │ ───────────────► │   active   │  adopted 9000   │
+│  │  gen N+1   │    (promote)     │   gen N    │  or a band VMID │
+│  └────────────┘                  └─────┬──────┘                 │
+│        ▲                               │ clone                  │
+│        │ bake                          ▼                        │
+│  maintain.timer 02:30         runner-01  runner-02  runner-03   │
+│  (does not promote)             2c/8GB     2c/8GB     2c/8GB    │
+│                                                                 │
+│  watch.timer  30s   fill pools                                  │
+│  guard.timer   5m   reap stopped / over-age VMs                 │
+│                         GitHub orgs (runners shared by repos)   │
 └─────────────────────────────────────────────────────────────────┘
+```
+
+`TEMPLATE_ID` stays the clone pointer. Promotion rewrites it. Existing clones
+keep their old template until they recycle.
+
+## Generations
+
+A **generation** is one baked Proxmox template plus a record of how it was
+built (runner version, cloud-image checksum, input digest). Generations are
+immutable once baked. Exactly one is **active** — the clone target — at a time.
+
+| State | Meaning |
+|---|---|
+| `baking` | Band VM installing tools. Not a template. Never cloned. |
+| `candidate` | Bake confirmed and converted to a template. Not yet the clone target. |
+| `active` | `TEMPLATE_ID` points here. New clones come from this VMID. |
+| `superseded` | Was active; a newer generation was promoted. In-flight clones keep running on it. |
+| `failed` | Bake failed. Partial band VM is destroyed; the live clone target is not. |
+| `rejected` | Reserved for rollback (not in this release). |
+
+Records live at `/var/lib/github-runners/generations/<vmid>.conf`. New bakes
+allocate from `TEMPLATE_BAND_MIN`–`TEMPLATE_BAND_MAX` (default 8900–8999),
+**below** runner VMIDs (`MIN_VMID`, default `TEMPLATE_ID + 1`). An adopted
+template keeps its existing VMID (9000 on a host that already had one).
+
+### What happens when a generation is promoted
+
+1. The candidate is marked `active`.
+2. `TEMPLATE_ID` in `/etc/github-runners.conf` is rewritten to that VMID.
+3. The previous active is marked `superseded`.
+4. In-flight runners finish on the old template. The watcher and shutdown
+   hookscript clone **new** VMs from the new pointer.
+5. Clones are tagged `runner,gen-<id>` from the template VMID they were
+   actually cloned from.
+
+The fleet does not drain for a promote. Garbage collection of superseded
+templates is **not in this release** — they stay on disk. Do not destroy them
+by hand; they may still have linked clones.
+
+### Who bakes, who promotes
+
+| Actor | What it does |
+|---|---|
+| `github-runner-maintain.timer` (daily 02:30) / `runner maintain` | Adopt if needed, reconcile interrupted bakes, detect, bake a **candidate** if needed. **Does not promote.** |
+| You | `runner upgrade --dry-run` then `runner upgrade` — bake if needed and promote. |
+| `runner setup` | No template at `TEMPLATE_ID`: bake and promote generation 1. Template already there: **adopt** it as generation 1 and skip the bake. |
+
+`install.sh` on an existing host adopts and enables the maintain timer. It does
+**not** bake or promote.
+
+The first detect after adoption usually wants a bake: the adopted digest is
+`unknown`, so it cannot match current inputs.
+
+### Inspecting generations
+
+`runner status` and `runner generations` are not in this release. Until they
+ship:
+
+```bash
+runner upgrade --dry-run
+ls /var/lib/github-runners/generations/
+cat /var/lib/github-runners/generations/<vmid>.conf
+grep ^TEMPLATE_ID= /etc/github-runners.conf
 ```
 
 ## Prerequisites
@@ -64,7 +141,9 @@ runner create runner-02
 
 - **Proxmox VE 7.x or 8.x**
 - **Root access** to the Proxmox host
-- **Storage pool** with at least 50GB free (template + runners)
+- **Storage pool** with at least 50GB free (template + runners); a bake needs
+  `BAKE_MIN_FREE_GB` (default 60) free so a candidate can exist next to the
+  active generation
 - **Network bridge** (vmbr0 or custom) with internet access
 
 ### Network Requirements
@@ -117,19 +196,72 @@ The Proxmox host and runner VMs need outbound access to:
 
 ## Commands
 
-After setup, the `runner` command is available globally:
+After setup, the `runner` command is available globally (`runner help`):
 
 | Command | Description |
 |---------|-------------|
 | `runner setup` | Re-run the setup wizard |
-| `runner create <name>` | Create a new runner VM |
-| `runner destroy <name>` | Destroy a managed runner VM |
+| `runner add-org` | Add a GitHub organization |
+| `runner remove-org [<org>]` | Remove a GitHub organization |
+| `runner list-orgs` | List configured organizations |
+| `runner create [--org <org>] <name>` | Create a runner VM manually |
+| `runner destroy <name>` | Destroy a managed runner VM (`--vmid <vmid>` also works) |
 | `runner start` | Exit maintenance mode and resume watcher |
 | `runner stop [options]` | Enter maintenance mode and stop managed runners |
 | `runner list` | List all runner VMs |
-| `runner guard [--dry-run]` | Reap stopped and over-age runner VMs (normally run by timer) |
-| `runner upgrade [--dry-run] [--force]` | Bake a candidate if needed and promote it |
+| `runner watch` | Fill runner pools (run by timer) |
+| `runner guard [--dry-run]` | Reap stopped and over-age runner VMs (run by timer) |
+| `runner bake [--force] [--dry-run]` | Bake a new **candidate** generation (does not promote) |
+| `runner promote <id> [--skip-canary]` | Promote a candidate to active. Canary is not implemented; `--skip-canary` is required and asks for confirmation |
+| `runner maintain` | Unattended adopt/detect/bake cycle (run by timer). Does not promote |
+| `runner upgrade [--dry-run] [--force] [--foreground]` | Bake if needed and promote. This is the operator confirmation |
 | `runner help` | Show available commands |
+
+`runner stop` options: `--watch-only`, `--vmid-range <min:max>`, `--yes`.
+`runner guard` also accepts `--stopped-only`, `--now`, and `--wait <seconds>`
+(used by `runner start`).
+
+### Not in this release
+
+These verbs are specified for later work. They are **not** in `runner help` and
+will fail as unknown commands. Do not invent flags for them.
+
+| Command | Later purpose |
+|---|---|
+| `runner status` | Fleet overview |
+| `runner generations` | Generation table |
+| `runner canary` | Promotion gate (real GitHub job) |
+| `runner rollback` | Point active at the retained previous generation |
+| `runner rollover` | Drain old-generation clones |
+| `runner gc` | Destroy superseded templates with no clones |
+| `runner drift` | 30-day window alarm |
+
+## Generation configuration
+
+Generation keys are **not** written into `/etc/github-runners.conf` by setup.
+Code defaults apply; add a line only to override. Invalid integers/bools fall
+back to the default (except `REBAKE_WINDOW`, which fail-closes the bake).
+
+| Key | Default | Meaning |
+|---|---|---|
+| `TEMPLATE_BAND_MIN` | `8900` | Low end of the VMID band for new generation templates |
+| `TEMPLATE_BAND_MAX` | `8999` | High end of the band. Must sit below `MIN_VMID` |
+| `REBAKE_ENABLED` | `true` | `false` skips detect-driven bakes (`upgrade --force` still bakes) |
+| `REBAKE_MAX_AGE_DAYS` | `7` | Bake even when the digest is unchanged (weekly floor) |
+| `REBAKE_WINDOW` | `02:00-06:00` | Host-local window when `maintain` may **start** a bake. `HH:MM-HH:MM`, no midnight wrap. `runner bake` and `runner upgrade` ignore the window |
+| `BAKE_TIMEOUT` | `5400` | Seconds to wait for the guest completion marker (90 minutes) |
+| `BAKE_MIN_FREE_GB` | `60` | Refuse to bake if `VM_STORAGE` has less free than this |
+| `CANARY_ENABLED` | `false` | Leave false. `true` makes `runner upgrade` refuse (it skip-canaries). `maintain` also refuses to bake when this is true and `CANARY_REPO` is empty |
+| `CANARY_REPO` | *(empty)* | Required only if you set `CANARY_ENABLED=true` before canary ships |
+| `DETECT_FAIL_WARN_HOURS` | `24` | Notify `detect.failed` after this many hours of consecutive digest-fetch failures. The weekly floor still applies |
+| `GENERATION_RETAIN` | `1` | How many superseded generations to keep. **Unused until GC ships** |
+| `FAILED_GEN_RETAIN_DAYS` | `7` | How long to keep a failed generation. **Unused until GC ships** |
+| `CANDIDATE_MAX_AGE_DAYS` | `3` | Max age of an unpromoted candidate. **Unused until GC ships** |
+
+`MIN_VMID` is required and must be an unsigned integer **greater than**
+`TEMPLATE_BAND_MAX` (so `9000` or higher with the default band). `MIN_VMID=0`
+(auto) is a hard error: `pvesh get /cluster/nextid` could land inside the band.
+`install.sh` aborts an upgrade until it is set.
 
 ## Runner Lifetime and Reaping
 
@@ -219,7 +351,7 @@ Supabase local development defaults to Postgres 17. `psql` 16 would connect to a
 server newer than themselves, so a 16 client would break exactly the dump and
 restore steps. A 17 client still works against older (15/16) servers, so it is
 the safe default. Change the pinned version in `templates/template-setup.yaml`
-and rebuild the template if you need to match a different server major version.
+and run `runner upgrade` if you need to match a different server major version.
 
 Note that the PGDG apt source is baked into the template permanently, so every
 runner VM -- not just the Proxmox host at bake time -- needs `apt.postgresql.org`
@@ -231,7 +363,7 @@ Playwright Chromium is baked into the runner user's default cache at
 `/home/runner/.cache/ms-playwright`, so jobs running as `runner` can use it
 without extra path configuration. Consumer repos need to pin Playwright to
 `1.62.1` to use the prebaked cache. Change the pinned version in
-`templates/template-setup.yaml` and rebuild the template when upgrading
+`templates/template-setup.yaml` and run `runner upgrade` when upgrading
 intentionally.
 
 During template baking, the installer also runs a throwaway `supabase init`,
@@ -302,12 +434,18 @@ jobs:
 
 ## Canary workflow
 
-A newly baked template is promoted only after a runner cloned from it
-**completes a real GitHub Actions job**. Registering is not evidence: a runner
-that registers, shows Online/Idle and is never assigned work is the exact
-failure this platform exists to catch, and no local smoke test sees it. The job
-that supplies that evidence is `templates/canary-workflow.yml`, which doubles as
-the acceptance test for everything the bake installs.
+`runner canary` is **not in this release**. Promotion is `runner upgrade`, which
+skip-canaries (and refuses if you set `CANARY_ENABLED=true`). Leave
+`CANARY_ENABLED` at its default of `false`.
+
+The workflow file is still the acceptance test for everything the bake installs,
+and the future promotion gate: a runner cloned from the candidate must
+**complete a real GitHub Actions job**. Registering is not evidence. Installing
+it into `CANARY_REPO` now is optional prep.
+
+Bake already stamps `/etc/github-runner/generation` on the guest after the
+setup marker and before shutdown, so the binding step below works when the gate
+ships.
 
 ### Installing it into `CANARY_REPO`
 
@@ -338,14 +476,13 @@ with the canonical copy before dispatching and refuse the run instead.
 
 ### The label contract
 
-The canary gate dispatches the workflow with the generation id as the
-`generation` input, and the job targets `gen-<generation>-canary` -- **that label
-alone, with no `self-hosted`**. The canary registers with `--no-default-labels`
-so it carries nothing else. GitHub assigns a queued job to any idle runner whose
-labels are a superset of `runs-on`, so adding `self-hosted` here would make the
-canary eligible for real production jobs: it would run one on an unvalidated
-image and then destroy itself (it is `--ephemeral`), leaving the canary dispatch
-with no runner and rejecting a good image.
+The canary job targets `gen-<generation>-canary` -- **that label alone, with no
+`self-hosted`**. The canary registers with `--no-default-labels` so it carries
+nothing else. GitHub assigns a queued job to any idle runner whose labels are a
+superset of `runs-on`, so adding `self-hosted` here would make the canary
+eligible for real production jobs: it would run one on an unvalidated image and
+then destroy itself (it is `--ephemeral`), leaving the canary dispatch with no
+runner and rejecting a good image.
 
 The label decides who *may* answer the dispatch, not who did. Every toolchain
 assertion below passes on any healthy runner of any generation, because the
@@ -353,9 +490,8 @@ pins are identical across generations by design -- so a stale `gen-N-canary`
 label left on a production clone would absorb the dispatch, pass everything
 trivially, and promote a candidate that never ran a job. The first step
 therefore binds the run to the image under test and **fails** when it cannot:
-it prefers a generation stamp at `/etc/github-runner/generation` and falls back
-to the `canary-gen<N>` clone name. Nothing writes that stamp yet; when the bake
-does, the binding survives any label mix-up.
+it prefers the generation stamp at `/etc/github-runner/generation` and falls
+back to the `canary-gen<N>` clone name.
 
 Hand-dispatching against a runner you labelled yourself therefore needs
 `strict=false`, which downgrades the binding to a notice and marks the summary
@@ -368,10 +504,8 @@ gh workflow run runner-canary.yml --repo <org>/<canary-repo> \
 
 ### What it asserts
 
-Roughly three minutes on a warm template, against `CANARY_TIMEOUT`'s 1800s
-budget for dispatch through conclusion. (The job's own `timeout-minutes` starts
-when the job begins executing, so queue latency counts against `CANARY_TIMEOUT`
-only.)
+Roughly three minutes on a warm template. The job's own `timeout-minutes`
+starts when the job begins executing.
 
 - every baked tool actually **runs** -- `--version` on each, not `command -v`,
   since a binary whose runtime the bake pruned still resolves on `PATH`
@@ -398,8 +532,7 @@ only.)
 - a `supabase start` / `supabase stop` round trip
 
 Each assertion emits a GitHub `::error::` annotation naming what was expected and
-what was found, because that annotation is what an operator sees quoted in the
-promotion-blocked notification.
+what was found.
 
 ### Keeping version expectations in sync
 
@@ -415,15 +548,13 @@ are duplicated in the `env:` block at the top of the file rather than derived:
 | `SUPABASE_PG_PROVE_IMAGE` | `CANARY_PROBE_IMAGE` |
 
 **Bumping a version on the left means bumping it on the right in the same
-change, bumping `CANARY_WORKFLOW_REVISION`, and reinstalling the workflow.** The
-cost of forgetting is not one red run: a canary failure is retried, and the
-third failure marks the generation `failed` *and* memoizes its digest, so the
-pipeline stops rebaking that image. A forgotten one-line `env:` bump can
-blacklist a perfectly good template until someone clears the memo by hand, with
-the log naming a version that was never installed. The failure messages name the
-mapping for that reason.
+change, bumping `CANARY_WORKFLOW_REVISION`, and reinstalling the workflow.**
+When the canary gate ships, a stale `env:` line can fail a good image and
+memo the digest; keep them in sync now so the workflow is ready.
 
-## Updating Runners
+## Updating runners
+
+### Cloud-init / bootstrap (every clone)
 
 To update runner registration/bootstrap behavior (cloud-init that runs on every
 cloned runner VM):
@@ -433,25 +564,42 @@ cloned runner VM):
    ```bash
    runner setup
    ```
-3. Destroy and recreate runners:
+3. Destroy and recreate **runner VMs** (not the template):
    ```bash
    runner destroy runner-01
    runner create runner-01
    ```
 
-To update prebaked software in the base VM template (does **not** destroy
-the live clone target):
+> **Record your config first.** The wizard re-prompts infrastructure questions
+> and rewrites `/etc/github-runners.conf` from its own answers. It preserves
+> `NOTIFY_*` and guard keys it already knows about, but it does not preserve
+> keys it never asked about. Generation keys are code defaults, so they survive
+> unless you had overrides in the file. Run `cat /etc/github-runners.conf`
+> beforehand. Org PATs are not touched — `add-org` only runs when no orgs exist
+> yet.
+
+### Prebaked software (the normal path)
+
+To update prebaked software in the base image, **do not destroy the live clone
+target**:
 
 ```bash
 runner upgrade --dry-run
 runner upgrade
 ```
 
-That bakes a new generation in the 8900–8999 band and promotes it. Existing
-clones keep running on the previous template until they recycle. Preview first
-with `--dry-run`. If the active template is older than `REBAKE_MAX_AGE_DAYS`
-(default 7), `--dry-run` shows `reason=weekly-floor` and upgrade rebakes even
-when the digest is unchanged.
+That is bake-if-needed then promote. Existing clones keep running on the
+previous template until they recycle. Preview first with `--dry-run`. If the
+active template is older than `REBAKE_MAX_AGE_DAYS` (default 7), `--dry-run`
+shows `reason=weekly-floor` and upgrade rebakes even when the digest is
+unchanged.
+
+`runner upgrade` without `--foreground` starts `github-runner-upgrade.service`
+and follows it. Ctrl-C detaches (non-zero); the unit keeps running. A dropped
+SSH does **not** fail the bake or memo the digest.
+
+`--foreground` bakes in this process (what the oneshot uses). `--force` ignores
+digest equality, the weekly floor, a memoed digest, and `REBAKE_ENABLED=false`.
 
 If a previous bake failed and the digest is memoed:
 
@@ -459,26 +607,71 @@ If a previous bake failed and the digest is memoed:
 runner upgrade --force
 ```
 
-### If the bake fails or appears stuck
+`github-runner-maintain.timer` may already have baked a candidate overnight.
+`upgrade --dry-run` then shows `bake_plan=skip (candidate exists)` and a
+`promote_plan`; `runner upgrade` only promotes.
 
-`runner upgrade` bakes in `github-runner-upgrade.service`, not in the SSH
-session. Ctrl-C on the CLI detaches (non-zero) and the unit keeps running.
-A dropped SSH does **not** `bake_fail` or memo the digest.
+### The 30-day window
+
+Runners register with `--disableupdate`, so they never self-update. That avoids
+re-downloading the ~225 MB runner package on every job boot, but it puts the
+image on a clock: a new `actions/runner` release must land in the fleet within
+**30 days** (sooner if it is a critical security update).
+
+Miss it and the failure is silent rather than loud. Registration keeps working,
+runners show **Online / Idle** in the GitHub UI, and jobs simply queue forever
+without being assigned -- which looks like a GitHub incident, not a stale
+template.
+
+This release handles detection and baking:
+
+1. Daily `runner maintain` (02:30, inside `REBAKE_WINDOW`) compares the active
+   digest to current inputs (`actions/runner` latest, Ubuntu `SHA256SUMS`,
+   rendered `template-setup.yaml`, plus infra values). A new runner release
+   changes the digest, so maintain bakes a **candidate**.
+2. The weekly floor (`REBAKE_MAX_AGE_DAYS=7`) bakes even if detection is
+   broken, unless that digest is memoed as failed.
+3. **You** confirm promotion: `runner upgrade --dry-run` then `runner upgrade`.
+
+Maintain does not auto-promote. `runner drift` is not in this release.
+
+The manual probe is a **verification** step, not the primary detector. Probe a
+**running runner clone** -- the template itself is never running, so
+`qm guest exec` cannot reach it, and it has no `.runner` file because the bake
+never runs `config.sh`:
+
+```bash
+vmid=$(qm list | awk '$3=="running" && $2 ~ /runner/ {print $1; exit}')
+qm guest exec "$vmid" -- /home/runner/actions-runner/bin/Runner.Listener --version | jq -r '."out-data"'
+curl -sf https://api.github.com/repos/actions/runner/releases/latest | jq -r .tag_name
+```
+
+With `--disableupdate` in force a clone's version equals the baked version, so
+those two outputs should match. A successful `runner upgrade` prints
+`runner_version=` in its summary.
+
+Before `--disableupdate` shipped, a clone would silently self-update on boot. You
+can still see the evidence on any long-lived clone: versioned `bin.<version>` and
+`externals.<version>` directories under `/home/runner/actions-runner` are created
+only by the self-update path, never by a fresh install.
+
+### If the bake fails or appears stuck
 
 The bake is gated so a partial template can never be published. The guest writes
 its completion marker last and does **not** power itself off. Bake confirms that
 marker over the guest agent while the VM is still running, then shuts the VM
 down itself and only then converts it to a template.
 
-- **Watch:** `journalctl -u github-runner-upgrade.service -f`. Guest log is on
-  the **band** VMID (`planned_vmid` from `--dry-run`, or `bake_log=` on success),
-  not on live `TEMPLATE_ID`:
+- **Watch:** `journalctl -u github-runner-upgrade.service -f` (or
+  `github-runner-maintain.service` for the timer). Guest log is on the **band**
+  VMID (`planned_vmid` from `--dry-run`, or `bake_log=` on success), not on live
+  `TEMPLATE_ID`:
   `qm guest exec <vmid> -- cat /var/log/template-setup.log`.
 - **Timeout:** the bake aborts after 90 minutes. A healthy bake runs 30-45
   minutes. Override with `BAKE_TIMEOUT=<seconds> runner upgrade`.
 - **`qm stop` on a stuck bake VM is safe.** The VM stopping without a confirmed
-  marker is treated as failure — the cleanup trap destroys the partial band VM,
-  never the live clone target, and memos the digest.
+  marker is treated as failure — the cleanup trap destroys the partial **band**
+  VM, never the live clone target, and memos the digest.
 - **Memoed digest** (previous bake failed): `runner upgrade --force`. Do not
   run `runner setup` — on a host that already has a live template, setup
   adopts and skips the bake. Do not run `runner bake --force` over SSH; that
@@ -489,38 +682,38 @@ down itself and only then converts it to a template.
   way out; `--force` downloads a fresh image. This is not a supply-chain
   compromise, though the error reads like one.
 
-### The 30-day rebake deadline
+### Break-glass: bake and promote by hand
 
-Runners register with `--disableupdate`, so they never self-update. That avoids
-re-downloading the ~225 MB runner package on every job boot, but it puts the
-template on a clock: **rebake within 30 days of each new `actions/runner`
-release** (sooner if it is a critical security update).
+Use this only when `runner upgrade` cannot (oneshot unit missing, or you need
+to inspect a candidate before promoting). It is **not** the normal path, and it
+still must not destroy the live clone target.
 
-Miss it and the failure is silent rather than loud. Registration keeps working,
-runners show **Online / Idle** in the GitHub UI, and jobs simply queue forever
-without being assigned -- which looks like a GitHub incident, not a stale
-template. Check the baked version against upstream by probing a **running runner
-clone** -- the template itself is never running, so `qm guest exec` cannot reach
-it, and it has no `.runner` file because the bake never runs `config.sh`:
+Prefer `runner upgrade --force`, which runs as a systemd oneshot so an SSH drop
+cannot memo the digest. If you must bake without promoting yet, do it under
+`tmux` or `screen` — `runner bake` is in-process:
 
 ```bash
-vmid=$(qm list | awk '$3=="running" && $2 ~ /runner/ {print $1; exit}')
-qm guest exec "$vmid" -- /home/runner/actions-runner/bin/Runner.Listener --version | jq -r '."out-data"'
-curl -sf https://api.github.com/repos/actions/runner/releases/latest | jq -r .tag_name
+runner bake --dry-run
+runner bake --force
+# read GEN_ID from /var/lib/github-runners/generations/<vmid>.conf
+runner promote <id> --skip-canary   # confirms on a tty; canary is not implemented
 ```
 
-With `--disableupdate` in force a clone's version equals the baked version, so
-those two outputs should match. If they have drifted, the rebake is overdue.
+Never destroy the live clone target (`TEMPLATE_ID`, often still 9000 until the
+first promotion). Never use `runner setup` to rebuild an existing template —
+setup adopts it and skips the bake.
 
-Before `--disableupdate` shipped, a clone would silently self-update on boot. You
-can still see the evidence on any long-lived clone: versioned `bin.<version>` and
-`externals.<version>` directories under `/home/runner/actions-runner` are created
-only by the self-update path, never by a fresh install.
+A failed bake cannot take the fleet down: the candidate is in the band, the
+active pointer is unchanged, and cleanup refuses to destroy `TEMPLATE_ID`.
+
+### Maintenance mode (`runner stop` / `runner start`)
 
 `runner stop` leaves the pool in maintenance mode until you run `runner start`.
-The maintenance flag is `/var/lib/github-runners/drain`. It is on disk rather
-than tmpfs, so it survives a host reboot: the watcher and `runner create` keep
-refusing to clone after a reboot taken between `runner stop` and `runner start`.
+The flag is `/var/lib/github-runners/drain`. It is on disk rather than tmpfs, so
+it **survives a host reboot**: the watcher and `runner create` keep refusing to
+clone after a reboot taken between `runner stop` and `runner start`. You do
+**not** need to avoid rebooting during a drain.
+
 The shutdown hookscript honors the same flag, but only once the copy deployed at
 `/var/lib/vz/snippets/runner-hookscript.sh` has been refreshed by `install.sh` or
 `runner setup` -- an older deployed copy still reclones a VM that stops
@@ -531,15 +724,22 @@ path is still read and written, `install.sh` migrates an active drain to the
 persistent path when you upgrade, and `runner start` clears both. A drain set by
 an older release and never migrated is still tmpfs-only, so it does **not**
 survive a reboot -- upgrade first, or re-run `runner stop` after the upgrade.
-On full stops, it also frees orphaned linked-clone child volumes for the current
-template when those volumes no longer have a VM config anywhere in the cluster.
-If any child volumes still belong to live VM/template configs, `runner stop`
-fails and tells you to resolve those dependents before deleting the template.
 
-`runner stop --vmid-range <min:max>` is for partial maintenance windows only.
-Do not use a VMID-limited stop immediately before destroying a linked-clone
-template, because every dependent clone must be removed before `qm destroy`
-will succeed.
+On a full stop (no `--vmid-range`), `runner stop` also frees orphaned
+linked-clone child volumes for the **current** `TEMPLATE_ID` when those volumes
+no longer have a VM config anywhere in the cluster. If any child volumes still
+belong to live VM/template configs, `runner stop` fails and tells you to resolve
+those dependents. That cleanup is not a prelude to destroying the template —
+leave `TEMPLATE_ID` alone.
+
+`runner stop --vmid-range <min:max>` is for partial maintenance windows only;
+it skips orphan-volume cleanup. `--watch-only` stops the watcher and sets the
+drain but leaves running runner VMs in place (the lifetime guard still reaps
+them). `--yes` skips the "type yes" prompt.
+
+```bash
+runner start    # reap stopped leftovers, clear drain, start watcher, fill pools
+```
 
 ## Notifications
 
@@ -555,12 +755,15 @@ NOTIFY_MIN_SEVERITY="warn"   # info|warn|error -- anything below this is dropped
 NOTIFY_FORMAT="slack"        # slack|text
 ```
 
-> `runner setup` rewrites `/etc/github-runners.conf` from its own prompts and
-> does not preserve keys it did not ask about. Re-add the `NOTIFY_*` lines after
-> re-running the wizard.
+Create a Slack **incoming webhook** for the channel you want alerts in and paste
+its URL. Default `NOTIFY_MIN_SEVERITY=warn` drops `info` events
+(`bake.started`, `generation.promoted`) unless you set `info`.
 
-For Slack, create an **incoming webhook** for the channel you want alerts in and
-paste its URL. The body is a Slack incoming-webhook payload:
+> `runner setup` rewrites `/etc/github-runners.conf` from its own prompts. It
+> preserves existing `NOTIFY_*` lines. Re-check the file if you re-run the
+> wizard.
+
+The body is a Slack incoming-webhook payload:
 
 ```json
 {
@@ -575,7 +778,8 @@ paste its URL. The body is a Slack incoming-webhook payload:
 
 Slack renders `text` and ignores the rest, so the same body also serves a
 generic consumer that wants the structured fields. `NOTIFY_FORMAT="text"` sends
-the `text` field alone as a plain body, for ntfy-style consumers.
+the `text` field alone as a plain body, for ntfy-style consumers. `generation`
+is `null` unless the caller set a numeric generation id.
 
 What this is designed to do, and not do:
 
@@ -597,11 +801,24 @@ What this is designed to do, and not do:
   output when you build a `detail` string.
 - **No history, no dedup, no email.** This is a push to one webhook.
 
-Currently emitted: `clone.failed`, when the watcher cannot fill runner slots
-and when a re-clone leaves a slot empty. The watcher sends one notification per
-run rather than one per slot, at `error` when every slot it attempted failed
-(a pool-wide problem: bad template, revoked PAT, full storage) and at `warn`
-when only some did.
+Events this release emits:
+
+| Event | Typical severity | When |
+|---|---|---|
+| `clone.failed` | error (all slots) / warn (some) | Watcher cannot fill runner slots, or a re-clone left a slot empty. One notification per watch run, not per slot |
+| `lifetime.forced_destroy` | warn | Guard destroyed a managed VM that outlived `MAX_VM_LIFETIME_HOURS` |
+| `stopped_vm.reaped` | warn (info on `runner start`) | Guard destroyed a managed VM stuck `stopped` |
+| `bake.started` | info | A bake began |
+| `bake.failed` | error (warn if disk is short) | Bake failed or could not start |
+| `generation.promoted` | info | A candidate is now active |
+| `generation.reconciled` | warn | More than one `active` record; extras demoted to superseded |
+| `promote.timeout` | warn | Promote gave up waiting for the pool activity lock |
+| `detect.failed` | warn | Digest detection has failed for `DETECT_FAIL_WARN_HOURS` |
+| `canary.unconfigured` | warn | `CANARY_ENABLED=true` but `CANARY_REPO` is empty — maintain refuses to bake |
+
+Not in this release: `canary.attempt_failed`, `canary.failed`,
+`generation.rolled_back`, `generation.destroyed`, `gc.blocked`,
+`drift.warning`, `drift.critical`.
 
 To try it without waiting for a real failure:
 
@@ -642,7 +859,9 @@ runner upgrade --dry-run
 runner upgrade
 ```
 
-Do not re-run `runner setup` if VM 9000 still exists — setup will adopt it and skip the bake.
+Do not re-run `runner setup` if VM 9000 (or whatever `TEMPLATE_ID` names) still
+exists — setup will adopt it and skip the bake. Do not `qm destroy` a remaining
+template to "force" a rebuild.
 
 ### VM creation fails with "storage not found"
 
@@ -692,7 +911,7 @@ The runner VM might not have network connectivity. Check:
    ```bash
    runner setup  # Re-run wizard with new PAT
    ```
-3. Recreate runners:
+3. Recreate **runner VMs** (not the template):
    ```bash
    runner destroy runner-01
    runner create runner-01
@@ -704,10 +923,19 @@ The runner VM might not have network connectivity. Check:
 |----------|---------|
 | `/opt/selfhosted-runners/` | Installed scripts and templates |
 | `/usr/local/bin/runner` | Symlink to runner entrypoint |
-| `/etc/github-runners.conf` | Infrastructure config (bridge, storage, template ID) |
+| `/etc/github-runners.conf` | Infrastructure config (bridge, storage, `TEMPLATE_ID` pointer) |
 | `/etc/github-runners.d/<org>.conf` | Per-org config (PAT, runner prefix, pool size) |
 | `/var/lib/vz/snippets/runner-user-data.yaml` | Cloud-init config for VMs |
-| VM template (default ID 9000) | Ubuntu cloud image template |
+| `/var/lib/github-runners/` | Persistent platform state (mode 700) |
+| `/var/lib/github-runners/drain` | Maintenance flag (survives reboot) |
+| `/var/lib/github-runners/generations/` | Generation records (`<vmid>.conf`, `.counter`, `archive.log`) |
+| `/var/log/github-runners/` | Bake logs |
+| `/var/cache/github-runners/` | Cached Ubuntu cloud image |
+| `github-runner-watch.timer` | Fill runner pools (30s) |
+| `github-runner-guard.timer` | Reap stopped / over-age VMs (5m) |
+| `github-runner-maintain.timer` | Daily 02:30 adopt/detect/bake |
+| `github-runner-upgrade.service` | Oneshot used by `runner upgrade` |
+| Active generation template | Whatever `TEMPLATE_ID` names (9000 until the first promotion) |
 
 ## Security Notes
 
@@ -732,7 +960,9 @@ The runner VM might not have network connectivity. Check:
 | 4 | 8 | 32 GB | 120 GB |
 | 8 | 16 | 64 GB | 240 GB |
 
-Plus ~30GB for the template VM.
+Plus ~30GB per generation template. Keep at least `BAKE_MIN_FREE_GB` (default
+60) free on `VM_STORAGE` so a candidate can bake while the active generation
+still has clones. Superseded templates stay until GC ships.
 
 ## Development
 
@@ -789,7 +1019,7 @@ run anywhere:
 | Helper | Purpose |
 |---|---|
 | `stub_out <cmd> <pattern> [rc]` | stdout (from stdin) for calls whose arguments glob-match `<pattern>` |
-| `stub_status <cmd> <pattern> <rc>` | same, no output — "this call fails" |
+| `stub_status <cmd> <pattern> <rc]` | same, no output — "this call fails" |
 | `stub_lenient` / `stub_strict` | opt out of / back into strict stubbing |
 | `stub_calls <cmd>` | every invocation, one argument list per line |
 | `call_count <cmd> [pattern]` | how many times it was called |
