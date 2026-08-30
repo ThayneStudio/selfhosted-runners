@@ -89,8 +89,14 @@ for entry in "${MISSING[@]}"; do
             log_warn "[watch] Skipping $slot — bad config for $org"
             exit 0
         fi
-        if clone_runner "$slot" "$org" >/dev/null; then
+        # clone_runner 3 = promotion pause; retry this slot next tick without
+        # counting it toward clone.failed.
+        clone_rc=0
+        clone_runner "$slot" "$org" >/dev/null || clone_rc=$?
+        if [[ "$clone_rc" -eq 0 ]]; then
             log_info "[watch] Created $slot"
+        elif [[ "$clone_rc" -eq 3 ]]; then
+            log_info "[watch] promotion in progress, will retry"
         else
             log_warn "[watch] Failed to create $slot"
             echo "$slot" >> "$FAILED_SLOTS"

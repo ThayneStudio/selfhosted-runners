@@ -1,0 +1,10 @@
+[Unit]
+Description=GitHub Actions runner maintain timer
+
+[Timer]
+OnCalendar=*-*-* 02:30:00
+Persistent=true
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

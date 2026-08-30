@@ -336,6 +336,7 @@ write_files:
       # operator `qm stop`, which is how a half-baked template used to get
       # published. The host waits for this marker, confirms it over the guest
       # agent while the VM is still up, then shuts the VM down itself.
+      printf '%s\n' "$RUNNER_VERSION" > /opt/.runner-version
       touch /opt/.template-setup-complete
 
 runcmd:

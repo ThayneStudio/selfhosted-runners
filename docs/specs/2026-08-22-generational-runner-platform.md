@@ -699,7 +699,8 @@ Existing commands are unchanged. New verbs:
 | `runner generations` | Table of generations: id, vmid, state, runner version, age, clone refcount, disk usage. |
 | `runner bake [--force]` | Non-interactive bake to a new candidate. `--force` ignores digest and window. |
 | `runner canary <gen>` | Run the canary gate against a candidate. |
-| `runner promote <gen> [--skip-canary]` | Manual promotion. `--skip-canary` requires an interactive confirmation. |
+| `runner promote <gen> [--skip-canary]` | Manual promotion. `--skip-canary` requires an interactive confirmation, except `--yes` from setup bootstrap, tests, and `runner upgrade`. |
+| `runner upgrade [--dry-run] [--force]` | Operator-invoked bake-then-promote. Invoking this verb is the skip-canary confirmation. Does not run from `install.sh` or the maintain timer. |
 | `runner rollback` | Point active at the retained previous generation, and move the generation being rolled away from to `rejected` (§4.1) with a reason. Refuses if none retained. |
 | `runner rollover [--force]` | Report old-generation clones still in service. `--force` deregisters and destroys the ones GitHub reports as **not busy**, so the pool refills from the active generation without waiting. Never touches a busy runner. |
 | `runner guard [--dry-run]` | Enforce VM lifetime and reap stopped managed VMs (§10.1, §10.4). Run by its own timer; `--dry-run` prints candidates and reasons without destroying. |

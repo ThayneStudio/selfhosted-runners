@@ -119,6 +119,37 @@ GUARD_MIN_CONFIG_AGE_SECONDS=60
 # shellcheck disable=SC2034  # consumed by lib/guard.sh via this shared file
 GUARD_DEFER_WARN_RUNS=3
 
+# Bake / maintain host paths and cloud-image identity. Lock and cache paths
+# are absolute so the unit harness sandboxes them by value. Persistent files
+# hang off RUNNER_STATE_DIR so relocating state relocates them too.
+# shellcheck disable=SC2034  # consumed by bake, detect, promote, maintain
+BAKE_LOCK_FILE="/run/lock/github-runner-bake.lock"
+# shellcheck disable=SC2034  # consumed by bake, detect, promote, maintain
+PROMOTION_PAUSE_FILE="/run/lock/github-runner-promote.pause"
+IMG_CACHE_DIR="/var/cache/github-runners"
+# shellcheck disable=SC2034  # consumed by bake, detect, promote, maintain
+BAKE_LOG_DIR="/var/log/github-runners"
+# shellcheck disable=SC2034  # consumed by bake, detect, promote, maintain
+FAILED_DIGESTS_FILE="$RUNNER_STATE_DIR/failed-digests"
+# shellcheck disable=SC2034  # consumed by bake, detect, promote, maintain
+DETECT_FAIL_FILE="$RUNNER_STATE_DIR/detect-fail"
+CLOUD_IMG="noble-server-cloudimg-amd64.img"
+# shellcheck disable=SC2034  # consumed by bake, detect, promote, maintain
+CLOUD_IMG_URL="https://cloud-images.ubuntu.com/noble/current/${CLOUD_IMG}"
+# shellcheck disable=SC2034  # consumed by bake, detect, promote, maintain
+CLOUD_IMG_CHECKSUM_URL="https://cloud-images.ubuntu.com/noble/current/SHA256SUMS"
+# shellcheck disable=SC2034  # consumed by bake, detect, promote, maintain
+CLOUD_IMG_PATH="$IMG_CACHE_DIR/$CLOUD_IMG"
+# shellcheck disable=SC2034  # consumed by bake, detect, promote, maintain
+MIN_CLOUD_IMG_BYTES=$((400 * 1024 * 1024))
+# shellcheck disable=SC2034  # consumed by bake, detect, promote, maintain
+GENERATION_VMID_LOCK_FILE="/run/lock/github-runner-gen-vmid.lock"
+# Host unit/logrotate directories. Overridable so tests can sandbox them.
+# shellcheck disable=SC2034
+SYSTEMD_UNIT_DIR="/etc/systemd/system"
+# shellcheck disable=SC2034
+LOGROTATE_DIR="/etc/logrotate.d"
+
 # Webhook notifications. Sourced here so every script that already sources
 # common.sh can call `notify` (and `redact_secrets`) without extra wiring.
 #
@@ -168,18 +199,152 @@ load_infra_config() {
         fi
     done
     apply_generation_defaults
+    validate_generation_band
 }
 
 # Generation-model settings (spec 14). Defaulting them here rather than writing
 # them into /etc/github-runners.conf keeps the upgrade a no-op: an existing
 # config file stays valid and unedited, and an operator only adds a key to
 # override it.
+# Unsigned integer: empty → default; set but not a uint → log_warn and default.
+_generation_uint_or_default() {
+    local var="$1" default="$2" value
+    value="${!var:-}"
+    if [[ -z "$value" ]]; then
+        printf -v "$var" '%s' "$default"
+        return 0
+    fi
+    if [[ ! "$value" =~ ^[0-9]+$ ]]; then
+        log_warn "Invalid $var='$value' — falling back to default $default"
+        printf -v "$var" '%s' "$default"
+    fi
+}
+
+# Boolean: empty → default; case-normalize true/false; unrecognized → default.
+_generation_bool_or_default() {
+    local var="$1" default="$2" raw folded
+    raw="${!var:-}"
+    if [[ -z "$raw" ]]; then
+        printf -v "$var" '%s' "$default"
+        return 0
+    fi
+    folded=$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]')
+    case "$folded" in
+        true|false)
+            printf -v "$var" '%s' "$folded"
+            ;;
+        *)
+            log_warn "Invalid $var='$raw' — falling back to default $default"
+            printf -v "$var" '%s' "$default"
+            ;;
+    esac
+}
+
 apply_generation_defaults() {
-    TEMPLATE_BAND_MIN="${TEMPLATE_BAND_MIN:-8900}"
-    TEMPLATE_BAND_MAX="${TEMPLATE_BAND_MAX:-8999}"
-    GENERATION_RETAIN="${GENERATION_RETAIN:-1}"
-    FAILED_GEN_RETAIN_DAYS="${FAILED_GEN_RETAIN_DAYS:-7}"
-    CANDIDATE_MAX_AGE_DAYS="${CANDIDATE_MAX_AGE_DAYS:-3}"
+    _generation_uint_or_default TEMPLATE_BAND_MIN 8900
+    _generation_uint_or_default TEMPLATE_BAND_MAX 8999
+    _generation_uint_or_default GENERATION_RETAIN 1
+    _generation_uint_or_default FAILED_GEN_RETAIN_DAYS 7
+    _generation_uint_or_default CANDIDATE_MAX_AGE_DAYS 3
+    _generation_bool_or_default REBAKE_ENABLED true
+    _generation_uint_or_default REBAKE_MAX_AGE_DAYS 7
+    # Invalid REBAKE_WINDOW is left for in_rebake_window (fail-closed).
+    REBAKE_WINDOW="${REBAKE_WINDOW:-02:00-06:00}"
+    _generation_uint_or_default BAKE_TIMEOUT 5400
+    _generation_uint_or_default BAKE_MIN_FREE_GB 60
+    _generation_bool_or_default CANARY_ENABLED false
+    _generation_uint_or_default DETECT_FAIL_WARN_HOURS 24
+}
+
+validate_generation_band() {
+    local min_vmid="${MIN_VMID:-0}"
+    local band_min="${TEMPLATE_BAND_MIN}"
+    local band_max="${TEMPLATE_BAND_MAX}"
+
+    if [[ ! "$band_min" =~ ^[0-9]+$ || ! "$band_max" =~ ^[0-9]+$ ]]; then
+        log_error "TEMPLATE_BAND_MIN/MAX must be unsigned integers (got ${band_min:-<empty>}, ${band_max:-<empty>})"
+        return 1
+    fi
+    if [[ ! "$min_vmid" =~ ^[0-9]+$ ]]; then
+        log_error "MIN_VMID must be an unsigned integer (got ${min_vmid:-<empty>})"
+        return 1
+    fi
+    if [[ "$band_min" -gt "$band_max" ]]; then
+        log_error "TEMPLATE_BAND_MIN ($band_min) is greater than TEMPLATE_BAND_MAX ($band_max)"
+        return 1
+    fi
+    if [[ "$min_vmid" -eq 0 ]]; then
+        log_error "MIN_VMID=0 (auto) is incompatible with generations; set MIN_VMID to $((band_max + 1)) or higher"
+        return 1
+    fi
+    if [[ "$band_max" -ge "$min_vmid" ]]; then
+        log_error "Generation VMID band ${band_min}-${band_max} overlaps [MIN_VMID, ∞) (MIN_VMID=${min_vmid})"
+        return 1
+    fi
+    return 0
+}
+
+# Replace only the TEMPLATE_ID= line in $CONFIG_FILE. Every other key, including
+# DOCKER_MIRROR_URL, is left byte-for-byte. Fail closed if the line is missing
+# so a truncated config cannot silently drop the pointer.
+# Proven by "rewrite_template_id changes only TEMPLATE_ID and preserves DOCKER_MIRROR_URL"
+# and "rewrite_template_id fails closed when CONFIG_FILE has no TEMPLATE_ID line".
+rewrite_template_id() {
+    local vmid="${1:-}" tmp
+
+    if [[ ! "$vmid" =~ ^[0-9]+$ ]]; then
+        log_error "rewrite_template_id: invalid VMID: ${vmid:-<empty>}"
+        return 1
+    fi
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        log_error "rewrite_template_id: $CONFIG_FILE not found"
+        return 1
+    fi
+    if ! grep -q '^TEMPLATE_ID=' "$CONFIG_FILE"; then
+        log_error "rewrite_template_id: $CONFIG_FILE has no TEMPLATE_ID= line"
+        return 1
+    fi
+
+    tmp=$(mktemp "${CONFIG_FILE}.XXXXXX") || return 1
+    if ! awk -v vmid="$vmid" '
+        BEGIN { found = 0 }
+        /^TEMPLATE_ID="/ { print "TEMPLATE_ID=\"" vmid "\""; found = 1; next }
+        /^TEMPLATE_ID='\''/ { print "TEMPLATE_ID='\''" vmid "'\''"; found = 1; next }
+        /^TEMPLATE_ID=/ { print "TEMPLATE_ID=" vmid; found = 1; next }
+        { print }
+        END { if (!found) exit 1 }
+    ' "$CONFIG_FILE" > "$tmp"; then
+        rm -f "$tmp"
+        log_error "rewrite_template_id: failed to rewrite TEMPLATE_ID in $CONFIG_FILE"
+        return 1
+    fi
+    chmod 600 "$tmp" || { rm -f "$tmp"; return 1; }
+    mv "$tmp" "$CONFIG_FILE" || { rm -f "$tmp"; return 1; }
+}
+
+# Source $CONFIG_FILE in a subshell and print TEMPLATE_ID. clone_runner uses
+# this after taking the shared pool lock so a promotion is visible before
+# qm clone. Proven by "clone_runner re-reads TEMPLATE_ID after the shared lock".
+reload_active_template_id() {
+    local value
+
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        log_error "reload_active_template_id: $CONFIG_FILE not found"
+        return 1
+    fi
+    value="$(
+        # shellcheck source=/dev/null
+        source "$CONFIG_FILE"
+        printf '%s' "${TEMPLATE_ID:-}"
+    )" || {
+        log_error "reload_active_template_id: failed to source $CONFIG_FILE"
+        return 1
+    }
+    if [[ -z "$value" ]]; then
+        log_error "reload_active_template_id: TEMPLATE_ID is empty in $CONFIG_FILE"
+        return 1
+    fi
+    printf '%s\n' "$value"
 }
 
 load_org_config() {
@@ -378,6 +543,7 @@ acquire_clone_slot() {
 
     while true; do
         pool_is_draining && return 1
+        [[ -e "$PROMOTION_PAUSE_FILE" ]] && return 3
         for ((slot = 1; slot <= max; slot++)); do
             exec 204>"${CLONE_SLOT_LOCK_PREFIX}-${slot}.lock"
             if flock -n 204; then
@@ -590,20 +756,132 @@ generate_mac() {
     echo -n "$1" | md5sum | sed 's/\(..\)\(..\)\(..\)\(..\)\(..\).*/02:\1:\2:\3:\4:\5/'
 }
 
+# GEN_ID whose record names this template VMID. Scans every record matching
+# GEN_VMID rather than "the currently active generation": a promotion can land
+# between a caller reading the pointer and clone_runner running, and tagging
+# the clone as the new generation would undercount the old one's children.
+# Proven by "clone_runner tags the clone gen-N from the cloned VMID's record".
+clone_generation_id_for_vmid() (
+    local target="${1:-}" rec_vmid
+    # gen_read assigns these via printf -v; locals keep the lookup from leaking.
+    local GEN_ID="" GEN_VMID=""
+    [[ -n "$target" ]] || return 1
+    while read -r rec_vmid; do
+        [[ -n "$rec_vmid" ]] || continue
+        gen_read "$rec_vmid" || continue
+        if [[ "$GEN_VMID" == "$target" ]]; then
+            printf '%s\n' "$GEN_ID"
+            return 0
+        fi
+    done < <(gen_list)
+    return 1
+)
+
+# Tag a fresh clone from the VMID actually cloned. Missing store or record is
+# a warning, not a failed clone.
+clone_tag_generation() {
+    local clone_vmid="$1" template_vmid="$2" gen_id=""
+
+    if ! declare -F gen_list >/dev/null 2>&1; then
+        if [[ -r "$LIB_DIR/generations.sh" ]]; then
+            # generations.sh sources common.sh; RUNNER_COMMON_LOADED makes that
+            # a no-op. source=/dev/null so shellcheck does not follow the cycle.
+            # shellcheck source=/dev/null
+            source "$LIB_DIR/generations.sh" || true
+        fi
+    fi
+    if ! declare -F gen_list >/dev/null 2>&1; then
+        log_warn "clone_runner: generation store unavailable — clone $clone_vmid untagged"
+        return 0
+    fi
+
+    gen_id=$(clone_generation_id_for_vmid "$template_vmid") || gen_id=""
+    if [[ -z "$gen_id" ]]; then
+        log_warn "clone_runner: no generation record for template VMID $template_vmid — clone $clone_vmid untagged"
+        return 0
+    fi
+    if ! qm set "$clone_vmid" --tags "runner,gen-${gen_id}" \
+        200>&- \
+        201>&- \
+        202>&- \
+        203>&- \
+        204>&-; then
+        log_error "clone_runner: failed to tag $clone_vmid as gen-${gen_id}"
+        return 1
+    fi
+    return 0
+}
+
 # Clone template, configure cloud-init, set hookscript, start VM.
-# Returns VMID on stdout. Returns 1 on failure (cleans up partial clone).
+# Returns VMID on stdout.
+# Returns 1 on failure (cleans up partial clone).
+# Returns 3 when PROMOTION_PAUSE_FILE is still present after a bounded wait
+# (CLONE_PAUSE_RETRY_MAX_SECONDS, default 130 — longer than promote's 120s
+# exclusive-lock wait). Distinct from 1 so reclone.sh / watch.sh retry
+# without notifying clone.failed. Tests set the bound to 0 to skip the wait.
 clone_runner() {
     local name="$1" org="$2" vmid="${3:-}"
     local RESERVED_VMID=""
+    local pause_waited=0
+    local pause_max="${CLONE_PAUSE_RETRY_MAX_SECONDS:-130}"
 
     exec 202>"$POOL_ACTIVITY_LOCK_FILE"
     flock -s 202
+
+    # Pause file lets promote acquire the exclusive lock: Linux flock has no
+    # writer preference, so new shared holders would otherwise starve it.
+    # Sleep 2, drop shared, re-acquire, re-check, up to pause_max seconds;
+    # then return 3 (not 1). Proven by "clone_runner returns 3 without cloning
+    # when PROMOTION_PAUSE_FILE remains" and "clone_runner clones the re-read
+    # TEMPLATE_ID when the pause file clears mid-wait".
+    [[ "$pause_max" =~ ^[0-9]+$ ]] || pause_max=130
+    while [[ -e "$PROMOTION_PAUSE_FILE" ]]; do
+        if (( pause_waited >= pause_max )); then
+            # Unflocked pause is leftover (SIGKILL). A live promote holds
+            # exclusive 211 on this file. Proven by "clone_runner returns 3
+            # without cloning when PROMOTION_PAUSE_FILE remains".
+            exec 211>>"$PROMOTION_PAUSE_FILE" || {
+                exec 202>&-
+                return 3
+            }
+            if flock -n 211; then
+                rm -f "$PROMOTION_PAUSE_FILE"
+                exec 211>&- 2>/dev/null || true
+                log_warn "clone_runner: removed stale promotion pause file"
+                break
+            fi
+            exec 211>&- 2>/dev/null || true
+            log_info "clone_runner: promotion in progress, will retry"
+            exec 202>&-
+            return 3
+        fi
+        if (( pause_waited == 0 )); then
+            log_info "clone_runner: promotion in progress, waiting to retry $name"
+        fi
+        exec 202>&-
+        sleep 2
+        pause_waited=$((pause_waited + 2))
+        exec 202>"$POOL_ACTIVITY_LOCK_FILE" || {
+            log_error "clone_runner: cannot reopen pool lock while waiting out promotion"
+            return 1
+        }
+        flock -s 202
+    done
 
     if pool_is_draining; then
         log_warn "clone_runner: pool drain active, refusing to create $name"
         exec 202>&-
         return 1
     fi
+
+    # Re-read after the shared lock so a promotion that ran after the caller
+    # sourced CONFIG_FILE is visible before qm clone.
+    # Proven by "clone_runner re-reads TEMPLATE_ID after the shared lock".
+    TEMPLATE_ID=$(reload_active_template_id) || {
+        log_error "clone_runner: failed to re-read TEMPLATE_ID"
+        exec 202>&-
+        return 1
+    }
 
     # Cleanup helper: destroy VM (only if it belongs to us), remove snippet, and
     # sweep orphan zvols at this VMID. The ownership check prevents touching
@@ -684,7 +962,15 @@ clone_runner() {
     # clone different VMIDs while this clone runs.
     exec 201>&-
 
-    if ! acquire_clone_slot; then
+    local slot_rc=0
+    acquire_clone_slot || slot_rc=$?
+    if (( slot_rc == 3 )); then
+        log_info "clone_runner: promotion in progress, will retry"
+        release_vmid_reservation "$vmid"
+        exec 202>&-
+        return 3
+    fi
+    if (( slot_rc != 0 )); then
         log_warn "clone_runner: pool drain became active before cloning $name"
         release_vmid_reservation "$vmid"
         exec 202>&-
@@ -718,6 +1004,13 @@ clone_runner() {
     fi
     rm -f "$clone_err"
     release_clone_slot
+
+    if ! clone_tag_generation "$vmid" "$TEMPLATE_ID"; then
+        _fail
+        release_vmid_reservation "$vmid"
+        exec 202>&-
+        return 1
+    fi
 
     if pool_is_draining; then
         log_warn "clone_runner: pool drain became active after cloning $name, cleaning up VM $vmid"

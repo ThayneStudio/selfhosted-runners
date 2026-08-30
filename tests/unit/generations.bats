@@ -865,6 +865,13 @@ create_full_record() {
     [ "$GENERATION_RETAIN" = "1" ]
     [ "$FAILED_GEN_RETAIN_DAYS" = "7" ]
     [ "$CANDIDATE_MAX_AGE_DAYS" = "3" ]
+    [ "$REBAKE_ENABLED" = "true" ]
+    [ "$REBAKE_MAX_AGE_DAYS" = "7" ]
+    [ "$REBAKE_WINDOW" = "02:00-06:00" ]
+    [ "$BAKE_TIMEOUT" = "5400" ]
+    [ "$BAKE_MIN_FREE_GB" = "60" ]
+    [ "$CANARY_ENABLED" = "false" ]
+    [ "$DETECT_FAIL_WARN_HOURS" = "24" ]
 }
 
 @test "a value already in the config file wins over the default" {
@@ -875,6 +882,19 @@ create_full_record() {
     [ "$TEMPLATE_BAND_MIN" = "8700" ]
     [ "$TEMPLATE_BAND_MAX" = "8999" ]
     [ "$FAILED_GEN_RETAIN_DAYS" = "14" ]
+}
+
+@test "REBAKE_MAX_AGE_DAYS=nope after apply is 7" {
+    REBAKE_MAX_AGE_DAYS=nope
+    apply_generation_defaults 2>"$GEN_TEST_DIR/apply.err"
+    [ "$REBAKE_MAX_AGE_DAYS" = "7" ]
+    grep -q "Invalid REBAKE_MAX_AGE_DAYS='nope'" "$GEN_TEST_DIR/apply.err"
+}
+
+@test "CANARY_ENABLED=TRUE becomes true" {
+    CANARY_ENABLED=TRUE
+    apply_generation_defaults
+    [ "$CANARY_ENABLED" = "true" ]
 }
 
 # ---------------------------------------------------------------------------

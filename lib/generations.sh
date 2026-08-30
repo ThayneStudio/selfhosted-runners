@@ -3,9 +3,10 @@
 # monotonic id counter that numbers them, the lifecycle state machine, and the
 # append-only archive log.
 #
-# This is the data layer only. Nothing here runs qm/pvesm/zfs, reads the fleet,
-# or decides policy — it just keeps the on-disk state consistent for the bake,
-# canary, promotion, and GC code that sits on top of it.
+# This is the data layer, plus adoption (spec 8). Record access, the state
+# machine, the archive log, and generation VMID allocation never talk to the
+# hypervisor. adopt_deployed_template is the exception: on an empty store it
+# inventories the already-deployed TEMPLATE_ID fleet. It never destroys.
 #
 # Two rules hold everywhere below, because GEN_ID is the identity that clone
 # attribution (spec 5), promotion, rollback and GC all key off:
@@ -824,4 +825,281 @@ gen_archive_append() {
 
     # umask so the log is created root-only without a chmod race on every append.
     ( umask 077; printf '%s\n' "$line" >> "$GENERATION_ARCHIVE_LOG" )
+}
+
+# ---------------------------------------------------------------------------
+# Generation VMID allocation (spec 4.2)
+#
+# Newly baked generations take the lowest free VMID in TEMPLATE_BAND_MIN..MAX.
+# This is a different pool from reserve_vmid / VMID_LOCK_FILE; taking that lock
+# would serialize template allocation against clone allocation. Proven by
+# "allocate_generation_vmid returns the lowest free band VMID".
+#
+# A config in the band that is not a generation record is a hard error, not a
+# hole to skip — otherwise a leftover VM is silently stranded next to templates
+# and the next bake still proceeds. Proven by "foreign config inside the band
+# is a hard error before allocation".
+#
+# flock -n on GENERATION_VMID_LOCK_FILE fd 206 serializes the scan. The
+# function is not a subshell so the caller can keep the lock held while it
+# gen_create's the record; command substitution still works because exclusive
+# create is the race-free backstop. Proven by "allocate_generation_vmid is busy
+# when the generation VMID lock is held".
+# ---------------------------------------------------------------------------
+
+# Walks the band and refuses any VMID whose qemu-server config exists without a
+# matching generation record. Not called from load_infra_config: config load
+# must stay qm-free (and this probe is the file equivalent of that inventory).
+validate_band_inventory() {
+    local vmid
+    for vmid in $(seq "$TEMPLATE_BAND_MIN" "$TEMPLATE_BAND_MAX"); do
+        if vmid_in_use "$vmid" && ! gen_exists "$vmid"; then
+            log_error "VMID $vmid has a config in the generation band ${TEMPLATE_BAND_MIN}-${TEMPLATE_BAND_MAX} but is not a known generation"
+            return 1
+        fi
+    done
+    return 0
+}
+
+# Lowest free band VMID on stdout. Exit 1 if the band is exhausted, invalid, or
+# contains a foreign config, or if another allocator holds the lock.
+allocate_generation_vmid() {
+    local vmid
+
+    validate_generation_band || return 1
+    validate_band_inventory || return 1
+
+    exec 206>"$GENERATION_VMID_LOCK_FILE"
+    if ! flock -n 206; then
+        log_error "generation VMID allocator is busy"
+        return 1
+    fi
+
+    for vmid in $(seq "$TEMPLATE_BAND_MIN" "$TEMPLATE_BAND_MAX"); do
+        if ! vmid_in_use "$vmid" && ! gen_exists "$vmid"; then
+            printf '%s\n' "$vmid"
+            return 0
+        fi
+    done
+    log_error "generation VMID band ${TEMPLATE_BAND_MIN}-${TEMPLATE_BAND_MAX} is exhausted"
+    return 1
+}
+
+# ---------------------------------------------------------------------------
+# Adoption (spec 8)
+#
+# Empty store + existing TEMPLATE_ID → generation 1, active, unknown digest
+# and image sha. Idempotent: any live record and a missing template are both
+# success. Never destroys. Tags untagged runner clones gen-1.
+#
+# Inventory is `qm list` plus per-VM `qm config`, matching lib/guard.sh and
+# lib/list.sh — not `qm list --full`.
+# ---------------------------------------------------------------------------
+
+# True when any tag already attributes the VM to a generation.
+adopt_tags_have_gen() {
+    local current="${1:-}" tag
+    local -a tags=()
+    IFS=';,' read -ra tags <<< "$current"
+    for tag in "${tags[@]}"; do
+        tag="${tag//[[:space:]]/}"
+        [[ "$tag" == gen-* ]] && return 0
+    done
+    return 1
+}
+
+# Comma-separated tags for `qm set --tags`: keep existing, ensure runner, append gen-N.
+adopt_tags_with_gen() {
+    local current="${1:-}" gen_id="${2:-}" tag has_runner=0 gen_tag
+    local -a kept=() out=()
+    [[ "$gen_id" =~ ^[0-9]+$ ]] || return 1
+    gen_tag="gen-${gen_id}"
+    IFS=';,' read -ra kept <<< "$current"
+    local -a existing=()
+    for tag in "${kept[@]}"; do
+        tag="${tag//[[:space:]]/}"
+        [[ -n "$tag" ]] || continue
+        [[ "$tag" == "$gen_tag" ]] && continue
+        if [[ "$tag" == "runner" ]]; then
+            has_runner=1
+        fi
+        existing+=("$tag")
+    done
+    if [[ "$has_runner" -eq 1 ]]; then
+        out=("${existing[@]}" "$gen_tag")
+    else
+        out=("runner" "${existing[@]}" "$gen_tag")
+    fi
+    local IFS=','
+    printf '%s' "${out[*]}"
+}
+
+adopt_tags_with_gen1() {
+    adopt_tags_with_gen "${1:-}" 1
+}
+
+# Clone VMIDs whose disk traces to TEMPLATE_ID (nested volid or ZFS origin).
+# Empty when origin cannot be resolved — skip unattributable rather than
+# tagging every runner cicustom.
+adopt_linked_clone_vmids() {
+    local child_list volid child
+    child_list=$(list_template_linked_clone_volids) || return 1
+    [[ -n "$child_list" ]] || return 0
+    while read -r volid; do
+        [[ -n "$volid" ]] || continue
+        child=$(linked_clone_child_vmid "$volid")
+        [[ -n "$child" ]] || continue
+        printf '%s\n' "$child"
+    done <<< "$child_list"
+}
+
+# Best-effort probe of a running clone. Always prints a token (never fails).
+# Parses qm guest exec JSON by hand so unit tests do not need a jq stub.
+adopt_probe_runner_version() {
+    local vmid="$1" result raw
+    result=$(qm guest exec "$vmid" -- \
+        /home/runner/actions-runner/bin/Runner.Listener --version \
+        2>/dev/null </dev/null) || {
+        printf 'unknown\n'
+        return 0
+    }
+    if [[ "$result" =~ \"out-data\"[[:space:]]*:[[:space:]]*\"([^\"]*)\" ]]; then
+        raw="${BASH_REMATCH[1]}"
+        raw="${raw//\\n/ }"
+        raw="${raw//\\r/ }"
+        raw="${raw//\\t/ }"
+    else
+        raw="$result"
+    fi
+    raw="${raw//$'\n'/ }"
+    raw="${raw//$'\r'/ }"
+    if [[ "$raw" =~ ([0-9]+\.[0-9]+([.][0-9]+)*) ]]; then
+        printf '%s\n' "${BASH_REMATCH[1]}"
+        return 0
+    fi
+    printf 'unknown\n'
+}
+
+# Adopt the deployed TEMPLATE_ID template as generation 1.
+# Usage: adopt_deployed_template
+# Exit: always 0 except when gen_create refuses a write after deciding to adopt.
+adopt_deployed_template() {
+    local min_vmid probed=unknown
+    local all_vms vmid vm_name status cfg tags_line new_tags rec list resume=0
+    local linked
+    local -a tag_vmids=() tag_values=() recs=()
+    local -A traced=()
+
+    list=$(gen_list) || return 1
+    if [[ -n "$list" ]]; then
+        while read -r rec; do
+            [[ -n "$rec" ]] || continue
+            recs+=("$rec")
+        done <<< "$list"
+        if ((${#recs[@]} == 1)); then
+            gen_read "${recs[0]}" || return 1
+            if [[ "$GEN_ID" == "1" && "$GEN_VMID" == "${TEMPLATE_ID:-}" ]]; then
+                resume=1
+            else
+                resume=2
+            fi
+        else
+            resume=2
+        fi
+    fi
+
+    if [[ -z "${TEMPLATE_ID:-}" ]]; then
+        log_warn "TEMPLATE_ID is not set — nothing to adopt"
+        return 0
+    fi
+
+    if [[ "$resume" -ne 0 ]] && ! gen_exists "$TEMPLATE_ID"; then
+        log_info "Generation store already has records — skipping adoption"
+        return 0
+    fi
+
+    if ! qm status "$TEMPLATE_ID" >/dev/null 2>&1 </dev/null; then
+        log_warn "Template VM $TEMPLATE_ID is not present — nothing to adopt"
+        return 0
+    fi
+
+    if ! qm config "$TEMPLATE_ID" 2>/dev/null </dev/null | grep -q '^template:[[:space:]]*1'; then
+        log_warn "TEMPLATE_ID $TEMPLATE_ID is not a Proxmox template — nothing to adopt"
+        return 0
+    fi
+
+    validate_band_inventory || return 1
+
+    min_vmid="${MIN_VMID:-}"
+    if [[ ! "$min_vmid" =~ ^[0-9]+$ ]]; then
+        min_vmid=$((TEMPLATE_ID + 1))
+    fi
+
+    local tag_gen_id=""
+    if [[ "$resume" -eq 0 ]]; then
+        tag_gen_id=1
+    elif gen_exists "$TEMPLATE_ID"; then
+        gen_read "$TEMPLATE_ID" || return 1
+        tag_gen_id="$GEN_ID"
+    else
+        log_info "Generation store already has records — skipping adoption"
+        return 0
+    fi
+
+    linked=$(adopt_linked_clone_vmids) || return 1
+    while read -r vmid; do
+        [[ -n "$vmid" ]] || continue
+        traced["$vmid"]=1
+    done <<< "$linked"
+
+    if ((${#traced[@]} > 0)); then
+        all_vms=$(qm list </dev/null) || {
+            log_error "Failed to list VMs for adoption tagging"
+            return 1
+        }
+        while read -r vmid vm_name status _; do
+            [[ "$vmid" =~ ^[0-9]+$ ]] || continue
+            [[ "$vmid" != "$TEMPLATE_ID" ]] || continue
+            [[ "$vmid" -ge "$min_vmid" ]] || continue
+            [[ -n "${traced[$vmid]:-}" ]] || continue
+
+            cfg=$(qm config "$vmid" 2>/dev/null </dev/null) || continue
+            [[ -n "$cfg" ]] || continue
+            if grep -q '^template:[[:space:]]*1' <<< "$cfg"; then
+                continue
+            fi
+            tags_line=$(grep -m1 '^tags:' <<< "$cfg" || true)
+            tags_line="${tags_line#tags:}"
+            if adopt_tags_have_gen "$tags_line"; then
+                continue
+            fi
+            if [[ "$status" == "running" && "$probed" == "unknown" ]]; then
+                probed=$(adopt_probe_runner_version "$vmid")
+            fi
+            tag_vmids+=("$vmid")
+            tag_values+=("$tags_line")
+        done <<< "$(tail -n +2 <<< "$all_vms")"
+    fi
+
+    if [[ "$resume" -eq 0 ]]; then
+        gen_create "$TEMPLATE_ID" \
+            GEN_ID=1 \
+            GEN_STATE=active \
+            GEN_RUNNER_VERSION="${probed:-unknown}" \
+            GEN_IMAGE_SHA256=unknown \
+            GEN_TEMPLATE_DIGEST=unknown || return 1
+        log_info "Adopted template VMID $TEMPLATE_ID as generation 1"
+    fi
+
+    if [[ ${#tag_vmids[@]} -gt 0 ]]; then
+        local i
+        for i in "${!tag_vmids[@]}"; do
+            new_tags=$(adopt_tags_with_gen "${tag_values[$i]}" "$tag_gen_id") || continue
+            if ! qm set "${tag_vmids[$i]}" --tags "$new_tags" </dev/null; then
+                log_warn "Failed to tag VMID ${tag_vmids[$i]} as gen-${tag_gen_id}"
+            fi
+        done
+    fi
+
+    return 0
 }

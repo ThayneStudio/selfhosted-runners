@@ -76,18 +76,29 @@ if ! pvesm status | awk '{print $1}' | grep -qxF "$VM_STORAGE"; then
     exit 1
 fi
 
-read -rp "Template VM ID [9000]: " TEMPLATE_ID
-TEMPLATE_ID=${TEMPLATE_ID:-9000}
+EXISTING_TEMPLATE_ID=""
+if [[ -f "$CONFIG_FILE" ]]; then
+    EXISTING_TEMPLATE_ID=$(sed -n 's/^TEMPLATE_ID=//p' "$CONFIG_FILE" | tail -n 1 | tr -d "\"'")
+fi
+DEFAULT_TEMPLATE_ID="${EXISTING_TEMPLATE_ID:-9000}"
+read -rp "Template VM ID [${DEFAULT_TEMPLATE_ID}]: " TEMPLATE_ID
+TEMPLATE_ID=${TEMPLATE_ID:-$DEFAULT_TEMPLATE_ID}
 
-# Minimum VM ID for runners (0 = use Proxmox default)
+# Minimum VM ID for runners. MIN_VMID=0 ("auto") is a hard error: nextid can
+# land in the generation band, and load_infra_config would then refuse the
+# written config (spec 4.2).
 DEFAULT_MIN_VMID=$((TEMPLATE_ID + 1))
-read -rp "Minimum VM ID for runners (0 = auto) [${DEFAULT_MIN_VMID}]: " MIN_VMID
+read -rp "Minimum VM ID for runners [${DEFAULT_MIN_VMID}]: " MIN_VMID
 MIN_VMID=${MIN_VMID:-$DEFAULT_MIN_VMID}
 if [[ ! "$MIN_VMID" =~ ^[0-9]+$ ]]; then
     log_error "Minimum VM ID must be a non-negative number"
     exit 1
 fi
-if [[ "$MIN_VMID" -ne 0 && "$MIN_VMID" -lt 100 ]]; then
+apply_generation_defaults
+if ! validate_generation_band; then
+    exit 1
+fi
+if [[ "$MIN_VMID" -lt 100 ]]; then
     log_error "Minimum VM ID must be at least 100"
     exit 1
 fi
@@ -144,7 +155,7 @@ echo "  Network Bridge: $NETWORK_BRIDGE"
 echo "  VLAN Tag:       ${VLAN_TAG:-none}"
 echo "  VM Storage:     $VM_STORAGE"
 echo "  Template ID:    $TEMPLATE_ID"
-echo "  Min VM ID:      $([ "${MIN_VMID:-0}" -eq 0 ] && echo "auto" || echo "$MIN_VMID")"
+echo "  Min VM ID:      $MIN_VMID"
 echo "  Balloon:        ${BALLOON:-0} MB ($([ "${BALLOON:-0}" -eq 0 ] && echo "disabled" || echo "enabled"))"
 echo "  DNS Servers:    ${DNS_SERVERS:-DHCP only}"
 echo "  Docker Mirror:  ${DOCKER_MIRROR_URL:-none}"
@@ -227,6 +238,9 @@ STOPPED_REAP_MINUTES=$(existing_conf_value STOPPED_REAP_MINUTES)
 STOPPED_REAP_MINUTES=${STOPPED_REAP_MINUTES:-$DEFAULT_STOPPED_REAP_MINUTES}
 GUARD_EXCLUDE_VMIDS=$(existing_conf_value GUARD_EXCLUDE_VMIDS)
 GUARD_EXCLUDE_VMIDS=${GUARD_EXCLUDE_VMIDS:-$DEFAULT_GUARD_EXCLUDE_VMIDS}
+NOTIFY_WEBHOOK_URL=$(existing_conf_value NOTIFY_WEBHOOK_URL)
+NOTIFY_MIN_SEVERITY=$(existing_conf_value NOTIFY_MIN_SEVERITY)
+NOTIFY_FORMAT=$(existing_conf_value NOTIFY_FORMAT)
 
 CONF_TMP=$(mktemp "${CONFIG_FILE}.XXXXXX")
 {
@@ -241,6 +255,9 @@ CONF_TMP=$(mktemp "${CONFIG_FILE}.XXXXXX")
     printf 'MAX_VM_LIFETIME_HOURS=%q\n' "$MAX_VM_LIFETIME_HOURS"
     printf 'STOPPED_REAP_MINUTES=%q\n' "$STOPPED_REAP_MINUTES"
     printf 'GUARD_EXCLUDE_VMIDS=%q\n' "$GUARD_EXCLUDE_VMIDS"
+    [[ -n "${NOTIFY_WEBHOOK_URL:-}" ]] && printf 'NOTIFY_WEBHOOK_URL=%q\n' "$NOTIFY_WEBHOOK_URL"
+    [[ -n "${NOTIFY_MIN_SEVERITY:-}" ]] && printf 'NOTIFY_MIN_SEVERITY=%q\n' "$NOTIFY_MIN_SEVERITY"
+    [[ -n "${NOTIFY_FORMAT:-}" ]] && printf 'NOTIFY_FORMAT=%q\n' "$NOTIFY_FORMAT"
 } > "$CONF_TMP"
 chmod 600 "$CONF_TMP"
 mv "$CONF_TMP" "$CONFIG_FILE"
@@ -284,356 +301,86 @@ fi
 # Check if template already exists
 if qm status "$TEMPLATE_ID" &> /dev/null; then
     log_info "[4/5] Template VM $TEMPLATE_ID already exists. Skipping creation."
-    log_warn "To recreate: qm destroy $TEMPLATE_ID && runner setup"
+    # Adopt as generation 1 when the store is empty (spec 8). No-op otherwise;
+    # never destroys.
+    # shellcheck source=generations.sh
+    source "$LIB_DIR/generations.sh"
+    adopt_deployed_template
 else
-    # Download and create template
-    log_info "[4/5] Creating baked Ubuntu cloud template..."
-    CLOUD_IMG="noble-server-cloudimg-amd64.img"
-    CLOUD_IMG_URL="https://cloud-images.ubuntu.com/noble/current/$CLOUD_IMG"
+    # Bootstrap (ruling 2): no template at TEMPLATE_ID. Bake a band candidate
+    # and promote it with skip-canary --yes only when the store had no active
+    # generation before the bake. --yes is not a production maintain bypass.
+    log_info "[4/5] No template at VMID $TEMPLATE_ID — baking the first generation..."
+    # shellcheck source=bake.sh
+    source "$LIB_DIR/bake.sh"
+    # shellcheck source=promote.sh
+    source "$LIB_DIR/promote.sh"
 
-    # Use a root-only cache directory instead of world-writable /tmp/
-    # to prevent symlink attacks or image replacement by unprivileged users
-    IMG_CACHE_DIR="/var/cache/github-runners"
-    mkdir -p "$IMG_CACHE_DIR"
-    chmod 700 "$IMG_CACHE_DIR"
-
-    CLOUD_IMG_PATH="$IMG_CACHE_DIR/$CLOUD_IMG"
-    CHECKSUM_URL="https://cloud-images.ubuntu.com/noble/current/SHA256SUMS"
-    # Floor for the plausibility check below, not a validity gate. The published
-    # image is ~595 MB; this sits under that so an upstream size change does not
-    # start failing bakes on its own.
-    MIN_CLOUD_IMG_BYTES=$((400 * 1024 * 1024))
-
-    # Names the build upstream actually served. pve-test kept receiving the
-    # 20260615 image long after noble/current had moved on, which a hash alone
-    # does not reveal; Last-Modified/ETag identify the build without comparing
-    # the hash against every dated directory by hand. Diagnostic only — a failed
-    # or unparsable probe must never affect the bake.
-    log_served_build() {
-        local headers served
-        headers=$(wget -S --spider --tries=1 --timeout=15 "$CLOUD_IMG_URL" 2>&1) || return 0
-        served=$(printf '%s\n' "$headers" \
-            | grep -iE '^[[:space:]]*(Last-Modified|ETag|Content-Length):' \
-            | tr -d '\r' | tr '\n' ' ' | tr -s ' ') || return 0
-        [[ -n "$served" ]] && log_info "Upstream served:$served"
-        return 0
-    }
-
-    # $1 is the attempt number. --tries/--timeout absorb a transient reset
-    # without spending the one retry on it. The retry also sends no-cache
-    # request headers; those only reach an explicit proxy or something
-    # terminating TLS, so treat them as cheap rather than reliable — the served
-    # headers logged next are what actually identify a mirror stuck on an old
-    # dated build.
-    download_cloud_img() {
-        local -a wget_args=(-q --show-progress --tries=3 --timeout=30)
-        if (( $1 > 1 )); then
-            wget_args+=(--no-cache)
-            log_info "Re-downloading Ubuntu 24.04 cloud image (asking caches to revalidate)..."
-        else
-            log_info "Downloading Ubuntu 24.04 cloud image..."
-        fi
-        if ! wget "${wget_args[@]}" -O "$CLOUD_IMG_PATH" "$CLOUD_IMG_URL"; then
-            log_error "Failed to download cloud image"
-            return 1
-        fi
-        log_served_build
-    }
-
-    # A diagnostic, not a validity gate: the SHA256 comparison below is what
-    # establishes that this is the image upstream published. This only checks a
-    # size floor and the four-byte qcow2 magic so that a truncated transfer or
-    # an error page says what it is, instead of surfacing as a checksum failure
-    # that reads like tampering. The magic is read directly rather than through
-    # qemu-img so the check holds on any host.
-    check_cloud_img_plausible() {
-        local size magic head_bytes
-        size=$(wc -c < "$CLOUD_IMG_PATH")
-        size=${size//[[:space:]]/}
-        if (( size < MIN_CLOUD_IMG_BYTES )); then
-            log_error "Cloud image is ${size:-0} bytes, far below the ~600 MB upstream publishes"
-            log_error "The download did not return a whole image — look for a proxy, captive portal, 404 page or truncated transfer"
-            head_bytes=$(head -c 200 "$CLOUD_IMG_PATH" | tr -cd '[:print:]' | tr -s ' ')
-            [[ -n "$head_bytes" ]] && log_error "Response began: $head_bytes"
-            return 1
-        fi
-        magic=$(od -An -N4 -tx1 "$CLOUD_IMG_PATH" | tr -cd '[:xdigit:]')
-        if [[ "$magic" != "514649fb" ]]; then
-            log_error "Cloud image is $size bytes but does not start with the qcow2 magic"
-            log_error "Leading bytes: ${magic:-none} (expected 514649fb)"
-            return 1
-        fi
-        return 0
-    }
-
-    # Ubuntu rotates noble/current every 2-4 weeks, so a cached image that no
-    # longer matches SHA256SUMS is far more often stale than tampered with.
-    # Discard it and download once more before treating the mismatch as fatal.
-    # SHA256SUMS is re-fetched each attempt so a rotation that lands mid-run
-    # recovers too, rather than pairing a new image against the old sums.
-    FIRST_ATTEMPT_NOTE=""
-    for attempt in 1 2; do
-        if [[ -f "$CLOUD_IMG_PATH" ]]; then
-            log_info "Using cached cloud image from $CLOUD_IMG_PATH"
-        elif ! download_cloud_img "$attempt"; then
-            rm -f "$CLOUD_IMG_PATH"
-            (( attempt == 1 )) || log_error "The re-download failed; attempt 1 had produced $FIRST_ATTEMPT_NOTE"
-            exit 1
-        fi
-
-        if ! check_cloud_img_plausible; then
-            rm -f "$CLOUD_IMG_PATH"
-            if (( attempt == 1 )); then
-                FIRST_ATTEMPT_NOTE="a file that was not a usable image"
-                log_warn "Discarding it and downloading again (attempt 2 of 2)..."
-                continue
-            fi
-            log_error "The re-downloaded file was not a usable image either — aborting"
-            exit 1
-        fi
-
-        # Verify SHA256 checksum. There is no proceed-without-it path: an
-        # unverified image would be baked into the template every runner clones.
-        log_info "Verifying cloud image checksum..."
-        SHA256SUMS_TEXT=$(wget -q -O - --tries=3 --timeout=30 "$CHECKSUM_URL") || {
-            log_error "Could not fetch $CHECKSUM_URL — cannot verify the cloud image"
-            exit 1
-        }
-        # Selected by exact filename. SHA256SUMS is sorted by hash, so picking a
-        # line by position would become arbitrary the day upstream adds a
-        # suffixed entry. awk also reports no-match as empty output rather than
-        # a non-zero status, which would abort this script without a word.
-        EXPECTED_SHA256=$(printf '%s\n' "$SHA256SUMS_TEXT" \
-            | awk -v img="$CLOUD_IMG" '$2 == img || $2 == "*" img { print $1; exit }')
-        if [[ -z "$EXPECTED_SHA256" ]]; then
-            log_error "No entry for $CLOUD_IMG in $CHECKSUM_URL — cannot verify the cloud image"
-            exit 1
-        fi
-
-        ACTUAL_SHA256=$(sha256sum "$CLOUD_IMG_PATH" | awk '{print $1}')
-        if [[ "$ACTUAL_SHA256" == "$EXPECTED_SHA256" ]]; then
-            log_info "Checksum verified"
-            if [[ -n "$FIRST_ATTEMPT_NOTE" ]]; then
-                log_warn "This bake needed a second download: attempt 1 produced $FIRST_ATTEMPT_NOTE"
-                log_warn "Attempt 2 matched upstream SHA256SUMS: $EXPECTED_SHA256"
-            fi
-            break
-        fi
-
-        rm -f "$CLOUD_IMG_PATH"
-        if (( attempt == 1 )); then
-            FIRST_ATTEMPT_NOTE="an image hashing $ACTUAL_SHA256"
-            log_warn "Cloud image does not match upstream SHA256SUMS"
-            log_warn "Expected: $EXPECTED_SHA256"
-            log_warn "Got:      $ACTUAL_SHA256"
-            log_warn "Upstream rotates noble/current every few weeks, so a cached image is most often simply stale."
-            log_warn "Discarding it and downloading again (attempt 2 of 2)..."
-            continue
-        fi
-
-        log_error "Checksum verification failed on both attempts — nothing was imported"
-        log_error "Expected: $EXPECTED_SHA256"
-        log_error "Got:      $ACTUAL_SHA256"
-        log_error "Attempt 1 produced $FIRST_ATTEMPT_NOTE"
-        log_error "The second download asked caches to revalidate and still did not match."
-        log_error "Check any upstream headers logged above: if the build served is older than the"
-        log_error "one noble/current now points at, compare it against the SHA256SUMS under"
-        log_error "https://cloud-images.ubuntu.com/noble/<date>/ to name it, then inspect"
-        log_error "http_proxy, /etc/wgetrc and DNS for cloud-images.ubuntu.com on this host."
-        exit 1
-    done
-
-    log_info "Creating VM template..."
-    NET_CONFIG="virtio,bridge=$NETWORK_BRIDGE"
-    if [[ -n "$VLAN_TAG" ]]; then
-        NET_CONFIG="${NET_CONFIG},tag=$VLAN_TAG"
+    had_active=0
+    if [[ -n "$(gen_list active)" ]]; then
+        had_active=1
     fi
-    if ! qm create "$TEMPLATE_ID" --name ubuntu-cloud-template \
-        --memory 8192 --balloon "$BALLOON" --cores 2 --cpu host --net0 "$NET_CONFIG"; then
-        log_error "Failed to create VM"
+
+    if ! bake_main --force; then
+        log_error "First-run bake failed"
         exit 1
     fi
 
-    # Cleanup trap: destroy template VM on any failure or interrupt from this point
-    cleanup_bake() {
-        log_warn "Baking failed, cleaning up template VM..."
-        qm stop "$TEMPLATE_ID" --timeout 30 2>/dev/null || true
-        qm destroy "$TEMPLATE_ID" --purge 2>/dev/null || true
-    }
-    trap cleanup_bake EXIT
-
-    IMPORT_OUTPUT=$(qm importdisk "$TEMPLATE_ID" "$IMG_CACHE_DIR/$CLOUD_IMG" "$VM_STORAGE" 2>&1) || {
-        log_error "Failed to import disk"
-        echo "$IMPORT_OUTPUT" >&2
-        exit 1
-    }
-
-    # Extract the disk volume from importdisk output
-    # Typical output: "Successfully imported disk as 'unused0:storage:vm-9000-disk-0'"
-    if [[ "$IMPORT_OUTPUT" =~ unused0:([^\'\"[:space:]]+) ]]; then
-        IMPORTED_DISK="${BASH_REMATCH[1]}"
-    else
-        # Fallback to conventional naming
-        IMPORTED_DISK="${VM_STORAGE}:vm-${TEMPLATE_ID}-disk-0"
-        log_warn "Could not parse imported disk name from importdisk output:"
-        log_warn "$IMPORT_OUTPUT"
-        log_warn "Assuming: $IMPORTED_DISK"
-    fi
-
-    qm set "$TEMPLATE_ID" --scsihw virtio-scsi-pci --scsi0 "$IMPORTED_DISK" \
-        || { log_error "Failed to configure SCSI"; exit 1; }
-    qm set "$TEMPLATE_ID" --ide2 "${VM_STORAGE}:cloudinit" \
-        || { log_error "Failed to add cloud-init drive"; exit 1; }
-    qm set "$TEMPLATE_ID" --boot c --bootdisk scsi0 \
-        || { log_error "Failed to set boot disk"; exit 1; }
-    qm set "$TEMPLATE_ID" --serial0 socket --vga serial0 \
-        || { log_error "Failed to set serial"; exit 1; }
-    qm set "$TEMPLATE_ID" --agent enabled=1 \
-        || { log_error "Failed to enable agent"; exit 1; }
-    qm resize "$TEMPLATE_ID" scsi0 30G \
-        || { log_error "Failed to resize disk"; exit 1; }
-
-    # Copy template-setup cloud-init to snippets and configure
-    log_info "Configuring template cloud-init..."
-    DOCKER_MIRROR_URL="${DOCKER_MIRROR_URL:-}" awk '
-    function lreplace(str, old, new,    i, result) {
-        result = ""
-        while ((i = index(str, old)) > 0) {
-            result = result substr(str, 1, i - 1) new
-            str = substr(str, i + length(old))
-        }
-        return result str
-    }
-    {
-        $0 = lreplace($0, "{{DOCKER_MIRROR_URL}}", ENVIRON["DOCKER_MIRROR_URL"])
-        print
-    }' "$INSTALL_DIR/templates/template-setup.yaml" > "$SNIPPETS_DIR/template-setup.yaml"
-    chmod 600 "$SNIPPETS_DIR/template-setup.yaml"
-
-    qm set "$TEMPLATE_ID" --cicustom "user=local:snippets/template-setup.yaml" \
-        || { log_error "Failed to set cloud-init config"; exit 1; }
-    qm set "$TEMPLATE_ID" --ipconfig0 ip=dhcp \
-        || { log_error "Failed to set IP config"; exit 1; }
-    if [[ -n "${DNS_SERVERS:-}" ]]; then
-        qm set "$TEMPLATE_ID" --nameserver "$DNS_SERVERS" \
-            || { log_error "Failed to set DNS servers"; exit 1; }
-    fi
-    qm set "$TEMPLATE_ID" --ciuser runner \
-        || { log_error "Failed to set cloud-init user"; exit 1; }
-
-    # Boot VM to bake tools into the template
-    log_info "Starting VM to install tools (this can take a while on cold caches)..."
-    if ! qm start "$TEMPLATE_ID"; then
-        log_error "Failed to start template VM"
-        exit 1
-    fi
-
-    # Poll for the guest's completion marker. The guest stays running until we
-    # confirm the marker and shut it down ourselves — see templates/template-setup.yaml.
-    log_info "Waiting for tool installation to complete..."
-    log_info "  (Monitor progress: qm guest exec $TEMPLATE_ID -- cat /var/log/template-setup.log)"
-    BAKE_ELAPSED=0
-    BAKE_INTERVAL=15
-    BAKE_TIMEOUT="${BAKE_TIMEOUT:-5400}"   # 90 min; a healthy bake runs ~30-45
-    BAKE_READY=false
-
-    while true; do
-        sleep $BAKE_INTERVAL
-        BAKE_ELAPSED=$((BAKE_ELAPSED + BAKE_INTERVAL))
-
-        if [[ $BAKE_ELAPSED -ge $BAKE_TIMEOUT ]]; then
-            echo "" >&2
-            log_error "Bake timed out after $((BAKE_TIMEOUT / 60)) minutes (override with BAKE_TIMEOUT=<seconds>)"
-            log_error "Last 40 lines from the guest:"
-            qm guest exec "$TEMPLATE_ID" -- tail -n 40 /var/log/template-setup.log 2>/dev/null \
-                | jq -r '."out-data" // empty' >&2 || true
+    if [[ "$had_active" -eq 0 ]]; then
+        cand_vmid=""
+        cand_count=0
+        while read -r cand_line; do
+            [[ -n "$cand_line" ]] || continue
+            cand_vmid="$cand_line"
+            cand_count=$((cand_count + 1))
+        done < <(gen_list candidate)
+        if [[ "$cand_count" -ne 1 || -z "$cand_vmid" ]]; then
+            log_error "Bake finished but could not find a single candidate to promote"
             exit 1
         fi
-
-        # The guest never powers itself off, so a stopped VM means a crash or an
-        # external `qm stop` — never success. Refuse to publish.
-        VM_STATUS=$(qm status "$TEMPLATE_ID" 2>/dev/null | awk '{print $2}') || true
-        if [[ "$VM_STATUS" != "running" ]]; then
-            echo "" >&2
-            log_error "Template VM stopped before setup completion was confirmed"
-            log_error "Refusing to publish a possibly half-baked template."
+        # gen_read publishes GEN_* into its caller. Capture in a subshell so
+        # we do not depend on the parent seeing those assignments.
+        # shellcheck disable=SC2031
+        bootstrap_gen_id=$(
+            gen_read "$cand_vmid" || exit 1
+            printf '%s' "$GEN_ID"
+        ) || exit 1
+        if [[ -z "$bootstrap_gen_id" ]]; then
+            log_error "Candidate VMID $cand_vmid has no GEN_ID"
             exit 1
         fi
-
-        # Try to check for completion marker via guest agent
-        EXEC_RESULT=$(qm guest exec "$TEMPLATE_ID" -- test -f /opt/.template-setup-complete 2>&1) || {
-            # Guest agent not ready yet (still installing qemu-guest-agent)
-            MINUTES=$((BAKE_ELAPSED / 60))
-            SECONDS_REM=$((BAKE_ELAPSED % 60))
-            printf '\r  Elapsed: %dm%02ds (waiting for guest agent...)' "$MINUTES" "$SECONDS_REM" >&2
-            continue
-        }
-
-        # Parse exit code from guest exec JSON response
-        EXEC_EXIT=$(echo "$EXEC_RESULT" | jq -r '.exitcode // "1"' 2>/dev/null) || EXEC_EXIT="1"
-        if [[ "$EXEC_EXIT" == "0" ]]; then
-            BAKE_READY=true
-            echo "" >&2
-            log_info "Template setup complete!"
-            break
+        if ! promote_generation "$bootstrap_gen_id" --skip-canary --yes; then
+            log_error "Failed to promote generation $bootstrap_gen_id"
+            exit 1
         fi
-
-        MINUTES=$((BAKE_ELAPSED / 60))
-        SECONDS_REM=$((BAKE_ELAPSED % 60))
-        printf '\r  Elapsed: %dm%02ds (installing tools...)' "$MINUTES" "$SECONDS_REM" >&2
-    done
-    echo "" >&2
-
-    # Publish gate: never convert a VM whose marker we did not confirm.
-    if [[ "$BAKE_READY" != "true" ]]; then
-        log_error "Internal error: bake loop exited without a confirmed completion marker"
-        exit 1
+        TEMPLATE_ID=$(reload_active_template_id) || exit 1
+        log_info "Promoted generation $bootstrap_gen_id (VMID $TEMPLATE_ID) as the active template"
     fi
-
-    log_info "Shutting down template VM..."
-    qm shutdown "$TEMPLATE_ID" --timeout 120 || {
-        log_warn "Graceful shutdown failed, forcing..."
-        qm stop "$TEMPLATE_ID" --skiplock 2>/dev/null || true
-    }
-    # shellcheck disable=SC2034  # loop counter is unused; this is a bounded poll
-    for i in {1..60}; do
-        VM_STATUS=$(qm status "$TEMPLATE_ID" 2>/dev/null | awk '{print $2}') || true
-        [[ "$VM_STATUS" == "stopped" ]] && break
-        sleep 2
-    done
-    if [[ "$VM_STATUS" != "stopped" ]]; then
-        log_error "Template VM did not reach stopped state; refusing to convert to template"
-        exit 1
-    fi
-
-    # Clear bake-time cloud-init settings so clones start fresh
-    log_info "Preparing template for cloning..."
-    qm set "$TEMPLATE_ID" --delete cicustom 2>/dev/null || true
-    qm set "$TEMPLATE_ID" --delete ciuser 2>/dev/null || true
-    qm set "$TEMPLATE_ID" --delete ipconfig0 2>/dev/null || true
-    qm set "$TEMPLATE_ID" --delete nameserver 2>/dev/null || true
-
-    # Convert to template
-    qm template "$TEMPLATE_ID" || { log_error "Failed to convert to template"; exit 1; }
-
-    # Disable cleanup trap — template created successfully
-    trap - EXIT
-
-    log_info "Template created successfully (tools baked in)"
 fi
 
-log_info "[5/5] Installing pool watcher and lifetime guard timers..."
-cp "$INSTALL_DIR/templates/github-runner-watch.service" /etc/systemd/system/
-cp "$INSTALL_DIR/templates/github-runner-watch.timer" /etc/systemd/system/
-cp "$INSTALL_DIR/templates/github-runner-guard.service" /etc/systemd/system/
-cp "$INSTALL_DIR/templates/github-runner-guard.timer" /etc/systemd/system/
+log_info "[5/5] Installing pool watcher, lifetime guard, and maintain timers..."
+cp "$INSTALL_DIR/templates/github-runner-watch.service" "$SYSTEMD_UNIT_DIR/"
+cp "$INSTALL_DIR/templates/github-runner-watch.timer" "$SYSTEMD_UNIT_DIR/"
+cp "$INSTALL_DIR/templates/github-runner-guard.service" "$SYSTEMD_UNIT_DIR/"
+cp "$INSTALL_DIR/templates/github-runner-guard.timer" "$SYSTEMD_UNIT_DIR/"
+cp "$INSTALL_DIR/templates/github-runner-maintain.service" "$SYSTEMD_UNIT_DIR/"
+cp "$INSTALL_DIR/templates/github-runner-maintain.timer" "$SYSTEMD_UNIT_DIR/"
+cp "$INSTALL_DIR/templates/github-runner-upgrade.service" "$SYSTEMD_UNIT_DIR/"
+mkdir -p "$LOGROTATE_DIR"
+cp "$INSTALL_DIR/templates/github-runners.logrotate" "$LOGROTATE_DIR/github-runners"
 systemctl daemon-reload
 systemctl enable --now github-runner-watch.timer 2>/dev/null || true
 systemctl enable --now github-runner-guard.timer 2>/dev/null || true
+systemctl enable --now github-runner-maintain.timer 2>/dev/null || true
 log_info "Pool watcher timer installed (30s interval)"
 log_info "Lifetime guard timer installed (5m interval, ${MAX_VM_LIFETIME_HOURS}h VM ceiling, ${STOPPED_REAP_MINUTES}m stopped reap)"
+log_info "Maintain timer installed (daily 02:30, rebake inside REBAKE_WINDOW)"
 echo "  Preview what it would destroy:  runner guard --dry-run"
 echo "  Turn it off:                    systemctl disable --now github-runner-guard.timer"
+echo "  Disable daily maintain:         systemctl disable --now github-runner-maintain.timer"
+echo "  Bake and promote a new generation:"
+echo "    runner upgrade --dry-run"
+echo "    runner upgrade"
 
 echo ""
 echo "========================================"

@@ -1,0 +1,8 @@
+/var/log/github-runners/*.log {
+    weekly
+    rotate 8
+    compress
+    missingok
+    notifempty
+    copytruncate
+}

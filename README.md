@@ -128,6 +128,7 @@ After setup, the `runner` command is available globally:
 | `runner stop [options]` | Enter maintenance mode and stop managed runners |
 | `runner list` | List all runner VMs |
 | `runner guard [--dry-run]` | Reap stopped and over-age runner VMs (normally run by timer) |
+| `runner upgrade [--dry-run] [--force]` | Bake a candidate if needed and promote it |
 | `runner help` | Show available commands |
 
 ## Runner Lifetime and Reaping
@@ -169,10 +170,10 @@ runner guard --dry-run     # prints candidates and reasons, destroys nothing
   check `runner destroy` uses. Unrelated VMs on the same host are invisible to
   it.
 - `TEMPLATE_ID`, and any VM that is itself a template.
-- Any VM below the runner VMID floor. That floor is `MIN_VMID`; if the key is
-  absent from your config it is `TEMPLATE_ID + 1`, and an explicit `MIN_VMID=0`
-  ("let Proxmox pick") means no floor, since runner VMIDs can then land
-  anywhere.
+- Any VM below the runner VMID floor (`MIN_VMID`). `MIN_VMID` is required and
+  must sit above the generation template band (`TEMPLATE_BAND_MAX`, default
+  8999, so `9000` or higher). Absent or `MIN_VMID=0` is a hard error at
+  config load; `install.sh` aborts an upgrade until it is set.
 - Any VM with `protection: 1` or a `lock:` line — including one suspended to
   disk. **This is the escape hatch**: to keep a wedged runner for forensics,
   `qm set <vmid> --protection 1`. A copy taken with `qm clone`/`qm restore`
@@ -438,58 +439,55 @@ cloned runner VM):
    runner create runner-01
    ```
 
-To update prebaked software in the base VM template:
+To update prebaked software in the base VM template (does **not** destroy
+the live clone target):
 
-1. Edit `/opt/selfhosted-runners/templates/template-setup.yaml`
-2. Stop the watcher, remove managed runners, and free any orphaned linked-clone child volumes that still point at the current template:
-   ```bash
-   runner stop
-   ```
-3. Destroy the existing template VM (default ID `9000`, or your configured template ID):
-   ```bash
-   qm destroy 9000
-   ```
-4. Re-run setup to bake a fresh template:
-   ```bash
-   runner setup
-   ```
-   > **Record your config first.** The wizard re-prompts all eight infrastructure
-   > questions with *hardcoded* defaults -- it does not read your existing
-   > `/etc/github-runners.conf`. Pressing Enter through it silently clears
-   > `DOCKER_MIRROR_URL` and `VLAN_TAG`, for the bake and for every future clone.
-   > Run `cat /etc/github-runners.conf` beforehand and retype every
-   > non-default value. Your PAT and org configs are not touched -- `add-org` only
-   > runs when no orgs exist yet, and the unprompted guard thresholds
-   > (`MAX_VM_LIFETIME_HOURS`, `STOPPED_REAP_MINUTES`) are read back and kept.
-5. Resume the pool and refill it:
-   ```bash
-   runner start
-   ```
+```bash
+runner upgrade --dry-run
+runner upgrade
+```
+
+That bakes a new generation in the 8900–8999 band and promotes it. Existing
+clones keep running on the previous template until they recycle. Preview first
+with `--dry-run`. If the active template is older than `REBAKE_MAX_AGE_DAYS`
+(default 7), `--dry-run` shows `reason=weekly-floor` and upgrade rebakes even
+when the digest is unchanged.
+
+If a previous bake failed and the digest is memoed:
+
+```bash
+runner upgrade --force
+```
 
 ### If the bake fails or appears stuck
 
-The bake is gated so a partial template can never be published. The guest writes
-its completion marker last and does **not** power itself off; `runner setup`
-confirms that marker over the guest agent while the VM is still running, then
-shuts the VM down itself and only then converts it to a template.
+`runner upgrade` bakes in `github-runner-upgrade.service`, not in the SSH
+session. Ctrl-C on the CLI detaches (non-zero) and the unit keeps running.
+A dropped SSH does **not** `bake_fail` or memo the digest.
 
-- **Timeout**: the bake aborts after 90 minutes and prints the last 40 lines from
-  the guest log. A healthy bake runs 30-45 minutes. Override with
-  `BAKE_TIMEOUT=<seconds> runner setup`.
-- **`qm stop` on a stuck bake is safe.** The VM stopping without a confirmed
-  marker is treated as failure -- setup aborts and the cleanup trap destroys the
-  partial VM rather than publishing it.
-- **Ctrl-C is also safe**, and does the same thing.
-- **Run `runner setup` under `tmux` or `screen`.** The wizard is interactive, so it
-  runs over SSH -- and a dropped connection fires the same cleanup trap, throwing
-  away an in-progress bake.
-- Watch progress with
-  `qm guest exec <TEMPLATE_ID> -- cat /var/log/template-setup.log`.
+The bake is gated so a partial template can never be published. The guest writes
+its completion marker last and does **not** power itself off. Bake confirms that
+marker over the guest agent while the VM is still running, then shuts the VM
+down itself and only then converts it to a template.
+
+- **Watch:** `journalctl -u github-runner-upgrade.service -f`. Guest log is on
+  the **band** VMID (`planned_vmid` from `--dry-run`, or `bake_log=` on success),
+  not on live `TEMPLATE_ID`:
+  `qm guest exec <vmid> -- cat /var/log/template-setup.log`.
+- **Timeout:** the bake aborts after 90 minutes. A healthy bake runs 30-45
+  minutes. Override with `BAKE_TIMEOUT=<seconds> runner upgrade`.
+- **`qm stop` on a stuck bake VM is safe.** The VM stopping without a confirmed
+  marker is treated as failure — the cleanup trap destroys the partial band VM,
+  never the live clone target, and memos the digest.
+- **Memoed digest** (previous bake failed): `runner upgrade --force`. Do not
+  run `runner setup` — on a host that already has a live template, setup
+  adopts and skips the bake. Do not run `runner bake --force` over SSH; that
+  is in-process and an SSH drop memos the digest again.
 - **Checksum verification failed?** The cached Ubuntu image at
   `/var/cache/github-runners/` goes stale whenever upstream rotates
-  `noble/current/`, roughly every 2-4 weeks. Setup deletes the bad file on its way
-  out, so just run `runner setup` again -- it downloads a fresh image. This is not
-  a supply-chain compromise, though the error reads like one.
+  `noble/current/`, roughly every 2-4 weeks. Bake deletes the bad file on its
+  way out; `--force` downloads a fresh image. This is not a supply-chain
+  compromise, though the error reads like one.
 
 ### The 30-day rebake deadline
 
@@ -637,7 +635,14 @@ Run `runner setup` first to create the configuration.
 
 ### "Template VM does not exist" error
 
-The template was deleted. Re-run `runner setup` to recreate it.
+The live clone target is gone. Preview then bake a new generation:
+
+```bash
+runner upgrade --dry-run
+runner upgrade
+```
+
+Do not re-run `runner setup` if VM 9000 still exists — setup will adopt it and skip the bake.
 
 ### VM creation fails with "storage not found"
 

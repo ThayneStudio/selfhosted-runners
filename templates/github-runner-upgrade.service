@@ -1,0 +1,15 @@
+[Unit]
+Description=GitHub Actions runner upgrade (bake then promote)
+# pvedaemon must be up before `qm` means anything; a bake talks to the guest.
+After=network-online.target pve-cluster.service pvedaemon.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# --foreground skips the systemctl wrap (INVOCATION_ID is also set here).
+ExecStart=/usr/local/bin/runner upgrade --foreground
+# Bake timeout is 90m; flock wait can add another 90m if maintain is baking.
+TimeoutStartSec=14400
+MemoryMax=512M
+CPUQuota=200%
+SyslogIdentifier=github-runner-upgrade

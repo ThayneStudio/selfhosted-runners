@@ -40,7 +40,7 @@ load_org_config "$SELECTED_ORG"
 
 # Verify template is ready
 qm config "$TEMPLATE_ID" 2>/dev/null | grep -q "^template: 1" || {
-    log_error "Template $TEMPLATE_ID not ready. Run 'runner setup'."; exit 1; }
+    log_error "Template $TEMPLATE_ID not ready. Run 'runner upgrade' (or 'runner setup' on a host with no template)."; exit 1; }
 
 # Verify snippet exists
 [[ -f "$SNIPPETS_DIR/runner-user-data-${SELECTED_ORG}.yaml" ]] || {
@@ -51,7 +51,16 @@ EXISTING=$(qm list | awk -v n="$RUNNER_NAME" '$2==n {print $1}')
 [[ -z "$EXISTING" ]] || { log_error "'$RUNNER_NAME' already exists (VMID $EXISTING)"; exit 1; }
 
 log_info "Creating $RUNNER_NAME for org $GITHUB_ORG..."
-VMID=$(clone_runner "$RUNNER_NAME" "$SELECTED_ORG") || { log_error "Clone failed"; exit 1; }
+clone_rc=0
+VMID=$(clone_runner "$RUNNER_NAME" "$SELECTED_ORG") || clone_rc=$?
+if [[ "$clone_rc" -eq 3 ]]; then
+    log_info "create: promotion in progress; not creating $RUNNER_NAME"
+    exit 3
+fi
+if [[ "$clone_rc" -ne 0 ]]; then
+    log_error "Clone failed"
+    exit 1
+fi
 
 echo ""
 log_info "Runner '$RUNNER_NAME' started (VMID: $VMID)"

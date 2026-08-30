@@ -304,24 +304,29 @@ run_guard() {
     ! destroyed 8500
 }
 
-@test "an absent MIN_VMID falls back to TEMPLATE_ID + 1" {
+@test "an absent MIN_VMID is a hard error at config load" {
+    # Generations cannot express overlap against auto-allocation, so
+    # load_infra_config treats a missing MIN_VMID like 0 and refuses to start.
     config_unset MIN_VMID
     make_vm 102 runner-low stopped github
     age_vm_config 102 3600
     enable_drain
     run_guard --now
-    [ "$status" -eq 0 ]
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"MIN_VMID=0"* ]]
     ! destroyed 102
 }
 
-@test "an explicit MIN_VMID=0 means no floor" {
+@test "an explicit MIN_VMID=0 is a hard error at config load" {
     config_set MIN_VMID 0
     make_vm 102 runner-low stopped github
     age_vm_config 102 3600
     enable_drain
     run_guard --now
-    [ "$status" -eq 0 ]
-    destroyed 102
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"MIN_VMID=0"* ]]
+    [[ "$output" == *"9000"* ]]
+    ! destroyed 102
 }
 
 @test "never destroys a template, whatever its VMID" {

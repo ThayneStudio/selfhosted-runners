@@ -67,6 +67,8 @@ HARNESS_SANDBOXED_CONSTANTS=(
     CLONE_SLOT_LOCK_PREFIX
     RUNNER_SLOT_LOCK_PREFIX
     RECLONE_STATE_PREFIX
+    SYSTEMD_UNIT_DIR
+    LOGROTATE_DIR
 )
 
 # --- Loading code under test ---------------------------------------------
@@ -143,7 +145,7 @@ _sandbox_one_path() {
     value="${!name}"
     [[ "$value" == "$HOST_SANDBOX"* ]] && return 0
     case "$value" in
-        /etc/*|/run/*|/var/lib/*|/var/log/*|/var/spool/*) ;;
+        /etc/*|/run/*|/var/lib/*|/var/log/*|/var/cache/*|/var/spool/*) ;;
         *) return 0 ;;
     esac
 

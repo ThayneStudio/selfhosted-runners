@@ -13,7 +13,7 @@ load test_helper
 
 # Directories the platform writes to on a host. /etc/github-runners{,.d} and
 # /var/lib/vz/snippets are included: they are just as unsandboxable.
-HOST_PATH_RE='"(/run/|/var/lib/|/etc/pve/|/etc/github-runners)'
+HOST_PATH_RE='"(/run/|/var/lib/|/var/log/|/var/cache/|/etc/pve/|/etc/github-runners|/etc/systemd/|/etc/logrotate)'
 
 @test "no lib script outside common.sh spells a host path as a literal" {
     local offenders=""

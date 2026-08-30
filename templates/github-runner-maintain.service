@@ -1,0 +1,14 @@
+[Unit]
+Description=GitHub Actions runner maintain
+# pvedaemon must be up before `qm` means anything; a bake talks to the guest.
+After=network-online.target pve-cluster.service pvedaemon.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/runner maintain
+# Bake timeout is 90m (BAKE_TIMEOUT); leave headroom for download and detect.
+TimeoutStartSec=7200
+MemoryMax=512M
+CPUQuota=200%
+SyslogIdentifier=github-runner-maintain

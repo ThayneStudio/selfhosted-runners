@@ -18,6 +18,10 @@ case "$COMMAND" in
     list-orgs) exec "$SCRIPT_DIR/lib/list-orgs.sh" "$@" ;;
     watch)     exec "$SCRIPT_DIR/lib/watch.sh" "$@" ;;
     guard)     exec "$SCRIPT_DIR/lib/guard.sh" "$@" ;;
+    bake)      exec "$SCRIPT_DIR/lib/bake.sh" "$@" ;;
+    promote)   exec "$SCRIPT_DIR/lib/promote.sh" "$@" ;;
+    maintain)  exec "$SCRIPT_DIR/lib/maintain.sh" "$@" ;;
+    upgrade)   exec "$SCRIPT_DIR/lib/upgrade.sh" "$@" ;;
     help|--help|-h)
         echo "Usage: runner <command> [args]"
         echo ""
@@ -33,6 +37,10 @@ case "$COMMAND" in
         echo "  list                        List all runner VMs"
         echo "  watch                       Fill runner pools (run by timer)"
         echo "  guard [--dry-run]           Reap stopped and over-age runner VMs (run by timer)"
+        echo "  bake [--force] [--dry-run]  Bake a new candidate generation"
+        echo "  promote <id> [--skip-canary] Promote a candidate generation to active"
+        echo "  maintain                    Unattended adopt/detect/bake cycle (run by timer)"
+        echo "  upgrade [--dry-run] [--force] [--foreground]  Bake if needed and promote"
         echo ""
         echo "Runners are ephemeral: one job, shutdown, auto-destroy, watcher recreates."
         ;;
