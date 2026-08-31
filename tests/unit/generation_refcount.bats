@@ -94,6 +94,9 @@ EOF
     run --separate-stderr generation_refcount 9
     [ "$status" -eq 0 ]
     [ "$output" = "1" ]
+    run --separate-stderr generation_ref_vmids 5
+    [ "$status" -eq 0 ]
+    [ "$output" = "9001" ]
     refute_called qm 'destroy *'
     refute_called pvesm 'free *'
 }

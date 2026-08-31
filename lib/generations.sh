@@ -929,19 +929,20 @@ generation_cfg_is_runner() {
     return 1
 }
 
-# Number of live VM configs attributed to generation <gen_id>.
-# Usage: generation_refcount <gen_id>
-# stdout: integer count. Exit 1 if the generation is unknown or inventory
-# cannot be read — never report 0 on a failed listing.
+# Live VMIDs attributed to generation <gen_id>. This is the authoritative
+# inventory used by both the numeric refcount and GC's blocker report, so those
+# two safety decisions cannot drift apart.
+# Usage: generation_ref_vmids <gen_id>
+# stdout: one VMID per line. Exit 1 if inventory cannot be read.
 # Proven by "generation_refcount counts VMs tagged gen-N and excludes the
 # template", "generation_refcount counts an untagged clone via ZFS origin",
 # "untagged clone with no origin is attributed to the active generation with
 # a warning", and "tag vs origin disagreement warns and counts the VM for
 # both generations".
-generation_refcount() (
+generation_ref_vmids() (
     local target="${1:-}" rec_vmid rec_id child_list child
     local all_vms vmid vm_name status cfg tags_line tag_id orig_id active_id=""
-    local count=0 attributed
+    local attributed
     local -A template_vmids=() origin_gen=()
 
     if ! gen_is_uint "$target"; then
@@ -1013,11 +1014,24 @@ generation_refcount() (
             fi
         fi
 
-        [[ "$attributed" -eq 1 ]] && count=$((count + 1))
+        [[ "$attributed" -eq 1 ]] && printf '%s\n' "$vmid"
     done <<< "$all_vms"
-
-    printf '%s\n' "$count"
+    return 0
 )
+
+# Number of live VM configs attributed to generation <gen_id>.
+# Usage: generation_refcount <gen_id>
+# stdout: integer count. Exit 1 if the generation is unknown or inventory
+# cannot be read — never report 0 on a failed listing.
+generation_refcount() {
+    local target="${1:-}" blockers count=0 vmid
+    blockers=$(generation_ref_vmids "$target") || return 1
+    while read -r vmid; do
+        [[ -n "$vmid" ]] || continue
+        count=$((count + 1))
+    done <<< "$blockers"
+    printf '%s\n' "$count"
+}
 
 # ---------------------------------------------------------------------------
 # Adoption (spec 8)

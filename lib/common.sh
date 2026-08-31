@@ -124,6 +124,11 @@ GUARD_DEFER_WARN_RUNS=3
 # hang off RUNNER_STATE_DIR so relocating state relocates them too.
 # shellcheck disable=SC2034  # consumed by bake, detect, promote, maintain
 BAKE_LOCK_FILE="/run/lock/github-runner-bake.lock"
+# Serializes manual and timer-driven garbage collection runs. GC makes several
+# decisions from one generation snapshot; overlapping runs must not both try to
+# destroy and archive the same record.
+# shellcheck disable=SC2034  # consumed by lib/gc.sh
+GC_LOCK_FILE="/run/lock/github-runner-gc.lock"
 # shellcheck disable=SC2034  # consumed by bake, detect, promote, maintain
 PROMOTION_PAUSE_FILE="/run/lock/github-runner-promote.pause"
 IMG_CACHE_DIR="/var/cache/github-runners"
@@ -245,6 +250,7 @@ apply_generation_defaults() {
     _generation_uint_or_default TEMPLATE_BAND_MAX 8999
     _generation_uint_or_default GENERATION_RETAIN 1
     _generation_uint_or_default FAILED_GEN_RETAIN_DAYS 7
+    _generation_uint_or_default GC_STUCK_WARN_HOURS 12
     _generation_uint_or_default CANDIDATE_MAX_AGE_DAYS 3
     _generation_bool_or_default REBAKE_ENABLED true
     _generation_uint_or_default REBAKE_MAX_AGE_DAYS 7
@@ -601,14 +607,29 @@ release_clone_slot() {
 # VMID to cross-check origin against a superseded template.
 list_template_base_volids() {
     local vmid="${1:-$TEMPLATE_ID}"
-    qm config "$vmid" 2>/dev/null | awk -F': ' -v storage="$VM_STORAGE:" '
+    local config bases storage_list
+
+    config=$(qm config "$vmid" 2>/dev/null || true)
+    bases=$(awk -F': ' -v storage="$VM_STORAGE:" '
         $1 ~ /^(ide|sata|scsi|virtio)[0-9]+$/ {
             split($2, parts, ",")
             if (index(parts[1], storage "base-") == 1) {
                 print parts[1]
             }
         }
-    '
+    ' <<< "$config")
+    if [[ -n "$bases" ]]; then
+        printf '%s\n' "$bases"
+        return 0
+    fi
+
+    # A previous GC attempt may have removed the VM config before failing to
+    # free every residual child. Recover the base name from storage so the next
+    # run can finish instead of stranding the record and volumes forever.
+    storage_list=$(pvesm list "$VM_STORAGE" 2>/dev/null) || return 1
+    awk -v storage="$VM_STORAGE:" -v vmid="$vmid" '
+        $1 ~ ("^" storage "([^/]+/)?base-" vmid "-disk-") { print $1 }
+    ' <<< "$storage_list"
 }
 
 linked_clone_child_vmid() {
@@ -680,21 +701,26 @@ list_template_linked_clone_volids() {
 }
 
 cleanup_template_orphan_volumes() {
-    local child_vmid config_path volid
+    local template_vmid="${1:-$TEMPLATE_ID}" child_vmid config_path volid
+    shift 2>/dev/null || true
     local -a child_volids=()
     local -a blocked_volids=()
     local -a freed_volids=()
 
-    local child_list
-    if ! child_list=$(list_template_linked_clone_volids); then
-        return 1
-    fi
-    if [[ -n "$child_list" ]]; then
-        mapfile -t child_volids <<< "$child_list"
+    local child_list=""
+    if [[ $# -gt 0 ]]; then
+        child_volids=("$@")
+    else
+        if ! child_list=$(list_template_linked_clone_volids "$template_vmid"); then
+            return 1
+        fi
+        if [[ -n "$child_list" ]]; then
+            mapfile -t child_volids <<< "$child_list"
+        fi
     fi
     [[ ${#child_volids[@]} -gt 0 ]] || return 0
 
-    log_info "Checking ${#child_volids[@]} linked-clone child volume(s) for template $TEMPLATE_ID..."
+    log_info "Checking ${#child_volids[@]} linked-clone child volume(s) for template $template_vmid..."
 
     for volid in "${child_volids[@]}"; do
         child_vmid=$(linked_clone_child_vmid "$volid")
@@ -716,11 +742,11 @@ cleanup_template_orphan_volumes() {
     done
 
     if [[ ${#freed_volids[@]} -gt 0 ]]; then
-        log_info "Freed ${#freed_volids[@]} orphaned linked-clone volume(s) for template $TEMPLATE_ID."
+        log_info "Freed ${#freed_volids[@]} orphaned linked-clone volume(s) for template $template_vmid."
     fi
 
     if [[ ${#blocked_volids[@]} -gt 0 ]]; then
-        log_error "Template $TEMPLATE_ID still has linked-clone child volume(s) with VM configs."
+        log_error "Template $template_vmid still has linked-clone child volume(s) with VM configs."
         log_error "Destroy those VMs/templates before deleting the template."
         return 2
     fi
