@@ -84,7 +84,7 @@ drift_fetch_latest() {
 # Record a consecutive API-fail. first_fail is sticky; notify warn once after
 # DETECT_FAIL_WARN_HOURS and set warned= so the timer does not spam.
 drift_note_failure() {
-    local now first warned epoch_now epoch_first age_h warn_after line
+    local now first warned epoch_now epoch_first epoch_warn age_h warn_after line
 
     now=$(gen_now)
     first=""
@@ -97,13 +97,27 @@ drift_note_failure() {
             esac
         done < "$DRIFT_FAIL_FILE"
     fi
-    [[ -n "$first" ]] || first="$now"
-
     warn_after="${DETECT_FAIL_WARN_HOURS:-24}"
-    if epoch_now=$(drift_iso_to_epoch "$now") && epoch_first=$(drift_iso_to_epoch "$first"); then
+    if ! epoch_now=$(drift_iso_to_epoch "$now"); then
+        first="$now"
+        warned=""
+    elif ! epoch_first=$(drift_iso_to_epoch "$first") || (( epoch_first > epoch_now )); then
+        # A corrupt or future timestamp must not suppress the prolonged-failure
+        # warning forever. Restart the consecutive-failure window from now.
+        first="$now"
+        warned=""
+        epoch_first="$epoch_now"
+    else
+        # Treat a corrupt, pre-window, or future warned marker as unwarned.
+        # Otherwise arbitrary file contents could suppress every later alert.
+        if [[ -n "$warned" ]] &&
+            { ! epoch_warn=$(drift_iso_to_epoch "$warned") ||
+              (( epoch_warn < epoch_first || epoch_warn > epoch_now )); }; then
+            warned=""
+        fi
         age_h=$(( (epoch_now - epoch_first) / 3600 ))
         if [[ "$warn_after" =~ ^[0-9]+$ ]] && (( age_h >= warn_after )) && [[ -z "$warned" ]]; then
-            drift_notify warn drift.check_failed \
+            drift_notify warn drift.warning \
                 "Could not fetch actions/runner latest release for ${age_h}h" \
                 "consecutive API failures; drift is not reporting clean"
             warned="$now"
@@ -111,11 +125,12 @@ drift_note_failure() {
     fi
 
     ensure_state_dir "$(dirname "$DRIFT_FAIL_FILE")" || return 0
-    {
+    if ! {
         printf 'first_fail=%s\n' "$first"
         [[ -n "$warned" ]] && printf 'warned=%s\n' "$warned"
-    } > "$DRIFT_FAIL_FILE" || return 0
-    chmod 600 "$DRIFT_FAIL_FILE" 2>/dev/null || true
+    } | gen_write_file_atomic "$DRIFT_FAIL_FILE"; then
+        log_warn "Failed to update drift failure state"
+    fi
     return 0
 }
 
@@ -126,8 +141,8 @@ drift_clear_failure() {
 # notify never fails the caller — even if the stubbed notify returns 1.
 drift_notify() {
     local severity="$1" event="$2" message="$3" detail="${4:-}"
-    if [[ "${GEN_ID:-}" =~ ^[0-9]+$ ]]; then
-        NOTIFY_GENERATION="$GEN_ID" notify "$severity" "$event" "$message" "$detail" || true
+    if [[ "${DRIFT_FLEET_GENERATION:-}" =~ ^[0-9]+$ ]]; then
+        NOTIFY_GENERATION="$DRIFT_FLEET_GENERATION" notify "$severity" "$event" "$message" "$detail" || true
     else
         notify "$severity" "$event" "$message" "$detail" || true
     fi
@@ -161,23 +176,29 @@ drift_probe_fleet_version() {
 
 # Prefer GEN_RUNNER_VERSION on the TEMPLATE_ID record (the generation the
 # fleet clones). Fall back to a running clone so this works before adoption.
+# Results are globals because command substitution would resolve the version in
+# a subshell and discard the generation metadata needed by notifications.
 drift_fleet_version() {
-    local ver=""
+    local ver="" generation=""
+
+    DRIFT_FLEET_VERSION=unknown
+    DRIFT_FLEET_GENERATION=""
 
     if [[ -n "${TEMPLATE_ID:-}" ]] && gen_exists "$TEMPLATE_ID" && gen_read "$TEMPLATE_ID"; then
         ver=$(drift_normalize_version "${GEN_RUNNER_VERSION:-}")
         if drift_version_is_valid "$ver"; then
-            printf '%s\n' "$ver"
+            generation="${GEN_ID:-}"
+            DRIFT_FLEET_VERSION="$ver"
+            [[ "$generation" =~ ^[0-9]+$ ]] && DRIFT_FLEET_GENERATION="$generation"
             return 0
         fi
     fi
     ver=$(drift_probe_fleet_version)
     ver=$(drift_normalize_version "$ver")
     if drift_version_is_valid "$ver"; then
-        printf '%s\n' "$ver"
-        return 0
+        DRIFT_FLEET_VERSION="$ver"
     fi
-    printf 'unknown\n'
+    return 0
 }
 
 drift_print() {
@@ -214,7 +235,8 @@ drift_main() {
 
     apply_generation_defaults
 
-    fleet=$(drift_fleet_version)
+    drift_fleet_version
+    fleet="$DRIFT_FLEET_VERSION"
     [[ -n "$fleet" ]] || fleet="unknown"
 
     if ! latest=$(drift_fetch_latest); then

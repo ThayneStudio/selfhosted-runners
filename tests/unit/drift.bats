@@ -40,7 +40,7 @@ setup() {
     export -f jq_stub
 
     notify() {
-        printf '%s\n' "$*" >> "$STUB_DIR/notify.log"
+        printf '%s NOTIFY_GENERATION=%s\n' "$*" "${NOTIFY_GENERATION:-}" >> "$STUB_DIR/notify.log"
         return "${NOTIFY_RC:-0}"
     }
 
@@ -187,6 +187,7 @@ make_template_gen() {
     grep -q '^days_remaining=-6$' <<< "$output"
     [ "$(notify_count)" -eq 1 ]
     grep -q '^error drift.critical ' "$STUB_DIR/notify.log"
+    grep -q 'NOTIFY_GENERATION=1$' "$STUB_DIR/notify.log"
 }
 
 @test "10 days remaining notifies warn drift.warning" {
@@ -461,13 +462,57 @@ EOF
     grep -q '^status=unknown$' <<< "$output"
     ! grep -q '^status=clean$' <<< "$output"
     [ "$(notify_count)" -eq 1 ]
-    grep -q '^warn ' "$STUB_DIR/notify.log"
+    grep -q '^warn drift.warning ' "$STUB_DIR/notify.log"
+    ! grep -q 'drift.check_failed' "$STUB_DIR/notify.log"
+    grep -q 'NOTIFY_GENERATION=1$' "$STUB_DIR/notify.log"
     grep -q '^warned=' "$DRIFT_FAIL_FILE"
     grep -q '^first_fail=2026-08-24T00:00:00Z$' "$DRIFT_FAIL_FILE"
 
     run --separate-stderr drift_main
     [ "$status" -eq 0 ]
     [ "$(notify_count)" -eq 1 ]
+}
+
+@test "corrupt first_fail restarts the failure window from now" {
+    stub_status curl '*' 22
+    ensure_state_dir "$(dirname "$DRIFT_FAIL_FILE")"
+    printf 'first_fail=not-a-timestamp\nwarned=2026-08-24T00:00:00Z\n' > "$DRIFT_FAIL_FILE"
+    DETECT_FAIL_WARN_HOURS=24
+    make_template_gen 2.334.0
+
+    run --separate-stderr drift_main
+    [ "$status" -eq 0 ]
+    [ "$(notify_count)" -eq 0 ]
+    grep -q '^first_fail=2026-08-25T00:00:00Z$' "$DRIFT_FAIL_FILE"
+    ! grep -q '^warned=' "$DRIFT_FAIL_FILE"
+}
+
+@test "future first_fail restarts the failure window from now" {
+    stub_status curl '*' 22
+    ensure_state_dir "$(dirname "$DRIFT_FAIL_FILE")"
+    printf 'first_fail=2036-08-25T00:00:00Z\nwarned=2036-08-25T00:00:00Z\n' > "$DRIFT_FAIL_FILE"
+    DETECT_FAIL_WARN_HOURS=24
+    make_template_gen 2.334.0
+
+    run --separate-stderr drift_main
+    [ "$status" -eq 0 ]
+    [ "$(notify_count)" -eq 0 ]
+    grep -q '^first_fail=2026-08-25T00:00:00Z$' "$DRIFT_FAIL_FILE"
+    ! grep -q '^warned=' "$DRIFT_FAIL_FILE"
+}
+
+@test "drift failure state uses the atomic writer" {
+    stub_status curl '*' 22
+    make_template_gen 2.334.0
+    gen_write_file_atomic() {
+        printf '%s\n' "$1" > "$STUB_DIR/atomic-write.log"
+        cat > "$STUB_DIR/atomic-write.contents"
+    }
+
+    run --separate-stderr drift_main
+    [ "$status" -eq 0 ]
+    grep -Fxq "$DRIFT_FAIL_FILE" "$STUB_DIR/atomic-write.log"
+    grep -q '^first_fail=2026-08-25T00:00:00Z$' "$STUB_DIR/atomic-write.contents"
 }
 
 @test "empty GitHub payload is not a clean report" {
