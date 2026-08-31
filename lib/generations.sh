@@ -43,6 +43,8 @@ GENERATION_FIELDS=(
     GEN_CREATED_AT
     GEN_PROMOTED_AT
     GEN_SUPERSEDED_AT
+    GEN_TERMINAL_AT
+    GEN_WAS_ACTIVE
     GEN_FAILED_REASON
     GEN_BAKE_LOG
     GEN_CANARY_RUN_URL
@@ -293,13 +295,19 @@ gen_validate_field() {
                 return 1
             fi
             ;;
+        GEN_WAS_ACTIVE)
+            if [[ -n "$value" && "$value" != "0" && "$value" != "1" ]]; then
+                log_error "$key must be 0 or 1, got: '$value'"
+                return 1
+            fi
+            ;;
         GEN_STATE)
             if ! gen_is_state "$value"; then
                 log_error "Invalid generation state: '$value'"
                 return 1
             fi
             ;;
-        GEN_CREATED_AT|GEN_PROMOTED_AT|GEN_SUPERSEDED_AT)
+        GEN_CREATED_AT|GEN_PROMOTED_AT|GEN_SUPERSEDED_AT|GEN_TERMINAL_AT)
             if [[ -n "$value" && ! "$value" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]; then
                 log_error "$key must be UTC ISO 8601 (YYYY-MM-DDTHH:MM:SSZ), got: '$value'"
                 return 1
@@ -478,6 +486,7 @@ gen_create() (
 
     [[ -n "$GEN_STATE" ]] || GEN_STATE=baking
     [[ -n "$GEN_CREATED_AT" ]] || GEN_CREATED_AT=$(gen_now)
+    [[ "$GEN_STATE" != "active" || -n "$GEN_WAS_ACTIVE" ]] || GEN_WAS_ACTIVE=1
     GEN_VMID="$vmid"
 
     rc=0
@@ -733,7 +742,7 @@ gen_transition_allowed() {
 # code 4 exists so a promotion can tell a policy refusal from a failed write
 # before it rewrites TEMPLATE_ID (spec 7.3).
 gen_transition() (
-    local vmid="${1:-}" to="${2:-}" reason="${3:-}" now rc=0
+    local vmid="${1:-}" to="${2:-}" reason="${3:-}" now rc=0 from
 
     if ! gen_is_state "$to"; then
         log_error "Invalid generation state: ${to:-<empty>}"
@@ -750,24 +759,31 @@ gen_transition() (
         return 1
     fi
 
+    from="$GEN_STATE"
     now=$(gen_now)
     case "$to" in
         active)
             # Overwritten on a re-promotion, so reconciliation's "newest
             # GEN_PROMOTED_AT wins" tiebreak reflects the latest promotion.
             GEN_PROMOTED_AT="$now"
+            GEN_WAS_ACTIVE=1
             ;;
         superseded)
             GEN_SUPERSEDED_AT="$now"
+            # Candidate cleanup shares the superseded state with former active
+            # templates, but it must never become the rollback generation.
+            [[ "$from" == "candidate" ]] && GEN_WAS_ACTIVE=0 || GEN_WAS_ACTIVE=1
             ;;
         rejected)
             # A rejected generation left active service, so it carries the same
             # timestamp a demotion would, and the operator's reason reuses
             # GEN_FAILED_REASON rather than adding a field (spec 4.3).
             GEN_SUPERSEDED_AT="$now"
+            GEN_TERMINAL_AT="$now"
             [[ -z "$reason" ]] || GEN_FAILED_REASON=$(gen_clip_reason "$reason")
             ;;
         failed)
+            GEN_TERMINAL_AT="$now"
             # Only when given: a bare retry must not erase a detail an earlier
             # gen_update recorded.
             [[ -z "$reason" ]] || GEN_FAILED_REASON=$(gen_clip_reason "$reason")
@@ -825,6 +841,17 @@ gen_archive_append() {
 
     # umask so the log is created root-only without a chmod race on every append.
     ( umask 077; printf '%s\n' "$line" >> "$GENERATION_ARCHIVE_LOG" )
+}
+
+# True when the archive already contains this generation event. GC uses this
+# after storage destruction so a retry following a failed record removal does
+# not append a second destroyed line.
+gen_archive_has_event() {
+    local gen_id="${1:-}" vmid="${2:-}" event="${3:-}"
+    gen_is_uint "$gen_id" && gen_is_uint "$vmid" && [[ -n "$event" ]] || return 1
+    [[ -f "$GENERATION_ARCHIVE_LOG" ]] || return 1
+    grep -qE "(^| )gen=0*${gen_id} vmid=0*${vmid} event=$(gen_archive_token "$event")( |$)" \
+        "$GENERATION_ARCHIVE_LOG"
 }
 
 # ---------------------------------------------------------------------------
@@ -986,7 +1013,14 @@ generation_ref_vmids() (
         [[ "$vmid" =~ ^[0-9]+$ ]] || continue
         [[ -z "${template_vmids[$vmid]:-}" ]] || continue
 
-        cfg=$(qm config "$vmid" 2>/dev/null </dev/null) || cfg=""
+        if ! cfg=$(qm config "$vmid" 2>/dev/null </dev/null); then
+            log_error "Failed to read config for listed VMID $vmid during generation refcount"
+            return 1
+        fi
+        if [[ -z "$cfg" ]]; then
+            log_error "Empty config for listed VMID $vmid during generation refcount"
+            return 1
+        fi
         if [[ -n "$cfg" ]] && grep -q '^template:[[:space:]]*1' <<< "$cfg"; then
             continue
         fi

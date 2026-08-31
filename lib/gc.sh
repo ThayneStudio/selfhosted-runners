@@ -11,6 +11,9 @@ if [[ -n "${RUNNER_GC_LOADED:-}" ]]; then
 fi
 RUNNER_GC_LOADED=1
 
+declare -ag GC_PROJECTED_SUPERSEDED=()
+declare -Ag GC_PROJECTED_STATE=()
+
 # shellcheck source=generations.sh
 source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/generations.sh"
 
@@ -76,15 +79,50 @@ gc_warn_failure() {
     fi
 }
 
+# Re-prove that a VMID still names the generation GC selected. This is called
+# after every potentially slow inventory operation and immediately before qm
+# destroy, closing the stale-record/VMID-reuse hole.
+gc_verify_destroy_ownership() {
+    local vmid="$1" expected_state="$2" expected_id="$3"
+    local pointer cfg name
+
+    pointer=$(reload_active_template_id) || {
+        log_error "Could not re-read TEMPLATE_ID before destroying VMID $vmid"
+        return 1
+    }
+    [[ "$vmid" != "$pointer" ]] || {
+        log_error "Refusing to destroy current TEMPLATE_ID $vmid"
+        return 1
+    }
+    gen_read "$vmid" || return 1
+    if [[ "$GEN_VMID" != "$vmid" || "$GEN_ID" != "$expected_id" || "$GEN_STATE" != "$expected_state" ]]; then
+        log_error "Generation ownership changed before destroy of VMID $vmid"
+        return 1
+    fi
+    if ! cfg=$(qm config "$vmid" 2>/dev/null </dev/null) || [[ -z "$cfg" ]]; then
+        log_error "Cannot read Proxmox config for generation $expected_id (VMID $vmid)"
+        return 1
+    fi
+    grep -q '^template:[[:space:]]*1' <<< "$cfg" || {
+        log_error "Refusing to destroy VMID $vmid: it is not a Proxmox template"
+        return 1
+    }
+    name=$(awk '/^name:/{print $2; exit}' <<< "$cfg")
+    if [[ "$name" != "github-runner-gen-${expected_id}" ]]; then
+        log_error "Refusing to destroy VMID $vmid: name is ${name:-<empty>}, expected github-runner-gen-${expected_id}"
+        return 1
+    fi
+}
+
 gc_destroy_generation() {
     local vmid="$1" expected_state="$2" dry_run="$3"
-    local gen_id runner_version child_list before="" after="" reclaimed=0 rc=0
+    local gen_id runner_version child_list before="" after="" reclaimed=0 rc=0 vm_exists=false
     local -a child_volids=()
 
     gen_read "$vmid" || return 1
     gen_id="$GEN_ID"
     runner_version="${GEN_RUNNER_VERSION:-unknown}"
-    if [[ "$GEN_STATE" != "$expected_state" ]]; then
+    if [[ "$GEN_STATE" != "$expected_state" && ! ( "$dry_run" == "true" && "${GC_PROJECTED_STATE[$vmid]:-}" == "$expected_state" ) ]]; then
         gc_warn_failure "$gen_id" "$vmid" \
             "Generation $gen_id (VMID $vmid) changed from $expected_state to $GEN_STATE during GC; skipping"
         return 1
@@ -112,6 +150,14 @@ gc_destroy_generation() {
     # continue with residual cleanup and verification rather than wedging the
     # retained record forever.
     if [[ -n "$(vm_config_path "$vmid")" ]] || qm status "$vmid" >/dev/null 2>&1; then
+        vm_exists=true
+    fi
+    if [[ "$vm_exists" == "true" ]]; then
+        if ! gc_verify_destroy_ownership "$vmid" "$expected_state" "$gen_id"; then
+            gc_warn_failure "$gen_id" "$vmid" \
+                "Ownership verification failed for generation $gen_id (VMID $vmid); refusing destroy"
+            return 1
+        fi
         if ! qm destroy "$vmid" --purge; then
             gc_warn_failure "$gen_id" "$vmid" \
                 "Failed to destroy generation $gen_id (VMID $vmid); record retained"
@@ -137,11 +183,13 @@ gc_destroy_generation() {
     if [[ -n "$before" && -n "$after" && "$before" -gt "$after" ]]; then
         reclaimed=$((before - after))
     fi
-    if ! gen_archive_append "$gen_id" "$vmid" destroyed \
-        "state=$expected_state" "runner=$runner_version" "reclaimed_bytes=$reclaimed"; then
-        gc_warn_failure "$gen_id" "$vmid" \
-            "Could not archive destroyed generation $gen_id (VMID $vmid); record retained"
-        return 1
+    if ! gen_archive_has_event "$gen_id" "$vmid" destroyed; then
+        if ! gen_archive_append "$gen_id" "$vmid" destroyed \
+            "state=$expected_state" "runner=$runner_version" "reclaimed_bytes=$reclaimed"; then
+            gc_warn_failure "$gen_id" "$vmid" \
+                "Could not archive destroyed generation $gen_id (VMID $vmid); record retained"
+            return 1
+        fi
     fi
     if ! gen_remove "$vmid"; then
         gc_warn_failure "$gen_id" "$vmid" \
@@ -156,7 +204,7 @@ gc_destroy_generation() {
 }
 
 gc_reconcile_candidates() {
-    local dry_run="$1" list vmid newest="" newest_id=-1 age id
+    local dry_run="$1" list vmid newest="" newest_id=-1 newest_active_id=-1 age id active_list
     local -a candidates=()
 
     list=$(gen_list candidate) || return 1
@@ -172,11 +220,22 @@ gc_reconcile_candidates() {
     done <<< "$list"
     [[ -n "$newest" ]] || return 0
 
+    active_list=$(gen_list active) || return 1
+    while read -r vmid; do
+        [[ -n "$vmid" ]] || continue
+        gen_read "$vmid" || return 1
+        id=$(gen_require_numeric_id "$vmid") || return 1
+        ((id > newest_active_id)) && newest_active_id="$id"
+    done <<< "$active_list"
+
     for vmid in "${candidates[@]}"; do
         gen_read "$vmid" || return 1
-        if [[ "$vmid" != "$newest" ]]; then
+        id=$(gen_require_numeric_id "$vmid") || return 1
+        if [[ "$vmid" != "$newest" || "$id" -lt "$newest_active_id" ]]; then
             if [[ "$dry_run" == "true" ]]; then
                 printf 'Would supersede orphaned candidate generation %s (VMID %s)\n' "$GEN_ID" "$vmid"
+                GC_PROJECTED_STATE["$vmid"]=superseded
+                GC_PROJECTED_SUPERSEDED+=("$vmid")
             elif ! gen_transition "$vmid" superseded "superseded by newer candidate"; then
                 gc_warn_failure "$GEN_ID" "$vmid" \
                     "Could not supersede orphaned candidate generation $GEN_ID (VMID $vmid)"
@@ -194,6 +253,7 @@ gc_reconcile_candidates() {
             if [[ "$dry_run" == "true" ]]; then
                 printf 'Would mark candidate generation %s (VMID %s) failed: never promoted after %s days\n' \
                     "$GEN_ID" "$vmid" "$CANDIDATE_MAX_AGE_DAYS"
+                GC_PROJECTED_STATE["$vmid"]=failed
             elif gen_transition "$vmid" failed \
                 "never promoted after ${CANDIDATE_MAX_AGE_DAYS} days"; then
                 NOTIFY_GENERATION="$GEN_ID" notify warn candidate.failed \
@@ -218,11 +278,16 @@ gc_collect_superseded() {
         superseded+=("$vmid")
         gen_read "$vmid" || return 1
         id=$(gen_require_numeric_id "$vmid") || return 1
-        if ((id > retain_id)); then
+        # An orphan candidate is superseded for cleanup, but has never served
+        # and therefore cannot displace a known-good rollback generation.
+        if [[ "${GEN_WAS_ACTIVE:-1}" != "0" ]] && ((id > retain_id)); then
             retain_id="$id"
             retain="$vmid"
         fi
     done <<< "$list"
+    if [[ "$dry_run" == "true" && ${#GC_PROJECTED_SUPERSEDED[@]} -gt 0 ]]; then
+        superseded+=("${GC_PROJECTED_SUPERSEDED[@]}")
+    fi
 
     for vmid in "${superseded[@]}"; do
         gen_read "$vmid" || return 1
@@ -245,7 +310,9 @@ gc_collect_superseded() {
             fi
             continue
         fi
-        if [[ "$vmid" == "$retain" ]]; then
+        # Missing GEN_WAS_ACTIVE is migration-compatible evidence: before the
+        # field existed, superseded necessarily meant previously active.
+        if [[ "$vmid" == "$retain" && "${GEN_WAS_ACTIVE:-1}" != "0" ]]; then
             log_info "Retaining newest superseded generation $GEN_ID (VMID $vmid) for rollback"
             continue
         fi
@@ -259,8 +326,12 @@ gc_collect_terminal() {
     while read -r vmid; do
         [[ -n "$vmid" ]] || continue
         gen_read "$vmid" || return 1
-        stamp="$GEN_CREATED_AT"
-        [[ "$state" != "rejected" || -z "$GEN_SUPERSEDED_AT" ]] || stamp="$GEN_SUPERSEDED_AT"
+        stamp="$GEN_TERMINAL_AT"
+        if [[ -z "$stamp" ]]; then
+            # Migration fallback for records written before GEN_TERMINAL_AT.
+            stamp="$GEN_CREATED_AT"
+            [[ "$state" != "rejected" || -z "$GEN_SUPERSEDED_AT" ]] || stamp="$GEN_SUPERSEDED_AT"
+        fi
         age=$(gc_age_seconds "$stamp") || {
             gc_warn_failure "$GEN_ID" "$vmid" \
                 "Cannot determine age of $state generation $GEN_ID (VMID $vmid)"
@@ -284,6 +355,8 @@ gc_main() {
     local dry_run="${1:-false}"
     local rc=0
     local GC_DRY_RUN="$dry_run"
+    GC_PROJECTED_SUPERSEDED=()
+    GC_PROJECTED_STATE=()
     apply_generation_defaults
     gen_store_init || return 1
 
@@ -304,10 +377,22 @@ gc_main() {
         exec 215>&- 214>&-
         return 1
     fi
-    exec 216>"$POOL_ACTIVITY_LOCK_FILE" || { exec 215>&- 214>&-; return 1; }
+    # Publish and exclusively own the same pause file promotion uses before
+    # waiting for the pool lock. New clones stop joining the shared lock, so a
+    # steady workload cannot starve GC. If promotion owns the pause, defer GC;
+    # taking the pause before pool also preserves the global lock order.
+    mkdir -p "$(dirname "$PROMOTION_PAUSE_FILE")" || { exec 215>&- 214>&-; return 1; }
+    exec 217>"$PROMOTION_PAUSE_FILE" || { exec 215>&- 214>&-; return 1; }
+    if ! flock -n 217; then
+        log_warn "Promotion pause is owned by another operation — skipping garbage collection"
+        exec 217>&- 215>&- 214>&-
+        return 1
+    fi
+    exec 216>"$POOL_ACTIVITY_LOCK_FILE" || { rm -f "$PROMOTION_PAUSE_FILE"; exec 217>&- 215>&- 214>&-; return 1; }
     if ! flock -w 30 216; then
         log_error "Timed out waiting for pool activity before garbage collection"
-        exec 216>&- 215>&- 214>&-
+        rm -f "$PROMOTION_PAUSE_FILE"
+        exec 216>&- 217>&- 215>&- 214>&-
         return 1
     fi
 
@@ -315,7 +400,9 @@ gc_main() {
     ((rc == 0)) && gc_collect_superseded "$dry_run" || rc=1
     ((rc == 0)) && gc_collect_terminal failed "$dry_run" || rc=1
     ((rc == 0)) && gc_collect_terminal rejected "$dry_run" || rc=1
-    exec 216>&- 215>&- 214>&-
+    exec 216>&-
+    rm -f "$PROMOTION_PAUSE_FILE"
+    exec 217>&- 215>&- 214>&-
     return "$rc"
 }
 

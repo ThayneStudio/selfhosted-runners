@@ -656,7 +656,7 @@ zfs_dataset_from_volid() {
 
 list_template_linked_clone_volids() {
     local template_vmid="${1:-$TEMPLATE_ID}"
-    local storage_list base_volid base_path prefix volid child_name base_dataset dataset origin
+    local storage_list base_volid base_path prefix volid child_name base_dataset dataset origin path
     local -A seen=()
 
     if ! storage_list=$(pvesm list "$VM_STORAGE" 2>/dev/null); then
@@ -684,14 +684,39 @@ list_template_linked_clone_volids() {
     # the template base volume snapshot via the ZFS origin property.
     while read -r base_volid; do
         [[ -n "$base_volid" ]] || continue
-        base_dataset=$(zfs_dataset_from_volid "$base_volid") || continue
+        if ! path=$(pvesm path "$base_volid" 2>/dev/null); then
+            log_error "Cannot resolve storage path for template volume $base_volid"
+            return 1
+        fi
+        [[ "$path" == /dev/zvol/* ]] || continue
+        if ! command -v zfs >/dev/null 2>&1; then
+            log_error "Cannot inspect ZFS origin for template volume $base_volid"
+            return 1
+        fi
+        base_dataset="${path#/dev/zvol/}"
+        if ! zfs list -H -o name "$base_dataset" >/dev/null 2>&1; then
+            log_error "Cannot inspect ZFS dataset $base_dataset for template volume $base_volid"
+            return 1
+        fi
 
         while read -r volid _; do
             [[ "$volid" == "$VM_STORAGE:vm-"* ]] || continue
             [[ -n "${seen[$volid]:-}" ]] && continue
 
-            dataset=$(zfs_dataset_from_volid "$volid") || continue
-            origin=$(zfs get -H -o value origin "$dataset" 2>/dev/null || true)
+            if ! path=$(pvesm path "$volid" 2>/dev/null); then
+                log_error "Cannot resolve storage path for possible clone volume $volid"
+                return 1
+            fi
+            [[ "$path" == /dev/zvol/* ]] || continue
+            dataset="${path#/dev/zvol/}"
+            if ! zfs list -H -o name "$dataset" >/dev/null 2>&1; then
+                log_error "Cannot inspect ZFS dataset $dataset for possible clone volume $volid"
+                return 1
+            fi
+            if ! origin=$(zfs get -H -o value origin "$dataset" 2>/dev/null); then
+                log_error "Cannot read ZFS origin for possible clone volume $volid"
+                return 1
+            fi
             [[ "$origin" == "$base_dataset@"* ]] || continue
 
             seen["$volid"]=1

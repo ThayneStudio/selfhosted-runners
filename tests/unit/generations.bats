@@ -118,9 +118,9 @@ create_full_record() {
     gen_create 8903 GEN_ID=1 GEN_STATE=baking
     gen_transition 8903 failed "$(printf 'bake timed out\nafter 5400s')"
 
-    # One line per field, still thirteen of them: an unfolded newline would
+    # One line per field, still fifteen of them: an unfolded newline would
     # split the record and the next read would report it as malformed.
-    [ "$(grep -c '^GEN_' "$GENERATIONS_DIR/8903.conf")" = "13" ]
+    [ "$(grep -c '^GEN_' "$GENERATIONS_DIR/8903.conf")" = "15" ]
     gen_read 8903
     [ "$GEN_FAILED_REASON" = "bake timed out after 5400s" ]
 }
@@ -758,6 +758,7 @@ create_full_record() {
     gen_read 8903
     [ "$GEN_STATE" = "failed" ]
     [ "$GEN_FAILED_REASON" = "image checksum mismatch after retry" ]
+    [[ "$GEN_TERMINAL_AT" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]
 }
 
 @test "a transition with no reason does not erase one already recorded" {
@@ -785,6 +786,7 @@ create_full_record() {
     [ "$GEN_STATE" = "rejected" ]
     [ "$GEN_FAILED_REASON" = "rolled back by ops: playwright browsers missing" ]
     [[ "$GEN_SUPERSEDED_AT" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]
+    [ "$GEN_TERMINAL_AT" = "$GEN_SUPERSEDED_AT" ]
 }
 
 # ---------------------------------------------------------------------------
