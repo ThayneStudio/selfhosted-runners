@@ -127,7 +127,10 @@ drift_note_failure() {
     ensure_state_dir "$(dirname "$DRIFT_FAIL_FILE")" || return 0
     if ! {
         printf 'first_fail=%s\n' "$first"
-        [[ -n "$warned" ]] && printf 'warned=%s\n' "$warned"
+        if [[ -n "$warned" ]]; then
+            printf 'warned=%s\n' "$warned"
+        fi
+        true
     } | gen_write_file_atomic "$DRIFT_FAIL_FILE"; then
         log_warn "Failed to update drift failure state"
     fi

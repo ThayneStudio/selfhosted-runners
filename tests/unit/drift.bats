@@ -432,6 +432,7 @@ EOF
     grep -q '^fleet=2.334.0$' <<< "$output"
     ! grep -q '^status=clean$' <<< "$output"
     [[ "$stderr" == *"fail"* || "$stderr" == *"latest"* || "$stderr" == *"API"* || "$stderr" == *"release"* ]]
+    [[ "$stderr" != *"Failed to update drift failure state"* ]]
     [ "$(notify_count)" -eq 0 ]
     [ -f "$DRIFT_FAIL_FILE" ]
     grep -q '^first_fail=' "$DRIFT_FAIL_FILE"
