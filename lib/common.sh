@@ -156,7 +156,13 @@ select_org() {
 get_vm_org() {
     local cicustom
     cicustom=$(qm config "$1" 2>/dev/null | grep "^cicustom:" || true)
-    if [[ "$cicustom" =~ runner-user-data-([^.]+)\.yaml ]]; then
+    # New per-VM snippet: runner-<vmid>-user-<org>.yaml (org has no dots).
+    # Legacy per-org snippet: runner-user-data-<org>.yaml (kept as a fallback so
+    # VMs created before the token refactor stay identifiable/destroyable).
+    # The two are mutually exclusive: legacy names have no digits after "runner-".
+    if [[ "$cicustom" =~ runner-[0-9]+-user-([a-zA-Z0-9-]+)\.yaml ]]; then
+        echo "${BASH_REMATCH[1]}"
+    elif [[ "$cicustom" =~ runner-user-data-([^.]+)\.yaml ]]; then
         echo "${BASH_REMATCH[1]}"
     else
         echo "unknown"
@@ -420,20 +426,84 @@ deregister_runner() {
 
     local runner_id
     runner_id=$(curl -sf --max-time 10 \
-        -H "Accept: application/vnd.github.v3+json" \
+        -H "Accept: application/vnd.github+json" \
         --config <(printf 'header = "Authorization: token %s"\n' "$pat") \
         "https://api.github.com/orgs/${github_org}/actions/runners?per_page=100" 2>/dev/null \
         | jq --arg name "$runner_name" -r '.runners[] | select(.name == $name) | .id' 2>/dev/null) || return 0
 
     [[ -n "$runner_id" && "$runner_id" != "null" && "$runner_id" =~ ^[0-9]+$ ]] || return 0
 
+    # stdout suppressed: DELETE returns 204 (empty), but this runs inside
+    # $(clone_runner) on the retry path, so keep it off the captured stdout.
     curl -sf --max-time 10 -X DELETE \
-        -H "Accept: application/vnd.github.v3+json" \
+        -H "Accept: application/vnd.github+json" \
         --config <(printf 'header = "Authorization: token %s"\n' "$pat") \
-        "https://api.github.com/orgs/${github_org}/actions/runners/${runner_id}" 2>/dev/null || return 0
+        "https://api.github.com/orgs/${github_org}/actions/runners/${runner_id}" >/dev/null 2>&1 || return 0
 }
 
 # --- Shared runner VM helpers ---
+
+# Mint a single-use JIT (just-in-time) runner config on the host. The runner
+# registers and auto-removes using this config, and it CANNOT be reused to
+# register another runner — so even if a job reads it from the cloud-init drive
+# it cannot be replayed. Requires GITHUB_PAT and GITHUB_ORG in scope (caller ran
+# load_org_config). The PAT is passed via curl --config to keep it off argv; the
+# request body (name/labels/group) is not sensitive. RUNNER_GROUP_ID (default 1
+# = the org's "Default" group) and RUNNER_LABELS may be set in the org config.
+# Prints the base64 encoded_jit_config on stdout; returns 1 on any failure.
+fetch_jit_config() {
+    local name="$1"
+    local group="${RUNNER_GROUP_ID:-1}"
+    local labels="${RUNNER_LABELS:-self-hosted,linux,x64}"
+    # Group IDs are >=1 (1 = Default); clamp anything else to 1.
+    [[ "$group" =~ ^[1-9][0-9]*$ ]] || group=1
+    local body response jit
+    # split → trim each label → drop empties, so a hand-edited RUNNER_LABELS with
+    # spaces or a trailing comma still yields clean labels.
+    body=$(jq -n --arg name "$name" --argjson group "$group" --arg labels "$labels" \
+        '{name: $name, runner_group_id: $group,
+          labels: ($labels | split(",") | map(gsub("^\\s+|\\s+$";"")) | map(select(length > 0)))}') || return 1
+    response=$(curl -sf --max-time 15 --retry 3 -X POST \
+        -H "Accept: application/vnd.github+json" \
+        -H "Content-Type: application/json" \
+        --config <(printf 'header = "Authorization: token %s"\n' "$GITHUB_PAT") \
+        --data "$body" \
+        "https://api.github.com/orgs/${GITHUB_ORG}/actions/runners/generate-jitconfig") || return 1
+    jit=$(jq -r '.encoded_jit_config // empty' <<<"$response" 2>/dev/null) || return 1
+    # Must be a single base64 token — rejects anything with quotes/newlines that
+    # could break out of the YAML string it gets rendered into.
+    [[ -n "$jit" && "$jit" =~ ^[A-Za-z0-9+/=_-]+$ ]] || return 1
+    printf '%s' "$jit"
+}
+
+# Render a per-VM cloud-init user snippet carrying only the single-use JIT
+# config and org (never the PAT). Uses awk with the config passed via ENVIRON so
+# it never appears in the process list.
+# Usage: render_user_snippet <vmid> <org> <jit_config>
+render_user_snippet() {
+    local vmid="$1" org="$2" jit_config="$3"
+    local tmp
+    tmp=$(mktemp "$SNIPPETS_DIR/.runner-${vmid}-user.XXXXXX") || return 1
+    chmod 600 "$tmp"
+    JIT_CONFIG="$jit_config" GITHUB_ORG="$GITHUB_ORG" DOCKER_MIRROR_URL="${DOCKER_MIRROR_URL:-}" awk '
+    # Literal string replace (avoids gsub special chars: & and \)
+    function lreplace(str, old, new,    i, result) {
+        result = ""
+        while ((i = index(str, old)) > 0) {
+            result = result substr(str, 1, i - 1) new
+            str = substr(str, i + length(old))
+        }
+        return result str
+    }
+    {
+        $0 = lreplace($0, "{{JIT_CONFIG}}", ENVIRON["JIT_CONFIG"])
+        $0 = lreplace($0, "{{GITHUB_ORG}}", ENVIRON["GITHUB_ORG"])
+        $0 = lreplace($0, "{{DOCKER_MIRROR_URL}}", ENVIRON["DOCKER_MIRROR_URL"])
+        print
+    }' "$INSTALL_DIR/templates/runner-user-data.yaml" > "$tmp" || { rm -f "$tmp"; return 1; }
+    mv "$tmp" "$SNIPPETS_DIR/runner-${vmid}-user-${org}.yaml" || { rm -f "$tmp"; return 1; }
+    chmod 600 "$SNIPPETS_DIR/runner-${vmid}-user-${org}.yaml"
+}
 
 # Deterministic MAC from name. Locally-administered unicast (02:xx:xx:xx:xx:xx).
 generate_mac() {
@@ -445,6 +515,12 @@ generate_mac() {
 clone_runner() {
     local name="$1" org="$2" vmid="${3:-}"
     local RESERVED_VMID=""
+
+    # GITHUB_PAT/GITHUB_ORG must be in scope (caller ran load_org_config).
+    if [[ -z "${GITHUB_PAT:-}" || -z "${GITHUB_ORG:-}" ]]; then
+        log_error "clone_runner: org config not loaded (GITHUB_PAT/GITHUB_ORG unset)"
+        return 1
+    fi
 
     exec 202>"$POOL_ACTIVITY_LOCK_FILE"
     flock -s 202
@@ -469,7 +545,7 @@ clone_runner() {
             return 0
         fi
 
-        rm -f "${SNIPPETS_DIR}/runner-${vmid}-meta.yaml"
+        rm -f "${SNIPPETS_DIR}/runner-${vmid}-meta.yaml" "${SNIPPETS_DIR}/runner-${vmid}-user-"*.yaml "${SNIPPETS_DIR}/runner-${vmid}-vendor.yaml"
 
         if [[ "$owner" == "$name" ]]; then
             local destroy_err; destroy_err=$(mktemp)
@@ -487,6 +563,23 @@ clone_runner() {
             pvesm list "$VM_STORAGE" 2>/dev/null |
                 awk -v v="$vmid" 'NR>1 && $1 ~ ("(^|:|/)vm-" v "-(disk-[0-9]+|cloudinit)$") {print $1}'
         )
+    }
+
+    # Mint the single-use JIT config BEFORE cloning so the PAT never enters the
+    # VM. Fail fast here (return 1, not _fail): nothing has been created yet, and
+    # on a VMID collision _fail's name match could destroy a foreign VM.
+    # generate-jitconfig 409s if a runner of this name still exists (e.g. a
+    # crashed VM left a stale entry). A healthy ephemeral runner auto-removes
+    # after its job, so the common path mints in one call; only on failure do we
+    # deregister the stale entry (mirrors config.sh --replace) and retry once.
+    local jit_config
+    jit_config=$(fetch_jit_config "$name") || {
+        deregister_runner "$org" "$name" || true
+        jit_config=$(fetch_jit_config "$name") || {
+            log_error "Failed to mint JIT config for org '$GITHUB_ORG' (check PAT/network/group)"
+            exec 202>&-
+            return 1
+        }
     }
 
     # Acquire global VMID allocation lock only long enough to reserve one VMID.
@@ -589,14 +682,19 @@ clone_runner() {
         qm set "$vmid" --net0 "$net0" 200>&- 201>&- 202>&- 203>&- 204>&- || { _fail; exec 202>&-; return 1; }
     fi
 
-    # Cloud-init
-    cat > "${SNIPPETS_DIR}/runner-${vmid}-meta.yaml" << EOF
-instance-id: "$name"
-local-hostname: "$name"
-EOF
-    chmod 600 "${SNIPPETS_DIR}/runner-${vmid}-meta.yaml"
+    # Cloud-init meta (instance-id / hostname). Guard the write itself — a brace
+    # group's exit status is its LAST command, so a failed write (e.g. ENOSPC mid
+    # clone) followed by a successful chmod would be masked and boot a VM with a
+    # truncated meta snippet.
+    printf 'instance-id: "%s"\nlocal-hostname: "%s"\n' "$name" "$name" \
+        > "${SNIPPETS_DIR}/runner-${vmid}-meta.yaml" || { _fail; exec 202>&-; return 1; }
+    chmod 600 "${SNIPPETS_DIR}/runner-${vmid}-meta.yaml" || { _fail; exec 202>&-; return 1; }
 
-    qm set "$vmid" --cicustom "user=local:snippets/runner-user-data-${org}.yaml,meta=local:snippets/runner-${vmid}-meta.yaml" \
+    # Per-VM user snippet carrying the single-use JIT config (must exist before
+    # qm set --cicustom, which validates the referenced volume).
+    render_user_snippet "$vmid" "$org" "$jit_config" || { _fail; exec 202>&-; return 1; }
+
+    qm set "$vmid" --cicustom "user=local:snippets/runner-${vmid}-user-${org}.yaml,meta=local:snippets/runner-${vmid}-meta.yaml" \
         200>&- \
         201>&- \
         202>&- \

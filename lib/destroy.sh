@@ -70,6 +70,10 @@ else
     VMID="${MANAGED_VMIDS[0]}"
 fi
 
+# Take the per-slot lock so we don't race watch/reclone on this slot.
+exec 200>"/run/lock/runner-${RUNNER_NAME}.lock"
+flock -n 200 || { log_error "'$RUNNER_NAME' is being managed by another process (reclone/watch); try again in a moment"; exit 1; }
+
 VM_ORG=$(get_vm_org "$VMID")
 if [[ "$VM_ORG" == "unknown" ]]; then
     log_error "VMID $VMID ($RUNNER_NAME) is not managed by selfhosted-runners"
@@ -93,8 +97,8 @@ fi
 log_info "Destroying $RUNNER_NAME (VMID $VMID)..."
 qm destroy "$VMID" --purge 200>&- 201>&- 202>&- || { log_error "Failed to destroy $VMID"; exit 1; }
 
-# Clean up snippets
-rm -f "${SNIPPETS_DIR}/runner-${VMID}-meta.yaml" "${SNIPPETS_DIR}/runner-${VMID}-vendor.yaml"
+# Clean up per-VM snippets
+rm -f "${SNIPPETS_DIR}/runner-${VMID}-meta.yaml" "${SNIPPETS_DIR}/runner-${VMID}-user-"*.yaml "${SNIPPETS_DIR}/runner-${VMID}-vendor.yaml"
 
 log_info "$RUNNER_NAME destroyed."
 if systemctl is-active --quiet github-runner-watch.timer 2>/dev/null; then
