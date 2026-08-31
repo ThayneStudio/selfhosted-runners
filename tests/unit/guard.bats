@@ -29,6 +29,7 @@ setup() {
         -e "s#^POOL_DRAIN_FILE=.*#POOL_DRAIN_FILE=\"$SANDBOX/run/lock/drain\"#" \
         -e "s#^GUARD_STATE_DIR=.*#GUARD_STATE_DIR=\"$SANDBOX/run/guard\"#" \
         -e "s#^POOL_ACTIVITY_LOCK_FILE=.*#POOL_ACTIVITY_LOCK_FILE=\"$SANDBOX/run/lock/pool.lock\"#" \
+        -e "s#^POOL_DRAIN_COORD_LOCK_FILE=.*#POOL_DRAIN_COORD_LOCK_FILE=\"$SANDBOX/run/lock/drain-coord.lock\"#" \
         -e "s#^RUNNER_SLOT_LOCK_PREFIX=.*#RUNNER_SLOT_LOCK_PREFIX=\"$SANDBOX/run/lock/runner\"#" \
         -e "s#/etc/pve/nodes#$SANDBOX/pve/nodes#" \
         -e "s#\$EUID -ne 0#1 -ne 1#" \

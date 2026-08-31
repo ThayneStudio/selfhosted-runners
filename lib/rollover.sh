@@ -16,6 +16,9 @@ source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/common.sh"
 source "$LIB_DIR/generations.sh"
 
 ROLLOVER_DESTROY_DELAY_SECONDS="${ROLLOVER_DESTROY_DELAY_SECONDS:-10}"
+ROLLOVER_OFFLINE_TIMEOUT_SECONDS="${ROLLOVER_OFFLINE_TIMEOUT_SECONDS:-90}"
+ROLLOVER_OFFLINE_POLL_SECONDS="${ROLLOVER_OFFLINE_POLL_SECONDS:-3}"
+ROLLOVER_REPLACEMENT_WAIT_SECONDS="${ROLLOVER_REPLACEMENT_WAIT_SECONDS:-120}"
 
 rollover_usage() {
     echo "Usage: runner rollover [--force]"
@@ -41,9 +44,11 @@ rollover_age() {
 }
 
 rollover_cfg_org() {
-    local cfg="$1"
+    local cfg="$1" org
     if [[ "$cfg" =~ runner-user-data-([^.]+)\.yaml ]]; then
-        printf '%s\n' "${BASH_REMATCH[1]}"
+        org="${BASH_REMATCH[1]}"
+        validate_org_name "$org" || return 1
+        printf '%s\n' "$org"
     else
         return 1
     fi
@@ -74,30 +79,39 @@ rollover_collect() {
 }
 
 rollover_busy() {
-    local org="$1" name="$2" lookup _id busy
-    lookup=$(github_runner_lookup "$org" "$name") || { printf '%s\n' unknown; return 1; }
-    IFS=$'\t' read -r _id busy <<< "$lookup"
+    local org="$1" name="$2" lookup _id busy _status
+    lookup=$(github_runner_lookup_details "$org" "$name") || { printf '%s\n' unknown; return 1; }
+    IFS=$'\t' read -r _id busy _status <<< "$lookup"
     printf '%s\n' "$busy"
 }
 
 # Re-inventory current running managed clones for one org. Failure returns
 # non-zero, never a misleading zero that could authorize a destroy.
 rollover_serving_count() {
-    local target="$1" all_vms vmid _name status cfg org count=0
+    local target="$1" exclude_name="${2:-}" all_vms vmid _listed_name name status cfg org tags details _id _busy gh_status count=0
     all_vms=$(qm list 2>/dev/null </dev/null) || return 1
-    while read -r vmid _name status _; do
+    while read -r vmid _listed_name status _; do
         [[ "$vmid" =~ ^[0-9]+$ && "$status" == running ]] || continue
         [[ "$vmid" != "${TEMPLATE_ID:-}" ]] || continue
         cfg=$(qm config "$vmid" 2>/dev/null </dev/null) || return 1
         grep -q '^template:[[:space:]]*1' <<< "$cfg" && continue
+        name=$(awk '/^name:/{print $2; exit}' <<< "$cfg")
+        [[ -n "$name" ]] || return 1
+        tags=$(grep -m1 '^tags:' <<< "$cfg" || true)
+        [[ "$tags" != *runner-retired* ]] || continue
         org=$(rollover_cfg_org "$cfg") || continue
-        [[ "$org" == "$target" ]] && count=$((count + 1))
+        [[ "$org" == "$target" && "$name" != "$exclude_name" ]] || continue
+        details=$(github_runner_lookup_details "$org" "$name") || return 1
+        IFS=$'\t' read -r _id _busy gh_status <<< "$details"
+        [[ "$gh_status" == online ]] && count=$((count + 1))
     done <<< "$all_vms"
     printf '%s\n' "$count"
 }
 
-rollover_release_slot() {
+rollover_release_locks() {
+    exec 212>&- 2>/dev/null || true
     exec 210>&- 2>/dev/null || true
+    exec 209>&- 2>/dev/null || true
 }
 
 rollover_destroy_vm() {
@@ -105,25 +119,105 @@ rollover_destroy_vm() {
         </dev/null 200>&- 201>&- 202>&- 203>&- 204>&-
 }
 
-# Returns 0 destroyed, 2 safely skipped, 1 actual destroy failure.
+# Freeze the runner service cgroup before inspecting it. Once cgroup.freeze is
+# acknowledged, Listener cannot accept another assignment. Busy/error paths
+# thaw themselves; success deliberately leaves the guest frozen.
+rollover_quiesce_guest() {
+    local vmid="$1" result
+    # shellcheck disable=SC2016  # guest-side program must expand in the guest
+    result=$(qm guest exec "$vmid" -- /bin/bash -c '
+set -eu
+units=$(systemctl list-units --type=service --all --no-legend "actions.runner.*.service" | awk "{print \$1}")
+[ "$(printf "%s\n" "$units" | sed "/^$/d" | wc -l)" -eq 1 ] || { echo ERROR; exit 1; }
+unit=$units
+cg=$(systemctl show -p ControlGroup --value "$unit")
+[ -n "$cg" ] && [ -w "/sys/fs/cgroup${cg}/cgroup.freeze" ] || { echo ERROR; exit 1; }
+thaw() { echo 0 > "/sys/fs/cgroup${cg}/cgroup.freeze" 2>/dev/null || true; }
+trap thaw EXIT
+echo 1 > "/sys/fs/cgroup${cg}/cgroup.freeze"
+i=0
+while ! grep -q "^frozen 1$" "/sys/fs/cgroup${cg}/cgroup.events"; do
+    i=$((i + 1)); [ "$i" -lt 50 ] || { echo ERROR; exit 1; }
+    sleep 0.1
+done
+for pid in $(cat "/sys/fs/cgroup${cg}/cgroup.procs"); do
+    comm=$(cat "/proc/${pid}/comm" 2>/dev/null || true)
+    case "$comm" in Runner.Worker*) thaw; echo BUSY; exit 20;; esac
+done
+trap - EXIT
+echo QUIESCED
+' 2>/dev/null </dev/null) || {
+        [[ "$result" == *BUSY* ]] && return 2
+        return 1
+    }
+    [[ "$result" == *QUIESCED* ]] || return 1
+}
+
+rollover_resume_guest() {
+    local vmid="$1"
+    # shellcheck disable=SC2016  # guest-side program must expand in the guest
+    qm guest exec "$vmid" -- /bin/bash -c '
+set -eu
+units=$(systemctl list-units --type=service --all --no-legend "actions.runner.*.service" | awk "{print \$1}")
+[ "$(printf "%s\n" "$units" | sed "/^$/d" | wc -l)" -eq 1
+cg=$(systemctl show -p ControlGroup --value "$units")
+[ -n "$cg" ]
+echo 0 > "/sys/fs/cgroup${cg}/cgroup.freeze"
+' >/dev/null 2>&1
+}
+
+# Wait for GitHub to acknowledge the already-frozen listener as offline. A job
+# assigned just before the freeze will remain busy and is never destroyed.
+rollover_wait_offline_idle() {
+    local org="$1" name="$2" deadline now details id busy status
+    deadline=$(($(date +%s) + ROLLOVER_OFFLINE_TIMEOUT_SECONDS))
+    while :; do
+        details=$(github_runner_lookup_details "$org" "$name") || return 1
+        IFS=$'\t' read -r id busy status <<< "$details"
+        if [[ "$status" == offline ]]; then
+            [[ "$busy" == false ]] || return 2
+            printf '%s\n' "$id"
+            return 0
+        fi
+        now=$(date +%s)
+        (( now < deadline )) || return 1
+        sleep "$ROLLOVER_OFFLINE_POLL_SECONDS"
+    done
+}
+
+# Deregistration is irreversible for this ephemeral runner. If its VM cannot
+# be destroyed, quarantine the frozen residual under a non-slot name/tag so
+# the watcher can refill the original slot. Keeping gen-N blocks unsafe GC.
+rollover_quarantine_vm() {
+    local vmid="$1" gen="$2"
+    qm set "$vmid" --name "retired-rollover-${vmid}" \
+        200>&- 209>&- 210>&- 212>&- </dev/null >/dev/null 2>&1 || return 1
+    qm set "$vmid" --tags "runner-retired,gen-${gen}" \
+        200>&- 209>&- 210>&- 212>&- </dev/null >/dev/null 2>&1 || true
+}
+
+# Returns 0 destroyed, 2 safely skipped, 3 deferred for replacement capacity,
+# 4 destroy failed but slot was quarantined/opened, 1 unrecovered failure.
 rollover_destroy_one() {
     local name="$1" vmid="$2" expected_gen="$3" org="$4"
-    local cfg current_name current_org current_gen status serving lookup runner_id busy
+    local cfg current_name current_org current_gen status serving runner_id quiesce_rc wait_rc
 
     if pool_is_draining; then
         log_error "rollover: maintenance mode became active — stopping"
         return 2
     fi
 
+    exec 209>"${ROLLOVER_ORG_LOCK_PREFIX}-${org}.lock"
+    flock 209
     exec 210>"${RUNNER_SLOT_LOCK_PREFIX}-${name}.lock"
     if ! flock -n 210; then
-        rollover_release_slot
+        rollover_release_locks
         log_info "rollover: skipping $name — its slot is busy"
         return 2
     fi
 
     cfg=$(qm config "$vmid" 2>/dev/null </dev/null) || {
-        rollover_release_slot
+        rollover_release_locks
         log_info "rollover: skipping $name — VMID $vmid disappeared"
         return 2
     }
@@ -131,62 +225,102 @@ rollover_destroy_one() {
     current_org=$(rollover_cfg_org "$cfg" || true)
     current_gen=$(generation_id_from_tags "$(grep -m1 '^tags:' <<< "$cfg" || true)" || true)
     if [[ "$current_name" != "$name" || "$current_org" != "$org" || "$current_gen" != "$expected_gen" ]]; then
-        rollover_release_slot
+        rollover_release_locks
         log_warn "rollover: skipping $name — VM identity or generation changed"
         return 2
     fi
 
     status=$(qm status "$vmid" 2>/dev/null </dev/null | awk '{print $2}') || {
-        rollover_release_slot
+        rollover_release_locks
         log_warn "rollover: skipping $name — status is uncertain"
         return 2
     }
-    [[ -n "$status" ]] || { rollover_release_slot; return 2; }
-    if [[ "$status" == running ]]; then
-        serving=$(rollover_serving_count "$org") || {
-            rollover_release_slot
-            log_warn "rollover: skipping $name — could not verify serving capacity for $org"
-            return 2
-        }
-        if [[ "$serving" -le 1 ]]; then
-            rollover_release_slot
-            log_info "rollover: skipping $name — it is the last running runner for $org"
-            return 2
-        fi
-    fi
+    [[ -n "$status" ]] || { rollover_release_locks; return 2; }
 
-    # This is the safety-critical busy re-check. Nothing that may wait happens
-    # between it and deregistration.
-    lookup=$(github_runner_lookup "$org" "$name") || {
-        rollover_release_slot
-        log_warn "rollover: skipping $name — GitHub busy state is uncertain"
+    serving=$(rollover_serving_count "$org" "$name") || {
+        rollover_release_locks
+        log_warn "rollover: skipping $name — could not verify online replacement capacity for $org"
         return 2
     }
-    IFS=$'\t' read -r runner_id busy <<< "$lookup"
-    if [[ "$busy" != false ]]; then
-        rollover_release_slot
-        log_info "rollover: skipping $name — GitHub reports busy"
+    if [[ "$serving" -lt 1 ]]; then
+        rollover_release_locks
+        log_info "rollover: deferring $name — no other GitHub-online runner serves $org"
+        return 3
+    fi
+
+    # Shared drain coordination makes this check atomic with maintenance entry:
+    # either maintenance published its flag first, or this transaction finishes
+    # before enable_pool_drain can publish it.
+    exec 212>"$POOL_DRAIN_COORD_LOCK_FILE"
+    flock -s 212
+    if pool_is_draining; then
+        rollover_release_locks
+        log_error "rollover: maintenance mode became active — stopping"
         return 2
     fi
+
+    quiesce_rc=0
+    rollover_quiesce_guest "$vmid" || quiesce_rc=$?
+    if [[ "$quiesce_rc" -ne 0 ]]; then
+        rollover_resume_guest "$vmid" || log_error "rollover: failed to resume $name after an uncertain quiesce"
+        rollover_release_locks
+        if [[ "$quiesce_rc" -eq 2 ]]; then
+            log_info "rollover: skipping $name — guest reports an active Runner.Worker"
+        else
+            log_warn "rollover: skipping $name — could not prove guest quiescence"
+        fi
+        return 2
+    fi
+
+    wait_rc=0
+    runner_id=$(rollover_wait_offline_idle "$org" "$name") || wait_rc=$?
+    if [[ "$wait_rc" -ne 0 ]]; then
+        rollover_resume_guest "$vmid" || log_error "rollover: failed to resume $name after quiesce"
+        rollover_release_locks
+        if [[ "$wait_rc" -eq 2 ]]; then
+            log_info "rollover: skipping $name — GitHub reports an assignment after quiesce"
+        else
+            log_warn "rollover: skipping $name — GitHub did not acknowledge safe offline state"
+        fi
+        return 2
+    fi
+
+    # Quiescence can take up to the GitHub offline timeout. Re-inventory under
+    # the org lock after that wait so a replacement that completed its own job
+    # in the meantime cannot disappear unnoticed before this DELETE.
+    serving=$(rollover_serving_count "$org" "$name") || serving=-1
+    if [[ "$serving" -lt 1 ]]; then
+        rollover_resume_guest "$vmid" || log_error "rollover: failed to resume $name after replacement capacity changed"
+        rollover_release_locks
+        log_warn "rollover: skipping $name — online replacement capacity changed during quiesce"
+        return 2
+    fi
+
     if ! github_runner_deregister_id "$org" "$runner_id"; then
-        rollover_release_slot
+        rollover_resume_guest "$vmid" || log_error "rollover: failed to resume $name after deregistration failure"
+        rollover_release_locks
         log_warn "rollover: skipping $name — GitHub deregistration failed"
         return 2
     fi
 
     if ! rollover_destroy_vm "$vmid"; then
-        rollover_release_slot
-        log_error "rollover: failed to destroy $name (VMID $vmid)"
+        if rollover_quarantine_vm "$vmid" "$expected_gen"; then
+            rollover_release_locks
+            log_error "rollover: failed to destroy $name (VMID $vmid); quarantined residual so the slot can refill"
+            return 4
+        fi
+        rollover_release_locks
+        log_error "rollover: failed to destroy or quarantine $name (VMID $vmid); frozen residual needs operator repair"
         return 1
     fi
-    rollover_release_slot
+    rollover_release_locks
     log_info "rollover: destroyed idle old-generation runner $name (VMID $vmid, gen-$expected_gen)"
     return 0
 }
 
 rollover_main() {
     local force=false active_id active_state candidates name vmid gen org status age busy rc
-    local destroyed=0 skipped=0 failed=0
+    local destroyed=0 skipped=0 failed=0 refill_opened=0 deferred="" deadline now
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --force) force=true; shift ;;
@@ -198,8 +332,11 @@ rollover_main() {
         log_error "Runner pool is stopped for maintenance. Run 'runner start' before rollover."
         return 1
     fi
-    if [[ ! "$ROLLOVER_DESTROY_DELAY_SECONDS" =~ ^[0-9]+$ ]]; then
-        log_error "ROLLOVER_DESTROY_DELAY_SECONDS must be a non-negative integer"
+    if [[ ! "$ROLLOVER_DESTROY_DELAY_SECONDS" =~ ^[0-9]+$ \
+        || ! "$ROLLOVER_OFFLINE_TIMEOUT_SECONDS" =~ ^[0-9]+$ \
+        || ! "$ROLLOVER_OFFLINE_POLL_SECONDS" =~ ^[0-9]+$ \
+        || ! "$ROLLOVER_REPLACEMENT_WAIT_SECONDS" =~ ^[0-9]+$ ]]; then
+        log_error "rollover timeout/delay settings must be non-negative integers"
         return 1
     fi
 
@@ -236,9 +373,12 @@ rollover_main() {
         case "$rc" in
             0)
                 destroyed=$((destroyed + 1))
+                refill_opened=$((refill_opened + 1))
                 [[ "$ROLLOVER_DESTROY_DELAY_SECONDS" -eq 0 ]] || sleep "$ROLLOVER_DESTROY_DELAY_SECONDS"
                 ;;
             2) skipped=$((skipped + 1)) ;;
+            3) deferred+="${name}|${vmid}|${gen}|${org}|${status}|${age}"$'\n' ;;
+            4) failed=$((failed + 1)); refill_opened=$((refill_opened + 1)) ;;
             *) failed=$((failed + 1)) ;;
         esac
         if pool_is_draining; then
@@ -246,6 +386,31 @@ rollover_main() {
             break
         fi
     done <<< "$candidates"
+
+    # The first old runner destroyed opens a slot that the watcher fills from
+    # the active generation. Revisit candidates deferred solely for capacity
+    # until that replacement is verifiably online (checked inside destroy_one).
+    if [[ -n "$deferred" && "$refill_opened" -gt 0 ]]; then
+        while IFS='|' read -r name vmid gen org status age; do
+            [[ -n "$name" ]] || continue
+            deadline=$(($(date +%s) + ROLLOVER_REPLACEMENT_WAIT_SECONDS))
+            while :; do
+                rc=0
+                rollover_destroy_one "$name" "$vmid" "$gen" "$org" || rc=$?
+                [[ "$rc" -ne 3 ]] && break
+                now=$(date +%s)
+                (( now < deadline )) || break
+                sleep "$ROLLOVER_OFFLINE_POLL_SECONDS"
+            done
+            case "$rc" in
+                0) destroyed=$((destroyed + 1)) ;;
+                1|4) failed=$((failed + 1)) ;;
+                *) skipped=$((skipped + 1)) ;;
+            esac
+        done <<< "$deferred"
+    elif [[ -n "$deferred" ]]; then
+        while IFS= read -r name; do [[ -n "$name" ]] && skipped=$((skipped + 1)); done <<< "$deferred"
+    fi
     log_info "rollover: destroyed $destroyed, skipped $skipped, failed $failed"
     [[ "$failed" -eq 0 ]]
 }

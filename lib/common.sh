@@ -78,6 +78,9 @@ GUARD_STATE_DIR="/run/github-runner-guard"
 # clone_runner holds a shared lock for its full lifecycle; runner stop takes an
 # exclusive lock so it can wait until all clone activity is quiesced.
 POOL_ACTIVITY_LOCK_FILE="/run/lock/github-runner-pool.lock"
+# Linearizes maintenance entry with rollover's destructive transaction without
+# putting network waits under the clone/promotion pool lock.
+POOL_DRAIN_COORD_LOCK_FILE="/run/lock/github-runner-drain-coord.lock"
 # Global lock serializing VMID allocation across reclone.sh/watch.sh/create.sh.
 # Scope is narrow: "pick free VMID -> reserve it". A per-VMID reservation
 # stays held until qm clone returns, so clone tasks can run with bounded
@@ -93,6 +96,9 @@ CLONE_SLOT_LOCK_PREFIX="/run/lock/runner-clone-slot"
 # guard would stop coordinating with the clone path and destroy mid-clone.
 # shellcheck disable=SC2034  # consumed by sourcing scripts (reclone.sh, watch.sh, guard.sh)
 RUNNER_SLOT_LOCK_PREFIX="/run/lock/runner"
+# Serializes capacity decisions and destruction within one organization.
+# shellcheck disable=SC2034  # consumed by lib/rollover.sh
+ROLLOVER_ORG_LOCK_PREFIX="/run/lock/github-runner-rollover-org"
 # Per-slot reclone bookkeeping (last-processed timestamp, rapid-death streak).
 # shellcheck disable=SC2034  # consumed by sourcing scripts (lib/reclone.sh)
 RECLONE_STATE_PREFIX="/run/runner"
@@ -377,6 +383,8 @@ ensure_state_dir() {
 }
 
 enable_pool_drain() {
+    exec 212>"$POOL_DRAIN_COORD_LOCK_FILE"
+    flock -x 212
     local state_dir
     state_dir="$(dirname "$POOL_DRAIN_FILE")"
 
@@ -386,10 +394,12 @@ enable_pool_drain() {
     # drained when the watcher is still cloning.
     if ! ensure_state_dir "$state_dir"; then
         log_error "Failed to create $state_dir — maintenance mode NOT entered"
+        exec 212>&-
         return 1
     fi
     if ! : > "$POOL_DRAIN_FILE"; then
         log_error "Failed to write $POOL_DRAIN_FILE — maintenance mode NOT entered"
+        exec 212>&-
         return 1
     fi
 
@@ -400,6 +410,7 @@ enable_pool_drain() {
     if ! : > "$POOL_DRAIN_FILE_LEGACY" 2>/dev/null; then
         log_warn "Could not write $POOL_DRAIN_FILE_LEGACY — a rollback to an older release would not see this drain"
     fi
+    exec 212>&-
 }
 
 disable_pool_drain() {
@@ -779,29 +790,49 @@ github_runner_credentials() {
     printf '%s\t%s\n' "$github_org" "$pat"
 }
 
-# Print "<runner-id>\t<busy>" only when GitHub returned exactly one runner
-# with the requested name and a boolean busy field.  Missing runners, duplicate
-# names, malformed responses and API failures are all uncertainty to
-# destructive callers and therefore fail closed.
-github_runner_lookup() {
-    local org="$1" runner_name="$2" credentials github_org pat result
+# Print "<runner-id>\t<busy>\t<status>" after a complete paginated scan.
+# Missing/duplicate names, malformed fields, API errors, and a changing
+# total_count all fail closed.
+github_runner_lookup_details() {
+    local org="$1" runner_name="$2" credentials github_org pat json
+    local total="" page=1 pages page_total matches=""
     credentials=$(github_runner_credentials "$org") || return 1
     IFS=$'\t' read -r github_org pat <<< "$credentials"
 
-    result=$(curl -sf --max-time 10 \
-        -H "Accept: application/vnd.github.v3+json" \
-        --config <(printf 'header = "Authorization: token %s"\n' "$pat") \
-        "https://api.github.com/orgs/${github_org}/actions/runners?per_page=100" 2>/dev/null \
-        | jq --arg name "$runner_name" -er '
-            [.runners[] | select(.name == $name)] as $matches
-            | select(($matches | length) == 1)
-            | $matches[0]
-            | select((.id | type) == "number" and (.busy | type) == "boolean")
-            | "\(.id)\t\(.busy)"
-        ' 2>/dev/null) || return 1
+    while :; do
+        json=$(curl -sf --max-time 10 \
+            -H "Accept: application/vnd.github.v3+json" \
+            --config <(printf 'header = "Authorization: token %s"\n' "$pat") \
+            "https://api.github.com/orgs/${github_org}/actions/runners?per_page=100&page=${page}" 2>/dev/null) || return 1
+        page_total=$(jq -er 'select((.total_count | type) == "number" and (.runners | type) == "array") | .total_count' <<< "$json" 2>/dev/null) || return 1
+        [[ "$page_total" =~ ^[0-9]+$ ]] || return 1
+        if [[ -z "$total" ]]; then
+            total="$page_total"
+            pages=$(((total + 99) / 100))
+            (( pages > 0 )) || pages=1
+        elif [[ "$page_total" != "$total" ]]; then
+            return 1
+        fi
+        matches+=$(jq --arg name "$runner_name" -r '
+            .runners[] | select(.name == $name)
+            | select((.id | type) == "number" and (.busy | type) == "boolean"
+                and (.status == "online" or .status == "offline"))
+            | "\(.id)\t\(.busy)\t\(.status)\n"
+        ' <<< "$json" 2>/dev/null) || return 1
+        (( page >= pages )) && break
+        page=$((page + 1))
+    done
 
-    [[ "$result" =~ ^[0-9]+$'\t'(true|false)$ ]] || return 1
-    printf '%s\n' "$result"
+    [[ "$matches" =~ ^[0-9]+$'\t'(true|false)$'\t'(online|offline)$ ]] || return 1
+    printf '%s\n' "$matches"
+}
+
+# Compatibility wrapper for callers that only need id/busy.
+github_runner_lookup() {
+    local details id busy _status
+    details=$(github_runner_lookup_details "$1" "$2") || return 1
+    IFS=$'\t' read -r id busy _status <<< "$details"
+    printf '%s\t%s\n' "$id" "$busy"
 }
 
 # Strict counterpart to deregister_runner for callers whose next operation is
