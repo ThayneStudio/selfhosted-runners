@@ -10,8 +10,13 @@ require_root "destroy"
 RUNNER_NAME=""
 VMID=""
 VM_ORG=""
+SKIP_DEREGISTER=false
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        --skip-deregister)
+            SKIP_DEREGISTER=true
+            shift
+            ;;
         --vmid)
             [[ $# -ge 2 ]] || { log_error "--vmid requires a value"; exit 1; }
             VMID="$2"
@@ -88,7 +93,9 @@ if [[ "$STATUS" == "running" ]]; then
 fi
 
 # Deregister from GitHub (best-effort)
-[[ "$VM_ORG" == "unknown" ]] || deregister_runner "$VM_ORG" "$RUNNER_NAME" || true
+if [[ "$SKIP_DEREGISTER" != true && "$VM_ORG" != "unknown" ]]; then
+    deregister_runner "$VM_ORG" "$RUNNER_NAME" || true
+fi
 
 # Destroy
 log_info "Destroying $RUNNER_NAME (VMID $VMID)..."

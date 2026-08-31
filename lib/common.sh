@@ -764,31 +764,66 @@ cleanup_runner_orphan_volumes() {
     exec 202>&-
 }
 
-deregister_runner() {
-    local org="$1" runner_name="$2"
+github_runner_credentials() {
+    local org="$1"
+    validate_org_name "$org" || return 1
     local org_file="$ORG_CONFIG_DIR/${org}.conf"
-    [[ -f "$org_file" ]] || return 0
+    [[ -f "$org_file" ]] || return 1
 
     local pat="" github_org=""
     # shellcheck source=/dev/null  # per-org config, written by add-org at runtime
-    pat=$(source "$org_file" && echo "$GITHUB_PAT") || return 0
+    pat=$(source "$org_file" && echo "$GITHUB_PAT") || return 1
     # shellcheck source=/dev/null  # per-org config, written by add-org at runtime
-    github_org=$(source "$org_file" && echo "$GITHUB_ORG") || return 0
-    [[ -n "$pat" && -n "$github_org" ]] || return 0
+    github_org=$(source "$org_file" && echo "$GITHUB_ORG") || return 1
+    [[ -n "$pat" && -n "$github_org" ]] || return 1
+    printf '%s\t%s\n' "$github_org" "$pat"
+}
 
-    local runner_id
-    runner_id=$(curl -sf --max-time 10 \
+# Print "<runner-id>\t<busy>" only when GitHub returned exactly one runner
+# with the requested name and a boolean busy field.  Missing runners, duplicate
+# names, malformed responses and API failures are all uncertainty to
+# destructive callers and therefore fail closed.
+github_runner_lookup() {
+    local org="$1" runner_name="$2" credentials github_org pat result
+    credentials=$(github_runner_credentials "$org") || return 1
+    IFS=$'\t' read -r github_org pat <<< "$credentials"
+
+    result=$(curl -sf --max-time 10 \
         -H "Accept: application/vnd.github.v3+json" \
         --config <(printf 'header = "Authorization: token %s"\n' "$pat") \
         "https://api.github.com/orgs/${github_org}/actions/runners?per_page=100" 2>/dev/null \
-        | jq --arg name "$runner_name" -r '.runners[] | select(.name == $name) | .id' 2>/dev/null) || return 0
+        | jq --arg name "$runner_name" -er '
+            [.runners[] | select(.name == $name)] as $matches
+            | select(($matches | length) == 1)
+            | $matches[0]
+            | select((.id | type) == "number" and (.busy | type) == "boolean")
+            | "\(.id)\t\(.busy)"
+        ' 2>/dev/null) || return 1
 
-    [[ -n "$runner_id" && "$runner_id" != "null" && "$runner_id" =~ ^[0-9]+$ ]] || return 0
+    [[ "$result" =~ ^[0-9]+$'\t'(true|false)$ ]] || return 1
+    printf '%s\n' "$result"
+}
+
+# Strict counterpart to deregister_runner for callers whose next operation is
+# destructive.  Failure is meaningful: they must leave the VM alone.
+github_runner_deregister_id() {
+    local org="$1" runner_id="$2" credentials github_org pat
+    [[ "$runner_id" =~ ^[0-9]+$ ]] || return 1
+    credentials=$(github_runner_credentials "$org") || return 1
+    IFS=$'\t' read -r github_org pat <<< "$credentials"
 
     curl -sf --max-time 10 -X DELETE \
         -H "Accept: application/vnd.github.v3+json" \
         --config <(printf 'header = "Authorization: token %s"\n' "$pat") \
-        "https://api.github.com/orgs/${github_org}/actions/runners/${runner_id}" 2>/dev/null || return 0
+        "https://api.github.com/orgs/${github_org}/actions/runners/${runner_id}" 2>/dev/null
+}
+
+deregister_runner() {
+    local org="$1" runner_name="$2" runner id _busy
+
+    runner=$(github_runner_lookup "$org" "$runner_name") || return 0
+    IFS=$'\t' read -r id _busy <<< "$runner"
+    github_runner_deregister_id "$org" "$id" || return 0
 }
 
 # --- Shared runner VM helpers ---
