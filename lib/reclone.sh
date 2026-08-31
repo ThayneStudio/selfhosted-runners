@@ -34,6 +34,13 @@ if pool_is_draining; then
     exit 0
 fi
 
+# Hold shared pool activity for the rest of this process so `runner stop`
+# (exclusive 202) waits out destroy + mint, not just the later qm clone.
+# clone_runner sees POOL_ACTIVITY_LOCK_HELD and will not reopen fd 202.
+exec 202>"$POOL_ACTIVITY_LOCK_FILE"
+flock -s 202
+POOL_ACTIVITY_LOCK_HELD=1
+
 # Backoff: defer to the watcher only after N consecutive rapid deaths.
 # A single fast reclone is normal — short linter jobs (~45s) complete well
 # inside any time-based window, so the old 120s blanket backoff misfired on

@@ -216,8 +216,7 @@ mv "$CONF_TMP" "$CONFIG_FILE"
 
 # Prune obsolete per-org snippets that embedded the org PAT. Cloud-init is now
 # rendered per-VM at clone time with a single-use JIT config; the PAT stays
-# on the host. Safe to remove: ephemeral VMs never restart, and any legacy VM
-# is replaced new-style on its next reclone.
+# on the host.
 if compgen -G "$SNIPPETS_DIR/runner-user-data-*.yaml" > /dev/null; then
     rm -f "$SNIPPETS_DIR"/runner-user-data-*.yaml
     log_info "Removed obsolete per-org PAT snippets"
@@ -478,9 +477,7 @@ else
     echo "To add another org:  runner add-org"
     echo "To list orgs:        runner list-orgs"
     echo ""
-    echo "Usage:"
-    echo "  runner create runner-01"
-    echo "  runner list"
-    echo "  runner help"
+    log_warn "Running VMs still have the old PAT on their cloud-init drive until recycled."
+    log_warn "Recycle the pool before the next job: runner stop && runner start"
     echo ""
 fi

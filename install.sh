@@ -45,14 +45,17 @@ if [[ -f /etc/github-runners.conf ]]; then
         systemctl daemon-reload
     fi
     # Prune obsolete per-org snippets. These embedded the org PAT; the PAT now
-    # stays on the host and a short-lived token is rendered per-VM at clone time.
-    # Safe to remove: ephemeral VMs never restart, and any legacy VM is replaced
-    # new-style on its next reclone.
+    # stays on the host and a single-use JIT config is rendered per-VM at clone time.
     if compgen -G "/var/lib/vz/snippets/runner-user-data-*.yaml" > /dev/null; then
         rm -f /var/lib/vz/snippets/runner-user-data-*.yaml
         echo "  Removed obsolete per-org PAT snippets"
     fi
     echo "Done. No need to re-run setup."
+    echo ""
+    echo "WARNING: VMs that are already running still have the old PAT on their"
+    echo "cloud-init drive until they are destroyed. Recycle the pool before the"
+    echo "next job or any workflow can still read it:"
+    echo "  runner stop && runner start"
 else
     echo ""
     echo "Run the setup wizard:"

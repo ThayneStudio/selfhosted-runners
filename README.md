@@ -138,11 +138,14 @@ After setup, the `runner` command is available globally:
 |---------|-------------|
 | `runner setup` | Re-run the infrastructure setup wizard |
 | `runner add-org` | Add a GitHub org (or rotate its PAT) |
+| `runner remove-org [<org>]` | Remove a configured org |
+| `runner list-orgs` | List configured orgs and runner counts |
 | `runner create [--org <org>] <name>` | Create a runner VM manually |
 | `runner destroy <name>` | Destroy a managed runner VM |
 | `runner start` | Exit maintenance mode and resume watcher |
 | `runner stop [options]` | Enter maintenance mode and stop managed runners |
 | `runner list` | List all runner VMs |
+| `runner watch` | Fill missing runner slots (run by a 30s timer) |
 | `runner help` | Show available commands |
 
 ## Installed Software
@@ -391,22 +394,23 @@ The storage pool specified during setup doesn't exist. Re-run `runner setup` and
 
 ### Runner shows "Offline" in GitHub
 
-The runner VM might have stopped or the service crashed.
+The runner is a foreground `run.sh --jitconfig` started by cloud-init, not a
+systemd unit. If that process exits, the EXIT trap shuts the VM down and the
+hookscript reclones the slot.
 
 **Check VM status:**
 ```bash
 qm status <vmid>
 ```
 
-**Check runner service:**
+**Check the in-guest setup log (while the VM is still running):**
 ```bash
-qm guest exec <vmid> -- systemctl status actions.runner.*
+qm guest exec <vmid> -- cat /var/log/runner-setup.log
 ```
 
-**Restart runner service:**
-```bash
-qm guest exec <vmid> -- systemctl restart actions.runner.*
-```
+If the VM is already stopped, wait for the watcher (or run `runner watch`) to
+refill the slot. Do not `qm stop` a runner to inspect it — the watcher will
+reclaim a stopped VM.
 
 ### Docker commands fail in workflows
 
