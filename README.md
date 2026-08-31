@@ -18,10 +18,10 @@ cd selfhosted-runners
 ```
 
 The wizard will:
-1. Ask for GitHub org, PAT, network bridge, storage pool
-2. Install to `/opt/selfhosted-runners`
-3. Add `runner` command to `/usr/local/bin`
-4. Download Ubuntu cloud image and create VM template
+1. Ask for network bridge, storage pool, and template settings
+2. Install to `/opt/selfhosted-runners` and add the `runner` command to `/usr/local/bin`
+3. Download the Ubuntu cloud image and bake the VM template
+4. Hand off to `runner add-org` for your first org + PAT
 
 Then create runners from anywhere:
 ```bash
@@ -35,8 +35,9 @@ runner create runner-02
 ┌─────────────────────────────────────────────────────────────────┐
 │ Proxmox Host                                                    │
 │                                                                 │
-│  /etc/github-runners.conf          ← Infra config (no secrets)  │
-│  /var/lib/vz/snippets/             ← Cloud-init config         │
+│  /etc/github-runners.conf          ← Infra config (no secrets) │
+│  /etc/github-runners.d/<org>.conf  ← Per-org PAT (600)         │
+│  /var/lib/vz/snippets/             ← Per-VM cloud-init         │
 │                                                                 │
 │  ┌──────────────────┐                                          │
 │  │ Template (9000)  │  ← Ubuntu 24.04 cloud image              │
@@ -94,18 +95,32 @@ The Proxmox host and runner VMs need outbound access to:
 ### GitHub Requirements
 
 - **GitHub organization** (free tier works)
-- **Personal Access Token (PAT)** with `admin:org` scope
+- **Personal Access Token (PAT)** — either a fine-grained or classic token (below)
 
 #### Creating a GitHub PAT
 
-1. Go to GitHub → Settings → Developer settings → Personal access tokens → **Tokens (classic)**
-2. Click **Generate new token (classic)**
-3. Set expiration (recommend 90 days)
-4. Select scope: **`admin:org`** (full control of orgs and teams)
-5. Click **Generate token**
-6. Copy the token (starts with `ghp_`)
+The host uses the PAT only to mint single-use JIT runner configs
+(`generate-jitconfig`) and to deregister stale runners. Two options:
 
-> **Note**: Fine-grained tokens don't currently support runner registration. Use classic tokens.
+**Fine-grained (recommended — least privilege):**
+1. GitHub → Settings → Developer settings → Personal access tokens → **Fine-grained tokens**
+2. **Resource owner**: your organization. Set an expiration.
+3. **Organization permissions** → **Self-hosted runners**: **Read and write**
+   (the mint needs *write* — "Read" alone is not enough; see the note below)
+4. Generate and copy the token (starts with `github_pat_`)
+
+This scopes the token to one capability on one org — if it leaks, the blast
+radius is "manage that org's runners," not full org control.
+
+**Classic (simpler, broader):**
+1. GitHub → Settings → Developer settings → Personal access tokens → **Tokens (classic)**
+2. Select scope **`admin:org`**, generate, and copy (starts with `ghp_`)
+
+`runner add-org` validates the token against the org's runner API, which catches
+a wrong org or a token with no runner access. Note: it confirms *read* access, so
+a fine-grained token granted only "Self-hosted runners: **Read**" passes setup but
+then fails at the first clone (the mint needs **write**) — grant **Read and
+write**. A classic `admin:org` token has both.
 
 ## Runner Specs
 
@@ -121,12 +136,16 @@ After setup, the `runner` command is available globally:
 
 | Command | Description |
 |---------|-------------|
-| `runner setup` | Re-run the setup wizard |
-| `runner create <name>` | Create a new runner VM |
+| `runner setup` | Re-run the infrastructure setup wizard |
+| `runner add-org` | Add a GitHub org (or rotate its PAT) |
+| `runner remove-org [<org>]` | Remove a configured org |
+| `runner list-orgs` | List configured orgs and runner counts |
+| `runner create [--org <org>] <name>` | Create a runner VM manually |
 | `runner destroy <name>` | Destroy a managed runner VM |
 | `runner start` | Exit maintenance mode and resume watcher |
 | `runner stop [options]` | Enter maintenance mode and stop managed runners |
 | `runner list` | List all runner VMs |
+| `runner watch` | Fill missing runner slots (run by a 30s timer) |
 | `runner help` | Show available commands |
 
 ## Installed Software
@@ -236,19 +255,20 @@ jobs:
 
 ## Updating Runners
 
-To update runner registration/bootstrap behavior (cloud-init that runs on every
-cloned runner VM):
+The per-VM cloud-init snippet is rendered fresh from the template at every
+clone, so to change runner bootstrap behavior you only edit the template and recycle:
 
 1. Edit `/opt/selfhosted-runners/templates/runner-user-data.yaml`
-2. Re-run setup to regenerate the per-org runner cloud-init snippets:
+2. Destroy a runner; the watcher recreates it from the updated template:
    ```bash
-   runner setup
+   runner destroy runner-01   # watcher recreates within ~30s
    ```
-3. Destroy and recreate runners:
-   ```bash
-   runner destroy runner-01
-   runner create runner-01
-   ```
+
+### Rotating a PAT
+
+The PAT lives only on the Proxmox host in `/etc/github-runners.d/<org>.conf`.
+Re-run `runner add-org`, enter the same org and the new PAT. The new token takes
+effect on the next clone — no runner stores the PAT, so nothing else is needed.
 
 To update prebaked software in the base VM template:
 
@@ -304,17 +324,16 @@ shuts the VM down itself and only then converts it to a template.
 
 ### The 30-day rebake deadline
 
-Runners register with `--disableupdate`, so they never self-update. That avoids
-re-downloading the ~225 MB runner package on every job boot, but it puts the
-template on a clock: **rebake within 30 days of each new `actions/runner`
-release** (sooner if it is a critical security update).
+Clones start the baked runner with `run.sh --jitconfig` (no `config.sh`, so
+`--disableupdate` is not applied). GitHub still requires a reasonably current
+runner version. **Rebake within 30 days of each new `actions/runner` release**
+(sooner if it is a critical security update).
 
-Miss it and the failure is silent rather than loud. Registration keeps working,
-runners show **Online / Idle** in the GitHub UI, and jobs simply queue forever
-without being assigned -- which looks like a GitHub incident, not a stale
-template. Check the baked version against upstream by probing a **running runner
-clone** -- the template itself is never running, so `qm guest exec` cannot reach
-it, and it has no `.runner` file because the bake never runs `config.sh`:
+Miss it and the failure can be silent: runners show **Online / Idle** in the
+GitHub UI while jobs queue forever — which looks like a GitHub incident, not a
+stale template. Check the baked version against upstream by probing a **running
+runner clone** — the template itself is never running, so `qm guest exec` cannot
+reach it:
 
 ```bash
 vmid=$(qm list | awk '$3=="running" && $2 ~ /runner/ {print $1; exit}')
@@ -322,13 +341,10 @@ qm guest exec "$vmid" -- /home/runner/actions-runner/bin/Runner.Listener --versi
 curl -sf https://api.github.com/repos/actions/runner/releases/latest | jq -r .tag_name
 ```
 
-With `--disableupdate` in force a clone's version equals the baked version, so
-those two outputs should match. If they have drifted, the rebake is overdue.
-
-Before `--disableupdate` shipped, a clone would silently self-update on boot. You
-can still see the evidence on any long-lived clone: versioned `bin.<version>` and
-`externals.<version>` directories under `/home/runner/actions-runner` are created
-only by the self-update path, never by a fresh install.
+If those two outputs have drifted, the rebake is overdue. A clone that
+self-updates on boot leaves versioned `bin.<version>` and `externals.<version>`
+directories under `/home/runner/actions-runner` and re-downloads the ~225 MB
+runner package on every job until the template is rebaked.
 
 `runner stop` leaves the pool in maintenance mode until you run `runner start`.
 The maintenance flag lives in `/run/lock/`, which is tmpfs -- it does **not**
@@ -360,7 +376,7 @@ qm guest exec <vmid> -- cat /var/log/runner-setup.log
 ```
 
 **Common causes:**
-- PAT doesn't have `admin:org` scope
+- PAT lacks runner access (`admin:org`, or fine-grained `Self-hosted runners: Read and write`)
 - Organization name is misspelled
 - Network connectivity issues (check DNS, firewall)
 
@@ -378,22 +394,23 @@ The storage pool specified during setup doesn't exist. Re-run `runner setup` and
 
 ### Runner shows "Offline" in GitHub
 
-The runner VM might have stopped or the service crashed.
+The runner is a foreground `run.sh --jitconfig` started by cloud-init, not a
+systemd unit. If that process exits, the EXIT trap shuts the VM down and the
+hookscript reclones the slot.
 
 **Check VM status:**
 ```bash
 qm status <vmid>
 ```
 
-**Check runner service:**
+**Check the in-guest setup log (while the VM is still running):**
 ```bash
-qm guest exec <vmid> -- systemctl status actions.runner.*
+qm guest exec <vmid> -- cat /var/log/runner-setup.log
 ```
 
-**Restart runner service:**
-```bash
-qm guest exec <vmid> -- systemctl restart actions.runner.*
-```
+If the VM is already stopped, wait for the watcher (or run `runner watch`) to
+refill the slot. Do not `qm stop` a runner to inspect it — the watcher will
+reclaim a stopped VM.
 
 ### Docker commands fail in workflows
 
@@ -416,15 +433,12 @@ The runner VM might not have network connectivity. Check:
 ### PAT expired or invalid
 
 1. Generate a new PAT in GitHub
-2. Update the configuration:
+2. Update the org config (PAT stays on the host, never in a VM):
    ```bash
-   runner setup  # Re-run wizard with new PAT
+   runner add-org   # enter the same org name and the new PAT
    ```
-3. Recreate runners:
-   ```bash
-   runner destroy runner-01
-   runner create runner-01
-   ```
+   The new token is used on the next clone. Existing runners keep working until
+   their next job; recycle one immediately with `runner destroy <name>` if needed.
 
 ## Files Created by Setup
 
@@ -433,16 +447,37 @@ The runner VM might not have network connectivity. Check:
 | `/opt/selfhosted-runners/` | Installed scripts and templates |
 | `/usr/local/bin/runner` | Symlink to runner entrypoint |
 | `/etc/github-runners.conf` | Infrastructure config (bridge, storage, template ID) |
-| `/etc/github-runners.d/<org>.conf` | Per-org config (PAT, runner prefix, pool size) |
-| `/var/lib/vz/snippets/runner-user-data.yaml` | Cloud-init config for VMs |
+| `/etc/github-runners.d/<org>.conf` | Per-org config (PAT, prefix, count, runner group ID) — mode 600 |
+| `/var/lib/vz/snippets/runner-<vmid>-user-<org>.yaml` | Per-VM cloud-init (single-use JIT config) |
+| `/var/lib/vz/snippets/runner-<vmid>-meta.yaml` | Per-VM cloud-init metadata |
 | VM template (default ID 9000) | Ubuntu cloud image template |
 
 ## Security Notes
 
-- **PAT storage**: PATs are stored per-org in `/etc/github-runners.d/<org>.conf` with mode 600 (root only readable). `/etc/github-runners.conf` holds infrastructure settings only and contains no secrets.
-- **Runner user**: VMs run as user `runner` with sudo access (required for Docker)
-- **Docker access**: The `runner` user is in the `docker` group
-- **Rotate PAT**: Edit config, re-run `runner setup`, recreate runners
+- **PAT never enters the VM**: The org PAT (`admin:org`, or a least-privilege
+  fine-grained token — see Prerequisites) stays on the Proxmox host in
+  `/etc/github-runners.d/<org>.conf` (mode 600, root-only). `/etc/github-runners.conf`
+  holds infrastructure settings only and contains no secrets. At clone time
+  the host calls GitHub's `generate-jitconfig` API and injects only the returned
+  **single-use JIT (just-in-time) config** via cloud-init.
+- **JIT config is single-use**: the config registers exactly one ephemeral
+  runner and cannot be replayed to register another. The in-VM script removes the
+  at-rest filesystem copies before the job runs; the config does still exist on
+  the attached cloud-init drive (`/dev/sr0`) and on `run.sh`'s command line while
+  the runner is up, but because it is single-use a job that recovers it cannot
+  register a rogue runner. This is the recommended GitHub mechanism for
+  short-lived runners and removes the reusable-token exposure entirely.
+- **Upgrade recycle**: after deploying this change, existing VMs still have the
+  old PAT on their cloud-init drive until they are destroyed. Recycle the pool
+  with `runner stop` then `runner start`.
+- **Runner user**: VMs run as user `runner` with NOPASSWD sudo and `docker`
+  group membership (both root-equivalent inside the VM) — required for Docker.
+- **⚠️ Do not use these runners on public repositories.** Self-hosted runners
+  execute workflow code from any PR, including forks. A malicious PR would get
+  full root inside the VM. Restrict the org's runners to **private repos** in
+  GitHub → Org Settings → Actions → Runner groups. The VM is ephemeral, but the
+  job is still arbitrary code execution on your host's network.
+- **Rotate PAT**: re-run `runner add-org` with the new PAT (effective next clone).
 
 ## Limitations
 

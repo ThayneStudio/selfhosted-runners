@@ -156,7 +156,13 @@ select_org() {
 get_vm_org() {
     local cicustom
     cicustom=$(qm config "$1" 2>/dev/null | grep "^cicustom:" || true)
-    if [[ "$cicustom" =~ runner-user-data-([^.]+)\.yaml ]]; then
+    # New per-VM snippet: runner-<vmid>-user-<org>.yaml (org has no dots).
+    # Legacy per-org snippet: runner-user-data-<org>.yaml (kept as a fallback so
+    # VMs created before the token refactor stay identifiable/destroyable).
+    # The two are mutually exclusive: legacy names have no digits after "runner-".
+    if [[ "$cicustom" =~ runner-[0-9]+-user-([a-zA-Z0-9-]+)\.yaml ]]; then
+        echo "${BASH_REMATCH[1]}"
+    elif [[ "$cicustom" =~ runner-user-data-([^.]+)\.yaml ]]; then
         echo "${BASH_REMATCH[1]}"
     else
         echo "unknown"
@@ -418,22 +424,108 @@ deregister_runner() {
     github_org=$(source "$org_file" && echo "$GITHUB_ORG") || return 0
     [[ -n "$pat" && -n "$github_org" ]] || return 0
 
-    local runner_id
+    local runner_id name_q
+    name_q=$(jq -nr --arg n "$runner_name" '$n|@uri') || return 0
+    # ?name= is exact match on GitHub's side, but still filter in jq so a
+    # surprising API change cannot DELETE the wrong runner. Avoids paging
+    # through every org runner (per_page max 100) to find a stale JIT leftover.
     runner_id=$(curl -sf --max-time 10 \
-        -H "Accept: application/vnd.github.v3+json" \
+        -H "Accept: application/vnd.github+json" \
         --config <(printf 'header = "Authorization: token %s"\n' "$pat") \
-        "https://api.github.com/orgs/${github_org}/actions/runners?per_page=100" 2>/dev/null \
+        "https://api.github.com/orgs/${github_org}/actions/runners?name=${name_q}&per_page=100" 2>/dev/null \
         | jq --arg name "$runner_name" -r '.runners[] | select(.name == $name) | .id' 2>/dev/null) || return 0
 
     [[ -n "$runner_id" && "$runner_id" != "null" && "$runner_id" =~ ^[0-9]+$ ]] || return 0
 
+    # stdout suppressed: DELETE returns 204 (empty), but this runs inside
+    # $(clone_runner) on the retry path, so keep it off the captured stdout.
     curl -sf --max-time 10 -X DELETE \
-        -H "Accept: application/vnd.github.v3+json" \
+        -H "Accept: application/vnd.github+json" \
         --config <(printf 'header = "Authorization: token %s"\n' "$pat") \
-        "https://api.github.com/orgs/${github_org}/actions/runners/${runner_id}" 2>/dev/null || return 0
+        "https://api.github.com/orgs/${github_org}/actions/runners/${runner_id}" >/dev/null 2>&1 || return 0
 }
 
 # --- Shared runner VM helpers ---
+
+# Mint a single-use JIT (just-in-time) runner config on the host. The runner
+# registers and auto-removes using this config, and it CANNOT be reused to
+# register another runner — so even if a job reads it from the cloud-init drive
+# it cannot be replayed. Requires GITHUB_PAT and GITHUB_ORG in scope (caller ran
+# load_org_config). The PAT is passed via curl --config to keep it off argv; the
+# request body (name/labels/group) is not sensitive. RUNNER_GROUP_ID (default 1
+# = the org's "Default" group) and RUNNER_LABELS may be set in the org config.
+# Prints the base64 encoded_jit_config on stdout.
+# Returns 0 on success, 2 on HTTP 409 (duplicate runner name), 1 on any other failure.
+fetch_jit_config() {
+    local name="$1"
+    local group="${RUNNER_GROUP_ID:-1}"
+    local labels="${RUNNER_LABELS:-self-hosted,linux,x64}"
+    [[ -n "$labels" ]] || labels="self-hosted,linux,x64"
+    # Group IDs are >=1 (1 = Default); clamp anything else to 1.
+    [[ "$group" =~ ^[1-9][0-9]*$ ]] || group=1
+    local body http_code jit tmp
+    # split → trim each label → drop empties, so a hand-edited RUNNER_LABELS with
+    # spaces or a trailing comma still yields clean labels.
+    body=$(jq -n --arg name "$name" --argjson group "$group" --arg labels "$labels" \
+        '{name: $name, runner_group_id: $group,
+          labels: ($labels | split(",") | map(gsub("^\\s+|\\s+$";"")) | map(select(length > 0)))}') || return 1
+    tmp=$(mktemp) || return 1
+    http_code=$(curl -sS -o "$tmp" -w "%{http_code}" --max-time 15 --retry 3 -X POST \
+        -H "Accept: application/vnd.github+json" \
+        -H "Content-Type: application/json" \
+        --config <(printf 'header = "Authorization: token %s"\n' "$GITHUB_PAT") \
+        --data "$body" \
+        "https://api.github.com/orgs/${GITHUB_ORG}/actions/runners/generate-jitconfig") || http_code="000"
+    body=$(cat "$tmp")
+    rm -f "$tmp"
+    if [[ "$http_code" == "409" ]]; then
+        log_warn "JIT mint conflict: a runner named '$name' already exists"
+        return 2
+    fi
+    if [[ "$http_code" != "201" && "$http_code" != "200" ]]; then
+        case "$http_code" in
+            401|403) log_error "JIT mint failed for '$name' (HTTP $http_code) — PAT needs runner write access" ;;
+            404) log_error "JIT mint failed for '$name' (HTTP $http_code) — org or runner group $group not found" ;;
+            422) log_error "JIT mint failed for '$name' (HTTP $http_code) — invalid name, labels, or group" ;;
+            *) log_error "JIT mint failed for '$name' (HTTP $http_code)" ;;
+        esac
+        return 1
+    fi
+    jit=$(jq -r '.encoded_jit_config // empty' <<<"$body" 2>/dev/null) || return 1
+    # Must be a single base64 token — rejects anything with quotes/newlines that
+    # could break out of the YAML string it gets rendered into.
+    [[ -n "$jit" && "$jit" =~ ^[A-Za-z0-9+/=_-]+$ ]] || return 1
+    printf '%s' "$jit"
+}
+
+# Render a per-VM cloud-init user snippet carrying only the single-use JIT
+# config and org (never the PAT). Uses awk with the config passed via ENVIRON so
+# it never appears in the process list.
+# Usage: render_user_snippet <vmid> <org> <jit_config>
+render_user_snippet() {
+    local vmid="$1" org="$2" jit_config="$3"
+    local tmp
+    tmp=$(mktemp "$SNIPPETS_DIR/.runner-${vmid}-user.XXXXXX") || return 1
+    chmod 600 "$tmp"
+    JIT_CONFIG="$jit_config" GITHUB_ORG="$GITHUB_ORG" DOCKER_MIRROR_URL="${DOCKER_MIRROR_URL:-}" awk '
+    # Literal string replace (avoids gsub special chars: & and \)
+    function lreplace(str, old, new,    i, result) {
+        result = ""
+        while ((i = index(str, old)) > 0) {
+            result = result substr(str, 1, i - 1) new
+            str = substr(str, i + length(old))
+        }
+        return result str
+    }
+    {
+        $0 = lreplace($0, "{{JIT_CONFIG}}", ENVIRON["JIT_CONFIG"])
+        $0 = lreplace($0, "{{GITHUB_ORG}}", ENVIRON["GITHUB_ORG"])
+        $0 = lreplace($0, "{{DOCKER_MIRROR_URL}}", ENVIRON["DOCKER_MIRROR_URL"])
+        print
+    }' "$INSTALL_DIR/templates/runner-user-data.yaml" > "$tmp" || { rm -f "$tmp"; return 1; }
+    mv "$tmp" "$SNIPPETS_DIR/runner-${vmid}-user-${org}.yaml" || { rm -f "$tmp"; return 1; }
+    chmod 600 "$SNIPPETS_DIR/runner-${vmid}-user-${org}.yaml"
+}
 
 # Deterministic MAC from name. Locally-administered unicast (02:xx:xx:xx:xx:xx).
 generate_mac() {
@@ -445,13 +537,37 @@ generate_mac() {
 clone_runner() {
     local name="$1" org="$2" vmid="${3:-}"
     local RESERVED_VMID=""
+    local pool_lock_owned=0
 
-    exec 202>"$POOL_ACTIVITY_LOCK_FILE"
-    flock -s 202
+    # GITHUB_PAT/GITHUB_ORG must be in scope (caller ran load_org_config).
+    if [[ -z "${GITHUB_PAT:-}" || -z "${GITHUB_ORG:-}" ]]; then
+        log_error "clone_runner: org config not loaded (GITHUB_PAT/GITHUB_ORG unset)"
+        return 1
+    fi
+
+    # reclone.sh holds fd 202 for its whole lifetime (POOL_ACTIVITY_LOCK_HELD=1)
+    # so runner stop's exclusive 202 waits out destroy+mint, not just qm clone.
+    # Do not exec 202> in that case — it would drop the caller's lock.
+    _pool_lock_acquire() {
+        if [[ "${POOL_ACTIVITY_LOCK_HELD:-0}" == "1" ]]; then
+            return 0
+        fi
+        exec 202>"$POOL_ACTIVITY_LOCK_FILE"
+        flock -s 202
+        pool_lock_owned=1
+    }
+    _pool_lock_release() {
+        if [[ "$pool_lock_owned" == "1" ]]; then
+            exec 202>&-
+            pool_lock_owned=0
+        fi
+    }
+
+    _pool_lock_acquire
 
     if pool_is_draining; then
         log_warn "clone_runner: pool drain active, refusing to create $name"
-        exec 202>&-
+        _pool_lock_release
         return 1
     fi
 
@@ -469,7 +585,7 @@ clone_runner() {
             return 0
         fi
 
-        rm -f "${SNIPPETS_DIR}/runner-${vmid}-meta.yaml"
+        rm -f "${SNIPPETS_DIR}/runner-${vmid}-meta.yaml" "${SNIPPETS_DIR}/runner-${vmid}-user-"*.yaml "${SNIPPETS_DIR}/runner-${vmid}-vendor.yaml"
 
         if [[ "$owner" == "$name" ]]; then
             local destroy_err; destroy_err=$(mktemp)
@@ -489,6 +605,29 @@ clone_runner() {
         )
     }
 
+    # Mint the single-use JIT config BEFORE cloning so the PAT never enters the
+    # VM. Fail fast here (return 1, not _fail): nothing has been created yet, and
+    # on a VMID collision _fail's name match could destroy a foreign VM.
+    # generate-jitconfig 409s if a runner of this name still exists (e.g. a
+    # crashed VM left a stale entry). A healthy ephemeral runner auto-removes
+    # after its job, so the common path mints in one call; only on failure do we
+    # deregister the stale entry (mirrors config.sh --replace) and retry once.
+    local jit_config mint_rc=0
+    jit_config=$(fetch_jit_config "$name") && mint_rc=0 || mint_rc=$?
+    if [[ $mint_rc -eq 2 ]]; then
+        # Duplicate name: deregister the stale GitHub-side runner and mint once more.
+        deregister_runner "$org" "$name" || true
+        jit_config=$(fetch_jit_config "$name") && mint_rc=0 || mint_rc=$?
+        if [[ $mint_rc -ne 0 ]]; then
+            log_error "Failed to mint JIT config for org '$GITHUB_ORG' after removing a stale runner named '$name'"
+            _pool_lock_release
+            return 1
+        fi
+    elif [[ $mint_rc -ne 0 ]]; then
+        _pool_lock_release
+        return 1
+    fi
+
     # Acquire global VMID allocation lock only long enough to reserve one VMID.
     # The per-VMID reservation stays held until qm clone returns, which lets
     # other workers reserve different VMIDs and clone with bounded parallelism.
@@ -500,14 +639,14 @@ clone_runner() {
     if ! flock -w 300 201; then
         log_error "clone_runner: timed out acquiring VMID lock for $name"
         exec 201>&-
-        exec 202>&-
+        _pool_lock_release
         return 1
     fi
 
     if [[ -z "$vmid" ]]; then
         if ! reserve_vmid; then
             exec 201>&-
-            exec 202>&-
+            _pool_lock_release
             return 1
         fi
         vmid="$RESERVED_VMID"
@@ -516,7 +655,7 @@ clone_runner() {
         # could have grabbed it between the caller's check and now.
         if ! reserve_vmid "$vmid"; then
             exec 201>&-
-            exec 202>&-
+            _pool_lock_release
             return 1
         fi
         vmid="$RESERVED_VMID"
@@ -526,7 +665,7 @@ clone_runner() {
         log_warn "clone_runner: pool drain became active before cloning $name"
         exec 201>&-
         release_vmid_reservation "$vmid"
-        exec 202>&-
+        _pool_lock_release
         return 1
     fi
 
@@ -537,7 +676,7 @@ clone_runner() {
     if ! acquire_clone_slot; then
         log_warn "clone_runner: pool drain became active before cloning $name"
         release_vmid_reservation "$vmid"
-        exec 202>&-
+        _pool_lock_release
         return 1
     fi
 
@@ -545,7 +684,7 @@ clone_runner() {
         log_warn "clone_runner: pool drain became active before cloning $name"
         release_clone_slot
         release_vmid_reservation "$vmid"
-        exec 202>&-
+        _pool_lock_release
         return 1
     fi
 
@@ -563,7 +702,7 @@ clone_runner() {
         release_clone_slot
         _fail
         release_vmid_reservation "$vmid"
-        exec 202>&-
+        _pool_lock_release
         return 1
     fi
     rm -f "$clone_err"
@@ -573,7 +712,7 @@ clone_runner() {
         log_warn "clone_runner: pool drain became active after cloning $name, cleaning up VM $vmid"
         _fail
         release_vmid_reservation "$vmid"
-        exec 202>&-
+        _pool_lock_release
         return 1
     fi
 
@@ -586,44 +725,49 @@ clone_runner() {
     net0=$(qm config "$vmid" 200>&- 201>&- 202>&- 203>&- 204>&- | grep '^net0:' | sed 's/^net0: //') || true
     if [[ -n "$net0" ]]; then
         net0=$(echo "$net0" | sed "s/virtio=[^,]*/virtio=$mac/")
-        qm set "$vmid" --net0 "$net0" 200>&- 201>&- 202>&- 203>&- 204>&- || { _fail; exec 202>&-; return 1; }
+        qm set "$vmid" --net0 "$net0" 200>&- 201>&- 202>&- 203>&- 204>&- || { _fail; _pool_lock_release; return 1; }
     fi
 
-    # Cloud-init
-    cat > "${SNIPPETS_DIR}/runner-${vmid}-meta.yaml" << EOF
-instance-id: "$name"
-local-hostname: "$name"
-EOF
-    chmod 600 "${SNIPPETS_DIR}/runner-${vmid}-meta.yaml"
+    # Cloud-init meta (instance-id / hostname). Guard the write itself — a brace
+    # group's exit status is its LAST command, so a failed write (e.g. ENOSPC mid
+    # clone) followed by a successful chmod would be masked and boot a VM with a
+    # truncated meta snippet.
+    printf 'instance-id: "%s"\nlocal-hostname: "%s"\n' "$name" "$name" \
+        > "${SNIPPETS_DIR}/runner-${vmid}-meta.yaml" || { _fail; _pool_lock_release; return 1; }
+    chmod 600 "${SNIPPETS_DIR}/runner-${vmid}-meta.yaml" || { _fail; _pool_lock_release; return 1; }
 
-    qm set "$vmid" --cicustom "user=local:snippets/runner-user-data-${org}.yaml,meta=local:snippets/runner-${vmid}-meta.yaml" \
+    # Per-VM user snippet carrying the single-use JIT config (must exist before
+    # qm set --cicustom, which validates the referenced volume).
+    render_user_snippet "$vmid" "$org" "$jit_config" || { _fail; _pool_lock_release; return 1; }
+
+    qm set "$vmid" --cicustom "user=local:snippets/runner-${vmid}-user-${org}.yaml,meta=local:snippets/runner-${vmid}-meta.yaml" \
         200>&- \
         201>&- \
         202>&- \
         203>&- \
         204>&- \
-        || { _fail; exec 202>&-; return 1; }
+        || { _fail; _pool_lock_release; return 1; }
     qm set "$vmid" --ipconfig0 ip=dhcp \
         200>&- \
         201>&- \
         202>&- \
         203>&- \
         204>&- \
-        || { _fail; exec 202>&-; return 1; }
+        || { _fail; _pool_lock_release; return 1; }
     [[ -z "${DNS_SERVERS:-}" ]] || qm set "$vmid" --nameserver "$DNS_SERVERS" \
         200>&- \
         201>&- \
         202>&- \
         203>&- \
         204>&- \
-        || { _fail; exec 202>&-; return 1; }
+        || { _fail; _pool_lock_release; return 1; }
     qm set "$vmid" --ciuser runner \
         200>&- \
         201>&- \
         202>&- \
         203>&- \
         204>&- \
-        || { _fail; exec 202>&-; return 1; }
+        || { _fail; _pool_lock_release; return 1; }
 
     # Hookscript for auto-destroy on shutdown
     if [[ -f "$SNIPPETS_DIR/runner-hookscript.sh" ]]; then
@@ -639,17 +783,17 @@ EOF
     if pool_is_draining; then
         log_warn "clone_runner: pool drain became active while configuring $name, cleaning up VM $vmid"
         _fail
-        exec 202>&-
+        _pool_lock_release
         return 1
     fi
 
     # Start
     if ! qm start "$vmid" 200>&- 201>&- 202>&- 203>&- 204>&-; then
         _fail
-        exec 202>&-
+        _pool_lock_release
         return 1
     fi
 
-    exec 202>&-
+    _pool_lock_release
     echo "$vmid"
 }

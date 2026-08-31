@@ -34,6 +34,13 @@ if pool_is_draining; then
     exit 0
 fi
 
+# Hold shared pool activity for the rest of this process so `runner stop`
+# (exclusive 202) waits out destroy + mint, not just the later qm clone.
+# clone_runner sees POOL_ACTIVITY_LOCK_HELD and will not reopen fd 202.
+exec 202>"$POOL_ACTIVITY_LOCK_FILE"
+flock -s 202
+POOL_ACTIVITY_LOCK_HELD=1
+
 # Backoff: defer to the watcher only after N consecutive rapid deaths.
 # A single fast reclone is normal — short linter jobs (~45s) complete well
 # inside any time-based window, so the old 120s blanket backoff misfired on
@@ -71,13 +78,13 @@ if (( STREAK >= FAIL_THRESHOLD )); then
     # problem persists, we'll re-accumulate to threshold and defer again
     # (bounded-rate backoff). If it resolved, we proceed normally.
     echo 0 > "$FAIL_STREAK_FILE"
-    rm -f "${SNIPPETS_DIR}/runner-${VMID}-meta.yaml"
+    rm -f "${SNIPPETS_DIR}/runner-${VMID}-meta.yaml" "${SNIPPETS_DIR}/runner-${VMID}-user-"*.yaml
     qm destroy "$VMID" --purge 200>&- 2>/dev/null || true
     exit 0
 fi
 
 # Destroy the old VM (retry briefly in case Proxmox lock hasn't released)
-rm -f "${SNIPPETS_DIR}/runner-${VMID}-meta.yaml"
+rm -f "${SNIPPETS_DIR}/runner-${VMID}-meta.yaml" "${SNIPPETS_DIR}/runner-${VMID}-user-"*.yaml
 for attempt in 1 2 3; do
     destroy_output=$(qm destroy "$VMID" --purge 200>&- 2>&1) && destroy_rc=0 || destroy_rc=$?
     printf '%s\n' "$destroy_output" | logger -t github-runner || true

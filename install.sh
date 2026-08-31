@@ -44,39 +44,18 @@ if [[ -f /etc/github-runners.conf ]]; then
         cp "$INSTALL_DIR/templates/github-runner-watch.timer" /etc/systemd/system/
         systemctl daemon-reload
     fi
-    # Regenerate per-org cloud-init snippets from updated template
-    if [[ -d /etc/github-runners.d ]]; then
-        for org_conf in /etc/github-runners.d/*.conf; do
-            [[ -f "$org_conf" ]] || continue
-            org=$(basename "$org_conf" .conf)
-            # Source org config to get PAT and org name
-            GITHUB_PAT="" GITHUB_ORG=""
-            source "$org_conf"
-            [[ -n "$GITHUB_PAT" && -n "$GITHUB_ORG" ]] || continue
-            # Re-render the snippet using the same awk substitution as add-org.sh
-            snippet_tmp=$(mktemp "/var/lib/vz/snippets/.runner-user-data-${org}.XXXXXX")
-            chmod 600 "$snippet_tmp"
-            DOCKER_MIRROR_URL="${DOCKER_MIRROR_URL:-}"
-            GITHUB_PAT="$GITHUB_PAT" GITHUB_ORG="$GITHUB_ORG" DOCKER_MIRROR_URL="$DOCKER_MIRROR_URL" awk '
-            function lreplace(str, old, new,    i, result) {
-                result = ""
-                while ((i = index(str, old)) > 0) {
-                    result = result substr(str, 1, i - 1) new
-                    str = substr(str, i + length(old))
-                }
-                return result str
-            }
-            {
-                $0 = lreplace($0, "{{GITHUB_PAT}}", ENVIRON["GITHUB_PAT"])
-                $0 = lreplace($0, "{{GITHUB_ORG}}", ENVIRON["GITHUB_ORG"])
-                $0 = lreplace($0, "{{DOCKER_MIRROR_URL}}", ENVIRON["DOCKER_MIRROR_URL"])
-                print
-            }' "$INSTALL_DIR/templates/runner-user-data.yaml" > "$snippet_tmp"
-            mv "$snippet_tmp" "/var/lib/vz/snippets/runner-user-data-${org}.yaml"
-            echo "  Updated snippet for $org"
-        done
+    # Prune obsolete per-org snippets. These embedded the org PAT; the PAT now
+    # stays on the host and a single-use JIT config is rendered per-VM at clone time.
+    if compgen -G "/var/lib/vz/snippets/runner-user-data-*.yaml" > /dev/null; then
+        rm -f /var/lib/vz/snippets/runner-user-data-*.yaml
+        echo "  Removed obsolete per-org PAT snippets"
     fi
     echo "Done. No need to re-run setup."
+    echo ""
+    echo "WARNING: VMs that are already running still have the old PAT on their"
+    echo "cloud-init drive until they are destroyed. Recycle the pool before the"
+    echo "next job or any workflow can still read it:"
+    echo "  runner stop && runner start"
 else
     echo ""
     echo "Run the setup wizard:"
