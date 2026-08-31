@@ -350,6 +350,33 @@ EOF
     grep -q '^fleet=2.336.0$' <<< "$output"
 }
 
+@test "falls back to probing when the generation record is corrupt after its version" {
+    stub_latest v2.336.0 2026-08-20T00:00:00Z
+    make_template_gen 2.334.0
+    printf 'malformed-record-line\n' >> "$(gen_record_path 9000)"
+    stub_out qm 'list' <<'EOF'
+      VMID NAME                 STATUS     MEM(MB)    BOOTDISK(GB) PID
+      9001 acme-1               running    8192              30.00 1234
+EOF
+    stub_out qm 'config 9001' <<'EOF'
+name: acme-1
+cicustom: user=local:snippets/runner-user-data-acme.yaml
+EOF
+    stub_out qm 'guest exec 9001 -- /home/runner/actions-runner/bin/Runner.Listener --version' <<'EOF'
+{
+   "exitcode" : 0,
+   "exited" : 1,
+   "out-data" : "2.336.0\n"
+}
+EOF
+
+    run --separate-stderr drift_main
+    [ "$status" -eq 0 ]
+    grep -q '^status=clean$' <<< "$output"
+    grep -q '^fleet=2.336.0$' <<< "$output"
+    assert_called qm 'guest exec 9001 -- /home/runner/actions-runner/bin/Runner.Listener --version'
+}
+
 @test "does not probe TEMPLATE_ID or an unmanaged VM" {
     stub_latest v2.336.0 2026-08-20T00:00:00Z
     make_template_gen unknown
@@ -454,6 +481,32 @@ EOF
     grep -q '^status=unknown$' <<< "$output"
     grep -q '^reason=api-failed$' <<< "$output"
     ! grep -q '^status=clean$' <<< "$output"
+    [ "$(notify_count)" -eq 0 ]
+}
+
+@test "malformed GitHub release timestamp counts as an API failure" {
+    stub_latest v2.336.0 yesterday
+    make_template_gen 2.336.0
+
+    run --separate-stderr drift_main
+    [ "$status" -eq 0 ]
+    grep -q '^status=unknown$' <<< "$output"
+    grep -q '^reason=api-failed$' <<< "$output"
+    ! grep -q '^status=clean$' <<< "$output"
+    [ -f "$DRIFT_FAIL_FILE" ]
+    grep -q '^first_fail=' "$DRIFT_FAIL_FILE"
+    [ "$(notify_count)" -eq 0 ]
+}
+
+@test "malformed GitHub release version counts as an API failure" {
+    stub_latest not-a-version 2026-08-20T00:00:00Z
+    make_template_gen 2.336.0
+
+    run --separate-stderr drift_main
+    [ "$status" -eq 0 ]
+    grep -q '^status=unknown$' <<< "$output"
+    grep -q '^reason=api-failed$' <<< "$output"
+    [ -f "$DRIFT_FAIL_FILE" ]
     [ "$(notify_count)" -eq 0 ]
 }
 

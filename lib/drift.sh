@@ -61,6 +61,10 @@ drift_normalize_version() {
     printf '%s' "$v"
 }
 
+drift_version_is_valid() {
+    [[ "${1:-}" =~ ^[0-9]+([.][0-9]+)+$ ]]
+}
+
 # stdout: <version><TAB><published_at>. Fail closed on a missing field.
 drift_fetch_latest() {
     local json tag published
@@ -71,8 +75,9 @@ drift_fetch_latest() {
     published=$(printf '%s' "$json" | jq -r '.published_at // empty') || return 1
     tag=$(drift_normalize_version "$tag")
     published="${published//[[:space:]]/}"
-    [[ -n "$tag" && "$tag" != "null" ]] || return 1
+    drift_version_is_valid "$tag" || return 1
     [[ -n "$published" && "$published" != "null" ]] || return 1
+    drift_iso_to_epoch "$published" >/dev/null 2>&1 || return 1
     printf '%s\t%s\n' "$tag" "$published"
 }
 
@@ -159,17 +164,16 @@ drift_probe_fleet_version() {
 drift_fleet_version() {
     local ver=""
 
-    if [[ -n "${TEMPLATE_ID:-}" ]] && gen_exists "$TEMPLATE_ID"; then
-        gen_read "$TEMPLATE_ID" || true
+    if [[ -n "${TEMPLATE_ID:-}" ]] && gen_exists "$TEMPLATE_ID" && gen_read "$TEMPLATE_ID"; then
         ver=$(drift_normalize_version "${GEN_RUNNER_VERSION:-}")
-        if [[ -n "$ver" && "$ver" != "unknown" ]]; then
+        if drift_version_is_valid "$ver"; then
             printf '%s\n' "$ver"
             return 0
         fi
     fi
     ver=$(drift_probe_fleet_version)
     ver=$(drift_normalize_version "$ver")
-    if [[ -n "$ver" && "$ver" != "unknown" ]]; then
+    if drift_version_is_valid "$ver"; then
         printf '%s\n' "$ver"
         return 0
     fi
