@@ -203,7 +203,7 @@ setup_destroy_candidate() {
     }
     export -f qm_stub
     rollover_serving_count() { printf '1\n'; }
-    rollover_quiesce_guest() { printf 'quiesce %s\n' "$1" >> "$STUB_DIR/protocol"; }
+    rollover_quiesce_guest() { ROLLOVER_FROZEN_CGROUP=/runner.slice/old-a; printf 'quiesce %s\n' "$1" >> "$STUB_DIR/protocol"; }
     rollover_wait_offline_idle() { printf '42\n'; }
     rollover_resume_guest() { printf 'resume %s\n' "$1" >> "$STUB_DIR/protocol"; }
     rollover_mark_identity() { ROLLOVER_IDENTITY_NONCE=test-nonce; ROLLOVER_ORIGINAL_TAGS='runner;gen-1'; }
@@ -233,6 +233,8 @@ setup_destroy_candidate() {
 
 @test "force defers without a verified online replacement for the org" {
     setup_destroy_candidate
+    write_org_config acme
+    printf 'RUNNER_COUNT="2"\n' >> "$ORG_CONFIG_DIR/acme.conf"
     rollover_serving_count() { printf '0\n'; }
 
     run rollover_destroy_one old-a 9001 1 acme
@@ -281,45 +283,19 @@ setup_destroy_candidate() {
     [ "$(wc -l < "$STUB_DIR/snapshots" | tr -d ' ')" -eq 1 ]
 }
 
-@test "singleton force creates and verifies temporary active capacity" {
+@test "singleton force refuses before mutation when no online peer exists" {
     setup_destroy_candidate
-    rollover_serving_count() {
-        if [[ -e "$STUB_DIR/spare" ]]; then printf '1\n'; else printf '0\n'; fi
-    }
-    rollover_prepare_capacity() { : > "$STUB_DIR/spare"; }
+    write_org_config acme
+    printf 'RUNNER_COUNT="1"\n' >> "$ORG_CONFIG_DIR/acme.conf"
+    rollover_serving_count() { printf '0\n'; }
+    rollover_mark_identity() { : > "$STUB_DIR/mutated"; }
+    rollover_quiesce_guest() { : > "$STUB_DIR/mutated"; }
 
     run rollover_destroy_one old-a 9001 1 acme
-    [ "$status" -eq 0 ]
-    [ -e "$STUB_DIR/spare" ]
-    grep -q '^destroy 9001$' "$STUB_DIR/actions"
-}
-
-@test "singleton reserve uses a non-ephemeral snippet" {
-    write_org_config acme ghp_test acme-org
-    cat > "$SNIPPETS_DIR/runner-user-data-acme.yaml" <<'EOF'
-if ./config.sh \
-  --disableupdate \
-  --ephemeral; then
-  break
-fi
-EOF
-    qm_stub() {
-        case "$1 ${2:-}" in
-            "list ") printf 'VMID NAME STATUS\n' ;;
-            "config 9002") printf 'tags: runner,gen-2\n' ;;
-            "set 9002") return 0 ;;
-            *) return 1 ;;
-        esac
-    }
-    export -f qm_stub
-    clone_runner() { printf '%s\n' "$4" > "$STUB_DIR/snippet-used"; printf '9002\n'; }
-    github_runner_lookup_details() { printf '42\tfalse\tonline\n'; }
-
-    run rollover_prepare_capacity 9001 acme
-    [ "$status" -eq 0 ]
-    [ "$(cat "$STUB_DIR/snippet-used")" = runner-rollover-data-acme.yaml ]
-    ! grep -q -- '--ephemeral' "$SNIPPETS_DIR/runner-rollover-data-acme.yaml"
-    grep -q -- '--disableupdate; then' "$SNIPPETS_DIR/runner-rollover-data-acme.yaml"
+    [ "$status" -eq 5 ]
+    [ ! -e "$STUB_DIR/mutated" ]
+    [ ! -e "$STUB_DIR/actions" ]
+    [ ! -e "$ROLLOVER_PENDING_DIR/9001.pending" ]
 }
 
 @test "force skips destruction if deregistration fails" {
@@ -367,17 +343,19 @@ EOF
     [ -f "$ROLLOVER_PENDING_DIR/9001.pending" ]
 }
 
-@test "quiescence protocol freezes the service cgroup before checking workers" {
+@test "quiescence protocol freezes the Listener cgroup before checking workers" {
     freeze_line=$(grep -n 'echo 1 >.*cgroup.freeze' "$REPO_ROOT/lib/rollover.sh" | head -1 | cut -d: -f1)
     worker_line=$(grep -n 'Runner.Worker' "$REPO_ROOT/lib/rollover.sh" | head -1 | cut -d: -f1)
     [ "$freeze_line" -lt "$worker_line" ]
     grep -q 'frozen 1' "$REPO_ROOT/lib/rollover.sh"
+    grep -q 'pgrep -x Runner.Listener' "$REPO_ROOT/lib/rollover.sh"
+    ! grep -q 'actions.runner' "$REPO_ROOT/lib/rollover.sh"
     grep -q 'rollover_wait_offline_idle' "$REPO_ROOT/lib/rollover.sh"
 }
 
 @test "quiesce honors qm guest-exec JSON exitcode and acknowledgement" {
     jq() { /usr/bin/jq "$@"; }
-    qm_stub() { printf '{"exitcode":1,"out-data":"QUIESCED\\n"}\n'; }
+    qm_stub() { printf '{"exitcode":1,"out-data":"QUIESCED:/runner\\n"}\n'; }
     export -f qm_stub
     run rollover_quiesce_guest 9001
     [ "$status" -eq 1 ]
@@ -387,33 +365,124 @@ EOF
     run rollover_quiesce_guest 9001
     [ "$status" -eq 2 ]
 
-    qm_stub() { printf '{"exitcode":0,"out-data":"QUIESCED\\n"}\n'; }
+    qm_stub() { printf '{"exitcode":0,"out-data":"QUIESCED:/runner\\n"}\n'; }
     export -f qm_stub
     run rollover_quiesce_guest 9001
     [ "$status" -eq 0 ]
 }
 
-@test "resume guest program executes and thaws the cgroup" {
-    mkdir -p "$STUB_DIR/cgroup/runner"
-    printf '1\n' > "$STUB_DIR/cgroup/runner/cgroup.freeze"
-    systemctl() {
-        [[ "$1" == list-units ]] && { printf 'actions.runner.acme.old.service loaded active running\n'; return; }
-        [[ "$1" == show ]] && { printf '/runner\n'; return; }
+@test "direct run.sh Listener cgroup is discovered frozen and persisted" {
+    mkdir -p "$STUB_DIR/proc/123" "$STUB_DIR/cgroup/runner"
+    printf '0::/runner\n' > "$STUB_DIR/proc/123/cgroup"
+    printf '0\n' > "$STUB_DIR/cgroup/runner/cgroup.freeze"
+    printf 'frozen 1\n' > "$STUB_DIR/cgroup/runner/cgroup.events"
+    pgrep() {
+        [[ "$2" == Runner.Listener ]] && { printf '123\n'; return 0; }
+        [[ "$2" == Runner.Worker ]] && return 1
         return 1
     }
-    export -f systemctl
+    export -f pgrep
     qm_stub() {
         [[ "$1 $2 $4" == 'guest exec --' ]] || return 1
         local out rc
-        out=$(RUNNER_CGROUP_ROOT="$STUB_DIR/cgroup" /bin/bash -c "$7") && rc=0 || rc=$?
+        out=$(RUNNER_PROC_ROOT="$STUB_DIR/proc" RUNNER_CGROUP_ROOT="$STUB_DIR/cgroup" \
+            RUNNER_ROLLOVER_MARKER="$STUB_DIR/marker" /bin/bash -c "$7") && rc=0 || rc=$?
         /usr/bin/jq -n --argjson rc "$rc" --arg out "$out" '{exitcode:$rc,"out-data":($out + "\n")}'
     }
     export -f qm_stub
     jq() { /usr/bin/jq "$@"; }
 
+    rollover_quiesce_guest 9001
+    [ "$ROLLOVER_FROZEN_CGROUP" = /runner ]
+    [ "$(cat "$STUB_DIR/cgroup/runner/cgroup.freeze")" = 1 ]
+    [ "$(cat "$STUB_DIR/marker")" = /runner ]
+}
+
+@test "quiescence fails closed for ambiguous Listener processes" {
+    pgrep() { [[ "$2" == Runner.Listener ]] && printf '123\n456\n'; }
+    export -f pgrep
+    qm_stub() {
+        local out rc
+        out=$(/bin/bash -c "$7") && rc=0 || rc=$?
+        /usr/bin/jq -n --argjson rc "$rc" --arg out "$out" '{exitcode:$rc,"out-data":($out + "\n")}'
+    }
+    export -f qm_stub
+    jq() { /usr/bin/jq "$@"; }
+    run rollover_quiesce_guest 9001
+    [ "$status" -ne 0 ]
+}
+
+@test "direct run.sh quiescence detects a Worker and thaws immediately" {
+    mkdir -p "$STUB_DIR/proc/123" "$STUB_DIR/cgroup/runner"
+    printf '0::/runner\n' > "$STUB_DIR/proc/123/cgroup"
+    printf '0\n' > "$STUB_DIR/cgroup/runner/cgroup.freeze"
+    printf 'frozen 1\n' > "$STUB_DIR/cgroup/runner/cgroup.events"
+    pgrep() {
+        [[ "$2" == Runner.Listener ]] && { printf '123\n'; return 0; }
+        [[ "$2" == Runner.Worker ]] && { printf '124\n'; return 0; }
+        return 1
+    }
+    export -f pgrep
+    qm_stub() {
+        local out rc
+        out=$(RUNNER_PROC_ROOT="$STUB_DIR/proc" RUNNER_CGROUP_ROOT="$STUB_DIR/cgroup" \
+            RUNNER_ROLLOVER_MARKER="$STUB_DIR/marker" /bin/bash -c "$7") && rc=0 || rc=$?
+        /usr/bin/jq -n --argjson rc "$rc" --arg out "$out" '{exitcode:$rc,"out-data":($out + "\n")}'
+    }
+    export -f qm_stub
+    jq() { /usr/bin/jq "$@"; }
+
+    run rollover_quiesce_guest 9001
+    [ "$status" -eq 2 ]
+    [ "$(cat "$STUB_DIR/cgroup/runner/cgroup.freeze")" = 0 ]
+    [ ! -e "$STUB_DIR/marker" ]
+}
+
+@test "resume guest program verifies identity and thaws the Listener cgroup" {
+    mkdir -p "$STUB_DIR/proc/123" "$STUB_DIR/cgroup/runner"
+    printf '0::/runner\n' > "$STUB_DIR/proc/123/cgroup"
+    mkdir -p "$STUB_DIR/cgroup/runner"
+    printf '1\n' > "$STUB_DIR/cgroup/runner/cgroup.freeze"
+    printf '/runner\n' > "$STUB_DIR/marker"
+    pgrep() { [[ "$2" == Runner.Listener ]] && printf '123\n'; }
+    export -f pgrep
+    qm_stub() {
+        [[ "$1 $2 $4" == 'guest exec --' ]] || return 1
+        local out rc
+        out=$(RUNNER_PROC_ROOT="$STUB_DIR/proc" RUNNER_CGROUP_ROOT="$STUB_DIR/cgroup" \
+            RUNNER_ROLLOVER_MARKER="$STUB_DIR/marker" /bin/bash -c "$7" "$8" "$9") && rc=0 || rc=$?
+        /usr/bin/jq -n --argjson rc "$rc" --arg out "$out" '{exitcode:$rc,"out-data":($out + "\n")}'
+    }
+    export -f qm_stub
+    jq() { /usr/bin/jq "$@"; }
+
+    ROLLOVER_FROZEN_CGROUP=/runner
     run rollover_resume_guest 9001
     [ "$status" -eq 0 ]
     [ "$(cat "$STUB_DIR/cgroup/runner/cgroup.freeze")" = 0 ]
+    [ ! -e "$STUB_DIR/marker" ]
+}
+
+@test "resume refuses a stale cgroup identity and leaves ownership marker" {
+    mkdir -p "$STUB_DIR/proc/123" "$STUB_DIR/cgroup/current"
+    printf '0::/current\n' > "$STUB_DIR/proc/123/cgroup"
+    printf '1\n' > "$STUB_DIR/cgroup/current/cgroup.freeze"
+    printf '/previous\n' > "$STUB_DIR/marker"
+    pgrep() { [[ "$2" == Runner.Listener ]] && printf '123\n'; }
+    export -f pgrep
+    qm_stub() {
+        local out rc
+        out=$(RUNNER_PROC_ROOT="$STUB_DIR/proc" RUNNER_CGROUP_ROOT="$STUB_DIR/cgroup" \
+            RUNNER_ROLLOVER_MARKER="$STUB_DIR/marker" /bin/bash -c "$7" "$8" "$9") && rc=0 || rc=$?
+        /usr/bin/jq -n --argjson rc "$rc" --arg out "$out" '{exitcode:$rc,"out-data":($out + "\n")}'
+    }
+    export -f qm_stub
+    jq() { /usr/bin/jq "$@"; }
+
+    run resume_runner_cgroup 9001 /previous
+    [ "$status" -ne 0 ]
+    [ "$(cat "$STUB_DIR/cgroup/current/cgroup.freeze")" = 1 ]
+    [ "$(cat "$STUB_DIR/marker")" = /previous ]
 }
 
 @test "resume requires guest-exec exitcode zero and explicit THAWED ack" {
@@ -516,7 +585,7 @@ EOF
     run rollover_destroy_one old-a 9001 1 acme
     [ "$status" -eq 4 ]
     [ -f "$ROLLOVER_PENDING_DIR/9001.pending" ]
-    grep -q '^committed|9001|old-a|acme|1|42|test-nonce$' "$ROLLOVER_PENDING_DIR/9001.pending"
+    grep -q '^committed|9001|old-a|acme|1|42|test-nonce|/runner.slice/old-a$' "$ROLLOVER_PENDING_DIR/9001.pending"
     run rollover_vmid_is_committed_pending 9001
     [ "$status" -eq 0 ]
     grep -q 'rollover_vmid_is_committed_pending' "$REPO_ROOT/lib/watch.sh"
@@ -596,24 +665,10 @@ EOF
     [ "$(cat "$STUB_DIR/actions")" = destroy ]
 }
 
-@test "singleton spare slot is acquired nonblocking outside org lock and held through commit" {
-    qm_stub() {
-        [[ "$1 $2" == 'config 9001' ]] || return 1
-        printf 'name: old-a\ntags: runner;gen-1\ncicustom: user=local:snippets/runner-user-data-acme.yaml\n'
-    }
-    export -f qm_stub
-    exec 209>"${ROLLOVER_ORG_LOCK_PREFIX}-acme.lock"; flock 209
-    rollover_lock_singleton_spare 9001 old-a acme 1
-    if (exec 207>"${RUNNER_SLOT_LOCK_PREFIX}-rollover-spare-9001.lock"; flock -n 207); then false; fi
-    rollover_release_locks
-    (exec 207>"${RUNNER_SLOT_LOCK_PREFIX}-rollover-spare-9001.lock"; flock -n 207)
-}
-
 @test "guard reclone and manual destroy share the org capacity lock" {
     grep -q 'ROLLOVER_ORG_LOCK_PREFIX' "$REPO_ROOT/lib/guard.sh"
     grep -q 'ROLLOVER_ORG_LOCK_PREFIX' "$REPO_ROOT/lib/reclone.sh"
     grep -q 'ROLLOVER_ORG_LOCK_PREFIX' "$REPO_ROOT/lib/destroy.sh"
-    grep -q 'runner-rollover-spare' "$REPO_ROOT/lib/reclone.sh"
 }
 
 @test "force skips when VM identity changed before the busy re-check" {

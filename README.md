@@ -541,12 +541,13 @@ Do not use a VMID-limited stop immediately before destroying a linked-clone
 template, because every dependent clone must be removed before `qm destroy`
 will succeed.
 
-`runner rollover --force` freezes an idle old-generation runner's systemd
-cgroup before removal, verifies that no `Runner.Worker` exists, waits for
-GitHub to acknowledge it offline, and preserves another GitHub-online runner
-for the organization. A singleton pool gets a non-ephemeral active-generation
-reserve first; its slot lock is held through the old runner's commit so normal
-job completion cannot remove the reserve in the final-check window. GitHub
+`runner rollover --force` locates the guest's single `Runner.Listener`, freezes
+its actual cgroup-v2 cgroup before removal, verifies that no `Runner.Worker`
+exists, waits for GitHub to acknowledge it offline, and preserves another
+GitHub-online runner for the organization. Zero-downtime rollover is not
+supported when `RUNNER_COUNT=1`: the command exits nonzero before mutating the
+runner. Temporarily increase the configured pool to at least two, wait for the
+watcher to register a GitHub-online peer, and then rerun rollover. GitHub
 exposes no atomic "lease idle runner and delete" operation, so
 the host-side freeze is the assignment boundary; the REST `busy` field is not
 treated as a lock. Interrupted operations are recovered from
@@ -669,14 +670,16 @@ The runner VM might have stopped or the service crashed.
 qm status <vmid>
 ```
 
-**Check runner service:**
+**Check the directly launched runner listener:**
 ```bash
-qm guest exec <vmid> -- systemctl status actions.runner.*
+qm guest exec <vmid> -- pgrep -a -x Runner.Listener
 ```
 
-**Restart runner service:**
+The runner is launched directly by cloud-init rather than as a systemd service.
+To replace a stuck ephemeral runner, stop the VM and let the Proxmox hookscript
+destroy and reclone its slot:
 ```bash
-qm guest exec <vmid> -- systemctl restart actions.runner.*
+qm stop <vmid>
 ```
 
 ### Docker commands fail in workflows

@@ -25,6 +25,7 @@ ROLLOVER_FROZEN_VMID=""
 ROLLOVER_FROZEN_NAME=""
 ROLLOVER_FROZEN_ORG=""
 ROLLOVER_FROZEN_GEN=""
+ROLLOVER_FROZEN_CGROUP=""
 ROLLOVER_PENDING_FILE=""
 ROLLOVER_IDENTITY_NONCE=""
 ROLLOVER_ORIGINAL_TAGS=""
@@ -54,11 +55,7 @@ rollover_age() {
 
 rollover_cfg_org() {
     local cfg="$1" org
-    if [[ "$cfg" =~ runner-rollover-data-([^.]+)\.yaml ]]; then
-        org="${BASH_REMATCH[1]}"
-        validate_org_name "$org" || return 1
-        printf '%s\n' "$org"
-    elif [[ "$cfg" =~ runner-user-data-([^.]+)\.yaml ]]; then
+    if [[ "$cfg" =~ runner-user-data-([^.]+)\.yaml ]]; then
         org="${BASH_REMATCH[1]}"
         validate_org_name "$org" || return 1
         printf '%s\n' "$org"
@@ -123,7 +120,6 @@ rollover_serving_count() {
 }
 
 rollover_release_locks() {
-    exec 208>&- 2>/dev/null || true
     exec 212>&- 2>/dev/null || true
     exec 210>&- 2>/dev/null || true
     exec 209>&- 2>/dev/null || true
@@ -134,21 +130,28 @@ rollover_destroy_vm() {
         </dev/null 200>&- 201>&- 202>&- 203>&- 204>&-
 }
 
-# Freeze the runner service cgroup before inspecting it. Once cgroup.freeze is
+# Freeze the listener's actual cgroup before inspecting it. Once cgroup.freeze is
 # acknowledged, Listener cannot accept another assignment. Busy/error paths
 # thaw themselves; success deliberately leaves the guest frozen.
 rollover_quiesce_guest() {
-    local vmid="$1" result exitcode out
+    local vmid="$1" result exitcode out ack
     # shellcheck disable=SC2016  # guest-side program must expand in the guest
     result=$(qm guest exec "$vmid" -- /bin/bash -c '
 set -eu
 cgroup_root=${RUNNER_CGROUP_ROOT:-/sys/fs/cgroup}
-units=$(systemctl list-units --type=service --all --no-legend "actions.runner.*.service" | awk "{print \$1}")
-[ "$(printf "%s\n" "$units" | sed "/^$/d" | wc -l)" -eq 1 ] || { echo ERROR; exit 1; }
-unit=$units
-cg=$(systemctl show -p ControlGroup --value "$unit")
-[ -n "$cg" ] && [ -w "${cgroup_root}${cg}/cgroup.freeze" ] || { echo ERROR; exit 1; }
-thaw() { echo 0 > "${cgroup_root}${cg}/cgroup.freeze" 2>/dev/null || true; }
+proc_root=${RUNNER_PROC_ROOT:-/proc}
+marker=${RUNNER_ROLLOVER_MARKER:-/run/github-runner-rollover-cgroup}
+pids=$(pgrep -x Runner.Listener || true)
+[ "$(printf "%s\n" "$pids" | sed "/^$/d" | wc -l)" -eq 1 ] || { echo ERROR; exit 1; }
+pid=$pids
+lines=$(grep "^0::" "${proc_root}/${pid}/cgroup" || true)
+[ "$(printf "%s\n" "$lines" | sed "/^$/d" | wc -l)" -eq 1 ] || { echo ERROR; exit 1; }
+cg=${lines#0::}
+case "$cg" in /|*[!a-zA-Z0-9_./:@-]*|*..*) echo ERROR; exit 1;; /*) ;; *) echo ERROR; exit 1;; esac
+[ -w "${cgroup_root}${cg}/cgroup.freeze" ] && [ -r "${cgroup_root}${cg}/cgroup.events" ] || { echo ERROR; exit 1; }
+printf "%s\n" "$cg" > "$marker"
+chmod 600 "$marker"
+thaw() { echo 0 > "${cgroup_root}${cg}/cgroup.freeze" 2>/dev/null || true; rm -f "$marker"; }
 trap thaw EXIT
 echo 1 > "${cgroup_root}${cg}/cgroup.freeze"
 i=0
@@ -156,29 +159,29 @@ while ! grep -q "^frozen 1$" "${cgroup_root}${cg}/cgroup.events"; do
     i=$((i + 1)); [ "$i" -lt 50 ] || { echo ERROR; exit 1; }
     sleep 0.1
 done
-for pid in $(cat "${cgroup_root}${cg}/cgroup.procs"); do
-    comm=$(cat "/proc/${pid}/comm" 2>/dev/null || true)
-    case "$comm" in Runner.Worker*) thaw; echo BUSY; exit 20;; esac
-done
+if pgrep -x Runner.Worker >/dev/null 2>&1; then thaw; echo BUSY; exit 20; fi
 trap - EXIT
-echo QUIESCED
+echo "QUIESCED:${cg}"
 ' 2>/dev/null </dev/null) || return 1
     exitcode=$(jq -er '.exitcode | select(type == "number")' <<< "$result" 2>/dev/null) || return 1
     out=$(jq -er '.["out-data"] | select(type == "string")' <<< "$result" 2>/dev/null) || return 1
     [[ "$exitcode" -eq 20 && "$out" == *BUSY* ]] && return 2
-    [[ "$exitcode" -eq 0 && "$out" == *QUIESCED* ]]
+    [[ "$exitcode" -eq 0 ]] || return 1
+    ack=$(sed -n 's/^QUIESCED:\(\/[a-zA-Z0-9_./:@-]*\)$/\1/p' <<< "$out")
+    [[ "$ack" =~ ^/[a-zA-Z0-9_./:@-]+$ && "$ack" != / && "$ack" != *'..'* && "$ack" != *$'\n'* ]] || return 1
+    ROLLOVER_FROZEN_CGROUP="$ack"
 }
 
 rollover_resume_guest() {
-    resume_runner_cgroup "$1"
+    resume_runner_cgroup "$1" "$ROLLOVER_FROZEN_CGROUP"
 }
 
 rollover_pending_write() {
-    local phase="$1" vmid="$2" name="$3" org="$4" gen="$5" runner_id="$6" nonce="$7" tmp
+    local phase="$1" vmid="$2" name="$3" org="$4" gen="$5" runner_id="$6" nonce="$7" cgroup="${8:-}" tmp
     ensure_state_dir "$ROLLOVER_PENDING_DIR"
     tmp=$(mktemp "$ROLLOVER_PENDING_DIR/.${vmid}.XXXXXX") || return 1
     chmod 600 "$tmp"
-    printf '%s|%s|%s|%s|%s|%s|%s\n' "$phase" "$vmid" "$name" "$org" "$gen" "$runner_id" "$nonce" > "$tmp"
+    printf '%s|%s|%s|%s|%s|%s|%s|%s\n' "$phase" "$vmid" "$name" "$org" "$gen" "$runner_id" "$nonce" "$cgroup" > "$tmp"
     mv -f "$tmp" "$ROLLOVER_PENDING_DIR/${vmid}.pending"
     ROLLOVER_PENDING_FILE="$ROLLOVER_PENDING_DIR/${vmid}.pending"
 }
@@ -245,72 +248,20 @@ rollover_wait_offline_idle() {
     done
 }
 
-# A singleton pool has no peer to preserve while its only old runner is
-# quiesced. Create one active-generation spare, wait until GitHub reports it
-# online. Its custom non-ephemeral registration and held slot lock keep it
-# stable through the old runner's destructive commit.
-rollover_prepare_capacity() {
-    local old_vmid="$1" org="$2" spare_name spare_vmid output tags deadline details _id _busy status spare_snippet
-    spare_name="rollover-spare-${old_vmid}"
-    if qm list 208>&- 2>/dev/null | awk 'NR>1 {print $2}' | grep -qxF "$spare_name"; then
-        spare_vmid=$(qm list 208>&- 2>/dev/null | awk -v n="$spare_name" '$2 == n {print $1; exit}')
-    else
-        [[ -f "$ORG_CONFIG_DIR/${org}.conf" ]] || return 1
-        load_org_config "$org" || return 1
-        spare_snippet="runner-rollover-data-${org}.yaml"
-        sed -e 's/--disableupdate \\/--disableupdate; then/' \
-            -e '/^[[:space:]]*--ephemeral; then$/d' \
-            -e 's/Runner configured successfully (ephemeral mode)/Runner configured successfully (rollover reserve)/' \
-            "$SNIPPETS_DIR/runner-user-data-${org}.yaml" > "$SNIPPETS_DIR/${spare_snippet}" || return 1
-        chmod 600 "$SNIPPETS_DIR/${spare_snippet}"
-        output=$(clone_runner "$spare_name" "$org" "" "$spare_snippet") || return 1
-        spare_vmid=$(tail -n 1 <<< "$output")
-        [[ "$spare_vmid" =~ ^[0-9]+$ ]] || return 1
-        tags=$(qm config "$spare_vmid" 208>&- 2>/dev/null | awk -F ': ' '/^tags:/{print $2; exit}')
-        qm set "$spare_vmid" --tags "${tags:+${tags},}runner-rollover-spare" 208>&- >/dev/null || {
-            RUNNER_DESTRUCTIVE_LOCKS_HELD=1 "$LIB_DIR/destroy.sh" --vmid "$spare_vmid" </dev/null 208>&- || true
-            return 1
-        }
-    fi
-    deadline=$(($(date +%s) + ROLLOVER_REPLACEMENT_WAIT_SECONDS))
-    while :; do
-        details=$(github_runner_lookup_details "$org" "$spare_name") || details=""
-        if [[ -n "$details" ]]; then
-            IFS=$'\t' read -r _id _busy status <<< "$details"
-            [[ "$status" == online ]] && return 0
-        fi
-        (( $(date +%s) < deadline )) || break
-        sleep "$ROLLOVER_OFFLINE_POLL_SECONDS"
-    done
-    log_warn "rollover: temporary replacement $spare_name did not become online"
-    return 1
-}
-
-rollover_lock_singleton_spare() {
-    local vmid="$1" name="$2" org="$3" gen="$4" cfg current_name current_org current_gen spare_name
-    spare_name="rollover-spare-${vmid}"
-    # Never wait for a second slot while holding org: release, try the spare
-    # slot nonblocking, then reacquire org in the global slot(s)->org order.
-    exec 209>&-
-    exec 208>"${RUNNER_SLOT_LOCK_PREFIX}-${spare_name}.lock"
-    if ! flock -n 208; then
-        exec 208>&-
-        exec 209>"${ROLLOVER_ORG_LOCK_PREFIX}-${org}.lock"; flock 209
-        return 1
-    fi
-    exec 209>"${ROLLOVER_ORG_LOCK_PREFIX}-${org}.lock"; flock 209
-    cfg=$(qm config "$vmid" 2>/dev/null) || return 1
-    current_name=$(awk '/^name:/{print $2; exit}' <<< "$cfg")
-    current_org=$(rollover_cfg_org "$cfg" || true)
-    current_gen=$(generation_id_from_tags "$(grep -m1 '^tags:' <<< "$cfg" || true)" || true)
-    [[ "$current_name" == "$name" && "$current_org" == "$org" && "$current_gen" == "$gen" ]]
+rollover_configured_count() {
+    local org="$1" count
+    [[ -f "$ORG_CONFIG_DIR/${org}.conf" ]] || return 1
+    count=$(sed -nE 's/^[[:space:]]*RUNNER_COUNT[[:space:]]*=[[:space:]]*"?([0-9]+)"?.*/\1/p' "$ORG_CONFIG_DIR/${org}.conf")
+    [[ "$count" =~ ^[1-9][0-9]*$ && "$count" != *$'\n'* ]] || return 1
+    printf '%s\n' "$count"
 }
 
 # Returns 0 destroyed, 2 safely skipped, 3 deferred for replacement capacity,
-# 4 destroy failed but slot was quarantined/opened, 1 unrecovered failure.
+# 4 destroy failed but slot was quarantined/opened, 5 unsupported singleton,
+# 1 unrecovered failure.
 rollover_destroy_one() {
     local name="$1" vmid="$2" expected_gen="$3" org="$4"
-    local cfg current_name current_org current_gen status serving runner_id quiesce_rc wait_rc
+    local cfg current_name current_org current_gen status serving configured runner_id quiesce_rc wait_rc
 
     if pool_is_draining; then
         log_error "rollover: maintenance mode became active — stopping"
@@ -357,22 +308,19 @@ rollover_destroy_one() {
         return 2
     }
     if [[ "$serving" -lt 1 ]]; then
-        if ! rollover_lock_singleton_spare "$vmid" "$name" "$org" "$expected_gen"; then
+        configured=$(rollover_configured_count "$org") || {
             rollover_release_locks
-            log_info "rollover: singleton spare slot is busy; retrying later"
-            return 3
-        fi
-        if ! rollover_prepare_capacity "$vmid" "$org"; then
+            log_warn "rollover: cannot verify configured pool size for $org"
+            return 2
+        }
+        if [[ "$configured" -eq 1 ]]; then
             rollover_release_locks
-            log_warn "rollover: could not establish temporary replacement capacity for singleton $org"
-            return 3
+            log_error "rollover: zero-downtime singleton rollover is unsupported for $org; increase RUNNER_COUNT first"
+            return 5
         fi
-        serving=$(rollover_serving_count "$org" "$name") || serving=-1
-        if [[ "$serving" -lt 1 ]]; then
-            rollover_release_locks
-            log_warn "rollover: temporary replacement capacity for $org could not be verified"
-            return 3
-        fi
+        rollover_release_locks
+        log_info "rollover: deferring $name until another GitHub-online runner for $org is available"
+        return 3
     fi
 
     # Shared drain coordination makes this check atomic with maintenance entry:
@@ -411,6 +359,13 @@ rollover_destroy_one() {
         fi
         return 2
     fi
+    if ! rollover_pending_write owned "$vmid" "$name" "$org" "$expected_gen" 0 "$ROLLOVER_IDENTITY_NONCE" "$ROLLOVER_FROZEN_CGROUP"; then
+        rollover_cleanup_frozen
+        rollover_disarm_cleanup
+        rollover_release_locks
+        log_error "rollover: could not persist frozen cgroup identity for $name"
+        return 2
+    fi
 
     wait_rc=0
     runner_id=$(rollover_wait_offline_idle "$org" "$name") || wait_rc=$?
@@ -445,7 +400,7 @@ rollover_destroy_one() {
         log_error "rollover: identity changed before commit for $name"
         return 2
     fi
-    if ! rollover_pending_write committed "$vmid" "$name" "$org" "$expected_gen" "$runner_id" "$ROLLOVER_IDENTITY_NONCE"; then
+    if ! rollover_pending_write committed "$vmid" "$name" "$org" "$expected_gen" "$runner_id" "$ROLLOVER_IDENTITY_NONCE" "$ROLLOVER_FROZEN_CGROUP"; then
         rollover_cleanup_frozen
         rollover_disarm_cleanup
         rollover_release_locks

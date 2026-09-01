@@ -30,8 +30,6 @@ fi
 VM_CFG=$(qm config "$VMID" 2>/dev/null) || true
 NAME=$(awk '/^name:/{print $2}' <<< "$VM_CFG") || true
 ORG=$(get_vm_org "$VMID") || true
-IS_ROLLOVER_SPARE=false
-grep -q 'runner-rollover-spare' <<< "$VM_CFG" && IS_ROLLOVER_SPARE=true
 
 if [[ -z "$NAME" || -z "$ORG" || "$ORG" == "unknown" ]]; then
     logger -t github-runner "reclone: could not identify VM $VMID (name=$NAME org=$ORG), skipping"
@@ -44,13 +42,6 @@ flock -n 200 || { log_info "reclone: another process is handling $NAME"; exit 0;
 
 exec 209>"${ROLLOVER_ORG_LOCK_PREFIX}-${ORG}.lock"
 flock 209
-
-if [[ "$IS_ROLLOVER_SPARE" == true ]]; then
-    rm -f "${SNIPPETS_DIR}/runner-${VMID}-meta.yaml"
-    qm destroy "$VMID" --purge 200>&- 209>&- 2>/dev/null || exit 1
-    logger -t github-runner "reclone: retired temporary rollover spare $NAME (VMID $VMID)"
-    exit 0
-fi
 
 if pool_is_draining; then
     logger -t github-runner "reclone: pool drain active for $NAME, skipping"
