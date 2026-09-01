@@ -248,16 +248,48 @@ setup_destroy_candidate() {
         esac
     }
     export -f qm_stub
-    github_runner_lookup_details() {
-        case "$2" in
-            old-a) printf '41\tfalse\tonline\n' ;;
-            new-a) printf '42\tfalse\toffline\n' ;;
-        esac
+    github_runners_snapshot() {
+        printf 'old-a\t41\tfalse\tonline\n'
+        printf 'new-a\t42\tfalse\toffline\n'
     }
 
     run rollover_serving_count acme old-a
     [ "$status" -eq 0 ]
     [ "$output" = 0 ]
+}
+
+@test "capacity uses one paginated org snapshot for multiple local runners" {
+    qm_stub() {
+        case "$1 ${2:-}" in
+            "list ") printf 'VMID NAME STATUS\n9001 old-a running\n9002 new-a running\n9003 new-b running\n' ;;
+            "config 9001") printf 'name: old-a\ntags: runner;gen-1\ncicustom: user=local:snippets/runner-user-data-acme.yaml\n' ;;
+            "config 9002") printf 'name: new-a\ntags: runner;gen-2\ncicustom: user=local:snippets/runner-user-data-acme.yaml\n' ;;
+            "config 9003") printf 'name: new-b\ntags: runner;gen-2\ncicustom: user=local:snippets/runner-user-data-acme.yaml\n' ;;
+            *) return 1 ;;
+        esac
+    }
+    export -f qm_stub
+    github_runners_snapshot() {
+        echo call >> "$STUB_DIR/snapshots"
+        printf 'new-a\t42\tfalse\tonline\nnew-b\t43\tfalse\tonline\n'
+    }
+    run rollover_serving_count acme old-a
+    [ "$status" -eq 0 ]
+    [ "$output" = 2 ]
+    [ "$(wc -l < "$STUB_DIR/snapshots" | tr -d ' ')" -eq 1 ]
+}
+
+@test "singleton force creates and verifies temporary active capacity" {
+    setup_destroy_candidate
+    rollover_serving_count() {
+        if [[ -e "$STUB_DIR/spare" ]]; then printf '1\n'; else printf '0\n'; fi
+    }
+    rollover_prepare_capacity() { : > "$STUB_DIR/spare"; }
+
+    run rollover_destroy_one old-a 9001 1 acme
+    [ "$status" -eq 0 ]
+    [ -e "$STUB_DIR/spare" ]
+    grep -q '^destroy 9001$' "$STUB_DIR/actions"
 }
 
 @test "force skips destruction if deregistration fails" {
@@ -322,6 +354,98 @@ setup_destroy_candidate() {
     [ "$freeze_line" -lt "$worker_line" ]
     grep -q 'frozen 1' "$REPO_ROOT/lib/rollover.sh"
     grep -q 'rollover_wait_offline_idle' "$REPO_ROOT/lib/rollover.sh"
+}
+
+@test "resume guest program executes and thaws the cgroup" {
+    mkdir -p "$STUB_DIR/cgroup/runner"
+    printf '1\n' > "$STUB_DIR/cgroup/runner/cgroup.freeze"
+    systemctl() {
+        [[ "$1" == list-units ]] && { printf 'actions.runner.acme.old.service loaded active running\n'; return; }
+        [[ "$1" == show ]] && { printf '/runner\n'; return; }
+        return 1
+    }
+    export -f systemctl
+    qm_stub() {
+        [[ "$1 $2 $4" == 'guest exec --' ]] || return 1
+        RUNNER_CGROUP_ROOT="$STUB_DIR/cgroup" /bin/bash -c "$7"
+    }
+    export -f qm_stub
+
+    run rollover_resume_guest 9001
+    [ "$status" -eq 0 ]
+    [ "$(cat "$STUB_DIR/cgroup/runner/cgroup.freeze")" = 0 ]
+}
+
+@test "EXIT cleanup thaws an owned freeze but preserves a committed one" {
+    rollover_resume_guest() { printf 'thaw %s\n' "$1" >> "$STUB_DIR/thaws"; }
+    run rollover_arm_cleanup 9001
+    [ "$status" -eq 0 ]
+    grep -q '^thaw 9001$' "$STUB_DIR/thaws"
+
+    rm -f "$STUB_DIR/thaws"
+    committed_arm() { rollover_arm_cleanup 9002; ROLLOVER_FROZEN_COMMITTED=true; }
+    run committed_arm
+    [ "$status" -eq 0 ]
+    [ ! -e "$STUB_DIR/thaws" ]
+}
+
+@test "committed pending destroy survives failure and is retried to cleanup" {
+    mkdir -p "$ROLLOVER_PENDING_DIR"
+    printf 'committed|9001|old-a|acme|1|42\n' > "$ROLLOVER_PENDING_DIR/9001.pending"
+    github_runner_deregister_id() { return 0; }
+    qm_stub() {
+        [[ "$1 $2" == 'destroy 9001' ]] || return 1
+        [[ ! -e "$STUB_DIR/destroy-fails" ]]
+    }
+    export -f qm_stub
+    : > "$STUB_DIR/destroy-fails"
+    run recover_rollover_pending
+    [ "$status" -eq 0 ]
+    [ -e "$ROLLOVER_PENDING_DIR/9001.pending" ]
+
+    rm -f "$STUB_DIR/destroy-fails"
+    run recover_rollover_pending
+    [ "$status" -eq 0 ]
+    [ ! -e "$ROLLOVER_PENDING_DIR/9001.pending" ]
+}
+
+@test "durable pre-quiesce ownership thaws after an untrappable process death" {
+    mkdir -p "$ROLLOVER_PENDING_DIR"
+    printf 'owned|9001|old-a|acme|1|0\n' > "$ROLLOVER_PENDING_DIR/9001.pending"
+    resume_runner_cgroup() { printf 'thaw %s\n' "$1" >> "$STUB_DIR/thaws"; }
+
+    run recover_rollover_pending
+    [ "$status" -eq 0 ]
+    grep -q '^thaw 9001$' "$STUB_DIR/thaws"
+    [ ! -e "$ROLLOVER_PENDING_DIR/9001.pending" ]
+}
+
+@test "pending recovery survives both destroy and quarantine failure" {
+    setup_destroy_candidate
+    rollover_destroy_vm() { return 1; }
+    rollover_quarantine_vm() { return 1; }
+
+    run rollover_destroy_one old-a 9001 1 acme
+    [ "$status" -eq 1 ]
+    [ -f "$ROLLOVER_PENDING_DIR/9001.pending" ]
+    grep -q '^committed|9001|old-a|acme|1|42$' "$ROLLOVER_PENDING_DIR/9001.pending"
+    run rollover_vmid_is_committed_pending 9001
+    [ "$status" -eq 0 ]
+    grep -q 'rollover_vmid_is_committed_pending' "$REPO_ROOT/lib/watch.sh"
+
+    github_runner_deregister_id() { return 0; }
+    qm_stub() { [[ "$1 $2" == 'destroy 9001' ]]; }
+    export -f qm_stub
+    run recover_rollover_pending
+    [ "$status" -eq 0 ]
+    [ ! -e "$ROLLOVER_PENDING_DIR/9001.pending" ]
+}
+
+@test "guard reclone and manual destroy share the org capacity lock" {
+    grep -q 'ROLLOVER_ORG_LOCK_PREFIX' "$REPO_ROOT/lib/guard.sh"
+    grep -q 'ROLLOVER_ORG_LOCK_PREFIX' "$REPO_ROOT/lib/reclone.sh"
+    grep -q 'ROLLOVER_ORG_LOCK_PREFIX' "$REPO_ROOT/lib/destroy.sh"
+    grep -q 'runner-rollover-spare' "$REPO_ROOT/lib/reclone.sh"
 }
 
 @test "force skips when VM identity changed before the busy re-check" {

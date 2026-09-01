@@ -82,6 +82,16 @@ if [[ "$VM_ORG" == "unknown" ]]; then
     exit 1
 fi
 
+# All destructive actors use slot -> org ordering. Rollover/guard pass the
+# marker because their parent already owns both locks and the child inherits
+# them; manual destroy acquires them here.
+if [[ "${RUNNER_DESTRUCTIVE_LOCKS_HELD:-}" != 1 ]]; then
+    exec 200>"${RUNNER_SLOT_LOCK_PREFIX}-${RUNNER_NAME}.lock"
+    flock 200
+    exec 209>"${ROLLOVER_ORG_LOCK_PREFIX}-${VM_ORG}.lock"
+    flock 209
+fi
+
 # Remove hookscript to prevent auto-destroy from racing with us
 qm set "$VMID" --delete hookscript 200>&- 201>&- 202>&- 2>/dev/null || true
 

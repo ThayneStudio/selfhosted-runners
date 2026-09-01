@@ -541,6 +541,16 @@ Do not use a VMID-limited stop immediately before destroying a linked-clone
 template, because every dependent clone must be removed before `qm destroy`
 will succeed.
 
+`runner rollover --force` freezes an idle old-generation runner's systemd
+cgroup before removal, verifies that no `Runner.Worker` exists, waits for
+GitHub to acknowledge it offline, and preserves another GitHub-online runner
+for the organization. A singleton pool gets a one-shot active-generation spare
+first. GitHub exposes no atomic "lease idle runner and delete" operation, so
+the host-side freeze is the assignment boundary; the REST `busy` field is not
+treated as a lock. Interrupted operations are recovered from
+`/var/lib/github-runners/rollover-pending`, and the watcher may refill a slot
+while it keeps retrying destruction of a deregistered residual by VMID.
+
 ## Notifications
 
 Failures that need a human are pushed to a webhook instead of being left in

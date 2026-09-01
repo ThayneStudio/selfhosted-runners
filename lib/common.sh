@@ -99,6 +99,7 @@ RUNNER_SLOT_LOCK_PREFIX="/run/lock/runner"
 # Serializes capacity decisions and destruction within one organization.
 # shellcheck disable=SC2034  # consumed by lib/rollover.sh
 ROLLOVER_ORG_LOCK_PREFIX="/run/lock/github-runner-rollover-org"
+ROLLOVER_PENDING_DIR="$RUNNER_STATE_DIR/rollover-pending"
 # Per-slot reclone bookkeeping (last-processed timestamp, rapid-death streak).
 # shellcheck disable=SC2034  # consumed by sourcing scripts (lib/reclone.sh)
 RECLONE_STATE_PREFIX="/run/runner"
@@ -793,9 +794,9 @@ github_runner_credentials() {
 # Print "<runner-id>\t<busy>\t<status>" after a complete paginated scan.
 # Missing/duplicate names, malformed fields, API errors, and a changing
 # total_count all fail closed.
-github_runner_lookup_details() {
-    local org="$1" runner_name="$2" credentials github_org pat json
-    local total="" page=1 pages page_total matches=""
+# Emit name, id, busy, status for one stable paginated organization snapshot.
+github_runners_snapshot() {
+    local org="$1" credentials github_org pat json total="" page=1 pages page_total
     credentials=$(github_runner_credentials "$org") || return 1
     IFS=$'\t' read -r github_org pat <<< "$credentials"
 
@@ -813,18 +814,76 @@ github_runner_lookup_details() {
         elif [[ "$page_total" != "$total" ]]; then
             return 1
         fi
-        matches+=$(jq --arg name "$runner_name" -r '
-            .runners[] | select(.name == $name)
-            | select((.id | type) == "number" and (.busy | type) == "boolean"
-                and (.status == "online" or .status == "offline"))
-            | "\(.id)\t\(.busy)\t\(.status)\n"
-        ' <<< "$json" 2>/dev/null) || return 1
+        jq -e 'all(.runners[]; (.name | type) == "string" and (.id | type) == "number"
+            and (.busy | type) == "boolean" and (.status == "online" or .status == "offline"))' \
+            <<< "$json" >/dev/null 2>&1 || return 1
+        jq -r '
+            .runners[]
+            | "\(.name)\t\(.id)\t\(.busy)\t\(.status)"
+        ' <<< "$json" 2>/dev/null || return 1
         (( page >= pages )) && break
         page=$((page + 1))
     done
+}
+
+github_runner_lookup_details() {
+    local org="$1" runner_name="$2" snapshot matches
+    snapshot=$(github_runners_snapshot "$org") || return 1
+    matches=$(awk -F '\t' -v n="$runner_name" '$1 == n {print $2 "\t" $3 "\t" $4}' <<< "$snapshot")
 
     [[ "$matches" =~ ^[0-9]+$'\t'(true|false)$'\t'(online|offline)$ ]] || return 1
     printf '%s\n' "$matches"
+}
+
+resume_runner_cgroup() {
+    local vmid="$1"
+    # shellcheck disable=SC2016  # guest-side program expands in the guest
+    qm guest exec "$vmid" -- /bin/bash -c '
+set -eu
+cgroup_root=${RUNNER_CGROUP_ROOT:-/sys/fs/cgroup}
+units=$(systemctl list-units --type=service --all --no-legend "actions.runner.*.service" | awk "{print \$1}")
+[ "$(printf "%s\n" "$units" | sed "/^$/d" | wc -l)" -eq 1 ]
+cg=$(systemctl show -p ControlGroup --value "$units")
+[ -n "$cg" ]
+echo 0 > "${cgroup_root}${cg}/cgroup.freeze"
+' >/dev/null 2>&1
+}
+
+# Retry committed rollover destroys. A committed VM is already frozen and
+# deregistered; leaving the record makes recovery durable across process/host
+# crashes. Failure is non-fatal so the watcher can still refill its slot.
+recover_rollover_pending() {
+    local file phase vmid name org _gen runner_id
+    [[ -d "$ROLLOVER_PENDING_DIR" ]] || return 0
+    for file in "$ROLLOVER_PENDING_DIR"/*.pending; do
+        [[ -f "$file" ]] || continue
+        IFS='|' read -r phase vmid name org _gen runner_id < "$file" || continue
+        [[ "$vmid" =~ ^[0-9]+$ ]] || continue
+        validate_org_name "$org" || continue
+        exec 209>"${ROLLOVER_ORG_LOCK_PREFIX}-${org}.lock"
+        flock -n 209 || { exec 209>&-; continue; }
+        if [[ "$phase" == owned ]]; then
+            if resume_runner_cgroup "$vmid" || ! qm status "$vmid" >/dev/null 2>&1; then
+                rm -f "$file"
+            fi
+            exec 209>&-
+            continue
+        fi
+        [[ "$phase" == committed ]] || { exec 209>&-; continue; }
+        github_runner_deregister_id "$org" "$runner_id" >/dev/null 2>&1 || true
+        if qm destroy "$vmid" --purge 200>&- 209>&- 2>/dev/null; then
+            rm -f "${SNIPPETS_DIR}/runner-${vmid}-meta.yaml" "${SNIPPETS_DIR}/runner-${vmid}-vendor.yaml" "$file"
+            log_info "[rollover-recovery] destroyed pending VMID $vmid ($name)"
+        fi
+        exec 209>&-
+    done
+}
+
+rollover_vmid_is_committed_pending() {
+    local vmid="$1" file
+    file="$ROLLOVER_PENDING_DIR/${vmid}.pending"
+    [[ "$vmid" =~ ^[0-9]+$ && -f "$file" ]] || return 1
+    grep -q "^committed|${vmid}|" "$file"
 }
 
 # Compatibility wrapper for callers that only need id/busy.

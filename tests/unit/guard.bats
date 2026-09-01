@@ -31,6 +31,8 @@ setup() {
         -e "s#^POOL_ACTIVITY_LOCK_FILE=.*#POOL_ACTIVITY_LOCK_FILE=\"$SANDBOX/run/lock/pool.lock\"#" \
         -e "s#^POOL_DRAIN_COORD_LOCK_FILE=.*#POOL_DRAIN_COORD_LOCK_FILE=\"$SANDBOX/run/lock/drain-coord.lock\"#" \
         -e "s#^RUNNER_SLOT_LOCK_PREFIX=.*#RUNNER_SLOT_LOCK_PREFIX=\"$SANDBOX/run/lock/runner\"#" \
+        -e "s#^ROLLOVER_ORG_LOCK_PREFIX=.*#ROLLOVER_ORG_LOCK_PREFIX=\"$SANDBOX/run/lock/rollover-org\"#" \
+        -e "s#^ROLLOVER_PENDING_DIR=.*#ROLLOVER_PENDING_DIR=\"$SANDBOX/run/rollover-pending\"#" \
         -e "s#/etc/pve/nodes#$SANDBOX/pve/nodes#" \
         -e "s#\$EUID -ne 0#1 -ne 1#" \
         "$SANDBOX/lib/common.sh"
