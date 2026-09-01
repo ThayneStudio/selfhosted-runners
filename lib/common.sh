@@ -607,20 +607,35 @@ release_clone_slot() {
 # VMID to cross-check origin against a superseded template.
 list_template_base_volids() {
     local vmid="${1:-$TEMPLATE_ID}"
-    local config bases storage_list
+    local config bases storage_list config_path
 
-    config=$(qm config "$vmid" 2>/dev/null || true)
-    bases=$(awk -F': ' -v storage="$VM_STORAGE:" '
-        $1 ~ /^(ide|sata|scsi|virtio)[0-9]+$/ {
-            split($2, parts, ",")
-            if (index(parts[1], storage "base-") == 1) {
-                print parts[1]
+    if config=$(qm config "$vmid" 2>/dev/null); then
+        bases=$(awk -F': ' -v storage="$VM_STORAGE:" '
+            $1 ~ /^(ide|sata|scsi|virtio)[0-9]+$/ {
+                split($2, parts, ",")
+                if (index(parts[1], storage "base-") == 1) {
+                    print parts[1]
+                }
             }
-        }
-    ' <<< "$config")
-    if [[ -n "$bases" ]]; then
-        printf '%s\n' "$bases"
+        ' <<< "$config")
+        if [[ -n "$bases" ]]; then
+            printf '%s\n' "$bases"
+            return 0
+        fi
+        # The config was read positively. A diskless/non-base config has no
+        # linked-clone ancestry to report; ownership checks decide separately
+        # whether it is a destroyable generation template.
         return 0
+    fi
+
+    # A config read failure is not proof of absence: quorum, permissions, or
+    # an API fault can all make qm config fail for a live template. Only use
+    # storage recovery when both the cluster config path and qm status say the
+    # VM is absent.
+    config_path=$(vm_config_path "$vmid")
+    if [[ -n "$config_path" ]] || qm status "$vmid" >/dev/null 2>&1; then
+        log_error "Cannot read config for live template VMID $vmid"
+        return 1
     fi
 
     # A previous GC attempt may have removed the VM config before failing to
@@ -656,13 +671,14 @@ zfs_dataset_from_volid() {
 
 list_template_linked_clone_volids() {
     local template_vmid="${1:-$TEMPLATE_ID}"
-    local storage_list base_volid base_path prefix volid child_name base_dataset dataset origin path
+    local storage_list base_list base_volid base_path prefix volid child_name base_dataset dataset origin path
     local -A seen=()
 
     if ! storage_list=$(pvesm list "$VM_STORAGE" 2>/dev/null); then
         log_error "Failed to list storage volumes on $VM_STORAGE"
         return 1
     fi
+    base_list=$(list_template_base_volids "$template_vmid") || return 1
     [[ -n "$storage_list" ]] || return 0
 
     while read -r base_volid; do
@@ -678,7 +694,7 @@ list_template_linked_clone_volids() {
             seen["$volid"]=1
             printf '%s\n' "$volid"
         done <<< "$storage_list"
-    done < <(list_template_base_volids "$template_vmid")
+    done <<< "$base_list"
 
     # ZFS linked clones are sibling zvols, not nested volids. They point at
     # the template base volume snapshot via the ZFS origin property.
@@ -722,7 +738,7 @@ list_template_linked_clone_volids() {
             seen["$volid"]=1
             printf '%s\n' "$volid"
         done <<< "$storage_list"
-    done < <(list_template_base_volids "$template_vmid")
+    done <<< "$base_list"
 }
 
 cleanup_template_orphan_volumes() {

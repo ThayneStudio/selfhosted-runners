@@ -45,6 +45,7 @@ GENERATION_FIELDS=(
     GEN_SUPERSEDED_AT
     GEN_TERMINAL_AT
     GEN_WAS_ACTIVE
+    GEN_TEMPLATE_NAME
     GEN_FAILED_REASON
     GEN_BAKE_LOG
     GEN_CANARY_RUN_URL
@@ -313,7 +314,7 @@ gen_validate_field() {
                 return 1
             fi
             ;;
-        GEN_RUNNER_VERSION|GEN_IMAGE_SHA256|GEN_TEMPLATE_DIGEST|GEN_BAKE_LOG|GEN_CANARY_RUN_URL)
+        GEN_RUNNER_VERSION|GEN_IMAGE_SHA256|GEN_TEMPLATE_DIGEST|GEN_TEMPLATE_NAME|GEN_BAKE_LOG|GEN_CANARY_RUN_URL)
             if [[ "$value" =~ [[:space:]] ]]; then
                 log_error "$key is a single token and must not contain whitespace: '$value'"
                 return 1
@@ -1168,7 +1169,7 @@ adopt_probe_runner_version() {
 adopt_deployed_template() {
     local min_vmid probed=unknown
     local all_vms vmid vm_name status cfg tags_line new_tags rec list resume=0
-    local linked
+    local linked template_cfg template_name
     local -a tag_vmids=() tag_values=() recs=()
     local -A traced=()
 
@@ -1205,9 +1206,15 @@ adopt_deployed_template() {
         return 0
     fi
 
-    if ! qm config "$TEMPLATE_ID" 2>/dev/null </dev/null | grep -q '^template:[[:space:]]*1'; then
+    if ! template_cfg=$(qm config "$TEMPLATE_ID" 2>/dev/null </dev/null) ||
+        ! grep -q '^template:[[:space:]]*1' <<< "$template_cfg"; then
         log_warn "TEMPLATE_ID $TEMPLATE_ID is not a Proxmox template — nothing to adopt"
         return 0
+    fi
+    template_name=$(awk '/^name:/{print $2; exit}' <<< "$template_cfg")
+    if [[ -z "$template_name" && "$resume" -eq 0 ]]; then
+        log_error "TEMPLATE_ID $TEMPLATE_ID has no verifiable Proxmox name — refusing adoption"
+        return 1
     fi
 
     validate_band_inventory || return 1
@@ -1269,8 +1276,20 @@ adopt_deployed_template() {
             GEN_STATE=active \
             GEN_RUNNER_VERSION="${probed:-unknown}" \
             GEN_IMAGE_SHA256=unknown \
-            GEN_TEMPLATE_DIGEST=unknown || return 1
+            GEN_TEMPLATE_DIGEST=unknown \
+            "GEN_TEMPLATE_NAME=$template_name" || return 1
         log_info "Adopted template VMID $TEMPLATE_ID as generation 1"
+    else
+        gen_read "$TEMPLATE_ID" || return 1
+        if [[ "$GEN_STATE" == "active" && -z "$GEN_TEMPLATE_NAME" && -n "$template_name" ]]; then
+            # Migration of a pre-marker adopted record is safe here: both the
+            # active pointer and live template config still identify this VM.
+            gen_update "$TEMPLATE_ID" "GEN_TEMPLATE_NAME=$template_name" || return 1
+        fi
+        gen_read "$TEMPLATE_ID" || return 1
+        if [[ "$GEN_STATE" == "active" && -z "$GEN_WAS_ACTIVE" ]]; then
+            gen_update "$TEMPLATE_ID" GEN_WAS_ACTIVE=1 || return 1
+        fi
     fi
 
     if [[ ${#tag_vmids[@]} -gt 0 ]]; then

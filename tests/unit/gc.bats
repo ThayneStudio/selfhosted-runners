@@ -43,6 +43,7 @@ EOF
     make_gen 8900 1 superseded
     make_gen 8901 2 superseded
     make_gen 8903 3 active
+    gen_update 8901 GEN_WAS_ACTIVE=1
     gen_update 8900 GEN_SUPERSEDED_AT=2026-08-01T00:00:00Z
     gen_update 8901 GEN_SUPERSEDED_AT=2026-08-20T00:00:00Z
     printf '9001\n9002\n' > "$STUB_DIR/blockers-1"
@@ -62,6 +63,7 @@ EOF
     make_gen 8900 1 superseded
     make_gen 8901 2 superseded
     make_gen 8903 3 active
+    gen_update 8901 GEN_WAS_ACTIVE=1
     stub_out qm 'status 8900' < /dev/null
     stub_generation_template 8900 1
     stub_out qm 'destroy 8900 --purge' < /dev/null
@@ -144,6 +146,7 @@ EOF
     make_gen 8900 1 superseded
     make_gen 8901 2 rejected
     make_gen 8903 3 active
+    gen_update 8900 GEN_WAS_ACTIVE=1
     gen_update 8901 GEN_SUPERSEDED_AT=2026-08-01T00:00:00Z
     stub_out qm 'status 8901' < /dev/null
     stub_generation_template 8901 2
@@ -177,6 +180,8 @@ EOF
     make_gen 8901 2 candidate
     make_gen 8903 3 active
     gen_update 8900 GEN_WAS_ACTIVE=1
+    stub_out qm 'status 8901' < /dev/null
+    stub_generation_template 8901 2
 
     run --separate-stderr gc_main true
     [ "$status" -eq 0 ]
@@ -184,6 +189,68 @@ EOF
     [[ "$output" == *"Would destroy generation 2"* ]]
     [ "$(gen_state_of 8901)" = candidate ]
     [ ! -f "$GENERATION_ARCHIVE_LOG" ]
+}
+
+@test "a missing GEN_WAS_ACTIVE needs positive promotion evidence for rollback" {
+    make_gen 8900 1 superseded
+    make_gen 8901 2 superseded
+    make_gen 8903 3 active
+    gen_update 8900 GEN_PROMOTED_AT=2026-08-20T00:00:00Z
+    stub_out qm 'status 8901' < /dev/null
+    stub_generation_template 8901 2
+    stub_out qm 'destroy 8901 --purge' < /dev/null
+
+    run --separate-stderr gc_main false
+    [ "$status" -eq 0 ]
+    gen_exists 8900
+    ! gen_exists 8901
+}
+
+@test "ownership accepts the fixed legacy adopted template name" {
+    make_gen 8900 1 superseded
+    gen_update 8900 GEN_IMAGE_SHA256=unknown GEN_TEMPLATE_DIGEST=unknown
+    stub_out qm 'status 8900' < /dev/null
+    stub_out qm 'config 8900' <<'EOF'
+name: ubuntu-cloud-template
+template: 1
+EOF
+    stub_out qm 'destroy 8900 --purge' < /dev/null
+
+    run --separate-stderr gc_destroy_generation 8900 superseded false
+    [ "$status" -eq 0 ]
+    ! gen_exists 8900
+    assert_called qm 'destroy 8900 --purge'
+}
+
+@test "dry-run executes ownership preflight and reports the real refusal" {
+    make_gen 8900 1 superseded
+    make_gen 8901 2 superseded
+    make_gen 8903 3 active
+    gen_update 8901 GEN_WAS_ACTIVE=1
+    stub_out qm 'status 8900' < /dev/null
+    stub_out qm 'config 8900' <<'EOF'
+name: reused-vmid
+template: 1
+EOF
+
+    run --separate-stderr gc_main true
+    [ "$status" -eq 1 ]
+    [[ "$stderr" == *"Ownership verification failed"* ]]
+    [[ "$output" != *"Would destroy generation 1"* ]]
+    gen_exists 8900
+}
+
+@test "dry-run executes storage inventory preflight before claiming destruction" {
+    make_gen 8900 1 superseded
+    make_gen 8901 2 superseded
+    make_gen 8903 3 active
+    gen_update 8901 GEN_WAS_ACTIVE=1
+    list_template_linked_clone_volids() { return 1; }
+
+    run --separate-stderr gc_main true
+    [ "$status" -eq 1 ]
+    [[ "$stderr" == *"Could not inventory child volumes"* ]]
+    [[ "$output" != *"Would destroy generation 1"* ]]
 }
 
 @test "a sole candidate older than the active generation is orphaned" {

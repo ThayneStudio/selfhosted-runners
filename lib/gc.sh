@@ -79,12 +79,20 @@ gc_warn_failure() {
     fi
 }
 
+gc_record_is_rollback_eligible() {
+    [[ "${GEN_WAS_ACTIVE:-}" == "1" ]] && return 0
+    [[ "${GEN_WAS_ACTIVE:-}" == "0" ]] && return 1
+    # Migration evidence for records written before GEN_WAS_ACTIVE existed.
+    # A promotion timestamp is positive proof; a missing field alone is not.
+    [[ -n "${GEN_PROMOTED_AT:-}" ]]
+}
+
 # Re-prove that a VMID still names the generation GC selected. This is called
 # after every potentially slow inventory operation and immediately before qm
 # destroy, closing the stale-record/VMID-reuse hole.
 gc_verify_destroy_ownership() {
     local vmid="$1" expected_state="$2" expected_id="$3"
-    local pointer cfg name
+    local pointer cfg name expected_name
 
     pointer=$(reload_active_template_id) || {
         log_error "Could not re-read TEMPLATE_ID before destroying VMID $vmid"
@@ -95,7 +103,8 @@ gc_verify_destroy_ownership() {
         return 1
     }
     gen_read "$vmid" || return 1
-    if [[ "$GEN_VMID" != "$vmid" || "$GEN_ID" != "$expected_id" || "$GEN_STATE" != "$expected_state" ]]; then
+    if [[ "$GEN_VMID" != "$vmid" || "$GEN_ID" != "$expected_id" ]] ||
+        [[ "$GEN_STATE" != "$expected_state" && ! ( "${GC_DRY_RUN:-false}" == "true" && "${GC_PROJECTED_STATE[$vmid]:-}" == "$expected_state" ) ]]; then
         log_error "Generation ownership changed before destroy of VMID $vmid"
         return 1
     fi
@@ -108,8 +117,17 @@ gc_verify_destroy_ownership() {
         return 1
     }
     name=$(awk '/^name:/{print $2; exit}' <<< "$cfg")
-    if [[ "$name" != "github-runner-gen-${expected_id}" ]]; then
-        log_error "Refusing to destroy VMID $vmid: name is ${name:-<empty>}, expected github-runner-gen-${expected_id}"
+    expected_name="${GEN_TEMPLATE_NAME:-github-runner-gen-${expected_id}}"
+    # Pre-marker generation 1 was adopted from the legacy deployment under
+    # this fixed name and deliberately kept that name. Its two unknown
+    # provenance values distinguish it from a baked generation record.
+    if [[ -z "${GEN_TEMPLATE_NAME:-}" && "$GEN_ID" == "1" &&
+        "$GEN_IMAGE_SHA256" == "unknown" && "$GEN_TEMPLATE_DIGEST" == "unknown" &&
+        "$name" == "ubuntu-cloud-template" ]]; then
+        expected_name="$name"
+    fi
+    if [[ "$name" != "$expected_name" ]]; then
+        log_error "Refusing to destroy VMID $vmid: name is ${name:-<empty>}, expected $expected_name"
         return 1
     fi
 }
@@ -133,11 +151,6 @@ gc_destroy_generation() {
         return 1
     fi
 
-    if [[ "$dry_run" == "true" ]]; then
-        printf 'Would destroy generation %s (VMID %s, state %s)\n' "$gen_id" "$vmid" "$expected_state"
-        return 0
-    fi
-
     child_list=$(list_template_linked_clone_volids "$vmid") || {
         gc_warn_failure "$gen_id" "$vmid" \
             "Could not inventory child volumes for generation $gen_id (VMID $vmid); record retained"
@@ -158,11 +171,21 @@ gc_destroy_generation() {
                 "Ownership verification failed for generation $gen_id (VMID $vmid); refusing destroy"
             return 1
         fi
+        if [[ "$dry_run" == "true" ]]; then
+            printf 'Would destroy generation %s (VMID %s, state %s)\n' "$gen_id" "$vmid" "$expected_state"
+            return 0
+        fi
         if ! qm destroy "$vmid" --purge; then
             gc_warn_failure "$gen_id" "$vmid" \
                 "Failed to destroy generation $gen_id (VMID $vmid); record retained"
             return 1
         fi
+    fi
+
+    if [[ "$dry_run" == "true" ]]; then
+        printf 'Would clean residual storage and remove generation %s (VMID %s, state %s)\n' \
+            "$gen_id" "$vmid" "$expected_state"
+        return 0
     fi
 
     if ((${#child_volids[@]} > 0)); then
@@ -280,7 +303,7 @@ gc_collect_superseded() {
         id=$(gen_require_numeric_id "$vmid") || return 1
         # An orphan candidate is superseded for cleanup, but has never served
         # and therefore cannot displace a known-good rollback generation.
-        if [[ "${GEN_WAS_ACTIVE:-1}" != "0" ]] && ((id > retain_id)); then
+        if gc_record_is_rollback_eligible && ((id > retain_id)); then
             retain_id="$id"
             retain="$vmid"
         fi
@@ -310,9 +333,7 @@ gc_collect_superseded() {
             fi
             continue
         fi
-        # Missing GEN_WAS_ACTIVE is migration-compatible evidence: before the
-        # field existed, superseded necessarily meant previously active.
-        if [[ "$vmid" == "$retain" && "${GEN_WAS_ACTIVE:-1}" != "0" ]]; then
+        if [[ "$vmid" == "$retain" ]] && gc_record_is_rollback_eligible; then
             log_info "Retaining newest superseded generation $GEN_ID (VMID $vmid) for rollback"
             continue
         fi
