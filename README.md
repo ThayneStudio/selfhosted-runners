@@ -544,8 +544,10 @@ will succeed.
 `runner rollover --force` freezes an idle old-generation runner's systemd
 cgroup before removal, verifies that no `Runner.Worker` exists, waits for
 GitHub to acknowledge it offline, and preserves another GitHub-online runner
-for the organization. A singleton pool gets a one-shot active-generation spare
-first. GitHub exposes no atomic "lease idle runner and delete" operation, so
+for the organization. A singleton pool gets a non-ephemeral active-generation
+reserve first; its slot lock is held through the old runner's commit so normal
+job completion cannot remove the reserve in the final-check window. GitHub
+exposes no atomic "lease idle runner and delete" operation, so
 the host-side freeze is the assignment boundary; the REST `busy` field is not
 treated as a lock. Interrupted operations are recovered from
 `/var/lib/github-runners/rollover-pending`, and the watcher may refill a slot

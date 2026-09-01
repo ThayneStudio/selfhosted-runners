@@ -22,7 +22,12 @@ ROLLOVER_REPLACEMENT_WAIT_SECONDS="${ROLLOVER_REPLACEMENT_WAIT_SECONDS:-120}"
 ROLLOVER_FROZEN_OWNED=false
 ROLLOVER_FROZEN_COMMITTED=false
 ROLLOVER_FROZEN_VMID=""
+ROLLOVER_FROZEN_NAME=""
+ROLLOVER_FROZEN_ORG=""
+ROLLOVER_FROZEN_GEN=""
 ROLLOVER_PENDING_FILE=""
+ROLLOVER_IDENTITY_NONCE=""
+ROLLOVER_ORIGINAL_TAGS=""
 
 rollover_usage() {
     echo "Usage: runner rollover [--force]"
@@ -49,7 +54,11 @@ rollover_age() {
 
 rollover_cfg_org() {
     local cfg="$1" org
-    if [[ "$cfg" =~ runner-user-data-([^.]+)\.yaml ]]; then
+    if [[ "$cfg" =~ runner-rollover-data-([^.]+)\.yaml ]]; then
+        org="${BASH_REMATCH[1]}"
+        validate_org_name "$org" || return 1
+        printf '%s\n' "$org"
+    elif [[ "$cfg" =~ runner-user-data-([^.]+)\.yaml ]]; then
         org="${BASH_REMATCH[1]}"
         validate_org_name "$org" || return 1
         printf '%s\n' "$org"
@@ -114,6 +123,7 @@ rollover_serving_count() {
 }
 
 rollover_release_locks() {
+    exec 208>&- 2>/dev/null || true
     exec 212>&- 2>/dev/null || true
     exec 210>&- 2>/dev/null || true
     exec 209>&- 2>/dev/null || true
@@ -128,7 +138,7 @@ rollover_destroy_vm() {
 # acknowledged, Listener cannot accept another assignment. Busy/error paths
 # thaw themselves; success deliberately leaves the guest frozen.
 rollover_quiesce_guest() {
-    local vmid="$1" result
+    local vmid="$1" result exitcode out
     # shellcheck disable=SC2016  # guest-side program must expand in the guest
     result=$(qm guest exec "$vmid" -- /bin/bash -c '
 set -eu
@@ -152,11 +162,11 @@ for pid in $(cat "${cgroup_root}${cg}/cgroup.procs"); do
 done
 trap - EXIT
 echo QUIESCED
-' 2>/dev/null </dev/null) || {
-        [[ "$result" == *BUSY* ]] && return 2
-        return 1
-    }
-    [[ "$result" == *QUIESCED* ]] || return 1
+' 2>/dev/null </dev/null) || return 1
+    exitcode=$(jq -er '.exitcode | select(type == "number")' <<< "$result" 2>/dev/null) || return 1
+    out=$(jq -er '.["out-data"] | select(type == "string")' <<< "$result" 2>/dev/null) || return 1
+    [[ "$exitcode" -eq 20 && "$out" == *BUSY* ]] && return 2
+    [[ "$exitcode" -eq 0 && "$out" == *QUIESCED* ]]
 }
 
 rollover_resume_guest() {
@@ -164,31 +174,51 @@ rollover_resume_guest() {
 }
 
 rollover_pending_write() {
-    local phase="$1" vmid="$2" name="$3" org="$4" gen="$5" runner_id="$6" tmp
+    local phase="$1" vmid="$2" name="$3" org="$4" gen="$5" runner_id="$6" nonce="$7" tmp
     ensure_state_dir "$ROLLOVER_PENDING_DIR"
     tmp=$(mktemp "$ROLLOVER_PENDING_DIR/.${vmid}.XXXXXX") || return 1
     chmod 600 "$tmp"
-    printf '%s|%s|%s|%s|%s|%s\n' "$phase" "$vmid" "$name" "$org" "$gen" "$runner_id" > "$tmp"
+    printf '%s|%s|%s|%s|%s|%s|%s\n' "$phase" "$vmid" "$name" "$org" "$gen" "$runner_id" "$nonce" > "$tmp"
     mv -f "$tmp" "$ROLLOVER_PENDING_DIR/${vmid}.pending"
     ROLLOVER_PENDING_FILE="$ROLLOVER_PENDING_DIR/${vmid}.pending"
 }
 
 rollover_cleanup_frozen() {
+    local thaw_verified=false
     [[ "$ROLLOVER_FROZEN_OWNED" == true ]] || return 0
     if [[ "$ROLLOVER_FROZEN_COMMITTED" != true ]]; then
-        rollover_resume_guest "$ROLLOVER_FROZEN_VMID" || log_error "rollover: cleanup could not thaw VMID $ROLLOVER_FROZEN_VMID"
-        [[ -z "$ROLLOVER_PENDING_FILE" ]] || rm -f "$ROLLOVER_PENDING_FILE"
+        if rollover_resume_guest "$ROLLOVER_FROZEN_VMID"; then
+            thaw_verified=true
+        elif rollover_vmid_absent_verified "$ROLLOVER_FROZEN_VMID"; then
+            thaw_verified=true
+        else
+            log_error "rollover: cleanup could not verify thaw of VMID $ROLLOVER_FROZEN_VMID; durable ownership retained"
+        fi
+        if [[ "$thaw_verified" == true && -n "$ROLLOVER_IDENTITY_NONCE" ]] && rollover_pending_identity_matches \
+            "$ROLLOVER_FROZEN_VMID" "$ROLLOVER_FROZEN_NAME" "$ROLLOVER_FROZEN_ORG" "$ROLLOVER_FROZEN_GEN" "$ROLLOVER_IDENTITY_NONCE"; then
+            qm set "$ROLLOVER_FROZEN_VMID" --tags "$ROLLOVER_ORIGINAL_TAGS" >/dev/null 2>&1 || true
+        fi
+        if [[ "$thaw_verified" == true && -n "$ROLLOVER_PENDING_FILE" ]]; then rm -f "$ROLLOVER_PENDING_FILE"; fi
     fi
     ROLLOVER_FROZEN_OWNED=false
 }
 
 rollover_arm_cleanup() {
-    ROLLOVER_FROZEN_VMID="$1"
+    ROLLOVER_FROZEN_VMID="$1"; ROLLOVER_FROZEN_NAME="$2"; ROLLOVER_FROZEN_ORG="$3"; ROLLOVER_FROZEN_GEN="$4"
     ROLLOVER_FROZEN_OWNED=true
     ROLLOVER_FROZEN_COMMITTED=false
     trap 'rollover_cleanup_frozen' EXIT
     trap 'rollover_cleanup_frozen; exit 130' INT
     trap 'rollover_cleanup_frozen; exit 143' TERM
+}
+
+rollover_mark_identity() {
+    local vmid="$1" name="$2" org="$3" gen="$4" cfg
+    cfg=$(qm config "$vmid" 2>/dev/null) || return 1
+    ROLLOVER_ORIGINAL_TAGS=$(awk -F ': ' '/^tags:/{print $2; exit}' <<< "$cfg")
+    ROLLOVER_IDENTITY_NONCE="$(date +%s)-$$-${RANDOM}"
+    qm set "$vmid" --tags "${ROLLOVER_ORIGINAL_TAGS:+${ROLLOVER_ORIGINAL_TAGS},}rollover-${ROLLOVER_IDENTITY_NONCE}" >/dev/null || return 1
+    rollover_pending_identity_matches "$vmid" "$name" "$org" "$gen" "$ROLLOVER_IDENTITY_NONCE"
 }
 
 rollover_disarm_cleanup() {
@@ -215,37 +245,30 @@ rollover_wait_offline_idle() {
     done
 }
 
-# Deregistration is irreversible for this ephemeral runner. If its VM cannot
-# be destroyed, quarantine the frozen residual under a non-slot name/tag so
-# the watcher can refill the original slot. Keeping gen-N blocks unsafe GC.
-rollover_quarantine_vm() {
-    local vmid="$1" gen="$2"
-    qm set "$vmid" --name "retired-rollover-${vmid}" \
-        200>&- 209>&- 210>&- 212>&- </dev/null >/dev/null 2>&1 || return 1
-    qm set "$vmid" --tags "runner-retired,gen-${gen}" \
-        200>&- 209>&- 210>&- 212>&- </dev/null >/dev/null 2>&1 || true
-}
-
 # A singleton pool has no peer to preserve while its only old runner is
 # quiesced. Create one active-generation spare, wait until GitHub reports it
-# online, and mark it one-shot so reclone destroys it after its first job.
+# online. Its custom non-ephemeral registration and held slot lock keep it
+# stable through the old runner's destructive commit.
 rollover_prepare_capacity() {
-    local old_vmid="$1" org="$2" spare_name spare_vmid output tags deadline details _id _busy status
+    local old_vmid="$1" org="$2" spare_name spare_vmid output tags deadline details _id _busy status spare_snippet
     spare_name="rollover-spare-${old_vmid}"
-    exec 208>"${RUNNER_SLOT_LOCK_PREFIX}-${spare_name}.lock"
-    flock 208
     if qm list 208>&- 2>/dev/null | awk 'NR>1 {print $2}' | grep -qxF "$spare_name"; then
         spare_vmid=$(qm list 208>&- 2>/dev/null | awk -v n="$spare_name" '$2 == n {print $1; exit}')
     else
-        [[ -f "$ORG_CONFIG_DIR/${org}.conf" ]] || { exec 208>&-; return 1; }
-        load_org_config "$org" || { exec 208>&-; return 1; }
-        output=$(clone_runner "$spare_name" "$org") || { exec 208>&-; return 1; }
+        [[ -f "$ORG_CONFIG_DIR/${org}.conf" ]] || return 1
+        load_org_config "$org" || return 1
+        spare_snippet="runner-rollover-data-${org}.yaml"
+        sed -e 's/--disableupdate \\/--disableupdate; then/' \
+            -e '/^[[:space:]]*--ephemeral; then$/d' \
+            -e 's/Runner configured successfully (ephemeral mode)/Runner configured successfully (rollover reserve)/' \
+            "$SNIPPETS_DIR/runner-user-data-${org}.yaml" > "$SNIPPETS_DIR/${spare_snippet}" || return 1
+        chmod 600 "$SNIPPETS_DIR/${spare_snippet}"
+        output=$(clone_runner "$spare_name" "$org" "" "$spare_snippet") || return 1
         spare_vmid=$(tail -n 1 <<< "$output")
-        [[ "$spare_vmid" =~ ^[0-9]+$ ]] || { exec 208>&-; return 1; }
+        [[ "$spare_vmid" =~ ^[0-9]+$ ]] || return 1
         tags=$(qm config "$spare_vmid" 208>&- 2>/dev/null | awk -F ': ' '/^tags:/{print $2; exit}')
         qm set "$spare_vmid" --tags "${tags:+${tags},}runner-rollover-spare" 208>&- >/dev/null || {
             RUNNER_DESTRUCTIVE_LOCKS_HELD=1 "$LIB_DIR/destroy.sh" --vmid "$spare_vmid" </dev/null 208>&- || true
-            exec 208>&-
             return 1
         }
     fi
@@ -254,14 +277,33 @@ rollover_prepare_capacity() {
         details=$(github_runner_lookup_details "$org" "$spare_name") || details=""
         if [[ -n "$details" ]]; then
             IFS=$'\t' read -r _id _busy status <<< "$details"
-            [[ "$status" == online ]] && { exec 208>&-; return 0; }
+            [[ "$status" == online ]] && return 0
         fi
         (( $(date +%s) < deadline )) || break
         sleep "$ROLLOVER_OFFLINE_POLL_SECONDS"
     done
-    exec 208>&-
     log_warn "rollover: temporary replacement $spare_name did not become online"
     return 1
+}
+
+rollover_lock_singleton_spare() {
+    local vmid="$1" name="$2" org="$3" gen="$4" cfg current_name current_org current_gen spare_name
+    spare_name="rollover-spare-${vmid}"
+    # Never wait for a second slot while holding org: release, try the spare
+    # slot nonblocking, then reacquire org in the global slot(s)->org order.
+    exec 209>&-
+    exec 208>"${RUNNER_SLOT_LOCK_PREFIX}-${spare_name}.lock"
+    if ! flock -n 208; then
+        exec 208>&-
+        exec 209>"${ROLLOVER_ORG_LOCK_PREFIX}-${org}.lock"; flock 209
+        return 1
+    fi
+    exec 209>"${ROLLOVER_ORG_LOCK_PREFIX}-${org}.lock"; flock 209
+    cfg=$(qm config "$vmid" 2>/dev/null) || return 1
+    current_name=$(awk '/^name:/{print $2; exit}' <<< "$cfg")
+    current_org=$(rollover_cfg_org "$cfg" || true)
+    current_gen=$(generation_id_from_tags "$(grep -m1 '^tags:' <<< "$cfg" || true)" || true)
+    [[ "$current_name" == "$name" && "$current_org" == "$org" && "$current_gen" == "$gen" ]]
 }
 
 # Returns 0 destroyed, 2 safely skipped, 3 deferred for replacement capacity,
@@ -315,6 +357,11 @@ rollover_destroy_one() {
         return 2
     }
     if [[ "$serving" -lt 1 ]]; then
+        if ! rollover_lock_singleton_spare "$vmid" "$name" "$org" "$expected_gen"; then
+            rollover_release_locks
+            log_info "rollover: singleton spare slot is busy; retrying later"
+            return 3
+        fi
         if ! rollover_prepare_capacity "$vmid" "$org"; then
             rollover_release_locks
             log_warn "rollover: could not establish temporary replacement capacity for singleton $org"
@@ -339,12 +386,18 @@ rollover_destroy_one() {
         return 2
     fi
 
-    if ! rollover_pending_write owned "$vmid" "$name" "$org" "$expected_gen" 0; then
+    if ! rollover_mark_identity "$vmid" "$name" "$org" "$expected_gen"; then
+        rollover_release_locks
+        log_error "rollover: could not bind recovery identity for $name"
+        return 2
+    fi
+    if ! rollover_pending_write owned "$vmid" "$name" "$org" "$expected_gen" 0 "$ROLLOVER_IDENTITY_NONCE"; then
+        qm set "$vmid" --tags "$ROLLOVER_ORIGINAL_TAGS" >/dev/null 2>&1 || true
         rollover_release_locks
         log_error "rollover: could not persist pre-quiesce recovery ownership for $name"
         return 2
     fi
-    rollover_arm_cleanup "$vmid"
+    rollover_arm_cleanup "$vmid" "$name" "$org" "$expected_gen"
     quiesce_rc=0
     rollover_quiesce_guest "$vmid" || quiesce_rc=$?
     if [[ "$quiesce_rc" -ne 0 ]]; then
@@ -385,7 +438,14 @@ rollover_destroy_one() {
         return 2
     fi
 
-    if ! rollover_pending_write committed "$vmid" "$name" "$org" "$expected_gen" "$runner_id"; then
+    if ! rollover_pending_identity_matches "$vmid" "$name" "$org" "$expected_gen" "$ROLLOVER_IDENTITY_NONCE"; then
+        rollover_cleanup_frozen
+        rollover_disarm_cleanup
+        rollover_release_locks
+        log_error "rollover: identity changed before commit for $name"
+        return 2
+    fi
+    if ! rollover_pending_write committed "$vmid" "$name" "$org" "$expected_gen" "$runner_id" "$ROLLOVER_IDENTITY_NONCE"; then
         rollover_cleanup_frozen
         rollover_disarm_cleanup
         rollover_release_locks
@@ -402,17 +462,17 @@ rollover_destroy_one() {
         return 2
     fi
 
-    if ! rollover_destroy_vm "$vmid"; then
-        if rollover_quarantine_vm "$vmid" "$expected_gen"; then
-            rollover_disarm_cleanup
-            rollover_release_locks
-            log_error "rollover: failed to destroy $name (VMID $vmid); quarantined residual so the slot can refill"
-            return 4
-        fi
+    if ! rollover_pending_identity_matches "$vmid" "$name" "$org" "$expected_gen" "$ROLLOVER_IDENTITY_NONCE"; then
         rollover_disarm_cleanup
         rollover_release_locks
-        log_error "rollover: failed to destroy or quarantine $name (VMID $vmid); frozen residual needs operator repair"
+        log_error "rollover: committed identity changed for $name; refusing destroy"
         return 1
+    fi
+    if ! rollover_destroy_vm "$vmid"; then
+        rollover_disarm_cleanup
+        rollover_release_locks
+        log_error "rollover: failed to destroy $name (VMID $vmid); durable recovery will retry and the slot may refill"
+        return 4
     fi
     rm -f "$ROLLOVER_PENDING_FILE"
     rollover_disarm_cleanup

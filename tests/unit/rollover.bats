@@ -159,7 +159,7 @@ setup() {
     [[ "$output" == *"destroyed 2"* ]]
 }
 
-@test "a quarantined residual also opens capacity for the final deferred runner" {
+@test "a durable pending residual also opens capacity for the final deferred runner" {
     rollover_collect() {
         printf 'old-a|9001|1|acme|running|2h3m\n'
         printf 'old-b|9002|1|acme|running|1h2m\n'
@@ -206,6 +206,8 @@ setup_destroy_candidate() {
     rollover_quiesce_guest() { printf 'quiesce %s\n' "$1" >> "$STUB_DIR/protocol"; }
     rollover_wait_offline_idle() { printf '42\n'; }
     rollover_resume_guest() { printf 'resume %s\n' "$1" >> "$STUB_DIR/protocol"; }
+    rollover_mark_identity() { ROLLOVER_IDENTITY_NONCE=test-nonce; ROLLOVER_ORIGINAL_TAGS='runner;gen-1'; }
+    rollover_pending_identity_matches() { return 0; }
     rollover_destroy_vm() { printf 'destroy %s\n' "$1" >> "$STUB_DIR/actions"; }
     github_runner_deregister_id() { printf 'deregister %s %s\n' "$1" "$2" >> "$STUB_DIR/actions"; }
 }
@@ -292,6 +294,34 @@ setup_destroy_candidate() {
     grep -q '^destroy 9001$' "$STUB_DIR/actions"
 }
 
+@test "singleton reserve uses a non-ephemeral snippet" {
+    write_org_config acme ghp_test acme-org
+    cat > "$SNIPPETS_DIR/runner-user-data-acme.yaml" <<'EOF'
+if ./config.sh \
+  --disableupdate \
+  --ephemeral; then
+  break
+fi
+EOF
+    qm_stub() {
+        case "$1 ${2:-}" in
+            "list ") printf 'VMID NAME STATUS\n' ;;
+            "config 9002") printf 'tags: runner,gen-2\n' ;;
+            "set 9002") return 0 ;;
+            *) return 1 ;;
+        esac
+    }
+    export -f qm_stub
+    clone_runner() { printf '%s\n' "$4" > "$STUB_DIR/snippet-used"; printf '9002\n'; }
+    github_runner_lookup_details() { printf '42\tfalse\tonline\n'; }
+
+    run rollover_prepare_capacity 9001 acme
+    [ "$status" -eq 0 ]
+    [ "$(cat "$STUB_DIR/snippet-used")" = runner-rollover-data-acme.yaml ]
+    ! grep -q -- '--ephemeral' "$SNIPPETS_DIR/runner-rollover-data-acme.yaml"
+    grep -q -- '--disableupdate; then' "$SNIPPETS_DIR/runner-rollover-data-acme.yaml"
+}
+
 @test "force skips destruction if deregistration fails" {
     setup_destroy_candidate
     github_runner_deregister_id() { return 1; }
@@ -327,25 +357,14 @@ setup_destroy_candidate() {
     [ "$(sed -n '1p' "$STUB_DIR/protocol")" = "quiesce 9001" ]
 }
 
-@test "destroy failure quarantines a deregistered VM so its slot can refill" {
+@test "destroy failure leaves durable committed recovery so its slot can refill" {
     setup_destroy_candidate
     rollover_destroy_vm() { return 1; }
-    rollover_quarantine_vm() { printf 'quarantine %s %s\n' "$1" "$2" >> "$STUB_DIR/actions"; }
 
     run rollover_destroy_one old-a 9001 1 acme
     [ "$status" -eq 4 ]
     grep -q '^deregister acme 42$' "$STUB_DIR/actions"
-    grep -q '^quarantine 9001 1$' "$STUB_DIR/actions"
-}
-
-@test "quarantine renames the residual before best-effort retagging" {
-    qm_stub() { printf '%s\n' "$*" >> "$STUB_DIR/qm-actions"; }
-    export -f qm_stub
-
-    run rollover_quarantine_vm 9001 1
-    [ "$status" -eq 0 ]
-    [ "$(sed -n '1p' "$STUB_DIR/qm-actions")" = 'set 9001 --name retired-rollover-9001' ]
-    [ "$(sed -n '2p' "$STUB_DIR/qm-actions")" = 'set 9001 --tags runner-retired,gen-1' ]
+    [ -f "$ROLLOVER_PENDING_DIR/9001.pending" ]
 }
 
 @test "quiescence protocol freezes the service cgroup before checking workers" {
@@ -354,6 +373,24 @@ setup_destroy_candidate() {
     [ "$freeze_line" -lt "$worker_line" ]
     grep -q 'frozen 1' "$REPO_ROOT/lib/rollover.sh"
     grep -q 'rollover_wait_offline_idle' "$REPO_ROOT/lib/rollover.sh"
+}
+
+@test "quiesce honors qm guest-exec JSON exitcode and acknowledgement" {
+    jq() { /usr/bin/jq "$@"; }
+    qm_stub() { printf '{"exitcode":1,"out-data":"QUIESCED\\n"}\n'; }
+    export -f qm_stub
+    run rollover_quiesce_guest 9001
+    [ "$status" -eq 1 ]
+
+    qm_stub() { printf '{"exitcode":20,"out-data":"BUSY\\n"}\n'; }
+    export -f qm_stub
+    run rollover_quiesce_guest 9001
+    [ "$status" -eq 2 ]
+
+    qm_stub() { printf '{"exitcode":0,"out-data":"QUIESCED\\n"}\n'; }
+    export -f qm_stub
+    run rollover_quiesce_guest 9001
+    [ "$status" -eq 0 ]
 }
 
 @test "resume guest program executes and thaws the cgroup" {
@@ -367,35 +404,84 @@ setup_destroy_candidate() {
     export -f systemctl
     qm_stub() {
         [[ "$1 $2 $4" == 'guest exec --' ]] || return 1
-        RUNNER_CGROUP_ROOT="$STUB_DIR/cgroup" /bin/bash -c "$7"
+        local out rc
+        out=$(RUNNER_CGROUP_ROOT="$STUB_DIR/cgroup" /bin/bash -c "$7") && rc=0 || rc=$?
+        /usr/bin/jq -n --argjson rc "$rc" --arg out "$out" '{exitcode:$rc,"out-data":($out + "\n")}'
     }
     export -f qm_stub
+    jq() { /usr/bin/jq "$@"; }
 
     run rollover_resume_guest 9001
     [ "$status" -eq 0 ]
     [ "$(cat "$STUB_DIR/cgroup/runner/cgroup.freeze")" = 0 ]
 }
 
+@test "resume requires guest-exec exitcode zero and explicit THAWED ack" {
+    qm_stub() { printf '{"exitcode":1,"out-data":"THAWED\\n"}\n'; }
+    export -f qm_stub
+    run resume_runner_cgroup 9001
+    [ "$status" -ne 0 ]
+
+    qm_stub() { printf '{"exitcode":0,"out-data":""}\n'; }
+    export -f qm_stub
+    run resume_runner_cgroup 9001
+    [ "$status" -ne 0 ]
+
+    mkdir -p "$ROLLOVER_PENDING_DIR"
+    printf 'owned|9001|old-a|acme|1|0|nonce-a\n' > "$ROLLOVER_PENDING_DIR/9001.pending"
+    rollover_pending_identity_matches() { return 0; }
+    qm_stub() {
+        [[ "$1 $2" == 'status 9001' ]] && return 0
+        [[ "$1 $2" == 'guest exec' ]] && printf '{"exitcode":0,"out-data":""}\n'
+    }
+    export -f qm_stub
+    run recover_rollover_pending
+    [ "$status" -eq 0 ]
+    [ -f "$ROLLOVER_PENDING_DIR/9001.pending" ]
+}
+
 @test "EXIT cleanup thaws an owned freeze but preserves a committed one" {
     rollover_resume_guest() { printf 'thaw %s\n' "$1" >> "$STUB_DIR/thaws"; }
-    run rollover_arm_cleanup 9001
+    rollover_pending_identity_matches() { return 0; }
+    run rollover_arm_cleanup 9001 old-a acme 1
     [ "$status" -eq 0 ]
     grep -q '^thaw 9001$' "$STUB_DIR/thaws"
 
     rm -f "$STUB_DIR/thaws"
-    committed_arm() { rollover_arm_cleanup 9002; ROLLOVER_FROZEN_COMMITTED=true; }
+    committed_arm() { rollover_arm_cleanup 9002 old-b acme 1; ROLLOVER_FROZEN_COMMITTED=true; }
     run committed_arm
     [ "$status" -eq 0 ]
     [ ! -e "$STUB_DIR/thaws" ]
 }
 
+@test "cleanup retains durable ownership when thaw cannot be verified" {
+    mkdir -p "$ROLLOVER_PENDING_DIR"
+    printf 'owned|9001|old-a|acme|1|0|nonce-a\n' > "$ROLLOVER_PENDING_DIR/9001.pending"
+    rollover_resume_guest() { return 1; }
+    qm_stub() { [[ "$1 $2" == 'status 9001' ]]; }
+    export -f qm_stub
+    failed_cleanup() {
+        rollover_arm_cleanup 9001 old-a acme 1
+        ROLLOVER_PENDING_FILE="$ROLLOVER_PENDING_DIR/9001.pending"
+        rollover_cleanup_frozen
+        rollover_disarm_cleanup
+    }
+    run failed_cleanup
+    [ "$status" -eq 0 ]
+    [ -f "$ROLLOVER_PENDING_DIR/9001.pending" ]
+}
+
 @test "committed pending destroy survives failure and is retried to cleanup" {
     mkdir -p "$ROLLOVER_PENDING_DIR"
-    printf 'committed|9001|old-a|acme|1|42\n' > "$ROLLOVER_PENDING_DIR/9001.pending"
+    printf 'committed|9001|old-a|acme|1|42|nonce-a\n' > "$ROLLOVER_PENDING_DIR/9001.pending"
     github_runner_deregister_id() { return 0; }
+    rollover_pending_identity_matches() { return 0; }
     qm_stub() {
-        [[ "$1 $2" == 'destroy 9001' ]] || return 1
-        [[ ! -e "$STUB_DIR/destroy-fails" ]]
+        case "$1 $2" in
+            "status 9001") printf 'status: stopped\n' ;;
+            "destroy 9001") [[ ! -e "$STUB_DIR/destroy-fails" ]] ;;
+            *) return 1 ;;
+        esac
     }
     export -f qm_stub
     : > "$STUB_DIR/destroy-fails"
@@ -411,8 +497,11 @@ setup_destroy_candidate() {
 
 @test "durable pre-quiesce ownership thaws after an untrappable process death" {
     mkdir -p "$ROLLOVER_PENDING_DIR"
-    printf 'owned|9001|old-a|acme|1|0\n' > "$ROLLOVER_PENDING_DIR/9001.pending"
+    printf 'owned|9001|old-a|acme|1|0|nonce-a\n' > "$ROLLOVER_PENDING_DIR/9001.pending"
     resume_runner_cgroup() { printf 'thaw %s\n' "$1" >> "$STUB_DIR/thaws"; }
+    rollover_pending_identity_matches() { return 0; }
+    qm_stub() { [[ "$1 $2" == 'status 9001' ]]; }
+    export -f qm_stub
 
     run recover_rollover_pending
     [ "$status" -eq 0 ]
@@ -420,25 +509,104 @@ setup_destroy_candidate() {
     [ ! -e "$ROLLOVER_PENDING_DIR/9001.pending" ]
 }
 
-@test "pending recovery survives both destroy and quarantine failure" {
+@test "pending recovery survives initial destroy failure" {
     setup_destroy_candidate
     rollover_destroy_vm() { return 1; }
-    rollover_quarantine_vm() { return 1; }
 
     run rollover_destroy_one old-a 9001 1 acme
-    [ "$status" -eq 1 ]
+    [ "$status" -eq 4 ]
     [ -f "$ROLLOVER_PENDING_DIR/9001.pending" ]
-    grep -q '^committed|9001|old-a|acme|1|42$' "$ROLLOVER_PENDING_DIR/9001.pending"
+    grep -q '^committed|9001|old-a|acme|1|42|test-nonce$' "$ROLLOVER_PENDING_DIR/9001.pending"
     run rollover_vmid_is_committed_pending 9001
     [ "$status" -eq 0 ]
     grep -q 'rollover_vmid_is_committed_pending' "$REPO_ROOT/lib/watch.sh"
 
     github_runner_deregister_id() { return 0; }
-    qm_stub() { [[ "$1 $2" == 'destroy 9001' ]]; }
+    qm_stub() {
+        [[ "$1 $2" == 'status 9001' ]] && { printf 'status: stopped\n'; return; }
+        [[ "$1 $2" == 'destroy 9001' ]]
+    }
     export -f qm_stub
     run recover_rollover_pending
     [ "$status" -eq 0 ]
     [ ! -e "$ROLLOVER_PENDING_DIR/9001.pending" ]
+}
+
+@test "stale pending record never destroys a reused VMID" {
+    mkdir -p "$ROLLOVER_PENDING_DIR"
+    printf 'committed|9001|old-a|acme|1|42|nonce-a\n' > "$ROLLOVER_PENDING_DIR/9001.pending"
+    qm_stub() {
+        case "$1 $2" in
+            "status 9001") printf 'status: stopped\n' ;;
+            "config 9001") printf 'name: intruder\ntags: runner;gen-1;rollover-other\ncicustom: user=local:snippets/runner-user-data-acme.yaml\n' ;;
+            "destroy 9001") echo destroyed >> "$STUB_DIR/actions" ;;
+            *) return 1 ;;
+        esac
+    }
+    export -f qm_stub
+    run recover_rollover_pending
+    [ "$status" -eq 0 ]
+    [ -f "$ROLLOVER_PENDING_DIR/9001.pending" ]
+    [ ! -e "$STUB_DIR/actions" ]
+}
+
+@test "pending identity requires exact name org generation and nonce tag" {
+    qm_stub() {
+        [[ "$1 $2" == 'config 9001' ]] || return 1
+        printf 'name: old-a\ntags: runner;gen-1;rollover-nonce-a\ncicustom: user=local:snippets/runner-user-data-acme.yaml\n'
+    }
+    export -f qm_stub
+    run rollover_pending_identity_matches 9001 old-a acme 1 nonce-a
+    [ "$status" -eq 0 ]
+    run rollover_pending_identity_matches 9001 old-a acme 1 nonce-b
+    [ "$status" -ne 0 ]
+    run rollover_pending_identity_matches 9001 other acme 1 nonce-a
+    [ "$status" -ne 0 ]
+}
+
+@test "committed recovery stops a running frozen VM before bounded destroy and retries stop failure" {
+    mkdir -p "$ROLLOVER_PENDING_DIR"
+    printf 'committed|9001|old-a|acme|1|42|nonce-a\n' > "$ROLLOVER_PENDING_DIR/9001.pending"
+    rollover_pending_identity_matches() { return 0; }
+    github_runner_deregister_id() { return 0; }
+    qm_stub() {
+        case "$1 $2" in
+            "status 9001") [[ -e "$STUB_DIR/stopped" ]] && printf 'status: stopped\n' || printf 'status: running\n' ;;
+            "stop 9001")
+                printf '%s\n' "$*" >> "$STUB_DIR/stops"
+                [[ ! -e "$STUB_DIR/stop-fails" ]] && : > "$STUB_DIR/stopped"
+                [[ ! -e "$STUB_DIR/stop-fails" ]]
+                ;;
+            "destroy 9001") printf destroy >> "$STUB_DIR/actions" ;;
+            *) return 1 ;;
+        esac
+    }
+    export -f qm_stub
+    : > "$STUB_DIR/stop-fails"
+    run recover_rollover_pending
+    [ "$status" -eq 0 ]
+    [ -f "$ROLLOVER_PENDING_DIR/9001.pending" ]
+    [ ! -e "$STUB_DIR/actions" ]
+
+    rm -f "$STUB_DIR/stop-fails"
+    run recover_rollover_pending
+    [ "$status" -eq 0 ]
+    [ ! -e "$ROLLOVER_PENDING_DIR/9001.pending" ]
+    grep -q '^stop 9001 --timeout 30$' "$STUB_DIR/stops"
+    [ "$(cat "$STUB_DIR/actions")" = destroy ]
+}
+
+@test "singleton spare slot is acquired nonblocking outside org lock and held through commit" {
+    qm_stub() {
+        [[ "$1 $2" == 'config 9001' ]] || return 1
+        printf 'name: old-a\ntags: runner;gen-1\ncicustom: user=local:snippets/runner-user-data-acme.yaml\n'
+    }
+    export -f qm_stub
+    exec 209>"${ROLLOVER_ORG_LOCK_PREFIX}-acme.lock"; flock 209
+    rollover_lock_singleton_spare 9001 old-a acme 1
+    if (exec 207>"${RUNNER_SLOT_LOCK_PREFIX}-rollover-spare-9001.lock"; flock -n 207); then false; fi
+    rollover_release_locks
+    (exec 207>"${RUNNER_SLOT_LOCK_PREFIX}-rollover-spare-9001.lock"; flock -n 207)
 }
 
 @test "guard reclone and manual destroy share the org capacity lock" {

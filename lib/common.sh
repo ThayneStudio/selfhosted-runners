@@ -481,7 +481,9 @@ select_org() {
 get_vm_org() {
     local cicustom
     cicustom=$(qm config "$1" 2>/dev/null | grep "^cicustom:" || true)
-    if [[ "$cicustom" =~ runner-user-data-([^.]+)\.yaml ]]; then
+    if [[ "$cicustom" =~ runner-rollover-data-([^.]+)\.yaml ]]; then
+        echo "${BASH_REMATCH[1]}"
+    elif [[ "$cicustom" =~ runner-user-data-([^.]+)\.yaml ]]; then
         echo "${BASH_REMATCH[1]}"
     else
         echo "unknown"
@@ -836,9 +838,9 @@ github_runner_lookup_details() {
 }
 
 resume_runner_cgroup() {
-    local vmid="$1"
+    local vmid="$1" result
     # shellcheck disable=SC2016  # guest-side program expands in the guest
-    qm guest exec "$vmid" -- /bin/bash -c '
+    result=$(qm guest exec "$vmid" -- /bin/bash -c '
 set -eu
 cgroup_root=${RUNNER_CGROUP_ROOT:-/sys/fs/cgroup}
 units=$(systemctl list-units --type=service --all --no-legend "actions.runner.*.service" | awk "{print \$1}")
@@ -846,24 +848,62 @@ units=$(systemctl list-units --type=service --all --no-legend "actions.runner.*.
 cg=$(systemctl show -p ControlGroup --value "$units")
 [ -n "$cg" ]
 echo 0 > "${cgroup_root}${cg}/cgroup.freeze"
-' >/dev/null 2>&1
+grep -q "^0$" "${cgroup_root}${cg}/cgroup.freeze"
+echo THAWED
+' 2>/dev/null) || return 1
+    jq -e 'select(.exitcode == 0 and ((.["out-data"] // "") | test("(^|\\n)THAWED(\\r?\\n|$)")))' \
+        <<< "$result" >/dev/null 2>&1
+}
+
+rollover_pending_identity_matches() {
+    local vmid="$1" expected_name="$2" expected_org="$3" expected_gen="$4" nonce="$5"
+    local cfg name org tags
+    cfg=$(qm config "$vmid" 2>/dev/null </dev/null) || return 1
+    name=$(awk '/^name:/{print $2; exit}' <<< "$cfg")
+    if [[ "$cfg" =~ runner-rollover-data-([^.]+)\.yaml ]]; then
+        org="${BASH_REMATCH[1]}"
+    elif [[ "$cfg" =~ runner-user-data-([^.]+)\.yaml ]]; then
+        org="${BASH_REMATCH[1]}"
+    else
+        return 1
+    fi
+    tags=$(awk -F ': ' '/^tags:/{print $2; exit}' <<< "$cfg")
+    [[ "$name" == "$expected_name" && "$org" == "$expected_org" ]] || return 1
+    [[ ",$tags," =~ [,\;]gen-${expected_gen}([,\;]|$) ]] || return 1
+    [[ ",$tags," =~ [,\;]rollover-${nonce}([,\;]|$) ]]
+}
+
+rollover_vmid_absent_verified() {
+    local vmid="$1" all
+    all=$(qm list 2>/dev/null) || return 1
+    ! awk -v v="$vmid" 'NR > 1 && $1 == v {found=1} END {exit !found}' <<< "$all"
 }
 
 # Retry committed rollover destroys. A committed VM is already frozen and
 # deregistered; leaving the record makes recovery durable across process/host
 # crashes. Failure is non-fatal so the watcher can still refill its slot.
 recover_rollover_pending() {
-    local file phase vmid name org _gen runner_id
+    local file phase vmid name org gen runner_id nonce status
     [[ -d "$ROLLOVER_PENDING_DIR" ]] || return 0
     for file in "$ROLLOVER_PENDING_DIR"/*.pending; do
         [[ -f "$file" ]] || continue
-        IFS='|' read -r phase vmid name org _gen runner_id < "$file" || continue
+        IFS='|' read -r phase vmid name org gen runner_id nonce < "$file" || continue
         [[ "$vmid" =~ ^[0-9]+$ ]] || continue
         validate_org_name "$org" || continue
         exec 209>"${ROLLOVER_ORG_LOCK_PREFIX}-${org}.lock"
         flock -n 209 || { exec 209>&-; continue; }
+        if ! qm status "$vmid" >/dev/null 2>&1; then
+            rollover_vmid_absent_verified "$vmid" && rm -f "$file"
+            exec 209>&-
+            continue
+        fi
+        if ! rollover_pending_identity_matches "$vmid" "$name" "$org" "$gen" "$nonce"; then
+            log_warn "[rollover-recovery] stale identity for pending VMID $vmid — leaving it untouched"
+            exec 209>&-
+            continue
+        fi
         if [[ "$phase" == owned ]]; then
-            if resume_runner_cgroup "$vmid" || ! qm status "$vmid" >/dev/null 2>&1; then
+            if resume_runner_cgroup "$vmid"; then
                 rm -f "$file"
             fi
             exec 209>&-
@@ -871,6 +911,13 @@ recover_rollover_pending() {
         fi
         [[ "$phase" == committed ]] || { exec 209>&-; continue; }
         github_runner_deregister_id "$org" "$runner_id" >/dev/null 2>&1 || true
+        status=$(qm status "$vmid" 2>/dev/null | awk '{print $2}') || { exec 209>&-; continue; }
+        if [[ "$status" == running ]]; then
+            qm stop "$vmid" --timeout 30 200>&- 209>&- >/dev/null 2>&1 || { exec 209>&-; continue; }
+            status=$(qm status "$vmid" 2>/dev/null | awk '{print $2}') || { exec 209>&-; continue; }
+            [[ "$status" == stopped ]] || { exec 209>&-; continue; }
+        fi
+        rollover_pending_identity_matches "$vmid" "$name" "$org" "$gen" "$nonce" || { exec 209>&-; continue; }
         if qm destroy "$vmid" --purge 200>&- 209>&- 2>/dev/null; then
             rm -f "${SNIPPETS_DIR}/runner-${vmid}-meta.yaml" "${SNIPPETS_DIR}/runner-${vmid}-vendor.yaml" "$file"
             log_info "[rollover-recovery] destroyed pending VMID $vmid ($name)"
@@ -880,10 +927,12 @@ recover_rollover_pending() {
 }
 
 rollover_vmid_is_committed_pending() {
-    local vmid="$1" file
+    local vmid="$1" file phase record_vmid name org gen _runner_id nonce
     file="$ROLLOVER_PENDING_DIR/${vmid}.pending"
     [[ "$vmid" =~ ^[0-9]+$ && -f "$file" ]] || return 1
-    grep -q "^committed|${vmid}|" "$file"
+    IFS='|' read -r phase record_vmid name org gen _runner_id nonce < "$file" || return 1
+    [[ "$phase" == committed && "$record_vmid" == "$vmid" ]] || return 1
+    rollover_pending_identity_matches "$vmid" "$name" "$org" "$gen" "$nonce"
 }
 
 # Compatibility wrapper for callers that only need id/busy.
@@ -988,6 +1037,7 @@ clone_tag_generation() {
 # without notifying clone.failed. Tests set the bound to 0 to skip the wait.
 clone_runner() {
     local name="$1" org="$2" vmid="${3:-}"
+    local user_data_snippet="${4:-runner-user-data-${org}.yaml}"
     local RESERVED_VMID=""
     local pause_waited=0
     local pause_max="${CLONE_PAUSE_RETRY_MAX_SECONDS:-130}"
@@ -1207,7 +1257,8 @@ local-hostname: "$name"
 EOF
     chmod 600 "${SNIPPETS_DIR}/runner-${vmid}-meta.yaml"
 
-    qm set "$vmid" --cicustom "user=local:snippets/runner-user-data-${org}.yaml,meta=local:snippets/runner-${vmid}-meta.yaml" \
+    [[ "$user_data_snippet" =~ ^[a-zA-Z0-9._-]+\.yaml$ ]] || { _fail; exec 202>&-; return 1; }
+    qm set "$vmid" --cicustom "user=local:snippets/${user_data_snippet},meta=local:snippets/runner-${vmid}-meta.yaml" \
         200>&- \
         201>&- \
         202>&- \
