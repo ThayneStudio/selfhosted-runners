@@ -872,6 +872,44 @@ echo "THAWED:${cg}"
     [[ -z "$expected" || "$ack" == "$expected" ]]
 }
 
+runner_rollover_marker_state() {
+    local vmid="$1" result exitcode out state
+    # shellcheck disable=SC2016  # guest-side program expands in the guest
+    result=$(qm guest exec "$vmid" -- /bin/bash -c '
+set -eu
+marker=${RUNNER_ROLLOVER_MARKER:-/run/github-runner-rollover-cgroup}
+if [ ! -e "$marker" ]; then echo MARKER_ABSENT; exit 0; fi
+[ -f "$marker" ] && [ -r "$marker" ]
+saved=$(cat "$marker")
+case "$saved" in /|*[!a-zA-Z0-9_./:@-]*|*..*) exit 1;; /*) ;; *) exit 1;; esac
+echo "MARKER:${saved}"
+' 2>/dev/null) || return 1
+    exitcode=$(jq -er '.exitcode | select(type == "number")' <<< "$result" 2>/dev/null) || return 1
+    out=$(jq -er '.["out-data"] | select(type == "string")' <<< "$result" 2>/dev/null) || return 1
+    [[ "$exitcode" -eq 0 ]] || return 1
+    if [[ "$out" == MARKER_ABSENT || "$out" == $'MARKER_ABSENT\n' || "$out" == $'MARKER_ABSENT\r\n' ]]; then
+        printf 'absent\n'
+        return 0
+    fi
+    state=$(sed -n 's/^MARKER:\(\/[a-zA-Z0-9_./:@-]*\)$/\1/p' <<< "$out")
+    [[ "$state" =~ ^/[a-zA-Z0-9_./:@-]+$ && "$state" != / && "$state" != *'..'* && "$state" != *$'\n'* ]] || return 1
+    printf '%s\n' "$state"
+}
+
+rollover_clear_identity_nonce() {
+    local vmid="$1" name="$2" org="$3" gen="$4" nonce="$5" cfg tags tag new=""
+    rollover_pending_identity_matches "$vmid" "$name" "$org" "$gen" "$nonce" || return 1
+    cfg=$(qm config "$vmid" 2>/dev/null </dev/null) || return 1
+    tags=$(awk -F ': ' '/^tags:/{print $2; exit}' <<< "$cfg")
+    tags=${tags//;/,}
+    while IFS= read -r tag; do
+        tag=${tag#"${tag%%[![:space:]]*}"}; tag=${tag%"${tag##*[![:space:]]}"}
+        [[ -n "$tag" && "$tag" != "rollover-${nonce}" ]] || continue
+        new+="${new:+;}${tag}"
+    done < <(tr ',' '\n' <<< "$tags")
+    qm set "$vmid" --tags "$new" >/dev/null 2>&1
+}
+
 rollover_pending_identity_matches() {
     local vmid="$1" expected_name="$2" expected_org="$3" expected_gen="$4" nonce="$5"
     local cfg name org tags
@@ -898,7 +936,7 @@ rollover_vmid_absent_verified() {
 # deregistered; leaving the record makes recovery durable across process/host
 # crashes. Failure is non-fatal so the watcher can still refill its slot.
 recover_rollover_pending() {
-    local file phase vmid name org gen runner_id nonce cgroup status
+    local file phase vmid name org gen runner_id nonce cgroup status marker_state recovered
     [[ -d "$ROLLOVER_PENDING_DIR" ]] || return 0
     for file in "$ROLLOVER_PENDING_DIR"/*.pending; do
         [[ -f "$file" ]] || continue
@@ -917,8 +955,30 @@ recover_rollover_pending() {
             exec 209>&-
             continue
         fi
+        if [[ "$phase" == preparing ]]; then
+            marker_state=$(runner_rollover_marker_state "$vmid") || { exec 209>&-; continue; }
+            recovered=false
+            if [[ "$marker_state" == absent ]]; then
+                recovered=true
+            elif resume_runner_cgroup "$vmid" "$marker_state"; then
+                recovered=true
+            fi
+            if [[ "$recovered" == true ]] && rollover_clear_identity_nonce "$vmid" "$name" "$org" "$gen" "$nonce"; then
+                rm -f "$file"
+            fi
+            exec 209>&-
+            continue
+        fi
         if [[ "$phase" == owned ]]; then
-            if resume_runner_cgroup "$vmid" "$cgroup"; then
+            marker_state=$(runner_rollover_marker_state "$vmid") || { exec 209>&-; continue; }
+            recovered=false
+            if [[ "$marker_state" == absent ]]; then
+                recovered=true
+            elif [[ "$marker_state" == "$cgroup" ]] && resume_runner_cgroup "$vmid" "$cgroup"; then
+                recovered=true
+            fi
+            if [[ "$recovered" == true ]] \
+                && rollover_clear_identity_nonce "$vmid" "$name" "$org" "$gen" "$nonce"; then
                 rm -f "$file"
             fi
             exec 209>&-

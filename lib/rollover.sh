@@ -26,6 +26,7 @@ ROLLOVER_FROZEN_NAME=""
 ROLLOVER_FROZEN_ORG=""
 ROLLOVER_FROZEN_GEN=""
 ROLLOVER_FROZEN_CGROUP=""
+ROLLOVER_QUIESCE_UNCHANGED=false
 ROLLOVER_PENDING_FILE=""
 ROLLOVER_IDENTITY_NONCE=""
 ROLLOVER_ORIGINAL_TAGS=""
@@ -141,17 +142,23 @@ set -eu
 cgroup_root=${RUNNER_CGROUP_ROOT:-/sys/fs/cgroup}
 proc_root=${RUNNER_PROC_ROOT:-/proc}
 marker=${RUNNER_ROLLOVER_MARKER:-/run/github-runner-rollover-cgroup}
+unchanged() { echo UNCHANGED; exit 0; }
 pids=$(pgrep -x Runner.Listener || true)
-[ "$(printf "%s\n" "$pids" | sed "/^$/d" | wc -l)" -eq 1 ] || { echo ERROR; exit 1; }
+[ "$(printf "%s\n" "$pids" | sed "/^$/d" | wc -l)" -eq 1 ] || unchanged
 pid=$pids
 lines=$(grep "^0::" "${proc_root}/${pid}/cgroup" || true)
-[ "$(printf "%s\n" "$lines" | sed "/^$/d" | wc -l)" -eq 1 ] || { echo ERROR; exit 1; }
+[ "$(printf "%s\n" "$lines" | sed "/^$/d" | wc -l)" -eq 1 ] || unchanged
 cg=${lines#0::}
-case "$cg" in /|*[!a-zA-Z0-9_./:@-]*|*..*) echo ERROR; exit 1;; /*) ;; *) echo ERROR; exit 1;; esac
-[ -w "${cgroup_root}${cg}/cgroup.freeze" ] && [ -r "${cgroup_root}${cg}/cgroup.events" ] || { echo ERROR; exit 1; }
+case "$cg" in /|*[!a-zA-Z0-9_./:@-]*|*..*) unchanged;; /*) ;; *) unchanged;; esac
+[ -w "${cgroup_root}${cg}/cgroup.freeze" ] && [ -r "${cgroup_root}${cg}/cgroup.events" ] || unchanged
 printf "%s\n" "$cg" > "$marker"
 chmod 600 "$marker"
-thaw() { echo 0 > "${cgroup_root}${cg}/cgroup.freeze" 2>/dev/null || true; rm -f "$marker"; }
+thaw() {
+    if echo 0 > "${cgroup_root}${cg}/cgroup.freeze" 2>/dev/null \
+        && grep -q "^0$" "${cgroup_root}${cg}/cgroup.freeze"; then
+        rm -f "$marker"
+    fi
+}
 trap thaw EXIT
 echo 1 > "${cgroup_root}${cg}/cgroup.freeze"
 i=0
@@ -159,15 +166,28 @@ while ! grep -q "^frozen 1$" "${cgroup_root}${cg}/cgroup.events"; do
     i=$((i + 1)); [ "$i" -lt 50 ] || { echo ERROR; exit 1; }
     sleep 0.1
 done
-if pgrep -x Runner.Worker >/dev/null 2>&1; then thaw; echo BUSY; exit 20; fi
+if pgrep -x Runner.Worker >/dev/null 2>&1; then
+    thaw
+    [ ! -e "$marker" ] || { echo ERROR; exit 1; }
+    trap - EXIT
+    echo BUSY_UNFROZEN
+    exit 0
+fi
 trap - EXIT
-echo "QUIESCED:${cg}"
+echo "FROZEN:${cg}"
 ' 2>/dev/null </dev/null) || return 1
     exitcode=$(jq -er '.exitcode | select(type == "number")' <<< "$result" 2>/dev/null) || return 1
     out=$(jq -er '.["out-data"] | select(type == "string")' <<< "$result" 2>/dev/null) || return 1
-    [[ "$exitcode" -eq 20 && "$out" == *BUSY* ]] && return 2
     [[ "$exitcode" -eq 0 ]] || return 1
-    ack=$(sed -n 's/^QUIESCED:\(\/[a-zA-Z0-9_./:@-]*\)$/\1/p' <<< "$out")
+    if [[ "$out" == BUSY_UNFROZEN || "$out" == $'BUSY_UNFROZEN\n' || "$out" == $'BUSY_UNFROZEN\r\n' ]]; then
+        ROLLOVER_QUIESCE_UNCHANGED=true
+        return 2
+    fi
+    if [[ "$out" == UNCHANGED || "$out" == $'UNCHANGED\n' || "$out" == $'UNCHANGED\r\n' ]]; then
+        ROLLOVER_QUIESCE_UNCHANGED=true
+        return 3
+    fi
+    ack=$(sed -n 's/^FROZEN:\(\/[a-zA-Z0-9_./:@-]*\)$/\1/p' <<< "$out")
     [[ "$ack" =~ ^/[a-zA-Z0-9_./:@-]+$ && "$ack" != / && "$ack" != *'..'* && "$ack" != *$'\n'* ]] || return 1
     ROLLOVER_FROZEN_CGROUP="$ack"
 }
@@ -187,21 +207,26 @@ rollover_pending_write() {
 }
 
 rollover_cleanup_frozen() {
-    local thaw_verified=false
+    local thaw_verified=false cleanup_complete=false
     [[ "$ROLLOVER_FROZEN_OWNED" == true ]] || return 0
     if [[ "$ROLLOVER_FROZEN_COMMITTED" != true ]]; then
-        if rollover_resume_guest "$ROLLOVER_FROZEN_VMID"; then
+        if [[ "$ROLLOVER_QUIESCE_UNCHANGED" == true ]]; then
+            thaw_verified=true
+        elif rollover_resume_guest "$ROLLOVER_FROZEN_VMID"; then
             thaw_verified=true
         elif rollover_vmid_absent_verified "$ROLLOVER_FROZEN_VMID"; then
             thaw_verified=true
         else
             log_error "rollover: cleanup could not verify thaw of VMID $ROLLOVER_FROZEN_VMID; durable ownership retained"
         fi
-        if [[ "$thaw_verified" == true && -n "$ROLLOVER_IDENTITY_NONCE" ]] && rollover_pending_identity_matches \
-            "$ROLLOVER_FROZEN_VMID" "$ROLLOVER_FROZEN_NAME" "$ROLLOVER_FROZEN_ORG" "$ROLLOVER_FROZEN_GEN" "$ROLLOVER_IDENTITY_NONCE"; then
-            qm set "$ROLLOVER_FROZEN_VMID" --tags "$ROLLOVER_ORIGINAL_TAGS" >/dev/null 2>&1 || true
+        if [[ "$thaw_verified" == true ]] && rollover_vmid_absent_verified "$ROLLOVER_FROZEN_VMID"; then
+            cleanup_complete=true
+        elif [[ "$thaw_verified" == true && -n "$ROLLOVER_IDENTITY_NONCE" ]] && rollover_pending_identity_matches \
+            "$ROLLOVER_FROZEN_VMID" "$ROLLOVER_FROZEN_NAME" "$ROLLOVER_FROZEN_ORG" "$ROLLOVER_FROZEN_GEN" "$ROLLOVER_IDENTITY_NONCE" \
+            && qm set "$ROLLOVER_FROZEN_VMID" --tags "$ROLLOVER_ORIGINAL_TAGS" >/dev/null 2>&1; then
+            cleanup_complete=true
         fi
-        if [[ "$thaw_verified" == true && -n "$ROLLOVER_PENDING_FILE" ]]; then rm -f "$ROLLOVER_PENDING_FILE"; fi
+        if [[ "$cleanup_complete" == true && -n "$ROLLOVER_PENDING_FILE" ]]; then rm -f "$ROLLOVER_PENDING_FILE"; fi
     fi
     ROLLOVER_FROZEN_OWNED=false
 }
@@ -210,6 +235,7 @@ rollover_arm_cleanup() {
     ROLLOVER_FROZEN_VMID="$1"; ROLLOVER_FROZEN_NAME="$2"; ROLLOVER_FROZEN_ORG="$3"; ROLLOVER_FROZEN_GEN="$4"
     ROLLOVER_FROZEN_OWNED=true
     ROLLOVER_FROZEN_COMMITTED=false
+    ROLLOVER_QUIESCE_UNCHANGED=false
     trap 'rollover_cleanup_frozen' EXIT
     trap 'rollover_cleanup_frozen; exit 130' INT
     trap 'rollover_cleanup_frozen; exit 143' TERM
@@ -339,7 +365,7 @@ rollover_destroy_one() {
         log_error "rollover: could not bind recovery identity for $name"
         return 2
     fi
-    if ! rollover_pending_write owned "$vmid" "$name" "$org" "$expected_gen" 0 "$ROLLOVER_IDENTITY_NONCE"; then
+    if ! rollover_pending_write preparing "$vmid" "$name" "$org" "$expected_gen" 0 "$ROLLOVER_IDENTITY_NONCE"; then
         qm set "$vmid" --tags "$ROLLOVER_ORIGINAL_TAGS" >/dev/null 2>&1 || true
         rollover_release_locks
         log_error "rollover: could not persist pre-quiesce recovery ownership for $name"
@@ -354,6 +380,8 @@ rollover_destroy_one() {
         rollover_release_locks
         if [[ "$quiesce_rc" -eq 2 ]]; then
             log_info "rollover: skipping $name — guest reports an active Runner.Worker"
+        elif [[ "$quiesce_rc" -eq 3 ]]; then
+            log_info "rollover: skipping $name — guest listener topology is unchanged but not uniquely quiesceable"
         else
             log_warn "rollover: skipping $name — could not prove guest quiescence"
         fi

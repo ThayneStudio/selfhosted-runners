@@ -198,6 +198,7 @@ setup_destroy_candidate() {
                 printf 'name: old-a\ntags: runner;gen-1\ncicustom: user=local:snippets/runner-user-data-acme.yaml\n'
                 ;;
             "status 9001") printf 'status: running\n' ;;
+            "set 9001") return 0 ;;
             *) return 1 ;;
         esac
     }
@@ -214,12 +215,29 @@ setup_destroy_candidate() {
 
 @test "force never destroys when the frozen guest contains a worker" {
     setup_destroy_candidate
-    rollover_quiesce_guest() { return 2; }
+    rollover_quiesce_guest() {
+        cut -d '|' -f1 "$ROLLOVER_PENDING_DIR/9001.pending" > "$STUB_DIR/phase-at-invocation"
+        ROLLOVER_QUIESCE_UNCHANGED=true
+        return 2
+    }
 
     run rollover_destroy_one old-a 9001 1 acme
     [ "$status" -eq 2 ]
     [ ! -e "$STUB_DIR/actions" ]
-    grep -q '^resume 9001$' "$STUB_DIR/protocol"
+    [ "$(cat "$STUB_DIR/phase-at-invocation")" = preparing ]
+    ! grep -q '^resume 9001$' "$STUB_DIR/protocol"
+    [ ! -e "$ROLLOVER_PENDING_DIR/9001.pending" ]
+}
+
+@test "force safely clears preparing state when Listener topology is ambiguous" {
+    setup_destroy_candidate
+    rollover_quiesce_guest() { ROLLOVER_QUIESCE_UNCHANGED=true; return 3; }
+
+    run rollover_destroy_one old-a 9001 1 acme
+    [ "$status" -eq 2 ]
+    [ ! -e "$STUB_DIR/actions" ]
+    ! grep -q '^resume 9001$' "$STUB_DIR/protocol"
+    [ ! -e "$ROLLOVER_PENDING_DIR/9001.pending" ]
 }
 
 @test "force skips on GitHub API uncertainty" {
@@ -355,17 +373,17 @@ setup_destroy_candidate() {
 
 @test "quiesce honors qm guest-exec JSON exitcode and acknowledgement" {
     jq() { /usr/bin/jq "$@"; }
-    qm_stub() { printf '{"exitcode":1,"out-data":"QUIESCED:/runner\\n"}\n'; }
+    qm_stub() { printf '{"exitcode":1,"out-data":"FROZEN:/runner\\n"}\n'; }
     export -f qm_stub
     run rollover_quiesce_guest 9001
     [ "$status" -eq 1 ]
 
-    qm_stub() { printf '{"exitcode":20,"out-data":"BUSY\\n"}\n'; }
+    qm_stub() { printf '{"exitcode":0,"out-data":"BUSY_UNFROZEN\\n"}\n'; }
     export -f qm_stub
     run rollover_quiesce_guest 9001
     [ "$status" -eq 2 ]
 
-    qm_stub() { printf '{"exitcode":0,"out-data":"QUIESCED:/runner\\n"}\n'; }
+    qm_stub() { printf '{"exitcode":0,"out-data":"FROZEN:/runner\\n"}\n'; }
     export -f qm_stub
     run rollover_quiesce_guest 9001
     [ "$status" -eq 0 ]
@@ -566,8 +584,10 @@ setup_destroy_candidate() {
 
 @test "durable pre-quiesce ownership thaws after an untrappable process death" {
     mkdir -p "$ROLLOVER_PENDING_DIR"
-    printf 'owned|9001|old-a|acme|1|0|nonce-a\n' > "$ROLLOVER_PENDING_DIR/9001.pending"
+    printf 'owned|9001|old-a|acme|1|0|nonce-a|/runner\n' > "$ROLLOVER_PENDING_DIR/9001.pending"
+    runner_rollover_marker_state() { printf '/runner\n'; }
     resume_runner_cgroup() { printf 'thaw %s\n' "$1" >> "$STUB_DIR/thaws"; }
+    rollover_clear_identity_nonce() { return 0; }
     rollover_pending_identity_matches() { return 0; }
     qm_stub() { [[ "$1 $2" == 'status 9001' ]]; }
     export -f qm_stub
@@ -576,6 +596,68 @@ setup_destroy_candidate() {
     [ "$status" -eq 0 ]
     grep -q '^thaw 9001$' "$STUB_DIR/thaws"
     [ ! -e "$ROLLOVER_PENDING_DIR/9001.pending" ]
+}
+
+@test "owned recovery accepts an absent marker only after a positive guest query" {
+    mkdir -p "$ROLLOVER_PENDING_DIR"
+    printf 'owned|9001|old-a|acme|1|0|nonce-a|/runner\n' > "$ROLLOVER_PENDING_DIR/9001.pending"
+    runner_rollover_marker_state() { printf 'absent\n'; }
+    resume_runner_cgroup() { return 1; }
+    rollover_pending_identity_matches() { return 0; }
+    rollover_clear_identity_nonce() { return 0; }
+    qm_stub() { [[ "$1 $2" == 'status 9001' ]]; }
+    export -f qm_stub
+
+    run recover_rollover_pending
+    [ "$status" -eq 0 ]
+    [ ! -e "$ROLLOVER_PENDING_DIR/9001.pending" ]
+}
+
+@test "preparing recovery clears a nonce when crash happened before guest invocation" {
+    mkdir -p "$ROLLOVER_PENDING_DIR"
+    printf 'preparing|9001|old-a|acme|1|0|nonce-a|\n' > "$ROLLOVER_PENDING_DIR/9001.pending"
+    rollover_pending_identity_matches() { return 0; }
+    runner_rollover_marker_state() { printf 'absent\n'; }
+    rollover_clear_identity_nonce() { printf 'clear %s %s\n' "$1" "$5" >> "$STUB_DIR/recovery"; }
+    resume_runner_cgroup() { printf 'unexpected thaw\n' >> "$STUB_DIR/recovery"; return 1; }
+    qm_stub() { [[ "$1 $2" == 'status 9001' ]]; }
+    export -f qm_stub
+
+    run recover_rollover_pending
+    [ "$status" -eq 0 ]
+    [ ! -e "$ROLLOVER_PENDING_DIR/9001.pending" ]
+    [ "$(cat "$STUB_DIR/recovery")" = 'clear 9001 nonce-a' ]
+}
+
+@test "preparing recovery thaws marker after crash before frozen phase advance" {
+    mkdir -p "$ROLLOVER_PENDING_DIR"
+    printf 'preparing|9001|old-a|acme|1|0|nonce-a|\n' > "$ROLLOVER_PENDING_DIR/9001.pending"
+    rollover_pending_identity_matches() { return 0; }
+    runner_rollover_marker_state() { printf '/runner\n'; }
+    resume_runner_cgroup() { printf 'thaw %s %s\n' "$1" "$2" >> "$STUB_DIR/recovery"; }
+    rollover_clear_identity_nonce() { printf 'clear %s %s\n' "$1" "$5" >> "$STUB_DIR/recovery"; }
+    qm_stub() { [[ "$1 $2" == 'status 9001' ]]; }
+    export -f qm_stub
+
+    run recover_rollover_pending
+    [ "$status" -eq 0 ]
+    [ ! -e "$ROLLOVER_PENDING_DIR/9001.pending" ]
+    [ "$(sed -n '1p' "$STUB_DIR/recovery")" = 'thaw 9001 /runner' ]
+    [ "$(sed -n '2p' "$STUB_DIR/recovery")" = 'clear 9001 nonce-a' ]
+}
+
+@test "preparing recovery retains ownership on guest transport uncertainty" {
+    mkdir -p "$ROLLOVER_PENDING_DIR"
+    printf 'preparing|9001|old-a|acme|1|0|nonce-a|\n' > "$ROLLOVER_PENDING_DIR/9001.pending"
+    rollover_pending_identity_matches() { return 0; }
+    runner_rollover_marker_state() { return 1; }
+    rollover_clear_identity_nonce() { return 0; }
+    qm_stub() { [[ "$1 $2" == 'status 9001' ]]; }
+    export -f qm_stub
+
+    run recover_rollover_pending
+    [ "$status" -eq 0 ]
+    [ -e "$ROLLOVER_PENDING_DIR/9001.pending" ]
 }
 
 @test "pending recovery survives initial destroy failure" {
