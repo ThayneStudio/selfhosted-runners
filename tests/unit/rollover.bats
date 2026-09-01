@@ -240,6 +240,51 @@ setup_destroy_candidate() {
     [ ! -e "$ROLLOVER_PENDING_DIR/9001.pending" ]
 }
 
+@test "BUSY state from one candidate cannot suppress thaw for the next candidate" {
+    qm_stub() {
+        case "$1 $2" in
+            "config 9001") printf 'name: old-a\ntags: runner;gen-1\ncicustom: user=local:snippets/runner-user-data-acme.yaml\n' ;;
+            "config 9002") printf 'name: old-b\ntags: runner;gen-1\ncicustom: user=local:snippets/runner-user-data-acme.yaml\n' ;;
+            "status 9001"|"status 9002") printf 'status: running\n' ;;
+            "set 9001"|"set 9002") return 0 ;;
+            *) return 1 ;;
+        esac
+    }
+    export -f qm_stub
+    rollover_serving_count() { printf '1\n'; }
+    rollover_mark_identity() {
+        ROLLOVER_IDENTITY_NONCE="nonce-$1"
+        ROLLOVER_ORIGINAL_TAGS='runner;gen-1'
+    }
+    rollover_pending_identity_matches() { return 0; }
+    rollover_quiesce_guest() {
+        if [[ "$1" == 9001 ]]; then
+            ROLLOVER_QUIESCE_UNCHANGED=true
+            return 2
+        fi
+        # Deliberately do not reset the flag here: candidate/arm isolation must.
+        ROLLOVER_FROZEN_CGROUP=/runner-b
+        return 0
+    }
+    rollover_wait_offline_idle() { return 1; }
+    rollover_resume_guest() {
+        printf 'resume %s %s\n' "$1" "$ROLLOVER_FROZEN_CGROUP" >> "$STUB_DIR/resumes"
+    }
+    sequential_candidates() {
+        local rc
+        rc=0; rollover_destroy_one old-a 9001 1 acme || rc=$?
+        [[ "$rc" -eq 2 ]] || return 1
+        rc=0; rollover_destroy_one old-b 9002 1 acme || rc=$?
+        [[ "$rc" -eq 2 ]]
+    }
+
+    run sequential_candidates
+    [ "$status" -eq 0 ]
+    [ "$(cat "$STUB_DIR/resumes")" = 'resume 9002 /runner-b' ]
+    [ ! -e "$ROLLOVER_PENDING_DIR/9001.pending" ]
+    [ ! -e "$ROLLOVER_PENDING_DIR/9002.pending" ]
+}
+
 @test "force skips on GitHub API uncertainty" {
     setup_destroy_candidate
     rollover_wait_offline_idle() { return 1; }

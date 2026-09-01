@@ -136,6 +136,8 @@ rollover_destroy_vm() {
 # thaw themselves; success deliberately leaves the guest frozen.
 rollover_quiesce_guest() {
     local vmid="$1" result exitcode out ack
+    ROLLOVER_QUIESCE_UNCHANGED=false
+    ROLLOVER_FROZEN_CGROUP=""
     # shellcheck disable=SC2016  # guest-side program must expand in the guest
     result=$(qm guest exec "$vmid" -- /bin/bash -c '
 set -eu
@@ -189,6 +191,7 @@ echo "FROZEN:${cg}"
     fi
     ack=$(sed -n 's/^FROZEN:\(\/[a-zA-Z0-9_./:@-]*\)$/\1/p' <<< "$out")
     [[ "$ack" =~ ^/[a-zA-Z0-9_./:@-]+$ && "$ack" != / && "$ack" != *'..'* && "$ack" != *$'\n'* ]] || return 1
+    ROLLOVER_QUIESCE_UNCHANGED=false
     ROLLOVER_FROZEN_CGROUP="$ack"
 }
 
@@ -229,6 +232,16 @@ rollover_cleanup_frozen() {
         if [[ "$cleanup_complete" == true && -n "$ROLLOVER_PENDING_FILE" ]]; then rm -f "$ROLLOVER_PENDING_FILE"; fi
     fi
     ROLLOVER_FROZEN_OWNED=false
+    ROLLOVER_FROZEN_COMMITTED=false
+    ROLLOVER_QUIESCE_UNCHANGED=false
+    ROLLOVER_FROZEN_CGROUP=""
+    ROLLOVER_FROZEN_VMID=""
+    ROLLOVER_FROZEN_NAME=""
+    ROLLOVER_FROZEN_ORG=""
+    ROLLOVER_FROZEN_GEN=""
+    ROLLOVER_PENDING_FILE=""
+    ROLLOVER_IDENTITY_NONCE=""
+    ROLLOVER_ORIGINAL_TAGS=""
 }
 
 rollover_arm_cleanup() {
@@ -236,6 +249,7 @@ rollover_arm_cleanup() {
     ROLLOVER_FROZEN_OWNED=true
     ROLLOVER_FROZEN_COMMITTED=false
     ROLLOVER_QUIESCE_UNCHANGED=false
+    ROLLOVER_FROZEN_CGROUP=""
     trap 'rollover_cleanup_frozen' EXIT
     trap 'rollover_cleanup_frozen; exit 130' INT
     trap 'rollover_cleanup_frozen; exit 143' TERM
@@ -252,6 +266,16 @@ rollover_mark_identity() {
 
 rollover_disarm_cleanup() {
     ROLLOVER_FROZEN_OWNED=false
+    ROLLOVER_FROZEN_COMMITTED=false
+    ROLLOVER_QUIESCE_UNCHANGED=false
+    ROLLOVER_FROZEN_CGROUP=""
+    ROLLOVER_FROZEN_VMID=""
+    ROLLOVER_FROZEN_NAME=""
+    ROLLOVER_FROZEN_ORG=""
+    ROLLOVER_FROZEN_GEN=""
+    ROLLOVER_PENDING_FILE=""
+    ROLLOVER_IDENTITY_NONCE=""
+    ROLLOVER_ORIGINAL_TAGS=""
     trap - EXIT INT TERM
 }
 
@@ -288,6 +312,9 @@ rollover_configured_count() {
 rollover_destroy_one() {
     local name="$1" vmid="$2" expected_gen="$3" org="$4"
     local cfg current_name current_org current_gen status serving configured runner_id quiesce_rc wait_rc
+
+    ROLLOVER_QUIESCE_UNCHANGED=false
+    ROLLOVER_FROZEN_CGROUP=""
 
     if pool_is_draining; then
         log_error "rollover: maintenance mode became active — stopping"
