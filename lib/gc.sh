@@ -79,12 +79,25 @@ gc_warn_failure() {
     fi
 }
 
+gc_record_is_legacy_adopted() {
+    local vmid_num
+    [[ "${GEN_ID:-}" == "1" && "${GEN_IMAGE_SHA256:-}" == "unknown" &&
+        "${GEN_TEMPLATE_DIGEST:-}" == "unknown" ]] || return 1
+    gen_is_uint "${GEN_VMID:-}" || return 1
+    vmid_num=$((10#$GEN_VMID))
+    # Adoption alone may keep the old deployment VMID. Every baked candidate
+    # must be inside the generation band, so this positive out-of-band proof
+    # cannot bless an orphan candidate produced by 8298c05.
+    ((vmid_num < TEMPLATE_BAND_MIN || vmid_num > TEMPLATE_BAND_MAX))
+}
+
 gc_record_is_rollback_eligible() {
     [[ "${GEN_WAS_ACTIVE:-}" == "1" ]] && return 0
     [[ "${GEN_WAS_ACTIVE:-}" == "0" ]] && return 1
     # Migration evidence for records written before GEN_WAS_ACTIVE existed.
     # A promotion timestamp is positive proof; a missing field alone is not.
-    [[ -n "${GEN_PROMOTED_AT:-}" ]]
+    [[ -n "${GEN_PROMOTED_AT:-}" ]] && return 0
+    gc_record_is_legacy_adopted
 }
 
 # Re-prove that a VMID still names the generation GC selected. This is called
@@ -121,9 +134,8 @@ gc_verify_destroy_ownership() {
     # Pre-marker generation 1 was adopted from the legacy deployment under
     # this fixed name and deliberately kept that name. Its two unknown
     # provenance values distinguish it from a baked generation record.
-    if [[ -z "${GEN_TEMPLATE_NAME:-}" && "$GEN_ID" == "1" &&
-        "$GEN_IMAGE_SHA256" == "unknown" && "$GEN_TEMPLATE_DIGEST" == "unknown" &&
-        "$name" == "ubuntu-cloud-template" ]]; then
+    if [[ -z "${GEN_TEMPLATE_NAME:-}" ]] && gc_record_is_legacy_adopted &&
+        [[ "$name" == "ubuntu-cloud-template" ]]; then
         expected_name="$name"
     fi
     if [[ "$name" != "$expected_name" ]]; then

@@ -206,20 +206,53 @@ EOF
     ! gen_exists 8901
 }
 
-@test "ownership accepts the fixed legacy adopted template name" {
+@test "a pre-field superseded adopted gen-1 remains the rollback target" {
+    make_gen 9000 1 superseded
+    gen_update 9000 GEN_IMAGE_SHA256=unknown GEN_TEMPLATE_DIGEST=unknown
+    make_gen 8900 2 superseded
+    gen_update 8900 GEN_WAS_ACTIVE=0
+    make_gen 8903 3 active
+    stub_out qm 'status 8900' < /dev/null
+    stub_generation_template 8900 2
+    stub_out qm 'destroy 8900 --purge' < /dev/null
+
+    run --separate-stderr gc_main false
+    [ "$status" -eq 0 ]
+    gen_exists 9000
+    ! gen_exists 8900
+    [[ "$stderr" == *"Retaining newest superseded generation 1 (VMID 9000)"* ]]
+}
+
+@test "an in-band orphan candidate cannot impersonate legacy adoption" {
     make_gen 8900 1 superseded
     gen_update 8900 GEN_IMAGE_SHA256=unknown GEN_TEMPLATE_DIGEST=unknown
+    make_gen 8901 2 superseded
+    gen_update 8901 GEN_WAS_ACTIVE=1
+    make_gen 8903 3 active
     stub_out qm 'status 8900' < /dev/null
-    stub_out qm 'config 8900' <<'EOF'
+    stub_generation_template 8900 1
+    stub_out qm 'destroy 8900 --purge' < /dev/null
+
+    run --separate-stderr gc_main false
+    [ "$status" -eq 0 ]
+    ! gen_exists 8900
+    gen_exists 8901
+}
+
+@test "ownership accepts the fixed legacy adopted template name" {
+    make_gen 9000 1 superseded
+    gen_update 9000 GEN_IMAGE_SHA256=unknown GEN_TEMPLATE_DIGEST=unknown
+    stub_out qm 'status 9000' < /dev/null
+    stub_out qm 'config 9000' <<'EOF'
 name: ubuntu-cloud-template
 template: 1
 EOF
-    stub_out qm 'destroy 8900 --purge' < /dev/null
+    stub_out qm 'destroy 9000 --purge' < /dev/null
 
-    run --separate-stderr gc_destroy_generation 8900 superseded false
+    run --separate-stderr gc_destroy_generation 9000 superseded false
     [ "$status" -eq 0 ]
-    ! gen_exists 8900
-    assert_called qm 'destroy 8900 --purge'
+    ! gen_exists 9000
+    assert_called qm 'destroy 9000 --purge'
 }
 
 @test "dry-run executes ownership preflight and reports the real refusal" {
