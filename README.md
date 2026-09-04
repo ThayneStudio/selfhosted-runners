@@ -128,6 +128,7 @@ After setup, the `runner` command is available globally:
 | `runner stop [options]` | Enter maintenance mode and stop managed runners |
 | `runner list` | List all runner VMs |
 | `runner guard [--dry-run]` | Reap stopped and over-age runner VMs (normally run by timer) |
+| `runner gc [--dry-run]` | Collect drained template generations according to retention policy |
 | `runner upgrade [--dry-run] [--force]` | Bake a candidate if needed and promote it |
 | `runner help` | Show available commands |
 
@@ -531,8 +532,8 @@ path is still read and written, `install.sh` migrates an active drain to the
 persistent path when you upgrade, and `runner start` clears both. A drain set by
 an older release and never migrated is still tmpfs-only, so it does **not**
 survive a reboot -- upgrade first, or re-run `runner stop` after the upgrade.
-On full stops, it also frees orphaned linked-clone child volumes for the current
-template when those volumes no longer have a VM config anywhere in the cluster.
+On full stops, it also frees orphaned linked-clone child volumes for every
+recorded generation when those volumes no longer have a VM config anywhere in the cluster.
 If any child volumes still belong to live VM/template configs, `runner stop`
 fails and tells you to resolve those dependents before deleting the template.
 
@@ -553,6 +554,23 @@ the host-side freeze is the assignment boundary; the REST `busy` field is not
 treated as a lock. Interrupted operations are recovered from
 `/var/lib/github-runners/rollover-pending`, and the watcher may refill a slot
 while it keeps retrying destruction of a deregistered residual by VMID.
+
+## Generation Garbage Collection
+
+`runner maintain` runs generation garbage collection automatically. Preview the
+same decisions without changing records, VMs, or storage with:
+
+```bash
+runner gc --dry-run
+```
+
+GC keeps the newest superseded generation as the rollback target and destroys
+older superseded generations only after their last runner clone is gone. It
+also expires abandoned candidates and retains failed or rejected generations
+for inspection for `FAILED_GEN_RETAIN_DAYS` (default 7). A superseded
+generation blocked longer than `GC_STUCK_WARN_HOURS` (default 12) emits a warn
+notification naming the blocking VMIDs. A destroy or volume-cleanup failure
+leaves the generation record in place so the next run can safely retry.
 
 ## Notifications
 

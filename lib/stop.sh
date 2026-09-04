@@ -2,8 +2,8 @@
 set -euo pipefail
 # Stop the watcher and optionally destroy managed runner VMs.
 
-# shellcheck source=common.sh
-source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/common.sh"
+# shellcheck source=generations.sh
+source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/generations.sh"
 
 require_root "stop"
 load_infra_config
@@ -28,7 +28,10 @@ collect_managed_runners() {
         vm_name=$(echo "$line" | awk '{print $2}')
         status=$(echo "$line" | awk '{print $3}')
 
-        [[ "$vmid" == "$TEMPLATE_ID" ]] && continue
+        # Every generation is a template, not a disposable runner. Checking
+        # the store rather than only TEMPLATE_ID also protects superseded,
+        # candidate, rejected, and failed templates during maintenance.
+        gen_exists "$vmid" && continue
 
         if [[ -n "$vmid_min" ]]; then
             [[ "$vmid" -ge "$vmid_min" && "$vmid" -le "$vmid_max" ]] || continue
@@ -101,7 +104,7 @@ else
     echo "  - destroy 0 managed runner VMs"
 fi
 if [[ "$WATCH_ONLY" != true && -z "$VMID_MIN" ]]; then
-    echo "  - free orphaned linked-clone child volumes for template $TEMPLATE_ID when safe"
+    echo "  - free orphaned linked-clone child volumes for all generations when safe"
 fi
 if [[ -n "$VMID_MIN" ]]; then
     echo "  - limit runner destruction to VMIDs ${VMID_MIN}-${VMID_MAX}"
@@ -176,13 +179,24 @@ if [[ ${#FAILURES[@]} -gt 0 ]]; then
 fi
 
 if [[ -z "$VMID_MIN" ]]; then
-    cleanup_rc=0
-    cleanup_template_orphan_volumes || cleanup_rc=$?
-    if [[ $cleanup_rc -ne 0 ]]; then
-        log_warn "Watcher remains stopped and pool drain remains active. Resolve the template storage issue before resuming."
+    generation_list=$(gen_list) || {
+        log_warn "Watcher remains stopped and pool drain remains active. Could not read generation records."
         exec 202>&-
         exit 1
+    }
+    if [[ -z "$generation_list" ]]; then
+        generation_list="$TEMPLATE_ID"
     fi
+    while read -r generation_vmid; do
+        [[ -n "$generation_vmid" ]] || continue
+        cleanup_rc=0
+        cleanup_template_orphan_volumes "$generation_vmid" || cleanup_rc=$?
+        if [[ $cleanup_rc -ne 0 ]]; then
+            log_warn "Watcher remains stopped and pool drain remains active. Resolve the template storage issue before resuming."
+            exec 202>&-
+            exit 1
+        fi
+    done <<< "$generation_list"
 else
     log_info "Skipping template orphan-volume cleanup because --vmid-range was specified."
 fi

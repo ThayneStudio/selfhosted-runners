@@ -131,6 +131,11 @@ GUARD_DEFER_WARN_RUNS=3
 # hang off RUNNER_STATE_DIR so relocating state relocates them too.
 # shellcheck disable=SC2034  # consumed by bake, detect, promote, maintain
 BAKE_LOCK_FILE="/run/lock/github-runner-bake.lock"
+# Serializes manual and timer-driven garbage collection runs. GC makes several
+# decisions from one generation snapshot; overlapping runs must not both try to
+# destroy and archive the same record.
+# shellcheck disable=SC2034  # consumed by lib/gc.sh
+GC_LOCK_FILE="/run/lock/github-runner-gc.lock"
 # shellcheck disable=SC2034  # consumed by bake, detect, promote, maintain
 PROMOTION_PAUSE_FILE="/run/lock/github-runner-promote.pause"
 IMG_CACHE_DIR="/var/cache/github-runners"
@@ -140,6 +145,9 @@ BAKE_LOG_DIR="/var/log/github-runners"
 FAILED_DIGESTS_FILE="$RUNNER_STATE_DIR/failed-digests"
 # shellcheck disable=SC2034  # consumed by bake, detect, promote, maintain
 DETECT_FAIL_FILE="$RUNNER_STATE_DIR/detect-fail"
+# Consecutive GitHub API failures for the drift alarm (lib/drift.sh).
+# shellcheck disable=SC2034
+DRIFT_FAIL_FILE="$RUNNER_STATE_DIR/drift-fail"
 CLOUD_IMG="noble-server-cloudimg-amd64.img"
 # shellcheck disable=SC2034  # consumed by bake, detect, promote, maintain
 CLOUD_IMG_URL="https://cloud-images.ubuntu.com/noble/current/${CLOUD_IMG}"
@@ -252,6 +260,7 @@ apply_generation_defaults() {
     _generation_uint_or_default TEMPLATE_BAND_MAX 8999
     _generation_uint_or_default GENERATION_RETAIN 1
     _generation_uint_or_default FAILED_GEN_RETAIN_DAYS 7
+    _generation_uint_or_default GC_STUCK_WARN_HOURS 12
     _generation_uint_or_default CANDIDATE_MAX_AGE_DAYS 3
     _generation_bool_or_default REBAKE_ENABLED true
     _generation_uint_or_default REBAKE_MAX_AGE_DAYS 7
@@ -613,14 +622,44 @@ release_clone_slot() {
 # VMID to cross-check origin against a superseded template.
 list_template_base_volids() {
     local vmid="${1:-$TEMPLATE_ID}"
-    qm config "$vmid" 2>/dev/null | awk -F': ' -v storage="$VM_STORAGE:" '
-        $1 ~ /^(ide|sata|scsi|virtio)[0-9]+$/ {
-            split($2, parts, ",")
-            if (index(parts[1], storage "base-") == 1) {
-                print parts[1]
+    local config bases storage_list config_path
+
+    if config=$(qm config "$vmid" 2>/dev/null); then
+        bases=$(awk -F': ' -v storage="$VM_STORAGE:" '
+            $1 ~ /^(ide|sata|scsi|virtio)[0-9]+$/ {
+                split($2, parts, ",")
+                if (index(parts[1], storage "base-") == 1) {
+                    print parts[1]
+                }
             }
-        }
-    '
+        ' <<< "$config")
+        if [[ -n "$bases" ]]; then
+            printf '%s\n' "$bases"
+            return 0
+        fi
+        # The config was read positively. A diskless/non-base config has no
+        # linked-clone ancestry to report; ownership checks decide separately
+        # whether it is a destroyable generation template.
+        return 0
+    fi
+
+    # A config read failure is not proof of absence: quorum, permissions, or
+    # an API fault can all make qm config fail for a live template. Only use
+    # storage recovery when both the cluster config path and qm status say the
+    # VM is absent.
+    config_path=$(vm_config_path "$vmid")
+    if [[ -n "$config_path" ]] || qm status "$vmid" >/dev/null 2>&1; then
+        log_error "Cannot read config for live template VMID $vmid"
+        return 1
+    fi
+
+    # A previous GC attempt may have removed the VM config before failing to
+    # free every residual child. Recover the base name from storage so the next
+    # run can finish instead of stranding the record and volumes forever.
+    storage_list=$(pvesm list "$VM_STORAGE" 2>/dev/null) || return 1
+    awk -v storage="$VM_STORAGE:" -v vmid="$vmid" '
+        $1 ~ ("^" storage "([^/]+/)?base-" vmid "-disk-") { print $1 }
+    ' <<< "$storage_list"
 }
 
 linked_clone_child_vmid() {
@@ -647,13 +686,14 @@ zfs_dataset_from_volid() {
 
 list_template_linked_clone_volids() {
     local template_vmid="${1:-$TEMPLATE_ID}"
-    local storage_list base_volid base_path prefix volid child_name base_dataset dataset origin
+    local storage_list base_list base_volid base_path prefix volid child_name base_dataset dataset origin path
     local -A seen=()
 
     if ! storage_list=$(pvesm list "$VM_STORAGE" 2>/dev/null); then
         log_error "Failed to list storage volumes on $VM_STORAGE"
         return 1
     fi
+    base_list=$(list_template_base_volids "$template_vmid") || return 1
     [[ -n "$storage_list" ]] || return 0
 
     while read -r base_volid; do
@@ -669,44 +709,74 @@ list_template_linked_clone_volids() {
             seen["$volid"]=1
             printf '%s\n' "$volid"
         done <<< "$storage_list"
-    done < <(list_template_base_volids "$template_vmid")
+    done <<< "$base_list"
 
     # ZFS linked clones are sibling zvols, not nested volids. They point at
     # the template base volume snapshot via the ZFS origin property.
     while read -r base_volid; do
         [[ -n "$base_volid" ]] || continue
-        base_dataset=$(zfs_dataset_from_volid "$base_volid") || continue
+        if ! path=$(pvesm path "$base_volid" 2>/dev/null); then
+            log_error "Cannot resolve storage path for template volume $base_volid"
+            return 1
+        fi
+        [[ "$path" == /dev/zvol/* ]] || continue
+        if ! command -v zfs >/dev/null 2>&1; then
+            log_error "Cannot inspect ZFS origin for template volume $base_volid"
+            return 1
+        fi
+        base_dataset="${path#/dev/zvol/}"
+        if ! zfs list -H -o name "$base_dataset" >/dev/null 2>&1; then
+            log_error "Cannot inspect ZFS dataset $base_dataset for template volume $base_volid"
+            return 1
+        fi
 
         while read -r volid _; do
             [[ "$volid" == "$VM_STORAGE:vm-"* ]] || continue
             [[ -n "${seen[$volid]:-}" ]] && continue
 
-            dataset=$(zfs_dataset_from_volid "$volid") || continue
-            origin=$(zfs get -H -o value origin "$dataset" 2>/dev/null || true)
+            if ! path=$(pvesm path "$volid" 2>/dev/null); then
+                log_error "Cannot resolve storage path for possible clone volume $volid"
+                return 1
+            fi
+            [[ "$path" == /dev/zvol/* ]] || continue
+            dataset="${path#/dev/zvol/}"
+            if ! zfs list -H -o name "$dataset" >/dev/null 2>&1; then
+                log_error "Cannot inspect ZFS dataset $dataset for possible clone volume $volid"
+                return 1
+            fi
+            if ! origin=$(zfs get -H -o value origin "$dataset" 2>/dev/null); then
+                log_error "Cannot read ZFS origin for possible clone volume $volid"
+                return 1
+            fi
             [[ "$origin" == "$base_dataset@"* ]] || continue
 
             seen["$volid"]=1
             printf '%s\n' "$volid"
         done <<< "$storage_list"
-    done < <(list_template_base_volids "$template_vmid")
+    done <<< "$base_list"
 }
 
 cleanup_template_orphan_volumes() {
-    local child_vmid config_path volid
+    local template_vmid="${1:-$TEMPLATE_ID}" child_vmid config_path volid
+    shift 2>/dev/null || true
     local -a child_volids=()
     local -a blocked_volids=()
     local -a freed_volids=()
 
-    local child_list
-    if ! child_list=$(list_template_linked_clone_volids); then
-        return 1
-    fi
-    if [[ -n "$child_list" ]]; then
-        mapfile -t child_volids <<< "$child_list"
+    local child_list=""
+    if [[ $# -gt 0 ]]; then
+        child_volids=("$@")
+    else
+        if ! child_list=$(list_template_linked_clone_volids "$template_vmid"); then
+            return 1
+        fi
+        if [[ -n "$child_list" ]]; then
+            mapfile -t child_volids <<< "$child_list"
+        fi
     fi
     [[ ${#child_volids[@]} -gt 0 ]] || return 0
 
-    log_info "Checking ${#child_volids[@]} linked-clone child volume(s) for template $TEMPLATE_ID..."
+    log_info "Checking ${#child_volids[@]} linked-clone child volume(s) for template $template_vmid..."
 
     for volid in "${child_volids[@]}"; do
         child_vmid=$(linked_clone_child_vmid "$volid")
@@ -728,11 +798,11 @@ cleanup_template_orphan_volumes() {
     done
 
     if [[ ${#freed_volids[@]} -gt 0 ]]; then
-        log_info "Freed ${#freed_volids[@]} orphaned linked-clone volume(s) for template $TEMPLATE_ID."
+        log_info "Freed ${#freed_volids[@]} orphaned linked-clone volume(s) for template $template_vmid."
     fi
 
     if [[ ${#blocked_volids[@]} -gt 0 ]]; then
-        log_error "Template $TEMPLATE_ID still has linked-clone child volume(s) with VM configs."
+        log_error "Template $template_vmid still has linked-clone child volume(s) with VM configs."
         log_error "Destroy those VMs/templates before deleting the template."
         return 2
     fi

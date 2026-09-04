@@ -358,13 +358,15 @@ else
     fi
 fi
 
-log_info "[5/5] Installing pool watcher, lifetime guard, and maintain timers..."
+log_info "[5/5] Installing pool watcher, lifetime guard, maintain, and drift timers..."
 cp "$INSTALL_DIR/templates/github-runner-watch.service" "$SYSTEMD_UNIT_DIR/"
 cp "$INSTALL_DIR/templates/github-runner-watch.timer" "$SYSTEMD_UNIT_DIR/"
 cp "$INSTALL_DIR/templates/github-runner-guard.service" "$SYSTEMD_UNIT_DIR/"
 cp "$INSTALL_DIR/templates/github-runner-guard.timer" "$SYSTEMD_UNIT_DIR/"
 cp "$INSTALL_DIR/templates/github-runner-maintain.service" "$SYSTEMD_UNIT_DIR/"
 cp "$INSTALL_DIR/templates/github-runner-maintain.timer" "$SYSTEMD_UNIT_DIR/"
+cp "$INSTALL_DIR/templates/github-runner-drift.service" "$SYSTEMD_UNIT_DIR/"
+cp "$INSTALL_DIR/templates/github-runner-drift.timer" "$SYSTEMD_UNIT_DIR/"
 cp "$INSTALL_DIR/templates/github-runner-upgrade.service" "$SYSTEMD_UNIT_DIR/"
 mkdir -p "$LOGROTATE_DIR"
 cp "$INSTALL_DIR/templates/github-runners.logrotate" "$LOGROTATE_DIR/github-runners"
@@ -372,12 +374,15 @@ systemctl daemon-reload
 systemctl enable --now github-runner-watch.timer 2>/dev/null || true
 systemctl enable --now github-runner-guard.timer 2>/dev/null || true
 systemctl enable --now github-runner-maintain.timer 2>/dev/null || true
+systemctl enable --now github-runner-drift.timer 2>/dev/null || true
 log_info "Pool watcher timer installed (30s interval)"
 log_info "Lifetime guard timer installed (5m interval, ${MAX_VM_LIFETIME_HOURS}h VM ceiling, ${STOPPED_REAP_MINUTES}m stopped reap)"
 log_info "Maintain timer installed (daily 02:30, rebake inside REBAKE_WINDOW)"
+log_info "Drift timer installed (every 6h; reports only, never bakes)"
 echo "  Preview what it would destroy:  runner guard --dry-run"
 echo "  Turn it off:                    systemctl disable --now github-runner-guard.timer"
 echo "  Disable daily maintain:         systemctl disable --now github-runner-maintain.timer"
+echo "  Disable drift alarm:            systemctl disable --now github-runner-drift.timer"
 echo "  Bake and promote a new generation:"
 echo "    runner upgrade --dry-run"
 echo "    runner upgrade"

@@ -98,11 +98,14 @@ if [[ -f /etc/github-runners.conf ]]; then
         cp "$INSTALL_DIR/templates/github-runner-guard.timer" "$SYSTEMD_UNIT_DIR/"
         cp "$INSTALL_DIR/templates/github-runner-maintain.service" "$SYSTEMD_UNIT_DIR/"
         cp "$INSTALL_DIR/templates/github-runner-maintain.timer" "$SYSTEMD_UNIT_DIR/"
+        cp "$INSTALL_DIR/templates/github-runner-drift.service" "$SYSTEMD_UNIT_DIR/"
+        cp "$INSTALL_DIR/templates/github-runner-drift.timer" "$SYSTEMD_UNIT_DIR/"
         cp "$INSTALL_DIR/templates/github-runner-upgrade.service" "$SYSTEMD_UNIT_DIR/"
         systemctl daemon-reload
         # New in this release, so an existing install has it disabled.
         systemctl enable --now github-runner-guard.timer 2>/dev/null || true
         systemctl enable --now github-runner-maintain.timer 2>/dev/null || true
+        systemctl enable --now github-runner-drift.timer 2>/dev/null || true
     fi
     # Backfill settings added after this host was set up. The guard falls back
     # to the same defaults, but an operator can only tune what they can see.
@@ -131,6 +134,8 @@ if [[ -f /etc/github-runners.conf ]]; then
     echo "    Preview: runner guard --dry-run   Disable: systemctl disable --now github-runner-guard.timer"
     echo "  Daily maintain timer: 02:30 (detect + rebake inside REBAKE_WINDOW)."
     echo "    Disable: systemctl disable --now github-runner-maintain.timer"
+    echo "  Drift alarm: every 6h (runner version vs the 30-day upstream window)."
+    echo "    Disable: systemctl disable --now github-runner-drift.timer"
     echo "  To bake a new generation and start cloning it (does not destroy TEMPLATE_ID):"
     echo "    runner upgrade --dry-run"
     echo "    runner upgrade"
