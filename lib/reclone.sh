@@ -27,7 +27,8 @@ if pool_is_draining; then
 fi
 
 # Read name and org from the stopped VM's config (still exists, just stopped)
-NAME=$(qm config "$VMID" 2>/dev/null | awk '/^name:/{print $2}') || true
+VM_CFG=$(qm config "$VMID" 2>/dev/null) || true
+NAME=$(awk '/^name:/{print $2}' <<< "$VM_CFG") || true
 ORG=$(get_vm_org "$VMID") || true
 
 if [[ -z "$NAME" || -z "$ORG" || "$ORG" == "unknown" ]]; then
@@ -38,6 +39,9 @@ fi
 # Per-runner lock prevents races with watch.sh cloning the same slot
 exec 200>"${RUNNER_SLOT_LOCK_PREFIX}-${NAME}.lock"
 flock -n 200 || { log_info "reclone: another process is handling $NAME"; exit 0; }
+
+exec 209>"${ROLLOVER_ORG_LOCK_PREFIX}-${ORG}.lock"
+flock 209
 
 if pool_is_draining; then
     logger -t github-runner "reclone: pool drain active for $NAME, skipping"

@@ -78,6 +78,9 @@ GUARD_STATE_DIR="/run/github-runner-guard"
 # clone_runner holds a shared lock for its full lifecycle; runner stop takes an
 # exclusive lock so it can wait until all clone activity is quiesced.
 POOL_ACTIVITY_LOCK_FILE="/run/lock/github-runner-pool.lock"
+# Linearizes maintenance entry with rollover's destructive transaction without
+# putting network waits under the clone/promotion pool lock.
+POOL_DRAIN_COORD_LOCK_FILE="/run/lock/github-runner-drain-coord.lock"
 # Global lock serializing VMID allocation across reclone.sh/watch.sh/create.sh.
 # Scope is narrow: "pick free VMID -> reserve it". A per-VMID reservation
 # stays held until qm clone returns, so clone tasks can run with bounded
@@ -93,6 +96,10 @@ CLONE_SLOT_LOCK_PREFIX="/run/lock/runner-clone-slot"
 # guard would stop coordinating with the clone path and destroy mid-clone.
 # shellcheck disable=SC2034  # consumed by sourcing scripts (reclone.sh, watch.sh, guard.sh)
 RUNNER_SLOT_LOCK_PREFIX="/run/lock/runner"
+# Serializes capacity decisions and destruction within one organization.
+# shellcheck disable=SC2034  # consumed by lib/rollover.sh
+ROLLOVER_ORG_LOCK_PREFIX="/run/lock/github-runner-rollover-org"
+ROLLOVER_PENDING_DIR="$RUNNER_STATE_DIR/rollover-pending"
 # Per-slot reclone bookkeeping (last-processed timestamp, rapid-death streak).
 # shellcheck disable=SC2034  # consumed by sourcing scripts (lib/reclone.sh)
 RECLONE_STATE_PREFIX="/run/runner"
@@ -386,6 +393,8 @@ ensure_state_dir() {
 }
 
 enable_pool_drain() {
+    exec 212>"$POOL_DRAIN_COORD_LOCK_FILE"
+    flock -x 212
     local state_dir
     state_dir="$(dirname "$POOL_DRAIN_FILE")"
 
@@ -395,10 +404,12 @@ enable_pool_drain() {
     # drained when the watcher is still cloning.
     if ! ensure_state_dir "$state_dir"; then
         log_error "Failed to create $state_dir — maintenance mode NOT entered"
+        exec 212>&-
         return 1
     fi
     if ! : > "$POOL_DRAIN_FILE"; then
         log_error "Failed to write $POOL_DRAIN_FILE — maintenance mode NOT entered"
+        exec 212>&-
         return 1
     fi
 
@@ -409,6 +420,7 @@ enable_pool_drain() {
     if ! : > "$POOL_DRAIN_FILE_LEGACY" 2>/dev/null; then
         log_warn "Could not write $POOL_DRAIN_FILE_LEGACY — a rollback to an older release would not see this drain"
     fi
+    exec 212>&-
 }
 
 disable_pool_drain() {
@@ -834,31 +846,268 @@ cleanup_runner_orphan_volumes() {
     exec 202>&-
 }
 
-deregister_runner() {
-    local org="$1" runner_name="$2"
+github_runner_credentials() {
+    local org="$1"
+    validate_org_name "$org" || return 1
     local org_file="$ORG_CONFIG_DIR/${org}.conf"
-    [[ -f "$org_file" ]] || return 0
+    [[ -f "$org_file" ]] || return 1
 
     local pat="" github_org=""
     # shellcheck source=/dev/null  # per-org config, written by add-org at runtime
-    pat=$(source "$org_file" && echo "$GITHUB_PAT") || return 0
+    pat=$(source "$org_file" && echo "$GITHUB_PAT") || return 1
     # shellcheck source=/dev/null  # per-org config, written by add-org at runtime
-    github_org=$(source "$org_file" && echo "$GITHUB_ORG") || return 0
-    [[ -n "$pat" && -n "$github_org" ]] || return 0
+    github_org=$(source "$org_file" && echo "$GITHUB_ORG") || return 1
+    [[ -n "$pat" && -n "$github_org" ]] || return 1
+    printf '%s\t%s\n' "$github_org" "$pat"
+}
 
-    local runner_id
-    runner_id=$(curl -sf --max-time 10 \
-        -H "Accept: application/vnd.github.v3+json" \
-        --config <(printf 'header = "Authorization: token %s"\n' "$pat") \
-        "https://api.github.com/orgs/${github_org}/actions/runners?per_page=100" 2>/dev/null \
-        | jq --arg name "$runner_name" -r '.runners[] | select(.name == $name) | .id' 2>/dev/null) || return 0
+# Print "<runner-id>\t<busy>\t<status>" after a complete paginated scan.
+# Missing/duplicate names, malformed fields, API errors, and a changing
+# total_count all fail closed.
+# Emit name, id, busy, status for one stable paginated organization snapshot.
+github_runners_snapshot() {
+    local org="$1" credentials github_org pat json total="" page=1 pages page_total
+    credentials=$(github_runner_credentials "$org") || return 1
+    IFS=$'\t' read -r github_org pat <<< "$credentials"
 
-    [[ -n "$runner_id" && "$runner_id" != "null" && "$runner_id" =~ ^[0-9]+$ ]] || return 0
+    while :; do
+        json=$(curl -sf --max-time 10 \
+            -H "Accept: application/vnd.github.v3+json" \
+            --config <(printf 'header = "Authorization: token %s"\n' "$pat") \
+            "https://api.github.com/orgs/${github_org}/actions/runners?per_page=100&page=${page}" 2>/dev/null) || return 1
+        page_total=$(jq -er 'select((.total_count | type) == "number" and (.runners | type) == "array") | .total_count' <<< "$json" 2>/dev/null) || return 1
+        [[ "$page_total" =~ ^[0-9]+$ ]] || return 1
+        if [[ -z "$total" ]]; then
+            total="$page_total"
+            pages=$(((total + 99) / 100))
+            (( pages > 0 )) || pages=1
+        elif [[ "$page_total" != "$total" ]]; then
+            return 1
+        fi
+        jq -e 'all(.runners[]; (.name | type) == "string" and (.id | type) == "number"
+            and (.busy | type) == "boolean" and (.status == "online" or .status == "offline"))' \
+            <<< "$json" >/dev/null 2>&1 || return 1
+        jq -r '
+            .runners[]
+            | "\(.name)\t\(.id)\t\(.busy)\t\(.status)"
+        ' <<< "$json" 2>/dev/null || return 1
+        (( page >= pages )) && break
+        page=$((page + 1))
+    done
+}
+
+github_runner_lookup_details() {
+    local org="$1" runner_name="$2" snapshot matches
+    snapshot=$(github_runners_snapshot "$org") || return 1
+    matches=$(awk -F '\t' -v n="$runner_name" '$1 == n {print $2 "\t" $3 "\t" $4}' <<< "$snapshot")
+
+    [[ "$matches" =~ ^[0-9]+$'\t'(true|false)$'\t'(online|offline)$ ]] || return 1
+    printf '%s\n' "$matches"
+}
+
+resume_runner_cgroup() {
+    local vmid="$1" expected="${2:-}" result exitcode out ack
+    if [[ -n "$expected" ]]; then
+        [[ "$expected" =~ ^/[a-zA-Z0-9_./:@-]+$ && "$expected" != / && "$expected" != *'..'* && "$expected" != *$'\n'* ]] || return 1
+    fi
+    # shellcheck disable=SC2016  # guest-side program expands in the guest
+    result=$(qm guest exec "$vmid" -- /bin/bash -c '
+set -eu
+cgroup_root=${RUNNER_CGROUP_ROOT:-/sys/fs/cgroup}
+proc_root=${RUNNER_PROC_ROOT:-/proc}
+marker=${RUNNER_ROLLOVER_MARKER:-/run/github-runner-rollover-cgroup}
+expected=${1:-}
+pids=$(pgrep -x Runner.Listener || true)
+[ "$(printf "%s\n" "$pids" | sed "/^$/d" | wc -l)" -eq 1 ]
+pid=$pids
+lines=$(grep "^0::" "${proc_root}/${pid}/cgroup" || true)
+[ "$(printf "%s\n" "$lines" | sed "/^$/d" | wc -l)" -eq 1 ]
+cg=${lines#0::}
+case "$cg" in /|*[!a-zA-Z0-9_./:@-]*|*..*) exit 1;; /*) ;; *) exit 1;; esac
+[ -r "$marker" ]
+saved=$(cat "$marker")
+[ "$saved" = "$cg" ]
+[ -z "$expected" ] || [ "$expected" = "$cg" ]
+[ -w "${cgroup_root}${cg}/cgroup.freeze" ]
+echo 0 > "${cgroup_root}${cg}/cgroup.freeze"
+grep -q "^0$" "${cgroup_root}${cg}/cgroup.freeze"
+rm -f "$marker"
+echo "THAWED:${cg}"
+' rollover-thaw "$expected" 2>/dev/null) || return 1
+    exitcode=$(jq -er '.exitcode | select(type == "number")' <<< "$result" 2>/dev/null) || return 1
+    out=$(jq -er '.["out-data"] | select(type == "string")' <<< "$result" 2>/dev/null) || return 1
+    [[ "$exitcode" -eq 0 ]] || return 1
+    ack=$(sed -n 's/^THAWED:\(\/[a-zA-Z0-9_./:@-]*\)$/\1/p' <<< "$out")
+    [[ "$ack" =~ ^/[a-zA-Z0-9_./:@-]+$ && "$ack" != / && "$ack" != *'..'* && "$ack" != *$'\n'* ]] || return 1
+    [[ -z "$expected" || "$ack" == "$expected" ]]
+}
+
+runner_rollover_marker_state() {
+    local vmid="$1" result exitcode out state
+    # shellcheck disable=SC2016  # guest-side program expands in the guest
+    result=$(qm guest exec "$vmid" -- /bin/bash -c '
+set -eu
+marker=${RUNNER_ROLLOVER_MARKER:-/run/github-runner-rollover-cgroup}
+if [ ! -e "$marker" ]; then echo MARKER_ABSENT; exit 0; fi
+[ -f "$marker" ] && [ -r "$marker" ]
+saved=$(cat "$marker")
+case "$saved" in /|*[!a-zA-Z0-9_./:@-]*|*..*) exit 1;; /*) ;; *) exit 1;; esac
+echo "MARKER:${saved}"
+' 2>/dev/null) || return 1
+    exitcode=$(jq -er '.exitcode | select(type == "number")' <<< "$result" 2>/dev/null) || return 1
+    out=$(jq -er '.["out-data"] | select(type == "string")' <<< "$result" 2>/dev/null) || return 1
+    [[ "$exitcode" -eq 0 ]] || return 1
+    if [[ "$out" == MARKER_ABSENT || "$out" == $'MARKER_ABSENT\n' || "$out" == $'MARKER_ABSENT\r\n' ]]; then
+        printf 'absent\n'
+        return 0
+    fi
+    state=$(sed -n 's/^MARKER:\(\/[a-zA-Z0-9_./:@-]*\)$/\1/p' <<< "$out")
+    [[ "$state" =~ ^/[a-zA-Z0-9_./:@-]+$ && "$state" != / && "$state" != *'..'* && "$state" != *$'\n'* ]] || return 1
+    printf '%s\n' "$state"
+}
+
+rollover_clear_identity_nonce() {
+    local vmid="$1" name="$2" org="$3" gen="$4" nonce="$5" cfg tags tag new=""
+    rollover_pending_identity_matches "$vmid" "$name" "$org" "$gen" "$nonce" || return 1
+    cfg=$(qm config "$vmid" 2>/dev/null </dev/null) || return 1
+    tags=$(awk -F ': ' '/^tags:/{print $2; exit}' <<< "$cfg")
+    tags=${tags//;/,}
+    while IFS= read -r tag; do
+        tag=${tag#"${tag%%[![:space:]]*}"}; tag=${tag%"${tag##*[![:space:]]}"}
+        [[ -n "$tag" && "$tag" != "rollover-${nonce}" ]] || continue
+        new+="${new:+;}${tag}"
+    done < <(tr ',' '\n' <<< "$tags")
+    qm set "$vmid" --tags "$new" >/dev/null 2>&1
+}
+
+rollover_pending_identity_matches() {
+    local vmid="$1" expected_name="$2" expected_org="$3" expected_gen="$4" nonce="$5"
+    local cfg name org tags
+    cfg=$(qm config "$vmid" 2>/dev/null </dev/null) || return 1
+    name=$(awk '/^name:/{print $2; exit}' <<< "$cfg")
+    if [[ "$cfg" =~ runner-user-data-([^.]+)\.yaml ]]; then
+        org="${BASH_REMATCH[1]}"
+    else
+        return 1
+    fi
+    tags=$(awk -F ': ' '/^tags:/{print $2; exit}' <<< "$cfg")
+    [[ "$name" == "$expected_name" && "$org" == "$expected_org" ]] || return 1
+    [[ ",$tags," =~ [,\;]gen-${expected_gen}([,\;]|$) ]] || return 1
+    [[ ",$tags," =~ [,\;]rollover-${nonce}([,\;]|$) ]]
+}
+
+rollover_vmid_absent_verified() {
+    local vmid="$1" all
+    all=$(qm list 2>/dev/null) || return 1
+    ! awk -v v="$vmid" 'NR > 1 && $1 == v {found=1} END {exit !found}' <<< "$all"
+}
+
+# Retry committed rollover destroys. A committed VM is already frozen and
+# deregistered; leaving the record makes recovery durable across process/host
+# crashes. Failure is non-fatal so the watcher can still refill its slot.
+recover_rollover_pending() {
+    local file phase vmid name org gen runner_id nonce cgroup status marker_state recovered
+    [[ -d "$ROLLOVER_PENDING_DIR" ]] || return 0
+    for file in "$ROLLOVER_PENDING_DIR"/*.pending; do
+        [[ -f "$file" ]] || continue
+        IFS='|' read -r phase vmid name org gen runner_id nonce cgroup < "$file" || continue
+        [[ "$vmid" =~ ^[0-9]+$ ]] || continue
+        validate_org_name "$org" || continue
+        exec 209>"${ROLLOVER_ORG_LOCK_PREFIX}-${org}.lock"
+        flock -n 209 || { exec 209>&-; continue; }
+        if ! qm status "$vmid" >/dev/null 2>&1; then
+            rollover_vmid_absent_verified "$vmid" && rm -f "$file"
+            exec 209>&-
+            continue
+        fi
+        if ! rollover_pending_identity_matches "$vmid" "$name" "$org" "$gen" "$nonce"; then
+            log_warn "[rollover-recovery] stale identity for pending VMID $vmid — leaving it untouched"
+            exec 209>&-
+            continue
+        fi
+        if [[ "$phase" == preparing ]]; then
+            marker_state=$(runner_rollover_marker_state "$vmid") || { exec 209>&-; continue; }
+            recovered=false
+            if [[ "$marker_state" == absent ]]; then
+                recovered=true
+            elif resume_runner_cgroup "$vmid" "$marker_state"; then
+                recovered=true
+            fi
+            if [[ "$recovered" == true ]] && rollover_clear_identity_nonce "$vmid" "$name" "$org" "$gen" "$nonce"; then
+                rm -f "$file"
+            fi
+            exec 209>&-
+            continue
+        fi
+        if [[ "$phase" == owned ]]; then
+            marker_state=$(runner_rollover_marker_state "$vmid") || { exec 209>&-; continue; }
+            recovered=false
+            if [[ "$marker_state" == absent ]]; then
+                recovered=true
+            elif [[ "$marker_state" == "$cgroup" ]] && resume_runner_cgroup "$vmid" "$cgroup"; then
+                recovered=true
+            fi
+            if [[ "$recovered" == true ]] \
+                && rollover_clear_identity_nonce "$vmid" "$name" "$org" "$gen" "$nonce"; then
+                rm -f "$file"
+            fi
+            exec 209>&-
+            continue
+        fi
+        [[ "$phase" == committed ]] || { exec 209>&-; continue; }
+        github_runner_deregister_id "$org" "$runner_id" >/dev/null 2>&1 || true
+        status=$(qm status "$vmid" 2>/dev/null | awk '{print $2}') || { exec 209>&-; continue; }
+        if [[ "$status" == running ]]; then
+            qm stop "$vmid" --timeout 30 200>&- 209>&- >/dev/null 2>&1 || { exec 209>&-; continue; }
+            status=$(qm status "$vmid" 2>/dev/null | awk '{print $2}') || { exec 209>&-; continue; }
+            [[ "$status" == stopped ]] || { exec 209>&-; continue; }
+        fi
+        rollover_pending_identity_matches "$vmid" "$name" "$org" "$gen" "$nonce" || { exec 209>&-; continue; }
+        if qm destroy "$vmid" --purge 200>&- 209>&- 2>/dev/null; then
+            rm -f "${SNIPPETS_DIR}/runner-${vmid}-meta.yaml" "${SNIPPETS_DIR}/runner-${vmid}-vendor.yaml" "$file"
+            log_info "[rollover-recovery] destroyed pending VMID $vmid ($name)"
+        fi
+        exec 209>&-
+    done
+}
+
+rollover_vmid_is_committed_pending() {
+    local vmid="$1" file phase record_vmid name org gen _runner_id nonce _cgroup
+    file="$ROLLOVER_PENDING_DIR/${vmid}.pending"
+    [[ "$vmid" =~ ^[0-9]+$ && -f "$file" ]] || return 1
+    IFS='|' read -r phase record_vmid name org gen _runner_id nonce _cgroup < "$file" || return 1
+    [[ "$phase" == committed && "$record_vmid" == "$vmid" ]] || return 1
+    rollover_pending_identity_matches "$vmid" "$name" "$org" "$gen" "$nonce"
+}
+
+# Compatibility wrapper for callers that only need id/busy.
+github_runner_lookup() {
+    local details id busy _status
+    details=$(github_runner_lookup_details "$1" "$2") || return 1
+    IFS=$'\t' read -r id busy _status <<< "$details"
+    printf '%s\t%s\n' "$id" "$busy"
+}
+
+# Strict counterpart to deregister_runner for callers whose next operation is
+# destructive.  Failure is meaningful: they must leave the VM alone.
+github_runner_deregister_id() {
+    local org="$1" runner_id="$2" credentials github_org pat
+    [[ "$runner_id" =~ ^[0-9]+$ ]] || return 1
+    credentials=$(github_runner_credentials "$org") || return 1
+    IFS=$'\t' read -r github_org pat <<< "$credentials"
 
     curl -sf --max-time 10 -X DELETE \
         -H "Accept: application/vnd.github.v3+json" \
         --config <(printf 'header = "Authorization: token %s"\n' "$pat") \
-        "https://api.github.com/orgs/${github_org}/actions/runners/${runner_id}" 2>/dev/null || return 0
+        "https://api.github.com/orgs/${github_org}/actions/runners/${runner_id}" 2>/dev/null
+}
+
+deregister_runner() {
+    local org="$1" runner_name="$2" runner id _busy
+
+    runner=$(github_runner_lookup "$org" "$runner_name") || return 0
+    IFS=$'\t' read -r id _busy <<< "$runner"
+    github_runner_deregister_id "$org" "$id" || return 0
 }
 
 # --- Shared runner VM helpers ---
