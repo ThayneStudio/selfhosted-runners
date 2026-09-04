@@ -90,3 +90,31 @@ EOF
     run list_template_linked_clone_volids
     [ "$status" -eq 1 ]
 }
+
+@test "an unreadable config for a live recorded template fails closed" {
+    stub_status qm 'config 9000' 2
+    stub_out qm 'status 9000' <<'EOF'
+status: stopped
+EOF
+    stub_out pvesm 'list local-zfs' <<'EOF'
+Volid Format
+local-zfs:base-9000-disk-0 raw
+EOF
+
+    run list_template_base_volids 9000
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"Cannot read config for live template VMID 9000"* ]]
+}
+
+@test "a positively absent config recovers residual base volumes from storage" {
+    stub_status qm 'config 9000' 2
+    stub_status qm 'status 9000' 2
+    stub_out pvesm 'list local-zfs' <<'EOF'
+Volid Format
+local-zfs:base-9000-disk-0 raw
+EOF
+
+    run list_template_base_volids 9000
+    [ "$status" -eq 0 ]
+    [ "$output" = "local-zfs:base-9000-disk-0" ]
+}

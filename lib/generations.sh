@@ -43,6 +43,9 @@ GENERATION_FIELDS=(
     GEN_CREATED_AT
     GEN_PROMOTED_AT
     GEN_SUPERSEDED_AT
+    GEN_TERMINAL_AT
+    GEN_WAS_ACTIVE
+    GEN_TEMPLATE_NAME
     GEN_FAILED_REASON
     GEN_BAKE_LOG
     GEN_CANARY_RUN_URL
@@ -293,19 +296,25 @@ gen_validate_field() {
                 return 1
             fi
             ;;
+        GEN_WAS_ACTIVE)
+            if [[ -n "$value" && "$value" != "0" && "$value" != "1" ]]; then
+                log_error "$key must be 0 or 1, got: '$value'"
+                return 1
+            fi
+            ;;
         GEN_STATE)
             if ! gen_is_state "$value"; then
                 log_error "Invalid generation state: '$value'"
                 return 1
             fi
             ;;
-        GEN_CREATED_AT|GEN_PROMOTED_AT|GEN_SUPERSEDED_AT)
+        GEN_CREATED_AT|GEN_PROMOTED_AT|GEN_SUPERSEDED_AT|GEN_TERMINAL_AT)
             if [[ -n "$value" && ! "$value" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]; then
                 log_error "$key must be UTC ISO 8601 (YYYY-MM-DDTHH:MM:SSZ), got: '$value'"
                 return 1
             fi
             ;;
-        GEN_RUNNER_VERSION|GEN_IMAGE_SHA256|GEN_TEMPLATE_DIGEST|GEN_BAKE_LOG|GEN_CANARY_RUN_URL)
+        GEN_RUNNER_VERSION|GEN_IMAGE_SHA256|GEN_TEMPLATE_DIGEST|GEN_TEMPLATE_NAME|GEN_BAKE_LOG|GEN_CANARY_RUN_URL)
             if [[ "$value" =~ [[:space:]] ]]; then
                 log_error "$key is a single token and must not contain whitespace: '$value'"
                 return 1
@@ -478,6 +487,7 @@ gen_create() (
 
     [[ -n "$GEN_STATE" ]] || GEN_STATE=baking
     [[ -n "$GEN_CREATED_AT" ]] || GEN_CREATED_AT=$(gen_now)
+    [[ "$GEN_STATE" != "active" || -n "$GEN_WAS_ACTIVE" ]] || GEN_WAS_ACTIVE=1
     GEN_VMID="$vmid"
 
     rc=0
@@ -733,7 +743,7 @@ gen_transition_allowed() {
 # code 4 exists so a promotion can tell a policy refusal from a failed write
 # before it rewrites TEMPLATE_ID (spec 7.3).
 gen_transition() (
-    local vmid="${1:-}" to="${2:-}" reason="${3:-}" now rc=0
+    local vmid="${1:-}" to="${2:-}" reason="${3:-}" now rc=0 from
 
     if ! gen_is_state "$to"; then
         log_error "Invalid generation state: ${to:-<empty>}"
@@ -750,24 +760,31 @@ gen_transition() (
         return 1
     fi
 
+    from="$GEN_STATE"
     now=$(gen_now)
     case "$to" in
         active)
             # Overwritten on a re-promotion, so reconciliation's "newest
             # GEN_PROMOTED_AT wins" tiebreak reflects the latest promotion.
             GEN_PROMOTED_AT="$now"
+            GEN_WAS_ACTIVE=1
             ;;
         superseded)
             GEN_SUPERSEDED_AT="$now"
+            # Candidate cleanup shares the superseded state with former active
+            # templates, but it must never become the rollback generation.
+            [[ "$from" == "candidate" ]] && GEN_WAS_ACTIVE=0 || GEN_WAS_ACTIVE=1
             ;;
         rejected)
             # A rejected generation left active service, so it carries the same
             # timestamp a demotion would, and the operator's reason reuses
             # GEN_FAILED_REASON rather than adding a field (spec 4.3).
             GEN_SUPERSEDED_AT="$now"
+            GEN_TERMINAL_AT="$now"
             [[ -z "$reason" ]] || GEN_FAILED_REASON=$(gen_clip_reason "$reason")
             ;;
         failed)
+            GEN_TERMINAL_AT="$now"
             # Only when given: a bare retry must not erase a detail an earlier
             # gen_update recorded.
             [[ -z "$reason" ]] || GEN_FAILED_REASON=$(gen_clip_reason "$reason")
@@ -825,6 +842,17 @@ gen_archive_append() {
 
     # umask so the log is created root-only without a chmod race on every append.
     ( umask 077; printf '%s\n' "$line" >> "$GENERATION_ARCHIVE_LOG" )
+}
+
+# True when the archive already contains this generation event. GC uses this
+# after storage destruction so a retry following a failed record removal does
+# not append a second destroyed line.
+gen_archive_has_event() {
+    local gen_id="${1:-}" vmid="${2:-}" event="${3:-}"
+    gen_is_uint "$gen_id" && gen_is_uint "$vmid" && [[ -n "$event" ]] || return 1
+    [[ -f "$GENERATION_ARCHIVE_LOG" ]] || return 1
+    grep -qE "(^| )gen=0*${gen_id} vmid=0*${vmid} event=$(gen_archive_token "$event")( |$)" \
+        "$GENERATION_ARCHIVE_LOG"
 }
 
 # ---------------------------------------------------------------------------
@@ -929,19 +957,20 @@ generation_cfg_is_runner() {
     return 1
 }
 
-# Number of live VM configs attributed to generation <gen_id>.
-# Usage: generation_refcount <gen_id>
-# stdout: integer count. Exit 1 if the generation is unknown or inventory
-# cannot be read — never report 0 on a failed listing.
+# Live VMIDs attributed to generation <gen_id>. This is the authoritative
+# inventory used by both the numeric refcount and GC's blocker report, so those
+# two safety decisions cannot drift apart.
+# Usage: generation_ref_vmids <gen_id>
+# stdout: one VMID per line. Exit 1 if inventory cannot be read.
 # Proven by "generation_refcount counts VMs tagged gen-N and excludes the
 # template", "generation_refcount counts an untagged clone via ZFS origin",
 # "untagged clone with no origin is attributed to the active generation with
 # a warning", and "tag vs origin disagreement warns and counts the VM for
 # both generations".
-generation_refcount() (
+generation_ref_vmids() (
     local target="${1:-}" rec_vmid rec_id child_list child
     local all_vms vmid vm_name status cfg tags_line tag_id orig_id active_id=""
-    local count=0 attributed
+    local attributed
     local -A template_vmids=() origin_gen=()
 
     if ! gen_is_uint "$target"; then
@@ -985,7 +1014,14 @@ generation_refcount() (
         [[ "$vmid" =~ ^[0-9]+$ ]] || continue
         [[ -z "${template_vmids[$vmid]:-}" ]] || continue
 
-        cfg=$(qm config "$vmid" 2>/dev/null </dev/null) || cfg=""
+        if ! cfg=$(qm config "$vmid" 2>/dev/null </dev/null); then
+            log_error "Failed to read config for listed VMID $vmid during generation refcount"
+            return 1
+        fi
+        if [[ -z "$cfg" ]]; then
+            log_error "Empty config for listed VMID $vmid during generation refcount"
+            return 1
+        fi
         if [[ -n "$cfg" ]] && grep -q '^template:[[:space:]]*1' <<< "$cfg"; then
             continue
         fi
@@ -1013,11 +1049,24 @@ generation_refcount() (
             fi
         fi
 
-        [[ "$attributed" -eq 1 ]] && count=$((count + 1))
+        [[ "$attributed" -eq 1 ]] && printf '%s\n' "$vmid"
     done <<< "$all_vms"
-
-    printf '%s\n' "$count"
+    return 0
 )
+
+# Number of live VM configs attributed to generation <gen_id>.
+# Usage: generation_refcount <gen_id>
+# stdout: integer count. Exit 1 if the generation is unknown or inventory
+# cannot be read — never report 0 on a failed listing.
+generation_refcount() {
+    local target="${1:-}" blockers count=0 vmid
+    blockers=$(generation_ref_vmids "$target") || return 1
+    while read -r vmid; do
+        [[ -n "$vmid" ]] || continue
+        count=$((count + 1))
+    done <<< "$blockers"
+    printf '%s\n' "$count"
+}
 
 # ---------------------------------------------------------------------------
 # Adoption (spec 8)
@@ -1120,7 +1169,7 @@ adopt_probe_runner_version() {
 adopt_deployed_template() {
     local min_vmid probed=unknown
     local all_vms vmid vm_name status cfg tags_line new_tags rec list resume=0
-    local linked
+    local linked template_cfg template_name
     local -a tag_vmids=() tag_values=() recs=()
     local -A traced=()
 
@@ -1157,9 +1206,15 @@ adopt_deployed_template() {
         return 0
     fi
 
-    if ! qm config "$TEMPLATE_ID" 2>/dev/null </dev/null | grep -q '^template:[[:space:]]*1'; then
+    if ! template_cfg=$(qm config "$TEMPLATE_ID" 2>/dev/null </dev/null) ||
+        ! grep -q '^template:[[:space:]]*1' <<< "$template_cfg"; then
         log_warn "TEMPLATE_ID $TEMPLATE_ID is not a Proxmox template — nothing to adopt"
         return 0
+    fi
+    template_name=$(awk '/^name:/{print $2; exit}' <<< "$template_cfg")
+    if [[ -z "$template_name" && "$resume" -eq 0 ]]; then
+        log_error "TEMPLATE_ID $TEMPLATE_ID has no verifiable Proxmox name — refusing adoption"
+        return 1
     fi
 
     validate_band_inventory || return 1
@@ -1221,8 +1276,20 @@ adopt_deployed_template() {
             GEN_STATE=active \
             GEN_RUNNER_VERSION="${probed:-unknown}" \
             GEN_IMAGE_SHA256=unknown \
-            GEN_TEMPLATE_DIGEST=unknown || return 1
+            GEN_TEMPLATE_DIGEST=unknown \
+            "GEN_TEMPLATE_NAME=$template_name" || return 1
         log_info "Adopted template VMID $TEMPLATE_ID as generation 1"
+    else
+        gen_read "$TEMPLATE_ID" || return 1
+        if [[ "$GEN_STATE" == "active" && -z "$GEN_TEMPLATE_NAME" && -n "$template_name" ]]; then
+            # Migration of a pre-marker adopted record is safe here: both the
+            # active pointer and live template config still identify this VM.
+            gen_update "$TEMPLATE_ID" "GEN_TEMPLATE_NAME=$template_name" || return 1
+        fi
+        gen_read "$TEMPLATE_ID" || return 1
+        if [[ "$GEN_STATE" == "active" && -z "$GEN_WAS_ACTIVE" ]]; then
+            gen_update "$TEMPLATE_ID" GEN_WAS_ACTIVE=1 || return 1
+        fi
     fi
 
     if [[ ${#tag_vmids[@]} -gt 0 ]]; then

@@ -94,6 +94,9 @@ EOF
     run --separate-stderr generation_refcount 9
     [ "$status" -eq 0 ]
     [ "$output" = "1" ]
+    run --separate-stderr generation_ref_vmids 5
+    [ "$status" -eq 0 ]
+    [ "$output" = "9001" ]
     refute_called qm 'destroy *'
     refute_called pvesm 'free *'
 }
@@ -311,6 +314,49 @@ EOF
     run --separate-stderr generation_refcount 5
     [ "$status" -ne 0 ]
     [ "$output" != "0" ]
+}
+
+@test "generation_refcount fails closed when a listed VM config is unreadable" {
+    create_two_gens
+    stub_template_configs
+    stub_empty_origin
+    qm_list "      9001 acme-1               running    8192              30.00 1234"
+    stub_status qm 'config 9001' 2
+
+    run --separate-stderr generation_refcount 5
+    [ "$status" -ne 0 ]
+    [[ "$stderr" == *"Failed to read config for listed VMID 9001"* ]]
+}
+
+@test "generation_refcount fails closed when a possible ZFS clone origin is unreadable" {
+    create_two_gens
+    stub_template_configs
+    qm_list "      9001 acme-1               running    8192              30.00 1234"
+    stub_out qm 'config 9001' <<'EOF'
+name: acme-1
+tags: runner;gen-5
+EOF
+    stub_out pvesm 'list *' <<'EOF'
+Volid Format
+local-zfs:base-8900-disk-0 raw
+local-zfs:base-8901-disk-0 raw
+local-zfs:vm-9001-disk-0 raw
+EOF
+    stub_out pvesm 'path local-zfs:base-8900-disk-0' <<'EOF'
+/dev/zvol/tank/base-8900-disk-0
+EOF
+    stub_out pvesm 'path local-zfs:base-8901-disk-0' <<'EOF'
+/dev/zvol/tank/base-8901-disk-0
+EOF
+    stub_out pvesm 'path local-zfs:vm-9001-disk-0' <<'EOF'
+/dev/zvol/tank/vm-9001-disk-0
+EOF
+    stub_out zfs 'list -H -o name *' < /dev/null
+    stub_status zfs 'get -H -o value origin tank/vm-9001-disk-0' 2
+
+    run --separate-stderr generation_refcount 5
+    [ "$status" -ne 0 ]
+    [[ "$stderr" == *"Cannot read ZFS origin"* ]]
 }
 
 @test "generation_refcount fails for an unknown generation id" {
