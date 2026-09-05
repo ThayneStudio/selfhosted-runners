@@ -14,6 +14,30 @@ setup() {
         printf '%s\n' "$*" >> "$STUB_DIR/notify.log"
     }
     gen_now() { printf '%s\n' '2026-08-25T00:00:00Z'; }
+
+    # status.sh now sources drift.sh for the upstream fetch, which shells out
+    # to jq (same stub as tests/unit/drift.bats -- kept in sync with it).
+    jq_stub() {
+        local json val=""
+        json=$(cat)
+        if [[ "$*" == *tag_name* ]]; then
+            if [[ "$json" =~ \"tag_name\"[[:space:]]*:[[:space:]]*\"([^\"]*)\" ]]; then
+                val="${BASH_REMATCH[1]}"
+            fi
+            printf '%s\n' "$val"
+            return 0
+        fi
+        if [[ "$*" == *published_at* ]]; then
+            if [[ "$json" =~ \"published_at\"[[:space:]]*:[[:space:]]*\"([^\"]*)\" ]]; then
+                val="${BASH_REMATCH[1]}"
+            fi
+            printf '%s\n' "$val"
+            return 0
+        fi
+        printf 'jq stub: unhandled args: %s\n' "$*" >&2
+        return 1
+    }
+    export -f jq_stub
 }
 
 host_fingerprint() {
@@ -189,6 +213,22 @@ EOF
     [ "$status" -eq 0 ]
     [[ "$output" == *"on latest"* ]]
     [[ "$output" == *"Drain: inactive"* ]]
+    [[ "$output" == *"Status: OK"* ]]
+}
+
+@test "status_main normalizes a v-prefixed active version against upstream" {
+    make_active v2.336.0
+    write_org_pool acme 2
+    stub_adopted_fleet
+    stub_disk
+    stub_upstream 2.336.0 2026-08-01T00:00:00Z
+
+    run --separate-stderr status_main
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"active:    2.336.0"* ]]
+    [[ "$output" == *"upstream:  2.336.0"* ]]
+    [[ "$output" == *"on latest"* ]]
+    [[ "$output" != *"[drift]"* ]]
     [[ "$output" == *"Status: OK"* ]]
 }
 

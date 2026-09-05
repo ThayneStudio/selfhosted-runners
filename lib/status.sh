@@ -23,32 +23,22 @@ RUNNER_STATUS_LOADED=1
 source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/common.sh"
 # shellcheck source=generations.sh
 source "$LIB_DIR/generations.sh"
-
-# GitHub refuses jobs on a runner more than this many days after a newer
-# actions/runner release. Display-only here; the drift alarm owns notify.
-STATUS_DRIFT_WINDOW_DAYS=30
-
-_status_fetch_upstream() {
-    local json tag="" published=""
-    _STATUS_UPSTREAM_VERSION=""
-    _STATUS_UPSTREAM_PUBLISHED=""
-    json=$(curl -sf --retry 3 --max-time 20 \
-        https://api.github.com/repos/actions/runner/releases/latest) || return 1
-    if [[ "$json" =~ \"tag_name\"[[:space:]]*:[[:space:]]*\"([^\"]*)\" ]]; then
-        tag="${BASH_REMATCH[1]}"
-        tag="${tag#v}"
-    fi
-    if [[ "$json" =~ \"published_at\"[[:space:]]*:[[:space:]]*\"([^\"]*)\" ]]; then
-        published="${BASH_REMATCH[1]}"
-    fi
-    [[ -n "$tag" ]] || return 1
-    _STATUS_UPSTREAM_VERSION="$tag"
-    _STATUS_UPSTREAM_PUBLISHED="$published"
-    return 0
-}
+#
+# Reuses drift.sh's own upstream fetch/normalize/window math rather than a
+# second, weaker implementation: drift_fetch_latest validates the tag with
+# jq + drift_version_is_valid and fails closed on a malformed release, and
+# drift_remaining_days/drift_normalize_version are what "runner drift"
+# itself compares against. Two independent parsers of the same GitHub
+# response could disagree on a malformed or v-prefixed value -- reusing one
+# means `status` and `drift` can never contradict each other on this. This
+# is source-only: drift.sh's load guard and its `BASH_SOURCE == $0` main
+# guard mean sourcing it here runs no notify/webhook code and touches no
+# failure-state file; jq is already a hard install dependency (setup.sh).
+# shellcheck source=drift.sh
+source "$LIB_DIR/drift.sh"
 
 status_print_version() {
-    local active_ver="" days_left age
+    local active_ver="" upstream="" published="" latest="" days_left
 
     echo "Runner version:"
     if [[ -z "${TEMPLATE_ID:-}" ]] || ! gen_exists "$TEMPLATE_ID"; then
@@ -58,27 +48,27 @@ status_print_version() {
         return 0
     fi
     gen_read "$TEMPLATE_ID" || return 1
-    active_ver="${GEN_RUNNER_VERSION:-unknown}"
+    active_ver=$(drift_normalize_version "${GEN_RUNNER_VERSION:-unknown}")
     [[ -n "$active_ver" ]] || active_ver="unknown"
     echo "  active:    $active_ver"
 
-    if ! _status_fetch_upstream; then
+    if ! latest=$(drift_fetch_latest); then
         echo "  upstream:  unknown"
         echo "  window:    unknown"
         STATUS_ATTENTION=1
         return 0
     fi
-    echo "  upstream:  $_STATUS_UPSTREAM_VERSION"
+    upstream="${latest%%$'\t'*}"
+    published="${latest#*$'\t'}"
+    echo "  upstream:  $upstream"
 
-    if [[ "$active_ver" == "$_STATUS_UPSTREAM_VERSION" ]]; then
+    if [[ "$active_ver" == "$upstream" ]]; then
         echo "  window:    n/a (on latest)"
         return 0
     fi
 
     STATUS_ATTENTION=1
-    if [[ -n "${_STATUS_UPSTREAM_PUBLISHED:-}" ]] && \
-        age=$(gen_age_days "$_STATUS_UPSTREAM_PUBLISHED"); then
-        days_left=$(( STATUS_DRIFT_WINDOW_DAYS - age ))
+    if days_left=$(drift_remaining_days "$published"); then
         if (( days_left < 0 )); then
             echo "  window:    overdue by $(( -days_left ))d (30-day)  [drift]"
         else
