@@ -34,7 +34,11 @@ list_runners() {
         org=$(get_vm_org "$vmid")
         [[ "$org" != "unknown" ]] || continue
 
-        gen=$(get_vm_generation "$vmid")
+        # get_vm_generation (lib/common.sh) fails on an untagged VM -- the
+        # common case before adoption/generations tagging runs -- so this must
+        # be guarded the same way generations.sh guards it, or an untagged
+        # runner would abort `runner list` under set -e.
+        gen=$(get_vm_generation "$vmid" || true)
         [[ -n "$gen" ]] || gen="-"
 
         printf "%-8s %-25s %-15s %-10s %-8s\n" "$vmid" "$name" "$org" "$status" "$gen"

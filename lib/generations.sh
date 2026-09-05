@@ -642,83 +642,12 @@ gen_vmid_for_id() (
 )
 
 # ---------------------------------------------------------------------------
-# Clone refcount (spec 5) — conservative tag-based count
-#
-# GC is out of scope. This does not walk ZFS origin, does not invent a
-# destroy path, and does not write. Untagged runner VMs (get_vm_org !=
-# unknown) are attributed to the active generation when one is known, and
-# always logged at warn — conservative, since it can only inflate the
-# active generation's count.
+# Generation table display (spec 13 / issue #16) — backs the read-only
+# `runner generations` CLI. Clone counts are NOT recomputed here: they come
+# from generation_refcount (Clone attribution, spec 5, defined further below),
+# which already cross-checks tags against ZFS/nested origin. Duplicating that
+# scan here would let this table's counts drift from GC's and rollover's.
 # ---------------------------------------------------------------------------
-
-# Fills _GEN_REFCOUNTS[gen_id] and _GEN_UNTAGGED. Warns once when any
-# runner VM has no gen-* tag. Never writes.
-_generation_refcount_scan() {
-    unset _GEN_REFCOUNTS
-    declare -gA _GEN_REFCOUNTS
-    _GEN_REFCOUNTS=()
-    _GEN_UNTAGGED=()
-
-    local active_id="" vmid line org gid
-    local -A exclude=()
-
-    if [[ -n "${TEMPLATE_ID:-}" ]] && gen_exists "$TEMPLATE_ID"; then
-        active_id=$(
-            gen_read "$TEMPLATE_ID" || exit 1
-            printf '%s' "$GEN_ID"
-        ) || return 1
-    fi
-
-    [[ -n "${TEMPLATE_ID:-}" ]] && exclude["$TEMPLATE_ID"]=1
-    while read -r vmid; do
-        [[ -n "$vmid" ]] || continue
-        exclude["$vmid"]=1
-    done < <(gen_list)
-
-    while read -r line; do
-        [[ -z "$line" ]] && continue
-        vmid=$(awk '{print $1}' <<< "$line")
-        [[ "$vmid" =~ ^[0-9]+$ ]] || continue
-        [[ -n "${exclude[$vmid]:-}" ]] && continue
-
-        if qm config "$vmid" 2>/dev/null | grep -q '^template:[[:space:]]*1'; then
-            continue
-        fi
-
-        gid=$(get_vm_generation "$vmid")
-        org=$(get_vm_org "$vmid")
-
-        if [[ -n "$gid" ]]; then
-            _GEN_REFCOUNTS["$gid"]=$(( ${_GEN_REFCOUNTS[$gid]:-0} + 1 ))
-            continue
-        fi
-        if [[ "$org" != "unknown" ]]; then
-            _GEN_UNTAGGED+=("$vmid")
-            if [[ -n "$active_id" ]]; then
-                _GEN_REFCOUNTS["$active_id"]=$(( ${_GEN_REFCOUNTS[$active_id]:-0} + 1 ))
-            fi
-        fi
-    done < <(qm list 2>/dev/null | tail -n +2 || true)
-
-    if [[ ${#_GEN_UNTAGGED[@]} -gt 0 ]]; then
-        log_warn "runner VM(s) missing gen-* tag: ${_GEN_UNTAGGED[*]}"
-    fi
-    return 0
-}
-
-# Number of non-template VMs attributed to <gen_id> by tag (or, for
-# untagged runners, to the active generation). stdout is a non-negative
-# integer. Proven by "generation_refcount counts tagged clones and excludes
-# the template VMID".
-generation_refcount() {
-    local target="${1:-}"
-    if ! gen_is_uint "$target"; then
-        log_error "Invalid generation id: ${target:-<empty>}"
-        return 1
-    fi
-    _generation_refcount_scan || return 1
-    printf '%s\n' "${_GEN_REFCOUNTS[$target]:-0}"
-}
 
 # Human disk usage for a generation VMID, from pvesm Size (bytes). "-" when
 # storage is unknown or the list fails — display, not a hard error.
@@ -763,8 +692,6 @@ generations_print_table() {
         return 0
     fi
 
-    _generation_refcount_scan || return 1
-
     printf "%-4s %-8s %-12s %-12s %-6s %-6s %-8s\n" \
         "ID" "VMID" "STATE" "RUNNER" "AGE" "CLONES" "DISK"
     printf "%-4s %-8s %-12s %-12s %-6s %-6s %-8s\n" \
@@ -781,7 +708,7 @@ generations_print_table() {
         if [[ -n "${GEN_CREATED_AT:-}" ]] && d=$(gen_age_days "$GEN_CREATED_AT"); then
             age="${d}d"
         fi
-        clones="${_GEN_REFCOUNTS[$id]:-0}"
+        clones=$(generation_refcount "$id") || return 1
         disk=$(generation_disk_usage "$vmid")
         printf "%-4s %-8s %-12s %-12s %-6s %-6s %-8s\n" \
             "$id" "$vmid" "$state" "$version" "$age" "$clones" "$disk"

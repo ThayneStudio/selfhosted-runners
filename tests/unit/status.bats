@@ -46,10 +46,20 @@ stub_upstream() {
 EOF
 }
 
+# generation_refcount (spec 5, #17) traces ZFS/nested origin for every live
+# generation record's own base volid, not just the disk-usage lookup this
+# helper is named for -- so `pvesm path` needs a rule too, or the untagged-
+# origin scan in generation_ref_vmids fails closed with "Cannot resolve
+# storage path". A plain non-zvol path is enough: it makes the ZFS-clone
+# branch in list_template_linked_clone_volids a no-op, same as
+# stub_empty_origin in tests/unit/generation_refcount.bats.
 stub_disk() {
     stub_out pvesm 'list local-zfs' <<'EOF'
 Volid                                          Format  Type              Size VMID
 local-zfs:base-9000-disk-0                     raw     images     32212254720 9000
+EOF
+    stub_out pvesm 'path *' <<'EOF'
+/dev/dm-3
 EOF
 }
 
