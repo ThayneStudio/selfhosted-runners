@@ -52,6 +52,10 @@ INSTALL_DIR="${INSTALL_DIR:-/opt/selfhosted-runners}"
 # production always uses the default.
 RUNNER_STATE_DIR="${RUNNER_STATE_DIR:-/var/lib/github-runners}"
 GENERATIONS_DIR="${GENERATIONS_DIR:-$RUNNER_STATE_DIR/generations}"
+# Optional last-sent notification line, written by notify if it ever records one.
+# status reads this; it never creates it.
+# shellcheck disable=SC2034  # consumed by lib/status.sh
+LAST_NOTIFY_FILE="$RUNNER_STATE_DIR/last-notify"
 # One mode for everything under RUNNER_STATE_DIR. `install -d -m` re-applies the
 # mode to an existing directory, so two callers disagreeing about it would flip
 # the permissions depending on which ran last.

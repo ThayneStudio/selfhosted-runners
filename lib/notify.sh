@@ -120,6 +120,28 @@ _notify_rank() {
     esac
 }
 
+# Best-effort record of the most recent notification actually sent (passed
+# severity filtering, webhook configured), for `runner status` to display.
+# Overwrites rather than appends: LAST_NOTIFY_FILE holds only the latest line,
+# matching how status.sh reads it back as a single display line.
+#
+# LAST_NOTIFY_FILE (lib/common.sh) is unset when this file is sourced
+# standalone (tests/unit/notify.bats does exactly that) — silently skip
+# rather than write somewhere unintended. Uses plain mkdir/redirect, not
+# ensure_state_dir/gen_write_file_atomic from common.sh/generations.sh,
+# because this file must keep working when neither is loaded. Never fails
+# the caller: every failure here is swallowed, same as the rest of notify.sh.
+_notify_record_last() {
+    local severity="${1-}" event="${2-}" message="${3-}"
+    [[ -n "${LAST_NOTIFY_FILE:-}" ]] || return 0
+    local now
+    now=$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null) || return 0
+    mkdir -p -- "$(dirname -- "$LAST_NOTIFY_FILE")" 2>/dev/null || return 0
+    printf '%s %s %s %s\n' "$now" "$severity" "$event" "$message" \
+        > "$LAST_NOTIFY_FILE" 2>/dev/null || true
+    return 0
+}
+
 # Notification problems go where the platform's other failures go, redacted.
 # reclone.sh runs detached from the Proxmox task with its stderr discarded, so
 # journald is the only place its notification failures can be read back.
@@ -288,6 +310,11 @@ _notify_dispatch() {
     event=$(redact_secrets "$event")
     message=$(redact_secrets "$message")
     detail=$(redact_secrets "$detail")
+
+    # Record before the delivery attempt, not after: this is "the last
+    # notification we sent", independent of whether the webhook itself
+    # answered. Uses the already-redacted values -- never the raw ones.
+    _notify_record_last "$severity" "$event" "$message"
 
     body=$(_notify_body "$severity" "$event" "$host" "[$host] $message" "$detail") || {
         _notify_log "notify: could not build a payload for '$event'"

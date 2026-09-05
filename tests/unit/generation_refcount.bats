@@ -3,6 +3,10 @@
 # tag or origin (spec 5). Untagged clones with no origin go to the active
 # generation. write_infra_config still defaults MIN_VMID=500, which overlaps
 # the generation band, so tests set 9001.
+#
+# generation_disk_usage (spec 13 / issue #16) reports per-generation storage
+# use for the `runner generations` CLI. It has no tag/origin logic of its
+# own, so its tests below stub only pvesm list.
 
 load test_helper
 bats_require_minimum_version 1.5.0
@@ -416,4 +420,207 @@ EOF
     run --separate-stderr generation_refcount 5
     [ "$status" -eq 0 ]
     [ "$output" = "0" ]
+}
+
+# ---------------------------------------------------------------------------
+# The tests below are carried over from the original issue-16 branch, which
+# was written against a simpler, tag-only, non-origin-aware generation_refcount
+# (predating #17's ZFS/nested-origin cross-check above). They exercise a
+# different single/two-generation fixture shape (TEMPLATE_ID 9000) than
+# create_two_gens above; kept for that distinct coverage, adapted to the
+# current implementation:
+#   - each now stubs pvesm (stub_empty_origin) since generation_ref_vmids
+#     always attempts origin tracing, even when every VM is already tagged;
+#   - the untagged-attribution warning text changed from "missing gen-*" to
+#     "untagged ... no resolvable origin" (see generation_ref_vmids).
+# ---------------------------------------------------------------------------
+
+make_active() {
+    TEMPLATE_ID=9000
+    gen_store_init
+    gen_create 9000 \
+        GEN_ID=1 \
+        GEN_STATE=active \
+        GEN_RUNNER_VERSION=2.334.0 \
+        GEN_TEMPLATE_DIGEST=abc \
+        GEN_IMAGE_SHA256=abc \
+        GEN_CREATED_AT=2026-08-22T00:00:00Z
+}
+
+@test "generation_refcount counts tagged clones and excludes the template VMID" {
+    make_active
+    stub_empty_origin
+    stub_out qm 'list' <<'EOF'
+      VMID NAME                 STATUS     MEM(MB)    BOOTDISK(GB) PID
+      9000 ubuntu-cloud-template stopped   8192              30.00 0
+      9001 runner-1             running    8192              30.00 1234
+      9002 runner-2             running    8192              30.00 1235
+EOF
+    stub_out qm 'config 9000' <<'EOF'
+name: ubuntu-cloud-template
+template: 1
+tags: runner;gen-1
+EOF
+    stub_out qm 'config 9001' <<'EOF'
+name: runner-1
+cicustom: user=local:snippets/runner-user-data-acme.yaml
+tags: runner;gen-1
+EOF
+    stub_out qm 'config 9002' <<'EOF'
+name: runner-2
+cicustom: user=local:snippets/runner-user-data-acme.yaml
+tags: runner;gen-1
+EOF
+
+    run --separate-stderr generation_refcount 1
+    [ "$status" -eq 0 ]
+    [ "$output" = "2" ]
+    refute_called qm 'set *'
+    refute_called qm 'clone *'
+    refute_called qm 'destroy *'
+}
+
+@test "generation_refcount attributes untagged runners to the active generation and warns" {
+    make_active
+    stub_empty_origin
+    stub_out qm 'list' <<'EOF'
+      VMID NAME                 STATUS     MEM(MB)    BOOTDISK(GB) PID
+      9000 ubuntu-cloud-template stopped   8192              30.00 0
+      9001 runner-1             running    8192              30.00 1234
+EOF
+    stub_out qm 'config 9000' <<'EOF'
+name: ubuntu-cloud-template
+template: 1
+tags: runner;gen-1
+EOF
+    stub_out qm 'config 9001' <<'EOF'
+name: runner-1
+cicustom: user=local:snippets/runner-user-data-acme.yaml
+EOF
+
+    run --separate-stderr generation_refcount 1
+    [ "$status" -eq 0 ]
+    [ "$output" = "1" ]
+    [[ "$stderr" == *"untagged"* ]]
+    [[ "$stderr" == *"9001"* ]]
+}
+
+@test "generation_refcount does not attribute untagged runners to a superseded generation" {
+    TEMPLATE_ID=9000
+    gen_store_init
+    gen_create 8900 \
+        GEN_ID=1 \
+        GEN_STATE=superseded \
+        GEN_RUNNER_VERSION=2.333.0 \
+        GEN_TEMPLATE_DIGEST=old \
+        GEN_IMAGE_SHA256=abc \
+        GEN_CREATED_AT=2026-08-01T00:00:00Z
+    gen_create 9000 \
+        GEN_ID=2 \
+        GEN_STATE=active \
+        GEN_RUNNER_VERSION=2.334.0 \
+        GEN_TEMPLATE_DIGEST=new \
+        GEN_IMAGE_SHA256=def \
+        GEN_CREATED_AT=2026-08-22T00:00:00Z
+    stub_empty_origin
+
+    stub_out qm 'list' <<'EOF'
+      VMID NAME                 STATUS     MEM(MB)    BOOTDISK(GB) PID
+      8900 github-runner-gen-1  stopped    8192              30.00 0
+      9000 ubuntu-cloud-template stopped   8192              30.00 0
+      9001 runner-1             running    8192              30.00 1234
+EOF
+    stub_out qm 'config 8900' <<'EOF'
+name: github-runner-gen-1
+template: 1
+tags: runner;gen-1
+EOF
+    stub_out qm 'config 9000' <<'EOF'
+name: ubuntu-cloud-template
+template: 1
+tags: runner;gen-2
+EOF
+    stub_out qm 'config 9001' <<'EOF'
+name: runner-1
+cicustom: user=local:snippets/runner-user-data-acme.yaml
+EOF
+
+    run --separate-stderr generation_refcount 1
+    [ "$status" -eq 0 ]
+    [ "$output" = "0" ]
+
+    run --separate-stderr generation_refcount 2
+    [ "$status" -eq 0 ]
+    [ "$output" = "1" ]
+}
+
+@test "generation_refcount ignores untagged non-runner VMs" {
+    make_active
+    stub_empty_origin
+    stub_out qm 'list' <<'EOF'
+      VMID NAME                 STATUS     MEM(MB)    BOOTDISK(GB) PID
+      9000 ubuntu-cloud-template stopped   8192              30.00 0
+      777  other                running    8192              30.00 9
+EOF
+    stub_out qm 'config 9000' <<'EOF'
+name: ubuntu-cloud-template
+template: 1
+tags: runner;gen-1
+EOF
+    stub_out qm 'config 777' <<'EOF'
+name: other
+EOF
+
+    run --separate-stderr generation_refcount 1
+    [ "$status" -eq 0 ]
+    [ "$output" = "0" ]
+    [[ "$stderr" != *"untagged"* ]]
+}
+
+# The original (pre-#17) generation_refcount silently reported 0 for an id
+# with no matching record at all. The current implementation resolves the id
+# via gen_vmid_for_id first and fails closed when it does not exist (see
+# "generation_refcount fails for an unknown generation id" above) -- an
+# unknown id is now always a hard error, matching "never report 0 on a failed
+# listing". The `runner generations` CLI itself does not regress: an empty
+# store short-circuits in generations_print_table (gen_list is empty) before
+# generation_refcount is ever called, so "no generation records" still
+# degrades to "(no generations)" rather than an error.
+@test "generation_refcount fails closed when the store has no generation records at all" {
+    stub_out qm 'list' <<'EOF'
+      VMID NAME                 STATUS     MEM(MB)    BOOTDISK(GB) PID
+      9001 runner-1             running    8192              30.00 1234
+EOF
+    stub_out qm 'config 9001' <<'EOF'
+name: runner-1
+cicustom: user=local:snippets/runner-user-data-acme.yaml
+EOF
+
+    run --separate-stderr generation_refcount 1
+    [ "$status" -ne 0 ]
+}
+
+@test "generation_refcount refuses a non-numeric id" {
+    run --separate-stderr generation_refcount abc
+    [ "$status" -eq 1 ]
+}
+
+@test "generation_disk_usage reports pvesm Size as GiB" {
+    stub_out pvesm 'list local-zfs' <<'EOF'
+Volid                                          Format  Type              Size VMID
+local-zfs:base-9000-disk-0                     raw     images     32212254720 9000
+local-zfs:vm-9001-disk-0                       raw     images     32212254720 9001
+EOF
+
+    run generation_disk_usage 9000
+    [ "$status" -eq 0 ]
+    [ "$output" = "30G" ]
+}
+
+@test "generation_disk_usage is dash when pvesm list fails" {
+    stub_status pvesm 'list local-zfs' 1
+
+    run generation_disk_usage 9000
+    [ "$status" -eq 0 ]
+    [ "$output" = "-" ]
 }

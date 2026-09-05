@@ -3,10 +3,12 @@
 # monotonic id counter that numbers them, the lifecycle state machine, and the
 # append-only archive log.
 #
-# This is the data layer, plus adoption (spec 8) and clone attribution
-# (spec 5). Record access, the state machine, the archive log, and generation
-# VMID allocation never talk to the hypervisor. adopt_deployed_template and
-# generation_refcount inventory the live fleet; they never destroy.
+# This is the data layer, plus adoption (spec 8), clone attribution (spec 5),
+# and the read-only `runner generations` CLI. Record access, the state
+# machine, the archive log, and generation VMID allocation never talk to the
+# hypervisor. adopt_deployed_template and generation_refcount inventory the
+# live fleet; they never destroy. generations_main (the CLI) never writes
+# config, VMs, or generation records either.
 #
 # Two rules hold everywhere below, because GEN_ID is the identity that clone
 # attribution (spec 5), promotion, rollback and GC all key off:
@@ -23,6 +25,11 @@
 # unused-variable and lost-in-a-subshell heuristics do not apply here.
 # shellcheck disable=SC2034,SC2030,SC2031
 set -euo pipefail
+
+if [[ -n "${RUNNER_GENERATIONS_LOADED:-}" ]]; then
+    return 0
+fi
+RUNNER_GENERATIONS_LOADED=1
 
 source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/common.sh"
 
@@ -92,6 +99,33 @@ gen_is_field() {
 
 gen_now() {
     date -u +%Y-%m-%dT%H:%M:%SZ
+}
+
+# UTC ISO-8601 (YYYY-MM-DDTHH:MM:SSZ, optional fractional seconds) to epoch.
+# BSD date has no -d; python3 is on pve, Ubuntu CI, and macOS test hosts.
+# Proven by "gen_age_days is 10 for a stamp 10 days before gen_now".
+gen_iso_to_epoch() {
+    local ts="${1:-}"
+    [[ -n "$ts" ]] || return 1
+    python3 -c '
+import sys, datetime
+s = sys.argv[1].strip()
+if s.endswith("Z"):
+    s = s[:-1]
+if "." in s:
+    s = s.split(".", 1)[0]
+print(int(datetime.datetime.strptime(s, "%Y-%m-%dT%H:%M:%S").replace(tzinfo=datetime.timezone.utc).timestamp()))
+' "$ts"
+}
+
+# Integer days since <iso8601> UTC, using gen_now as "now".
+gen_age_days() {
+    local ts="${1:-}" now epoch_then epoch_now
+    [[ -n "$ts" ]] || return 1
+    now=$(gen_now)
+    epoch_now=$(gen_iso_to_epoch "$now") || return 1
+    epoch_then=$(gen_iso_to_epoch "$ts") || return 1
+    printf '%s\n' $(( (epoch_now - epoch_then) / 86400 ))
 }
 
 # ---------------------------------------------------------------------------
@@ -606,6 +640,99 @@ gen_vmid_for_id() (
     log_error "No generation with id $target"
     return 1
 )
+
+# ---------------------------------------------------------------------------
+# Generation table display (spec 13 / issue #16) — backs the read-only
+# `runner generations` CLI. Clone counts are NOT recomputed here: they come
+# from generation_refcount (Clone attribution, spec 5, defined further below),
+# which already cross-checks tags against ZFS/nested origin. Duplicating that
+# scan here would let this table's counts drift from GC's and rollover's.
+# ---------------------------------------------------------------------------
+
+# Human disk usage for a generation VMID, from pvesm Size (bytes). "-" when
+# storage is unknown or the list fails — display, not a hard error.
+generation_disk_usage() {
+    local vmid="${1:-}" total=0 size list=""
+    if [[ ! "$vmid" =~ ^[0-9]+$ ]]; then
+        printf '%s\n' '-'
+        return 0
+    fi
+    if [[ -z "${VM_STORAGE:-}" ]]; then
+        printf '%s\n' '-'
+        return 0
+    fi
+    # Capture first: a failing pvesm under pipefail must not abort display.
+    list=$(pvesm list "$VM_STORAGE" 2>/dev/null) || list=""
+    while read -r size; do
+        [[ "$size" =~ ^[0-9]+$ ]] || continue
+        total=$((total + size))
+    done < <(printf '%s\n' "$list" | awk -v vmid="$vmid" '
+        NR > 1 && $NF == vmid && $(NF-1) ~ /^[0-9]+$/ { print $(NF-1) }
+    ')
+    if (( total >= 1073741824 )); then
+        printf '%dG\n' $(( total / 1073741824 ))
+    elif (( total >= 1048576 )); then
+        printf '%dM\n' $(( total / 1048576 ))
+    elif (( total > 0 )); then
+        printf '%dB\n' "$total"
+    else
+        printf '%s\n' '-'
+    fi
+}
+
+# Table of live generations. Empty store prints "(no generations)" and
+# succeeds. Never writes. Proven by "generations_main degrades with no records".
+#
+# generation_refcount fails closed on any unreadable VM config, qm list
+# failure, or unresolvable ZFS origin -- correct for its GC/rollover callers,
+# which must never under-count before destroying. A display has no destroy
+# path to protect and every reason to keep going: a VM the guard/watch timer
+# destroyed between `qm list` and `qm config` is a routine race on a live
+# host, not a reason to truncate the rest of this report. So a refcount
+# failure here degrades to "?" (and sets STATUS_ATTENTION when the caller is
+# status_main) rather than aborting the table. This is the only place that
+# contract is loosened; generation_refcount itself is untouched.
+generations_print_table() {
+    local vmid id state version age clones disk d
+    local list
+
+    list=$(gen_list) || return 1
+    if [[ -z "$list" ]]; then
+        echo "(no generations)"
+        return 0
+    fi
+
+    printf "%-4s %-8s %-12s %-12s %-6s %-6s %-8s\n" \
+        "ID" "VMID" "STATE" "RUNNER" "AGE" "CLONES" "DISK"
+    printf "%-4s %-8s %-12s %-12s %-6s %-6s %-8s\n" \
+        "--" "----" "-----" "------" "---" "------" "----"
+
+    while read -r vmid; do
+        [[ -n "$vmid" ]] || continue
+        gen_read "$vmid" || return 1
+        id="${GEN_ID:-?}"
+        state="${GEN_STATE:-?}"
+        version="${GEN_RUNNER_VERSION:-unknown}"
+        [[ -n "$version" ]] || version="unknown"
+        age="-"
+        if [[ -n "${GEN_CREATED_AT:-}" ]] && d=$(gen_age_days "$GEN_CREATED_AT"); then
+            age="${d}d"
+        fi
+        if ! clones=$(generation_refcount "$id"); then
+            clones="?"
+            STATUS_ATTENTION=1
+        fi
+        disk=$(generation_disk_usage "$vmid")
+        printf "%-4s %-8s %-12s %-12s %-6s %-6s %-8s\n" \
+            "$id" "$vmid" "$state" "$version" "$age" "$clones" "$disk"
+    done <<< "$list"
+}
+
+generations_main() {
+    echo ""
+    generations_print_table || return 1
+    echo ""
+}
 
 # ---------------------------------------------------------------------------
 # Generation id counter
@@ -1307,3 +1434,13 @@ adopt_deployed_template() {
 
     return 0
 }
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    require_root generations
+    if [[ -f "$CONFIG_FILE" ]]; then
+        load_infra_config
+    else
+        apply_generation_defaults
+    fi
+    generations_main "$@"
+fi
