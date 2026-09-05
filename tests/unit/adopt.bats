@@ -69,6 +69,20 @@ EOF
     [ "$GEN_TEMPLATE_DIGEST" = "unknown" ]
     [ "$GEN_IMAGE_SHA256" = "unknown" ]
     [ "$GEN_RUNNER_VERSION" = "unknown" ]
+    [ "$GEN_TEMPLATE_NAME" = "ubuntu-cloud-template" ]
+}
+
+@test "adopt resume migrates a pre-marker active record with its live name" {
+    stub_adopt_fleet
+    gen_create 9000 GEN_ID=1 GEN_STATE=active \
+        GEN_IMAGE_SHA256=unknown GEN_TEMPLATE_DIGEST=unknown
+    sed -i.bak 's/^GEN_WAS_ACTIVE=.*/GEN_WAS_ACTIVE=""/' "$GENERATIONS_DIR/9000.conf"
+
+    run adopt_deployed_template
+    [ "$status" -eq 0 ]
+    gen_read 9000
+    [ "$GEN_TEMPLATE_NAME" = "ubuntu-cloud-template" ]
+    [ "$GEN_WAS_ACTIVE" = "1" ]
 }
 
 @test "adopt is a no-op on the second run" {

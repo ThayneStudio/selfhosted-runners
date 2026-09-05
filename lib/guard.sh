@@ -357,11 +357,12 @@ collect_candidates() {
             continue
         fi
 
-        CANDIDATES+=("$vmid|$vm_name|$status")
+        CANDIDATES+=("$vmid|$vm_name|$status|$org")
     done <<< "$(tail -n +2 <<< "$all_vms")"
 }
 
 install -d -m 700 "$GUARD_STATE_DIR"
+recover_rollover_pending
 
 NOW=$(date +%s)
 LOCK_DEADLINE=$((NOW + LOCK_WAIT))
@@ -373,7 +374,7 @@ if ! collect_candidates; then
 fi
 
 for entry in "${CANDIDATES[@]}"; do
-    IFS='|' read -r VMID VM_NAME STATUS <<< "$entry"
+    IFS='|' read -r VMID VM_NAME STATUS VM_ORG <<< "$entry"
     REASON=""
     EVENT=""
 
@@ -432,9 +433,12 @@ for entry in "${CANDIDATES[@]}"; do
         continue
     fi
     rm -f "$(deferred_file "$VMID")"
+    exec 209>"${ROLLOVER_ORG_LOCK_PREFIX}-${VM_ORG}.lock"
+    flock 209
 
     RC=0
-    reap_vm "$VMID" "$VM_NAME" "$REASON" "$EVENT" || RC=$?
+    RUNNER_DESTRUCTIVE_LOCKS_HELD=1 reap_vm "$VMID" "$VM_NAME" "$REASON" "$EVENT" || RC=$?
+    exec 209>&-
     release_slot_lock
 
     case "$RC" in

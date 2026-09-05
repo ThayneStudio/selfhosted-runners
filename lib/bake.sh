@@ -885,6 +885,7 @@ bake_locked() {
 
     gen_create "$vmid" \
         "GEN_ID=$gen_id" \
+        "GEN_TEMPLATE_NAME=github-runner-gen-${gen_id}" \
         "GEN_TEMPLATE_DIGEST=$digest" \
         "GEN_IMAGE_SHA256=$image_sha" \
         "GEN_BAKE_LOG=$GEN_BAKE_LOG" || {

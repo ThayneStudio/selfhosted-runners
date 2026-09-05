@@ -9,6 +9,28 @@ setup() {
     load_lib
 }
 
+# The per-VM snippet is what every clone minted since the JIT refactor carries;
+# the legacy per-org name below only survives on VMs cloned before it.
+@test "get_vm_org reads the org out of a per-VM JIT snippet name" {
+    stub_out qm 'config 9001' <<'EOF'
+name: runner-1
+cicustom: user=local:snippets/runner-9001-user-acme.yaml,meta=local:snippets/runner-9001-meta.yaml
+EOF
+
+    run get_vm_org 9001
+    [ "$output" = "acme" ]
+    assert_called qm 'config 9001'
+}
+
+@test "get_vm_org keeps hyphens in the org name of a per-VM JIT snippet" {
+    stub_out qm 'config *' <<'EOF'
+cicustom: user=local:snippets/runner-9002-user-thayne-studio.yaml,meta=local:snippets/runner-9002-meta.yaml
+EOF
+
+    run get_vm_org 9002
+    [ "$output" = "thayne-studio" ]
+}
+
 @test "get_vm_org reads the org out of a full cicustom line" {
     stub_out qm 'config 501' <<'EOF'
 name: runner-acme-a1b2

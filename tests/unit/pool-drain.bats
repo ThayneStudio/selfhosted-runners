@@ -21,6 +21,7 @@ drain_call() {
         source "$1" >/dev/null 2>&1
         POOL_DRAIN_FILE="$2"
         POOL_DRAIN_FILE_LEGACY="$3"
+        POOL_DRAIN_COORD_LOCK_FILE="$(dirname "$3")/drain-coord.lock"
         shift 3
         "$@"
     ' _ "$REPO_ROOT/lib/common.sh" "$DRAIN_FILE" "$LEGACY_DRAIN_FILE" "$@"
@@ -37,6 +38,7 @@ setup_hookscript() {
     cat >> "$HOOK_ROOT/lib/common.sh" <<EOF
 POOL_DRAIN_FILE="$DRAIN_FILE"
 POOL_DRAIN_FILE_LEGACY="$LEGACY_DRAIN_FILE"
+POOL_DRAIN_COORD_LOCK_FILE="$TEST_DIR/run/lock/drain-coord.lock"
 EOF
 
     cat > "$HOOK_ROOT/lib/reclone.sh" <<EOF
@@ -101,6 +103,19 @@ reclone_triggered() {
 @test "enable_pool_drain also writes the legacy path so a rollback sees it" {
     drain_call enable_pool_drain
     [ -f "$LEGACY_DRAIN_FILE" ]
+}
+
+@test "maintenance entry waits for an in-flight rollover drain transaction" {
+    local coord="$TEST_DIR/run/lock/drain-coord.lock"
+    exec 212>"$coord"
+    flock -s 212
+    drain_call enable_pool_drain 212>&- &
+    local drain_pid=$!
+    sleep 0.1
+    [ ! -e "$DRAIN_FILE" ]
+    exec 212>&-
+    wait "$drain_pid"
+    [ -e "$DRAIN_FILE" ]
 }
 
 @test "enable_pool_drain reports failure instead of half-entering maintenance" {
