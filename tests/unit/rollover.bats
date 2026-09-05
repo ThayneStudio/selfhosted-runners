@@ -58,6 +58,82 @@ setup() {
     [ "$output" = 'old-a|9001|1|acme|running|3h4m' ]
 }
 
+# Every clone minted since the JIT refactor carries the per-VM snippet name
+# instead of the legacy per-org one. If rollover_cfg_org only knew the legacy
+# name, rollover would see an empty inventory and silently never roll anything.
+@test "inventory recognises clones carrying the per-VM JIT snippet" {
+    qm_stub() {
+        case "$1 ${2:-}" in
+            "list ")
+                printf 'VMID NAME STATUS\n9001 old-a running\n9002 new-a running\n'
+                ;;
+            "config 9001") printf 'name: old-a\ntags: runner;gen-1\ncicustom: user=local:snippets/runner-9001-user-acme.yaml,meta=local:snippets/runner-9001-meta.yaml\n' ;;
+            "config 9002") printf 'name: new-a\ntags: runner;gen-2\ncicustom: user=local:snippets/runner-9002-user-acme.yaml,meta=local:snippets/runner-9002-meta.yaml\n' ;;
+            *) return 1 ;;
+        esac
+    }
+    export -f qm_stub
+    rollover_age() { printf '3h4m\n'; }
+
+    run rollover_collect 2
+    [ "$status" -eq 0 ]
+    [ "$output" = 'old-a|9001|1|acme|running|3h4m' ]
+}
+
+@test "rollover_cfg_org reads both the per-VM JIT snippet and the legacy one" {
+    run rollover_cfg_org 'name: old-a
+cicustom: user=local:snippets/runner-9001-user-acme.yaml,meta=local:snippets/runner-9001-meta.yaml'
+    [ "$status" -eq 0 ]
+    [ "$output" = "acme" ]
+
+    run rollover_cfg_org 'name: old-a
+cicustom: user=local:snippets/runner-user-data-acme.yaml'
+    [ "$status" -eq 0 ]
+    [ "$output" = "acme" ]
+
+    run rollover_cfg_org 'name: leftover
+cicustom: user=local:snippets/some-other-user-data.yaml'
+    [ "$status" -ne 0 ]
+}
+
+# The pending-rollover recovery path re-identifies a VM before destroying it.
+# Failing to match the per-VM snippet name would strand every new-style clone
+# in $ROLLOVER_PENDING_DIR forever.
+@test "pending identity matches a VM carrying the per-VM JIT snippet" {
+    stub_out qm 'config 9001' <<'EOF'
+name: old-a
+cicustom: user=local:snippets/runner-9001-user-acme.yaml,meta=local:snippets/runner-9001-meta.yaml
+tags: runner;gen-1;rollover-abc123
+EOF
+
+    run rollover_pending_identity_matches 9001 old-a acme 1 abc123
+    [ "$status" -eq 0 ]
+
+    run rollover_pending_identity_matches 9001 old-a other-org 1 abc123
+    [ "$status" -ne 0 ]
+}
+
+@test "pending identity still matches a VM carrying the legacy per-org snippet" {
+    stub_out qm 'config 9001' <<'EOF'
+name: old-a
+cicustom: user=local:snippets/runner-user-data-acme.yaml
+tags: runner;gen-1;rollover-abc123
+EOF
+
+    run rollover_pending_identity_matches 9001 old-a acme 1 abc123
+    [ "$status" -eq 0 ]
+}
+
+@test "pending identity fails closed for a VM with no runner snippet at all" {
+    stub_out qm 'config 9001' <<'EOF'
+name: old-a
+tags: runner;gen-1;rollover-abc123
+EOF
+
+    run rollover_pending_identity_matches 9001 old-a acme 1 abc123
+    [ "$status" -ne 0 ]
+}
+
 @test "report shows unknown when GitHub state cannot be verified" {
     rollover_collect() { printf 'old-a|9001|1|acme|running|2h3m\n'; }
     rollover_busy() { printf 'unknown\n'; return 1; }

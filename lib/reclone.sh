@@ -55,12 +55,31 @@ fi
 # Non-blocking on purpose. We already hold the slot lock (fd 200) and `runner
 # stop` takes the two the other way round — exclusive 202 first, then fd 200
 # inside destroy.sh — so waiting here would close an ABBA cycle and hang both
-# processes on a VM this script has not destroyed yet. Exclusive 202 is only
-# ever held by stop, promote or gc, and every one of those means "do not
-# reclone right now": leave the slot to the watcher instead.
+# processes on a VM this script has not destroyed yet.
+#
+# When the lock is busy we still destroy below and skip only the clone. Bailing
+# out with the stopped VM still in place would be worse than useless: watch.sh
+# builds its slot inventory from `qm list`, which lists stopped VMs, so the slot
+# would read as filled and nothing would refill it until the lifetime guard's
+# stopped reap — up to ~15 minutes later, and that reap pages a warn-severity
+# stopped_vm.reaped for what was routine maintenance. `runner stop` is not the
+# common case here either; it sets the drain flag first, so the check above
+# already caught it. The exclusive holders that actually land here are
+# promote.sh, gc.sh, bake.sh and maintain.sh.
+#
+# Destroying without the lock breaks no guarantee: `runner stop` already
+# tolerates a VM vanishing mid-loop, and every exclusive holder is defending
+# against clones being *created* — a destroy only ever lowers a generation's
+# refcount, never raises it. The empty slot is then genuinely the watcher's to
+# refill on its next ~30s tick.
+POOL_ACTIVITY_LOCK_HELD=0
 exec 202>"$POOL_ACTIVITY_LOCK_FILE"
-flock -s -n 202 || { log_info "reclone: pool activity locked, leaving $NAME to the watcher"; exit 0; }
-POOL_ACTIVITY_LOCK_HELD=1
+if flock -s -n 202; then
+    POOL_ACTIVITY_LOCK_HELD=1
+else
+    exec 202>&-
+    log_info "reclone: pool activity locked by another maintenance operation; destroying $NAME without recloning"
+fi
 
 # Backoff: defer to the watcher only after N consecutive rapid deaths.
 # A single fast reclone is normal — short linter jobs (~45s) complete well
@@ -127,6 +146,14 @@ fi
 
 if pool_is_draining; then
     logger -t github-runner "reclone: pool drain active after destroy for $NAME, leaving slot empty"
+    exit 0
+fi
+
+# Only clone under the shared pool lock (see the fd 202 block above). The VM is
+# destroyed either way, so the slot is empty now — exactly the state watch.sh
+# exists to fix, on its next tick.
+if [[ "$POOL_ACTIVITY_LOCK_HELD" != 1 ]]; then
+    log_info "reclone: leaving the empty $NAME slot to the watcher"
     exit 0
 fi
 

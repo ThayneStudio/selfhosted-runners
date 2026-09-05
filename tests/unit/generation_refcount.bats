@@ -202,6 +202,28 @@ EOF
     [[ "$stderr" == *"active"* ]]
 }
 
+# Same shape as above with the per-VM JIT snippet name, which is what every
+# clone minted since the token refactor carries. If generation_cfg_is_runner
+# stopped recognising it, this VM would read as a non-runner leftover, the
+# refcount would drop to 0 and GC would be free to reclaim a generation whose
+# clones are still running.
+@test "untagged clone with a per-VM JIT snippet is attributed to the active generation" {
+    create_two_gens
+    stub_template_configs
+    stub_empty_origin
+    qm_list "      9004 acme-4               running    8192              30.00 1237"
+    stub_out qm 'config 9004' <<'EOF'
+name: acme-4
+cicustom: user=local:snippets/runner-9004-user-acme.yaml,meta=local:snippets/runner-9004-meta.yaml
+EOF
+
+    run --separate-stderr generation_refcount 9
+    [ "$status" -eq 0 ]
+    [ "$output" = "1" ]
+    [[ "$stderr" == *"9004"* ]]
+    [[ "$stderr" == *"untagged"* ]]
+}
+
 @test "untagged clone with no origin is not counted for a superseded generation" {
     create_two_gens
     stub_template_configs
