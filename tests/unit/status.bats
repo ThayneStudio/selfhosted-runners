@@ -373,6 +373,24 @@ EOF
     [[ "$output" == *"Last notification: none"* ]]
 }
 
+@test "status_main reads back a notification recorded by the real notify()" {
+    make_active 2.336.0
+    write_org_pool acme 2
+    stub_adopted_fleet
+    stub_disk
+    stub_upstream v2.336.0 2026-08-01T00:00:00Z
+    # setup() stubs the top-level notify() so no other test ever hits a real
+    # webhook; call the real dispatch directly here to exercise the actual
+    # write path (lib/notify.sh) that populates LAST_NOTIFY_FILE, and confirm
+    # status.sh reads back exactly what it wrote.
+    NOTIFY_WEBHOOK_URL="https://hooks.example.com/T000/B000/xxxx"
+    _notify_dispatch warn drift.warning "Runner behind upstream" \
+        "fleet=2.334.0 upstream=2.336.0" || true
+
+    run --separate-stderr status_main
+    [[ "$output" == *"Last notification: "*" warn drift.warning Runner behind upstream"* ]]
+}
+
 @test "status_main does not write config VMs or generation records" {
     make_active 2.334.0
     write_org_pool acme 2
