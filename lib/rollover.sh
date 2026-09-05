@@ -56,13 +56,11 @@ rollover_age() {
 
 rollover_cfg_org() {
     local cfg="$1" org
-    if [[ "$cfg" =~ runner-user-data-([^.]+)\.yaml ]]; then
-        org="${BASH_REMATCH[1]}"
-        validate_org_name "$org" || return 1
-        printf '%s\n' "$org"
-    else
-        return 1
-    fi
+    # org_from_vm_config knows both the per-VM JIT snippet and the legacy
+    # per-org one; rollover must see clones minted either way.
+    org=$(org_from_vm_config "$cfg") || return 1
+    validate_org_name "$org" || return 1
+    printf '%s\n' "$org"
 }
 
 # NAME|VMID|GEN|ORG|STATUS|AGE. A tagged VM is considered only when its

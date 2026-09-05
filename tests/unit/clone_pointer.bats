@@ -10,6 +10,10 @@ load test_helper
 bats_require_minimum_version 1.5.0
 
 setup() {
+    # clone_runner renders each VM's cloud-init snippet from the installed
+    # runner-user-data.yaml, so point INSTALL_DIR at the repo copy. Must precede
+    # load_lib: common.sh only defaults INSTALL_DIR when the caller sets nothing.
+    INSTALL_DIR="$REPO_ROOT"
     load_lib generations.sh
     MIN_VMID=9001
     TEMPLATE_ID=9000
@@ -21,6 +25,12 @@ setup() {
     DNS_SERVERS="${DNS_SERVERS:-}"
     # Skip the ~130s pause wait unless a test is proving the retry itself.
     CLONE_PAUSE_RETRY_MAX_SECONDS=0
+    # clone_runner mints a single-use JIT config on the host before cloning and
+    # refuses to run without the org config loaded. Give it both; the mint call
+    # itself is not what these tests are about, so stand in at that seam.
+    write_org_config acme ghp_test acme-org
+    load_org_config acme
+    fetch_jit_config() { printf 'AAAAjitconfigAAAA'; }
     stub_clone_success
 }
 
@@ -76,6 +86,22 @@ write_pointer() {
     assert_called qm 'clone 8900 *'
     assert_called qm 'set 9001 --tags runner,gen-5'
     refute_called qm 'set * --tags runner,gen-9'
+}
+
+# The security invariant this whole clone path exists to hold: the guest gets a
+# single-use JIT config and never the org PAT.
+@test "clone_runner points the clone at a per-VM snippet holding the JIT config, not the PAT" {
+    run --separate-stderr clone_runner runner-acme-1 acme
+    [ "$status" -eq 0 ]
+
+    snippet="$SNIPPETS_DIR/runner-9001-user-acme.yaml"
+    [ -f "$snippet" ]
+    grep -q 'JIT_CONFIG="AAAAjitconfigAAAA"' "$snippet"
+    grep -q 'GITHUB_ORG="acme-org"' "$snippet"
+    ! grep -q 'ghp_test' "$snippet"
+    ! grep -q '{{' "$snippet"
+    assert_called qm 'set 9001 --cicustom user=local:snippets/runner-9001-user-acme.yaml,meta=local:snippets/runner-9001-meta.yaml'
+    refute_called qm 'set * --cicustom user=local:snippets/runner-user-data-*'
 }
 
 @test "clone_runner returns 3 without cloning when PROMOTION_PAUSE_FILE remains" {

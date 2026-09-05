@@ -47,7 +47,6 @@ for org in "${ORGS[@]}"; do
     count="${count:-0}"
     prefix="${prefix:-runner}"
     [[ "$count" =~ ^[0-9]+$ && "$count" -gt 0 ]] || continue
-    [[ -f "$SNIPPETS_DIR/runner-user-data-${org}.yaml" ]] || continue
 
     for n in $(seq 1 "$count"); do
         slot="${prefix}-${n}"

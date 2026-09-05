@@ -84,7 +84,10 @@ fi
 
 # All destructive actors use slot -> org ordering. Rollover/guard pass the
 # marker because their parent already owns both locks and the child inherits
-# them; manual destroy acquires them here.
+# them; manual destroy acquires them here. This is also what keeps a manual or
+# `runner stop` destroy from racing watch/reclone on the slot — it must stay
+# behind the marker check, since an unconditional flock here would make every
+# guard and rollover destroy fail against its own parent's slot lock.
 if [[ "${RUNNER_DESTRUCTIVE_LOCKS_HELD:-}" != 1 ]]; then
     exec 200>"${RUNNER_SLOT_LOCK_PREFIX}-${RUNNER_NAME}.lock"
     flock 200
@@ -111,8 +114,8 @@ fi
 log_info "Destroying $RUNNER_NAME (VMID $VMID)..."
 qm destroy "$VMID" --purge 200>&- 201>&- 202>&- || { log_error "Failed to destroy $VMID"; exit 1; }
 
-# Clean up snippets
-rm -f "${SNIPPETS_DIR}/runner-${VMID}-meta.yaml" "${SNIPPETS_DIR}/runner-${VMID}-vendor.yaml"
+# Clean up per-VM snippets
+rm -f "${SNIPPETS_DIR}/runner-${VMID}-meta.yaml" "${SNIPPETS_DIR}/runner-${VMID}-user-"*.yaml "${SNIPPETS_DIR}/runner-${VMID}-vendor.yaml"
 
 log_info "$RUNNER_NAME destroyed."
 if systemctl is-active --quiet github-runner-watch.timer 2>/dev/null; then

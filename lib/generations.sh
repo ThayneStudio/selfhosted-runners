@@ -946,7 +946,10 @@ generation_origin_child_vmids() {
 generation_cfg_is_runner() {
     local cfg="${1:-}" tags_line tag
     local -a tags=()
-    [[ "$cfg" =~ runner-user-data-[^.]+\.yaml ]] && return 0
+    # Both snippet namings count: per-VM JIT (runner-<vmid>-user-<org>.yaml) and
+    # the legacy per-org one. Undercounting here would let GC reclaim a
+    # generation whose clones are still alive.
+    org_from_vm_config "$cfg" >/dev/null && return 0
     tags_line=$(grep -m1 '^tags:' <<< "$cfg" || true)
     tags_line="${tags_line#tags:}"
     IFS=';,' read -ra tags <<< "$tags_line"
