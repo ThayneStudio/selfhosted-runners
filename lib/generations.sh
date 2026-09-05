@@ -682,6 +682,16 @@ generation_disk_usage() {
 
 # Table of live generations. Empty store prints "(no generations)" and
 # succeeds. Never writes. Proven by "generations_main degrades with no records".
+#
+# generation_refcount fails closed on any unreadable VM config, qm list
+# failure, or unresolvable ZFS origin -- correct for its GC/rollover callers,
+# which must never under-count before destroying. A display has no destroy
+# path to protect and every reason to keep going: a VM the guard/watch timer
+# destroyed between `qm list` and `qm config` is a routine race on a live
+# host, not a reason to truncate the rest of this report. So a refcount
+# failure here degrades to "?" (and sets STATUS_ATTENTION when the caller is
+# status_main) rather than aborting the table. This is the only place that
+# contract is loosened; generation_refcount itself is untouched.
 generations_print_table() {
     local vmid id state version age clones disk d
     local list
@@ -708,7 +718,10 @@ generations_print_table() {
         if [[ -n "${GEN_CREATED_AT:-}" ]] && d=$(gen_age_days "$GEN_CREATED_AT"); then
             age="${d}d"
         fi
-        clones=$(generation_refcount "$id") || return 1
+        if ! clones=$(generation_refcount "$id"); then
+            clones="?"
+            STATUS_ATTENTION=1
+        fi
         disk=$(generation_disk_usage "$vmid")
         printf "%-4s %-8s %-12s %-12s %-6s %-6s %-8s\n" \
             "$id" "$vmid" "$state" "$version" "$age" "$clones" "$disk"

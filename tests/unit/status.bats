@@ -276,6 +276,39 @@ EOF
     echo "$output" | grep gamma | grep -q '\[under\]'
 }
 
+@test "status_main keeps printing the full report when one VM's qm config races" {
+    make_active 2.336.0
+    write_org_pool acme 2
+    stub_disk
+    stub_upstream v2.336.0 2026-08-01T00:00:00Z
+    stub_out qm 'list' <<'EOF'
+      VMID NAME                 STATUS     MEM(MB)    BOOTDISK(GB) PID
+      9000 ubuntu-cloud-template stopped   8192              30.00 0
+      9001 runner-1             running    8192              30.00 1234
+EOF
+    stub_out qm 'config 9000' <<'EOF'
+name: ubuntu-cloud-template
+template: 1
+tags: runner;gen-1
+EOF
+    # Simulates the guard/watch timer destroying VMID 9001 between `qm list`
+    # and `qm config` -- a routine race on a live host, not a reason to
+    # truncate the rest of the report. generation_refcount itself still
+    # fails closed (that contract is for GC/rollover); the display degrades
+    # the CLONES column to "?" and keeps going.
+    stub_status qm 'config 9001' 2
+
+    run --separate-stderr status_main
+    [ "$status" -ne 0 ]
+    echo "$output" | grep -E '^1[[:space:]]+9000' | grep -q '?'
+    [[ "$output" == *"Runner version:"* ]]
+    [[ "$output" == *"Last bake:"* ]]
+    [[ "$output" == *"Pool fill:"* ]]
+    [[ "$output" == *"Drain:"* ]]
+    [[ "$output" == *"Last notification:"* ]]
+    [[ "$output" == *"Status: ATTENTION"* ]]
+}
+
 @test "status_main flags drain as attention" {
     make_active 2.336.0
     write_org_pool acme 2
