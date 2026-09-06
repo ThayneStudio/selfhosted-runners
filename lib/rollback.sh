@@ -63,7 +63,12 @@ _rollback_leftover_vmids() (
     picked=$(gen_rollback_target "$current_id" 2>/dev/null) || picked=""
     if [[ -n "$picked" ]]; then
         gen_read "$picked" || return 1
-        anchor="${GEN_PROMOTED_AT:-}"
+        # A legacy-adopted retained target (spec 8) was created directly in
+        # active and never passed through gen_transition ... active, so it
+        # has no GEN_PROMOTED_AT of its own -- fall back to <current-promoted>
+        # rather than disabling leftover detection entirely (issue #19 review
+        # round 2).
+        anchor="${GEN_PROMOTED_AT:-$current_promoted}"
     else
         anchor="$current_promoted"
     fi
@@ -77,8 +82,21 @@ _rollback_leftover_vmids() (
         gen_record_is_rollback_eligible || continue
         sup="${GEN_SUPERSEDED_AT:-}"
         [[ -n "$sup" ]] || continue
-        [[ "$sup" > "$anchor" ]] && printf '%s\n' "$vmid"
+        # if/fi, not `[[ ... ]] && printf`: the loop body's exit status is the
+        # function's own exit status (this is a subshell, not a caller-visible
+        # `return`), so a false condition on the LAST record examined must not
+        # make the whole scan look like a failure. gen_list sorts by VMID, and
+        # allocate_generation_vmid hands out the lowest free one in the band,
+        # so an old, still-blocked superseded generation routinely holds a
+        # HIGHER VMID than the retained target -- this is not a rare ordering.
+        # Proven by "an ordinary rollback succeeds when an older superseded
+        # generation has a higher VMID than the retained target" (issue #19
+        # review round 2).
+        if [[ "$sup" > "$anchor" ]]; then
+            printf '%s\n' "$vmid"
+        fi
     done <<< "$list"
+    return 0
 )
 
 _rollback_collect_vmids() {
@@ -184,7 +202,10 @@ rollback_generation() {
         return 1
     fi
 
-    leftover_list=$(_rollback_leftover_vmids "$current_id" "$current_promoted") || return 1
+    leftover_list=$(_rollback_leftover_vmids "$current_id" "$current_promoted") || {
+        log_error "Could not scan for an incomplete prior rollback"
+        return 1
+    }
     leftovers=()
     while read -r vmid; do
         [[ -n "$vmid" ]] || continue
@@ -284,6 +305,7 @@ rollback_generation() {
     fi
 
     leftover_list=$(_rollback_leftover_vmids "$current_id" "$current_promoted") || {
+        log_error "Could not scan for an incomplete prior rollback"
         _rollback_release
         return 1
     }

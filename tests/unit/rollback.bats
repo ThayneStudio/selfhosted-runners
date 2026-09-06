@@ -486,6 +486,103 @@ EOF
     grep -q 'TEMPLATE_ID="9000"' "$CONFIG_FILE"
 }
 
+@test "an ordinary rollback succeeds when an older superseded generation has a higher VMID than the retained target" {
+    # gen_list sorts by VMID, and allocate_generation_vmid hands out the
+    # lowest free VMID in the band, so an old, still-around superseded
+    # generation routinely holds a HIGHER VMID than the more recently
+    # retained target -- generation 3 here is the last record
+    # _rollback_leftover_vmids examines, and it is not a leftover. The scan
+    # must not report failure just because the LAST record it looked at
+    # didn't match (issue #19 review round 2).
+    gen_store_init
+    gen_create 8902 \
+        GEN_ID=3 \
+        GEN_STATE=superseded \
+        GEN_TEMPLATE_DIGEST=old \
+        GEN_IMAGE_SHA256=aaa \
+        GEN_RUNNER_VERSION=2.333.0 \
+        GEN_PROMOTED_AT=2026-06-01T00:00:00Z \
+        GEN_SUPERSEDED_AT=2026-07-01T00:00:00Z
+    gen_create 8900 \
+        GEN_ID=5 \
+        GEN_STATE=superseded \
+        GEN_TEMPLATE_DIGEST=good \
+        GEN_IMAGE_SHA256=abc \
+        GEN_RUNNER_VERSION=2.335.0 \
+        GEN_PROMOTED_AT=2026-08-01T00:00:00Z \
+        GEN_SUPERSEDED_AT=2026-08-20T00:00:00Z
+    gen_create 8901 \
+        GEN_ID=6 \
+        GEN_STATE=active \
+        GEN_TEMPLATE_DIGEST=newest \
+        GEN_IMAGE_SHA256=def \
+        GEN_RUNNER_VERSION=2.336.0 \
+        GEN_PROMOTED_AT=2026-08-20T00:00:00Z
+    TEMPLATE_ID=8901
+    write_infra_config
+    TEMPLATE_ID=8901
+
+    run --separate-stderr rollback_generation --yes --reason 'higher VMID older generation'
+    [ "$status" -eq 0 ]
+
+    gen_read 8900
+    [ "$GEN_STATE" = "active" ]
+    gen_read 8901
+    [ "$GEN_STATE" = "rejected" ]
+    gen_read 8902
+    [ "$GEN_STATE" = "superseded" ]
+    grep -q 'TEMPLATE_ID="8900"' "$CONFIG_FILE"
+}
+
+@test "a leftover is detected after rollback restores a legacy-adopted generation with no GEN_PROMOTED_AT" {
+    # Adoption (spec 8) creates the record directly in active, so it never
+    # passes through gen_transition ... active and has no GEN_PROMOTED_AT of
+    # its own. Falling back to the current active's own GEN_PROMOTED_AT for
+    # the anchor (rather than disabling leftover detection because the
+    # retained target's timestamp is empty) is what still finds generation 3
+    # here, the escaped image from a crashed rollback back onto the adopted
+    # generation 1 (issue #19 review round 2).
+    gen_store_init
+    gen_create 9000 \
+        GEN_ID=1 \
+        GEN_STATE=superseded \
+        GEN_TEMPLATE_DIGEST=unknown \
+        GEN_IMAGE_SHA256=unknown \
+        GEN_RUNNER_VERSION=2.330.0 \
+        GEN_SUPERSEDED_AT=2026-07-01T00:00:00Z
+    gen_create 8900 \
+        GEN_ID=2 \
+        GEN_STATE=active \
+        GEN_TEMPLATE_DIGEST=good \
+        GEN_IMAGE_SHA256=abc \
+        GEN_RUNNER_VERSION=2.335.0 \
+        GEN_PROMOTED_AT=2026-08-25T00:00:00Z
+    gen_create 8901 \
+        GEN_ID=3 \
+        GEN_STATE=superseded \
+        GEN_TEMPLATE_DIGEST=bad \
+        GEN_IMAGE_SHA256=def \
+        GEN_RUNNER_VERSION=2.336.0 \
+        GEN_PROMOTED_AT=2026-07-15T00:00:00Z \
+        GEN_SUPERSEDED_AT=2026-08-26T00:00:00Z
+    TEMPLATE_ID=8900
+    write_infra_config
+    TEMPLATE_ID=8900
+
+    run --separate-stderr rollback_generation --yes --reason 'complete after legacy adoption'
+    [ "$status" -eq 0 ]
+
+    gen_read 8900
+    [ "$GEN_STATE" = "active" ]
+    gen_read 8901
+    [ "$GEN_STATE" = "rejected" ]
+    [ "$GEN_FAILED_REASON" = "complete after legacy adoption" ]
+    gen_read 9000
+    [ "$GEN_STATE" = "superseded" ]
+    grep -q 'TEMPLATE_ID="8900"' "$CONFIG_FILE"
+    grep -q 'generation.rolled_back' "$STUB_DIR/notify.log"
+}
+
 @test "rollback fails closed when gen_list superseded cannot be read" {
     seed_active_and_previous
     printf 'garbage\n' >> "$GENERATIONS_DIR/9000.conf"
