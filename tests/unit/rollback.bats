@@ -379,6 +379,113 @@ EOF
     grep -q 'generation.rolled_back' "$STUB_DIR/notify.log"
 }
 
+@test "leftover below the current active id is still completed after a later promote" {
+    # Same crash as above, but a routine promote happened afterward (spec 15,
+    # issue #19 review round 1): active is now generation 4, so the escaped
+    # generation 3's GEN_ID (3) is *below* the current active's, not above
+    # it as in the test above. Detection must not depend on being above
+    # <current-id> -- it has to survive any number of promotions since the
+    # crash, so it is anchored to the retained target's own GEN_PROMOTED_AT
+    # instead.
+    gen_store_init
+    gen_create 8899 \
+        GEN_ID=1 \
+        GEN_STATE=superseded \
+        GEN_TEMPLATE_DIGEST=oldest \
+        GEN_IMAGE_SHA256=aaa \
+        GEN_RUNNER_VERSION=2.333.0 \
+        GEN_PROMOTED_AT=2026-06-01T00:00:00Z \
+        GEN_SUPERSEDED_AT=2026-07-01T00:00:00Z
+    gen_create 9000 \
+        GEN_ID=2 \
+        GEN_STATE=superseded \
+        GEN_TEMPLATE_DIGEST=good \
+        GEN_IMAGE_SHA256=abc \
+        GEN_RUNNER_VERSION=2.335.0 \
+        GEN_PROMOTED_AT=2026-08-25T00:00:00Z \
+        GEN_SUPERSEDED_AT=2026-08-30T00:00:00Z
+    gen_create 8900 \
+        GEN_ID=3 \
+        GEN_STATE=superseded \
+        GEN_TEMPLATE_DIGEST=bad \
+        GEN_IMAGE_SHA256=def \
+        GEN_RUNNER_VERSION=2.336.0 \
+        GEN_PROMOTED_AT=2026-07-15T00:00:00Z \
+        GEN_SUPERSEDED_AT=2026-08-26T00:00:00Z
+    gen_create 8901 \
+        GEN_ID=4 \
+        GEN_STATE=active \
+        GEN_TEMPLATE_DIGEST=newest \
+        GEN_IMAGE_SHA256=ghi \
+        GEN_RUNNER_VERSION=2.337.0 \
+        GEN_PROMOTED_AT=2026-08-30T00:00:00Z
+    TEMPLATE_ID=8901
+    write_infra_config
+    TEMPLATE_ID=8901
+
+    run --separate-stderr rollback_generation --yes --reason 'complete after later promote'
+    [ "$status" -eq 0 ]
+
+    gen_read 8901
+    [ "$GEN_STATE" = "active" ]
+    gen_read 8900
+    [ "$GEN_STATE" = "rejected" ]
+    [ "$GEN_FAILED_REASON" = "complete after later promote" ]
+    gen_read 9000
+    [ "$GEN_STATE" = "superseded" ]
+    gen_read 8899
+    [ "$GEN_STATE" = "superseded" ]
+    grep -q 'TEMPLATE_ID="8901"' "$CONFIG_FILE"
+    grep -q 'generation.rolled_back' "$STUB_DIR/notify.log"
+}
+
+@test "an ordinary older superseded generation is not mistaken for a leftover" {
+    # Three generations deep with no rollback ever involved: generation 1's
+    # GEN_SUPERSEDED_AT lands in the very same instant generation 2 was
+    # promoted (the normal promote_generation transaction demotes the
+    # previous active in the same call that promotes the new one). It must
+    # not be mistaken for a leftover and rejected -- it is simply an older
+    # superseded record waiting for ordinary GC (issue #19 review round 1).
+    gen_store_init
+    gen_create 8899 \
+        GEN_ID=1 \
+        GEN_STATE=superseded \
+        GEN_TEMPLATE_DIGEST=oldest \
+        GEN_IMAGE_SHA256=aaa \
+        GEN_RUNNER_VERSION=2.333.0 \
+        GEN_PROMOTED_AT=2026-07-01T00:00:00Z \
+        GEN_SUPERSEDED_AT=2026-08-01T00:00:00Z
+    gen_create 9000 \
+        GEN_ID=2 \
+        GEN_STATE=superseded \
+        GEN_TEMPLATE_DIGEST=good \
+        GEN_IMAGE_SHA256=abc \
+        GEN_RUNNER_VERSION=2.335.0 \
+        GEN_PROMOTED_AT=2026-08-01T00:00:00Z \
+        GEN_SUPERSEDED_AT=2026-08-20T00:00:00Z
+    gen_create 8900 \
+        GEN_ID=3 \
+        GEN_STATE=active \
+        GEN_TEMPLATE_DIGEST=newest \
+        GEN_IMAGE_SHA256=def \
+        GEN_RUNNER_VERSION=2.336.0 \
+        GEN_PROMOTED_AT=2026-08-20T00:00:00Z
+    TEMPLATE_ID=8900
+    write_infra_config
+    TEMPLATE_ID=8900
+
+    run --separate-stderr rollback_generation --yes --reason 'ordinary rollback'
+    [ "$status" -eq 0 ]
+
+    gen_read 9000
+    [ "$GEN_STATE" = "active" ]
+    gen_read 8900
+    [ "$GEN_STATE" = "rejected" ]
+    gen_read 8899
+    [ "$GEN_STATE" = "superseded" ]
+    grep -q 'TEMPLATE_ID="9000"' "$CONFIG_FILE"
+}
+
 @test "rollback fails closed when gen_list superseded cannot be read" {
     seed_active_and_previous
     printf 'garbage\n' >> "$GENERATIONS_DIR/9000.conf"

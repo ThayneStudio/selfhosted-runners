@@ -39,27 +39,45 @@ _rollback_release() {
     exec 202>&- 2>/dev/null || true
 }
 
-# Superseded former actives with GEN_ID higher than the current active,
-# demoted at or after the current promotion — leftovers from a crash after
-# the pointer moved, before reject. An older high-id superseded generation
-# (SUPERSEDED_AT before the current GEN_PROMOTED_AT) is not a leftover.
-# Never a rollback target (that would undo the rollback).
+# Superseded former actives demoted during the retained target's most recent
+# reign as active — leftovers from a crash after the pointer moved, before
+# reject (spec 15). Anchored to gen_rollback_target's own pick, not to
+# <current-id> directly: a plain "GEN_ID above <current-id>" comparison stops
+# seeing the leftover as soon as any later, unrelated promotion raises the
+# active id past it (issue #19 review round 1) -- the retained target's own
+# GEN_PROMOTED_AT does not move just because a later promotion happens, so a
+# leftover demoted at or after it is found regardless of how many
+# promotions have happened since. Strictly after, not at-or-after: an
+# ordinary immediate predecessor is superseded in the very same instant the
+# retained target was promoted (same promote_generation transaction), and
+# must not be mistaken for a leftover. Falls back to <current-promoted>
+# itself only when nothing is retained below <current-id> at all. Same
+# eligibility test as GC and gen_rollback_target
+# (gen_record_is_rollback_eligible), so there is exactly one definition of
+# "was this ever a clone target". Never a rollback target itself (that would
+# undo the rollback).
 _rollback_leftover_vmids() (
-    local current_id="${1:-}" current_promoted="${2:-}" vmid id list sup
+    local current_id="${1:-}" current_promoted="${2:-}" vmid list sup anchor picked
 
     gen_is_uint "$current_id" || return 1
+    picked=$(gen_rollback_target "$current_id" 2>/dev/null) || picked=""
+    if [[ -n "$picked" ]]; then
+        gen_read "$picked" || return 1
+        anchor="${GEN_PROMOTED_AT:-}"
+    else
+        anchor="$current_promoted"
+    fi
+    [[ -n "$anchor" ]] || return 0
+
     list=$(gen_list superseded) || return 1
     while read -r vmid; do
         [[ -n "$vmid" ]] || continue
+        [[ "$vmid" != "$picked" ]] || continue
         gen_read "$vmid" || return 1
-        [[ -n "$GEN_PROMOTED_AT" ]] || continue
-        id=$(gen_require_numeric_id "$vmid") || return 1
-        [[ "$id" -gt "$((10#$current_id))" ]] || continue
+        gen_record_is_rollback_eligible || continue
         sup="${GEN_SUPERSEDED_AT:-}"
-        [[ -n "$sup" && -n "$current_promoted" ]] || continue
-        if [[ "$sup" > "$current_promoted" || "$sup" == "$current_promoted" ]]; then
-            printf '%s\n' "$vmid"
-        fi
+        [[ -n "$sup" ]] || continue
+        [[ "$sup" > "$anchor" ]] && printf '%s\n' "$vmid"
     done <<< "$list"
 )
 
