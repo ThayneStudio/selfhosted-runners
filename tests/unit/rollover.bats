@@ -150,7 +150,7 @@ EOF
 
     run github_runner_lookup acme old-a
     [ "$status" -eq 0 ]
-    [ "$output" = $'42\tfalse' ]
+    assert_output_is $'42\tfalse'
 }
 
 @test "GitHub lookup fails closed for a missing runner or malformed busy state" {
@@ -176,7 +176,7 @@ EOF
     }
     run github_runner_lookup_details acme old-a
     [ "$status" -eq 0 ]
-    [ "$output" = $'42\tfalse\toffline' ]
+    assert_output_is $'42\tfalse\toffline'
 
     curl() {
         case "${*: -1}" in

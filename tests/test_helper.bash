@@ -227,6 +227,26 @@ stub_strict
 # works.
 stub_out logger '*' < /dev/null
 
+# --- Asserting on captured output ----------------------------------------
+
+# assert_output_is <expected>
+# Exact-match $output, printing both sides when they differ.
+#
+# `[ "$output" = "..." ]` reports only "line N failed", which is close to
+# useless when the mismatch is something merged into $output rather than the
+# value under test: bats `run` folds the callee's stderr into $output, so one
+# stray warning from anywhere in the call tree fails an equality assertion
+# while the value itself was right. That cost a CI-only flake weeks of
+# guessing; print what was actually captured instead.
+assert_output_is() {
+    local expected="$1"
+    # shellcheck disable=SC2154  # $output is set by bats `run`
+    if [[ "$output" != "$expected" ]]; then
+        printf 'expected output: %q\n  actual output: %q\n' "$expected" "$output" >&2
+        return 1
+    fi
+}
+
 # --- Inspecting what was called ------------------------------------------
 
 # Every invocation of a stub, one "$*" per line, in order.
