@@ -25,7 +25,10 @@
 # second invocation while one is running returns 2 and touches nothing, an
 # already-spent budget finalises the generation without cloning, a leftover
 # canary VM from a killed attempt is destroyed before the next clone, and an
-# unconfigured canary never consumes an attempt.
+# unconfigured canary never consumes an attempt. Proven by "two canaries do
+# not run at once", "an attempt budget already spent is finalised without
+# another clone", "a leftover canary VM from a killed attempt is destroyed
+# before the clone", and the item-5 tests in tests/unit/canary.bats.
 #
 # LOCKS. The gate holds exactly one lock of its own — CANARY_LOCK_FILE — for
 # the whole run, and takes no other lock directly. That is what keeps it clear
@@ -36,7 +39,8 @@
 # CANARY_LOCK_FILE, which neither of them wants. The only other lock it ever
 # touches is the per-slot lock around the canary VM's destroy, which is the
 # lock lib/reclone.sh holds on the same VM name, and it is taken with a bounded
-# wait and released immediately.
+# wait and released immediately. Proven by "the gate takes no pool lock of its
+# own" and "the canary lock is released when the gate finishes".
 #
 # Library: functions only at source time. Tests load_lib canary.sh and call
 # canary_main. When executed as the CLI (`BASH_SOURCE == $0`), require_root,
@@ -86,6 +90,14 @@ CANARY_UNCONFIGURED_REASON=""
 
 canary_usage() {
     echo "Usage: runner canary <generation-id>"
+}
+
+# fd 218 is the gate's own lock (CANARY_LOCK_FILE). Released explicitly on
+# every exit path rather than left to process exit, because canary_main is a
+# library function: maintain (#24) calls it in-process and would otherwise hold
+# the lock for the rest of its cycle.
+_canary_unlock() {
+    exec 218>&- 2>/dev/null || true
 }
 
 # ---------------------------------------------------------------------------
@@ -156,6 +168,7 @@ canary_repo_full_name() {
 # argv, where /proc/PID/cmdline hands it to any local user, never in curl's
 # environment, and never on a process-substitution fd — see the long note on
 # github_runners_snapshot for why the fd is the wrong shape.
+# Proven by "the canary PAT never reaches curl argv".
 #
 # Usage: _canary_api <method> <url> [json-body]
 # stdout: the response body, then the HTTP status code on its own last line.
@@ -417,6 +430,7 @@ canary_wait_online() {
 # Highest existing workflow_dispatch run id, read before dispatching so the run
 # this gate then watches is provably a new one. Clock-independent, unlike
 # filtering on created_at.
+# Proven by "a workflow run that predates the dispatch is never adopted".
 canary_latest_run_id() {
     local resp code body id
     resp=$(_canary_api GET "https://api.github.com/repos/${CANARY_RUN_REPO}/actions/workflows/${CANARY_WORKFLOW}/runs?event=workflow_dispatch&per_page=1") || return 1
@@ -471,7 +485,8 @@ canary_dispatch() {
 }
 
 # The run the dispatch created: newer than the pre-dispatch baseline, and
-# preferring the one whose run-name names this generation.
+# preferring the one whose run-name names this generation. Proven by "the new
+# run whose title names this generation is the one watched".
 # stdout: "<run-id>\t<html-url>".
 canary_find_run() {
     local gen_id="$1" baseline="$2" deadline="$3"
@@ -548,7 +563,9 @@ canary_vmid_by_name() {
 #
 # The per-slot lock is the one lib/reclone.sh takes for the same VM name when
 # the canary powers off, so the two cannot race; the hookscript is deleted
-# first so the destroy does not fire a re-clone at all.
+# first so the destroy does not fire a re-clone at all. Proven by "a failed run
+# keeps the candidate template and destroys only the canary VM" and "a canary
+# VM that already powered off and vanished is not an error".
 canary_destroy_vm() {
     local vmid="${1:-}" name="${2:-}" org="${3:-}" attempt rc=0 status
 
@@ -701,6 +718,8 @@ canary_attempt() {
 # notification, and — the one path where a canary failure reaches the memo
 # (spec 7.5) — memo the digest so the pipeline stops rebaking something that
 # cannot pass. Returns non-zero when the store could not be updated.
+# Proven by "three consecutive failures reject the generation and memo its
+# digest" and "a non-final failure does not memo the digest".
 canary_finalize_failed() {
     local vmid="$1" gen_id="$2" digest="$3" attempts="$4" reason="$5"
     local state rc=0 url="${CANARY_RUN_URL:-}"
@@ -831,16 +850,16 @@ canary_main() {
         return 1
     }
     if ! flock -w "$lock_wait" -x 218; then
-        exec 218>&-
+        _canary_unlock
         log_info "canary: another canary run holds $CANARY_LOCK_FILE — skipping"
         return 2
     fi
 
     # Re-read under the lock: a canary that finished between the checks above
     # and this point may already have promoted or rejected this generation.
-    gen_read "$vmid" || { exec 218>&-; return 1; }
+    gen_read "$vmid" || { _canary_unlock; return 1; }
     if [[ "$GEN_STATE" != "candidate" ]]; then
-        exec 218>&-
+        _canary_unlock
         log_info "Generation $gen_id is ${GEN_STATE} — another canary got there first"
         [[ "$GEN_STATE" == "active" ]] && return 0
         [[ "$GEN_STATE" == "failed" ]] && return 4
@@ -849,7 +868,7 @@ canary_main() {
     attempts="${GEN_CANARY_ATTEMPTS:-0}"
     [[ "$attempts" =~ ^[0-9]+$ ]] || attempts=0
     if (( attempts >= max )); then
-        exec 218>&-
+        _canary_unlock
         canary_finalize_failed "$vmid" "$gen_id" "$digest" "$attempts" \
             "the attempt budget ($max) was already spent" || return 1
         return 4
@@ -860,7 +879,7 @@ canary_main() {
     # alternative is a crash loop that canaries forever.
     attempt=$(( attempts + 1 ))
     if ! gen_update "$vmid" GEN_CANARY_ATTEMPTS="$attempt"; then
-        exec 218>&-
+        _canary_unlock
         log_error "canary: could not record attempt $attempt for generation $gen_id"
         return 1
     fi
@@ -880,20 +899,28 @@ canary_main() {
         canary_destroy_vm "$CANARY_VMID" "canary-gen${gen_id}" "$CANARY_RUN_ORG" || true
     fi
 
-    exec 218>&-
-
+    # The lock is still held here, deliberately: promotion is the last step of
+    # this canary, and a second gate starting on the same candidate while it
+    # runs would clone a canary for a generation that is about to be active.
+    # No deadlock — promote wants PROMOTION_PAUSE_FILE and the pool lock, and
+    # nothing that holds those ever wants CANARY_LOCK_FILE.
     case "$rc" in
         0)
             log_info "canary: generation $gen_id passed — promoting"
             if ! promote_generation "$gen_id" --canary-passed; then
+                _canary_unlock
                 log_error "canary: generation $gen_id passed the canary but promotion failed"
                 return 1
             fi
+            _canary_unlock
             return 0
             ;;
         2|5)
             # Never attempted: hand the budget back so a misconfiguration or a
-            # promotion window cannot reject a good image (spec 7.5).
+            # promotion window cannot reject a good image (spec 7.5). Proven by
+            # "a dispatch GitHub refuses hands the attempt back" and "a
+            # promotion in progress does not consume an attempt and stays
+            # quiet".
             gen_update "$vmid" GEN_CANARY_ATTEMPTS="$attempts" \
                 || log_warn "canary: could not restore the attempt count for generation $gen_id"
             if [[ "$rc" -eq 2 ]]; then
@@ -903,13 +930,17 @@ canary_main() {
             else
                 log_info "canary: generation $gen_id was not attempted: ${CANARY_FAIL_REASON:-unknown}"
             fi
+            _canary_unlock
             return 2
             ;;
     esac
 
     if (( attempt >= max )); then
+        rc=0
         canary_finalize_failed "$vmid" "$gen_id" "$digest" "$attempt" \
-            "${CANARY_FAIL_REASON:-the canary failed}" || return 1
+            "${CANARY_FAIL_REASON:-the canary failed}" || rc=$?
+        _canary_unlock
+        [[ "$rc" -eq 0 ]] || return 1
         return 4
     fi
 
@@ -917,6 +948,7 @@ canary_main() {
         "Canary attempt $attempt/$max failed for generation $gen_id: ${CANARY_FAIL_REASON:-unknown}" \
         "run ${url:-<none>}"
     log_warn "canary: attempt $attempt/$max failed for generation $gen_id: ${CANARY_FAIL_REASON:-unknown} (run ${url:-<none>})"
+    _canary_unlock
     return 3
 }
 

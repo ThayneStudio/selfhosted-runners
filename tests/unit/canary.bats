@@ -786,3 +786,56 @@ tags: runner;gen-5'
 tags: runner;runner-canary-old'
     [ "$status" -ne 0 ]
 }
+
+# ---------------------------------------------------------------------------
+# The acceptance list of issue #22, as close as a stubbed harness gets to it.
+# ---------------------------------------------------------------------------
+
+@test "a failed canary leaves the active generation and the clone pointer alone" {
+    # "the active generation keeps serving jobs throughout": the gate never
+    # touches the active template, the pointer, or the pool.
+    api_response '*/actions/runs/9911' 200 <<'EOF'
+{"id": 9911, "status": "completed", "conclusion": "failure"}
+EOF
+    run --separate-stderr canary_main 2
+    [ "$status" -eq 3 ]
+    gen_read 9000
+    [ "$GEN_STATE" = "active" ]
+    grep -q 'TEMPLATE_ID="9000"' "$CONFIG_FILE"
+    refute_called qm 'destroy 9000*'
+    refute_called qm 'stop 9000*'
+    refute_called qm 'set 9000 *'
+}
+
+@test "three consecutive failures reject the generation and memo its digest" {
+    api_response '*/actions/runs/9911' 200 <<'EOF'
+{"id": 9911, "status": "completed", "conclusion": "failure", "html_url": "https://github.com/acme-org/canary-repo/actions/runs/9911"}
+EOF
+    local attempt
+    for attempt in 1 2; do
+        run --separate-stderr canary_main 2
+        [ "$status" -eq 3 ]
+        [ "$(attempts_of 8901)" = "$attempt" ]
+        gen_read 8901
+        [ "$GEN_STATE" = "candidate" ]
+        run digest_is_memoed newdigest
+        [ "$status" -ne 0 ]
+    done
+
+    run --separate-stderr canary_main 2
+    [ "$status" -eq 4 ]
+    [ "$(attempts_of 8901)" = "3" ]
+    gen_read 8901
+    [ "$GEN_STATE" = "failed" ]
+    run digest_is_memoed newdigest
+    [ "$status" -eq 0 ]
+    [ "$(grep -c 'warn canary.attempt_failed' "$STUB_DIR/notify.log")" = "2" ]
+    [ "$(grep -c 'error canary.failed' "$STUB_DIR/notify.log")" = "1" ]
+    [ ! -f "$STUB_DIR/promote.log" ]
+
+    # And a fourth cycle does not clone again, or notify again.
+    rm -f "$STUB_DIR/clone.log"
+    run --separate-stderr canary_main 2
+    [ "$status" -eq 4 ]
+    ! cloned
+}
