@@ -179,6 +179,61 @@ EOF
     [ "$(cat "$STUB_DIR/curl-stdin")" = 'header = "Authorization: token ghp_secret_pat"' ]
 }
 
+# The other two PAT calls in lib/common.sh carry the same contract, and until
+# now nothing exercised their real bodies at all — every other reference to
+# them replaces the function itself. They are covered here, next to the
+# snapshot test, so the three GitHub calls that hold a PAT are pinned as one
+# group rather than drifting apart.
+@test "deregister-by-id sends the PAT config on stdin, never on argv" {
+    write_org_config acme ghp_secret_pat acme-org
+    curl() {
+        printf '%s\n' "$*" > "$STUB_DIR/curl-argv"
+        cat > "$STUB_DIR/curl-stdin"
+    }
+
+    run github_runner_deregister_id acme 42
+    [ "$status" -eq 0 ]
+
+    [[ "$(cat "$STUB_DIR/curl-argv")" != *ghp_secret_pat* ]]
+    [[ "$(cat "$STUB_DIR/curl-argv")" != */dev/fd/* ]]
+    [[ "$(cat "$STUB_DIR/curl-argv")" == *"--config -"* ]]
+    [[ "$(cat "$STUB_DIR/curl-argv")" == *"orgs/acme-org/actions/runners/42"* ]]
+    [ "$(cat "$STUB_DIR/curl-stdin")" = 'header = "Authorization: token ghp_secret_pat"' ]
+}
+
+# fetch_jit_config is the one of the three that already used every other
+# channel: the request body on argv (--data), the response body in a -o file,
+# and the HTTP code on stdout. Assert the config took stdin without displacing
+# any of them, and that the happy path still yields the JIT token.
+@test "JIT mint sends the PAT config on stdin without disturbing body or response" {
+    write_org_config acme ghp_secret_pat acme-org
+    load_org_config acme
+    jq() { /usr/bin/jq "$@"; }
+    curl() {
+        local args=("$@") i out=""
+        printf '%s\n' "$*" > "$STUB_DIR/curl-argv"
+        cat > "$STUB_DIR/curl-stdin"
+        for (( i = 0; i < ${#args[@]} - 1; i++ )); do
+            [[ "${args[i]}" == "-o" ]] && out="${args[i + 1]}"
+        done
+        [[ -n "$out" ]] || return 1
+        printf '{"encoded_jit_config":"QUJDaml0"}' > "$out"
+        printf '201'
+    }
+
+    run fetch_jit_config runner-x
+    [ "$status" -eq 0 ]
+    assert_output_is 'QUJDaml0'
+
+    [[ "$(cat "$STUB_DIR/curl-argv")" != *ghp_secret_pat* ]]
+    [[ "$(cat "$STUB_DIR/curl-argv")" != */dev/fd/* ]]
+    [[ "$(cat "$STUB_DIR/curl-argv")" == *"--config -"* ]]
+    [[ "$(cat "$STUB_DIR/curl-argv")" == *'--data'* ]]
+    [[ "$(cat "$STUB_DIR/curl-argv")" == *'"name": "runner-x"'* ]]
+    [[ "$(cat "$STUB_DIR/curl-argv")" == *generate-jitconfig* ]]
+    [ "$(cat "$STUB_DIR/curl-stdin")" = 'header = "Authorization: token ghp_secret_pat"' ]
+}
+
 @test "GitHub lookup fails closed for a missing runner or malformed busy state" {
     write_org_config acme ghp_test acme-org
     jq() { /usr/bin/jq "$@"; }

@@ -907,8 +907,15 @@ github_runners_snapshot() {
     # steps under a CI runner — the write fails instead and bash prints
     # "printf: write error: Broken pipe" on the *caller's* stderr. The
     # 2>/dev/null below cannot suppress it, because the writer is forked during
-    # word expansion, before this command's redirections are applied. A
-    # here-string is written by the shell itself: no child, so nothing to race.
+    # word expansion, before this command's redirections are applied.
+    #
+    # A here-string has no writer to race: bash fills the redirection itself,
+    # synchronously, before curl is exec'd. What bash backs it with — a pipe or
+    # a temporary file it creates for this command alone and unlinks before the
+    # command runs — varies by version and platform, and the guarantee here
+    # does not rest on which: either way the PAT is never on argv, never in
+    # curl's environment, and never reachable by another process through a
+    # filesystem path.
     printf -v auth_config 'header = "Authorization: token %s"\n' "$pat"
 
     while :; do
