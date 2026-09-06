@@ -60,6 +60,63 @@ setup() {
         printf 'called %s\n' "$*" >> "$STUB_DIR/promote.log"
         return 0
     }
+
+    # The drift check is a cycle stage (spec 11.1). Stubbed here for the same
+    # reason bake_main is: the cycle tests are about ordering and gating, not
+    # about re-testing lib/drift.sh, which tests/unit/drift.bats owns.
+    drift_main() {
+        printf 'called %s\n' "$*" >> "$STUB_DIR/drift.log"
+        printf 'status=clean\n'
+        return 0
+    }
+
+    # The canary gate's exit status is API (see the contract in lib/canary.sh).
+    # The stub replays whichever branch a test asks for with set_canary_rc, and
+    # a pass performs the promote-and-demote the real gate would, so the stages
+    # after it see the store the real gate would have left.
+    canary_main() {
+        printf '%s\n' "$*" >> "$STUB_DIR/canary.log"
+        local rc=0 vmid
+        [[ -f "$STUB_DIR/canary_rc" ]] && rc=$(cat "$STUB_DIR/canary_rc")
+        if [[ "$rc" -eq 0 ]] && vmid=$(gen_vmid_for_id "$1" 2>/dev/null); then
+            gen_transition "$vmid" active >/dev/null 2>&1 || true
+            [[ "$vmid" == "${TEMPLATE_ID:-}" ]] ||
+                gen_transition "${TEMPLATE_ID:-}" superseded >/dev/null 2>&1 || true
+            TEMPLATE_ID="$vmid"
+        elif [[ "$rc" -eq 4 ]] && vmid=$(gen_vmid_for_id "$1" 2>/dev/null); then
+            gen_transition "$vmid" failed "canary rejected" >/dev/null 2>&1 || true
+        fi
+        return "$rc"
+    }
+}
+
+set_canary_rc() {
+    printf '%s' "$1" > "$STUB_DIR/canary_rc"
+}
+
+canary_log() {
+    [[ -f "$STUB_DIR/canary.log" ]] && cat "$STUB_DIR/canary.log"
+    return 0
+}
+
+canary_called() {
+    [[ -f "$STUB_DIR/canary.log" ]]
+}
+
+drift_called() {
+    [[ -f "$STUB_DIR/drift.log" ]]
+}
+
+# How many generation records are in <state>. `gen_list | grep -c` cannot be
+# used: grep exits 1 on zero matches, which would read as a failed assertion
+# rather than a count of nothing.
+count_state() {
+    local state="$1" vmid n=0
+    while read -r vmid; do
+        [[ -n "$vmid" ]] || continue
+        n=$((n + 1))
+    done < <(gen_list "$state")
+    printf '%s\n' "$n"
 }
 
 stub_digest_ok() {
@@ -85,6 +142,19 @@ make_active() {
         "$@"
 }
 
+make_candidate() {
+    local vmid="$1" gen_id="$2" digest="${3:-newdigest}"
+    shift 3 2>/dev/null || shift $#
+    gen_store_init
+    gen_create "$vmid" \
+        GEN_ID="$gen_id" \
+        GEN_STATE=candidate \
+        GEN_TEMPLATE_DIGEST="$digest" \
+        GEN_IMAGE_SHA256=def \
+        GEN_RUNNER_VERSION=2.336.0 \
+        "$@"
+}
+
 bake_main_called() {
     [[ -f "$STUB_DIR/bake_main.log" ]]
 }
@@ -105,6 +175,19 @@ notify_log() {
 @test "runner dispatches the maintain verb" {
     grep -Eq '^[[:space:]]*maintain\)' "$REPO_ROOT/runner"
     grep -q 'maintain' "$REPO_ROOT/runner"
+}
+
+@test "runner help documents the maintain cycle and its skip flags" {
+    grep -q -- '--skip-canary' "$REPO_ROOT/runner"
+    grep -q -- '--skip-bake' "$REPO_ROOT/runner"
+    grep -q -- '--skip-drift' "$REPO_ROOT/runner"
+    grep -q -- '--skip-gc' "$REPO_ROOT/runner"
+}
+
+@test "README documents the maintain cycle and the timer" {
+    grep -q 'runner maintain' "$REPO_ROOT/README.md"
+    grep -q 'github-runner-maintain.timer' "$REPO_ROOT/README.md"
+    grep -q '02:30' "$REPO_ROOT/README.md"
 }
 
 @test "maintain timer fires daily at 02:30 with Persistent=true" {
@@ -827,4 +910,556 @@ EOF
     gen_read 8900
     [ "$GEN_STATE" = "rejected" ]
     notify_log | grep -q 'generation.reconciled'
+}
+
+# ---------------------------------------------------------------------------
+# Canary gate inside the cycle (issue #24 item 1; spec 7.5, 11.1)
+#
+# canary_main's exit status is the contract documented at the top of
+# lib/canary.sh: 0 promoted, 1 gate error, 2 not attempted, 3 attempt failed
+# with attempts remaining, 4 budget spent. The cycle branches on all five.
+# ---------------------------------------------------------------------------
+
+@test "a candidate is gated through the canary by generation id" {
+    stub_digest_ok
+    make_active olddigest GEN_CREATED_AT=2026-08-24T00:00:00Z
+    make_candidate 8901 2
+    CANARY_ENABLED=true
+    CANARY_REPO=acme/canary
+    set_canary_rc 0
+    MAINTAIN_NOW_HHMM=03:00
+
+    run maintain_main
+    [ "$status" -eq 0 ]
+    canary_log | grep -qx '2'
+}
+
+@test "a canary pass promotes the candidate and the cycle continues" {
+    stub_digest_ok
+    make_active olddigest GEN_CREATED_AT=2026-08-24T00:00:00Z
+    make_candidate 8901 2
+    CANARY_ENABLED=true
+    CANARY_REPO=acme/canary
+    set_canary_rc 0
+    MAINTAIN_NOW_HHMM=03:00
+
+    run maintain_main
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"canary passed"* ]]
+    [ "$(count_state candidate)" = "0" ]
+    [ "$(count_state active)" = "1" ]
+    drift_called
+}
+
+@test "canary rc=2 (not attempted) does not bake a second candidate" {
+    stub_digest_ok
+    make_active unknown GEN_CREATED_AT=2026-08-24T00:00:00Z
+    make_candidate 8901 2
+    CANARY_ENABLED=true
+    CANARY_REPO=acme/canary
+    set_canary_rc 2
+    MAINTAIN_NOW_HHMM=03:00
+
+    run maintain_main
+    [ "$status" -eq 0 ]
+    canary_called
+    ! bake_main_called
+    [[ "$output" == *"waiting on the canary gate"* ]]
+    [ "$(count_state candidate)" = "1" ]
+}
+
+@test "canary rc=3 (attempt failed, attempts remain) retries next cycle without baking" {
+    stub_digest_ok
+    make_active unknown GEN_CREATED_AT=2026-08-24T00:00:00Z
+    make_candidate 8901 2
+    CANARY_ENABLED=true
+    CANARY_REPO=acme/canary
+    set_canary_rc 3
+    MAINTAIN_NOW_HHMM=03:00
+
+    run maintain_main
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"retry"* ]]
+    ! bake_main_called
+    [ "$(count_state candidate)" = "1" ]
+}
+
+@test "canary rc=4 (budget spent) leaves no candidate and lets a different digest bake" {
+    stub_digest_ok
+    make_active unknown GEN_CREATED_AT=2026-08-24T00:00:00Z
+    make_candidate 8901 2
+    CANARY_ENABLED=true
+    CANARY_REPO=acme/canary
+    set_canary_rc 4
+    MAINTAIN_NOW_HHMM=03:00
+
+    run maintain_main
+    [ "$status" -eq 0 ]
+    [ "$(count_state candidate)" = "0" ]
+    bake_main_called
+}
+
+@test "canary rc=4 does not rebake the memoed digest" {
+    # Spec 6.3/7.5: the digest the gate rejected is memoed, and detect refuses
+    # it. bake_main's own memo check is what has to hold here.
+    stub_digest_ok
+    local digest
+    digest=$(compute_template_digest)
+    make_active "$digest" GEN_CREATED_AT=2026-08-01T00:00:00Z
+    make_candidate 8901 2 "$digest"
+    memo_failed_digest "$digest"
+    CANARY_ENABLED=true
+    CANARY_REPO=acme/canary
+    set_canary_rc 4
+    MAINTAIN_NOW_HHMM=03:00
+
+    run maintain_main
+    [ "$status" -eq 0 ]
+    ! bake_main_called
+    [[ "$output" == *"memoed"* ]]
+}
+
+@test "canary rc=1 (gate error) fails the cycle and starts no bake" {
+    stub_digest_ok
+    make_active unknown GEN_CREATED_AT=2026-08-24T00:00:00Z
+    make_candidate 8901 2
+    CANARY_ENABLED=true
+    CANARY_REPO=acme/canary
+    set_canary_rc 1
+    MAINTAIN_NOW_HHMM=03:00
+
+    run maintain_main
+    [ "$status" -ne 0 ]
+    ! bake_main_called
+    notify_log | grep -q 'error maintain.canary_error'
+}
+
+@test "a gate error still runs the drift check before failing" {
+    # Spec 11.4: drift is independent of the bake pipeline, so it still fires
+    # when the pipeline is broken.
+    stub_digest_ok
+    make_active unknown GEN_CREATED_AT=2026-08-24T00:00:00Z
+    make_candidate 8901 2
+    CANARY_ENABLED=true
+    CANARY_REPO=acme/canary
+    set_canary_rc 1
+    MAINTAIN_NOW_HHMM=03:00
+
+    run maintain_main
+    [ "$status" -ne 0 ]
+    drift_called
+}
+
+@test "no candidate means the canary gate is not invoked" {
+    stub_digest_ok
+    make_active unknown GEN_CREATED_AT=2026-08-24T00:00:00Z
+    CANARY_ENABLED=true
+    CANARY_REPO=acme/canary
+    MAINTAIN_NOW_HHMM=03:00
+
+    run maintain_main
+    [ "$status" -eq 0 ]
+    ! canary_called
+}
+
+@test "a freshly baked candidate is gated in the same cycle" {
+    # Acceptance: with a stale generation a full cycle runs bake, canary,
+    # promote unattended -- not bake now and canary tomorrow.
+    stub_digest_ok
+    make_active unknown GEN_CREATED_AT=2026-08-24T00:00:00Z
+    CANARY_ENABLED=true
+    CANARY_REPO=acme/canary
+    set_canary_rc 0
+    MAINTAIN_NOW_HHMM=03:00
+    bake_main() {
+        printf 'called\n' >> "$STUB_DIR/bake_main.log"
+        make_candidate 8901 2
+    }
+
+    run maintain_main
+    [ "$status" -eq 0 ]
+    bake_main_called
+    canary_log | grep -qx '2'
+    [ "$(count_state candidate)" = "0" ]
+}
+
+@test "CANARY_ENABLED=false leaves a candidate for the operator and does not bake" {
+    stub_digest_ok
+    make_active unknown GEN_CREATED_AT=2026-08-24T00:00:00Z
+    make_candidate 8901 2
+    CANARY_ENABLED=false
+    MAINTAIN_NOW_HHMM=03:00
+
+    run maintain_main
+    [ "$status" -eq 0 ]
+    ! canary_called
+    ! bake_main_called
+    [[ "$output" == *"runner upgrade"* ]]
+    notify_log | grep -q 'warn maintain.candidate_pending'
+}
+
+@test "the candidate-pending notice is not repeated every cycle" {
+    stub_digest_ok
+    make_active unknown GEN_CREATED_AT=2026-08-24T00:00:00Z
+    make_candidate 8901 2
+    CANARY_ENABLED=false
+    MAINTAIN_NOW_HHMM=03:00
+
+    run maintain_main
+    [ "$status" -eq 0 ]
+    run maintain_main
+    [ "$status" -eq 0 ]
+    run maintain_main
+    [ "$status" -eq 0 ]
+    [ "$(grep -c 'maintain.candidate_pending' "$STUB_DIR/notify.log")" = "1" ]
+}
+
+@test "a different candidate notices again" {
+    stub_digest_ok
+    make_active unknown GEN_CREATED_AT=2026-08-24T00:00:00Z
+    make_candidate 8901 2
+    CANARY_ENABLED=false
+    MAINTAIN_NOW_HHMM=03:00
+
+    run maintain_main
+    [ "$status" -eq 0 ]
+    gen_transition 8901 failed "operator rejected"
+    make_candidate 8902 3
+
+    run maintain_main
+    [ "$status" -eq 0 ]
+    [ "$(grep -c 'maintain.candidate_pending' "$STUB_DIR/notify.log")" = "2" ]
+}
+
+# ---------------------------------------------------------------------------
+# Drift inside the cycle (issue #24 item 3; spec 11.1 lists the drift check as
+# a cycle stage, 11.4 makes it independent of the bake pipeline)
+# ---------------------------------------------------------------------------
+
+@test "maintain runs the drift check every cycle" {
+    stub_digest_ok
+    make_active unknown GEN_CREATED_AT=2026-08-24T00:00:00Z
+    MAINTAIN_NOW_HHMM=03:00
+
+    run maintain_main
+    [ "$status" -eq 0 ]
+    drift_called
+}
+
+@test "the drift check runs on a healthy fleet with nothing else to do" {
+    stub_digest_ok
+    local digest
+    digest=$(compute_template_digest)
+    gen_now() { printf '%s\n' '2026-08-25T00:00:00Z'; }
+    make_active "$digest" GEN_CREATED_AT=2026-08-24T00:00:00Z
+    MAINTAIN_NOW_HHMM=03:00
+
+    run maintain_main
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"nothing to do"* ]]
+    drift_called
+}
+
+@test "the drift check runs outside the rebake window" {
+    stub_digest_ok
+    make_active unknown GEN_CREATED_AT=2026-08-24T00:00:00Z
+    MAINTAIN_NOW_HHMM=07:00
+
+    run maintain_main
+    [ "$status" -eq 0 ]
+    ! bake_main_called
+    drift_called
+}
+
+@test "REBAKE_ENABLED=false leaves garbage collection and the drift check running" {
+    stub_digest_ok
+    make_active unknown GEN_CREATED_AT=2026-08-24T00:00:00Z
+    MAINTAIN_NOW_HHMM=03:00
+    REBAKE_ENABLED=false
+    gc_main() { printf 'called %s\n' "$*" >> "$STUB_DIR/gc.log"; return 0; }
+
+    run maintain_main
+    [ "$status" -eq 0 ]
+    ! bake_main_called
+    [ -f "$STUB_DIR/gc.log" ]
+    drift_called
+}
+
+@test "a failing garbage collection does not silence the rest of the cycle" {
+    # A manual bake or upgrade holding the bake lock is enough to time GC out.
+    # Spec 11.4 wants the drift alarm firing precisely then, so the failure
+    # goes into the exit status and the cycle carries on.
+    stub_digest_ok
+    make_active unknown GEN_CREATED_AT=2026-08-24T00:00:00Z
+    MAINTAIN_NOW_HHMM=03:00
+    gc_main() { log_error "gc exploded"; return 1; }
+
+    run maintain_main
+    [ "$status" -ne 0 ]
+    bake_main_called
+    drift_called
+}
+
+@test "the rebake window gates only maintain, never runner bake --force" {
+    # Issue #24 item 4. The window helper lives in maintain.sh and lib/bake.sh
+    # never consults it, so --force cannot be blocked by the clock. Scoped to
+    # code lines: a comment naming the window is not a gate.
+    grep -q 'in_rebake_window' "$REPO_ROOT/lib/maintain.sh"
+    run grep -nE '^[[:space:]]*[^#[:space:]].*(in_rebake_window|REBAKE_WINDOW)' \
+        "$REPO_ROOT/lib/bake.sh"
+    [ "$status" -ne 0 ]
+}
+
+@test "the drift timer stays installed alongside the maintain timer" {
+    # Spec 11.4: the alarm is independent of the bake pipeline, so it keeps its
+    # own 6-hourly timer as well as running inside the cycle.
+    grep -q 'github-runner-drift.timer' "$REPO_ROOT/lib/setup.sh"
+    grep -q 'enable --now github-runner-drift.timer' "$REPO_ROOT/lib/setup.sh"
+    grep -q 'github-runner-drift.timer' "$REPO_ROOT/install.sh"
+    grep -q 'enable --now github-runner-drift.timer' "$REPO_ROOT/install.sh"
+}
+
+# ---------------------------------------------------------------------------
+# Stage skipping (issue #24 item 1)
+# ---------------------------------------------------------------------------
+
+@test "maintain --help lists every skip flag and exits 0" {
+    run maintain_main --help
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"--skip-adopt"* ]]
+    [[ "$output" == *"--skip-reconcile"* ]]
+    [[ "$output" == *"--skip-gc"* ]]
+    [[ "$output" == *"--skip-canary"* ]]
+    [[ "$output" == *"--skip-bake"* ]]
+    [[ "$output" == *"--skip-drift"* ]]
+}
+
+@test "maintain rejects an unknown option with usage" {
+    run maintain_main --nope
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"Usage: runner maintain"* ]]
+}
+
+@test "--skip-gc skips garbage collection" {
+    stub_digest_ok
+    make_active unknown GEN_CREATED_AT=2026-08-24T00:00:00Z
+    MAINTAIN_NOW_HHMM=03:00
+    gc_main() { printf 'called\n' >> "$STUB_DIR/gc.log"; return 0; }
+
+    run maintain_main --skip-gc
+    [ "$status" -eq 0 ]
+    [ ! -f "$STUB_DIR/gc.log" ]
+    drift_called
+}
+
+@test "--skip-canary skips the gate but still refuses to bake over the candidate" {
+    stub_digest_ok
+    make_active unknown GEN_CREATED_AT=2026-08-24T00:00:00Z
+    make_candidate 8901 2
+    CANARY_ENABLED=true
+    CANARY_REPO=acme/canary
+    set_canary_rc 0
+    MAINTAIN_NOW_HHMM=03:00
+
+    run maintain_main --skip-canary
+    [ "$status" -eq 0 ]
+    ! canary_called
+    ! bake_main_called
+}
+
+@test "--skip-bake runs every other stage and starts no bake" {
+    stub_digest_ok
+    make_active unknown GEN_CREATED_AT=2026-08-24T00:00:00Z
+    MAINTAIN_NOW_HHMM=03:00
+
+    run maintain_main --skip-bake
+    [ "$status" -eq 0 ]
+    ! bake_main_called
+    drift_called
+}
+
+@test "--skip-drift skips the drift check" {
+    stub_digest_ok
+    make_active unknown GEN_CREATED_AT=2026-08-24T00:00:00Z
+    MAINTAIN_NOW_HHMM=03:00
+
+    run maintain_main --skip-drift
+    [ "$status" -eq 0 ]
+    ! drift_called
+}
+
+@test "--skip-reconcile leaves a dead baking record alone" {
+    stub_digest_ok
+    make_active unknown GEN_CREATED_AT=2026-08-24T00:00:00Z
+    gen_create 8900 \
+        GEN_ID=2 \
+        GEN_STATE=baking \
+        GEN_TEMPLATE_DIGEST=deadbeef \
+        GEN_IMAGE_SHA256=abc \
+        GEN_RUNNER_VERSION=unknown
+    MAINTAIN_NOW_HHMM=03:00
+
+    run maintain_main --skip-reconcile --skip-gc
+    [ "$status" -eq 0 ]
+    gen_read 8900
+    [ "$GEN_STATE" = "baking" ]
+    refute_called qm 'destroy*'
+}
+
+@test "--skip-adopt does not adopt" {
+    stub_digest_ok
+    make_active unknown GEN_CREATED_AT=2026-08-24T00:00:00Z
+    MAINTAIN_NOW_HHMM=03:00
+    adopt_deployed_template() { printf 'called\n' >> "$STUB_DIR/adopt.log"; return 0; }
+
+    run maintain_main --skip-adopt
+    [ "$status" -eq 0 ]
+    [ ! -f "$STUB_DIR/adopt.log" ]
+}
+
+# ---------------------------------------------------------------------------
+# Interrupt and re-run (acceptance: no duplicate generations)
+# ---------------------------------------------------------------------------
+
+@test "a bake interrupted after the record was written leaves exactly one candidate" {
+    stub_digest_ok
+    make_active unknown GEN_CREATED_AT=2026-08-24T00:00:00Z
+    # What a SIGKILL mid-bake leaves behind: a baking record, no bake lock.
+    gen_create 8900 \
+        GEN_ID=2 \
+        GEN_STATE=baking \
+        GEN_TEMPLATE_DIGEST=deadbeef \
+        GEN_IMAGE_SHA256=abc \
+        GEN_RUNNER_VERSION=unknown
+    stub_out qm 'status 8900' <<'EOF'
+status: stopped
+EOF
+    stub_out qm 'config 8900' < /dev/null
+    stub_out qm 'destroy 8900*' < /dev/null
+    stub_out pvesm '*' < /dev/null
+    CANARY_ENABLED=true
+    CANARY_REPO=acme/canary
+    set_canary_rc 2
+    MAINTAIN_NOW_HHMM=03:00
+    bake_main() {
+        printf 'called\n' >> "$STUB_DIR/bake_main.log"
+        gen_exists 8902 || make_candidate 8902 3
+    }
+
+    run maintain_main
+    [ "$status" -eq 0 ]
+    run maintain_main
+    [ "$status" -eq 0 ]
+
+    [ "$(count_state candidate)" = "1" ]
+    [ "$(count_state baking)" = "0" ]
+}
+
+@test "a canary interrupted mid-attempt is re-gated with no duplicate candidate" {
+    stub_digest_ok
+    make_active unknown GEN_CREATED_AT=2026-08-24T00:00:00Z
+    make_candidate 8901 2 newdigest GEN_CANARY_ATTEMPTS=1
+    CANARY_ENABLED=true
+    CANARY_REPO=acme/canary
+    set_canary_rc 3
+    MAINTAIN_NOW_HHMM=03:00
+
+    run maintain_main
+    [ "$status" -eq 0 ]
+    [ "$(count_state candidate)" = "1" ]
+
+    set_canary_rc 0
+    run maintain_main
+    [ "$status" -eq 0 ]
+    [ "$(count_state candidate)" = "0" ]
+    [ "$(count_state active)" = "1" ]
+}
+
+@test "a promotion interrupted between promote and demote leaves exactly one active" {
+    stub_digest_ok
+    # The demoted generation becomes GC's retained rollback target, so GC
+    # refcounts it -- an inventory it cannot read is a GC failure, not the
+    # reconcile behavior under test.
+    stub_out qm 'list*' <<'EOF'
+      VMID NAME                 STATUS
+EOF
+    stub_out pvesm 'list *' < /dev/null
+    gen_store_init
+    TEMPLATE_ID=9000
+    gen_create 9000 \
+        GEN_ID=1 \
+        GEN_STATE=active \
+        GEN_TEMPLATE_DIGEST=old \
+        GEN_IMAGE_SHA256=abc \
+        GEN_RUNNER_VERSION=2.335.0 \
+        GEN_PROMOTED_AT=2026-08-01T00:00:00Z
+    gen_create 8901 \
+        GEN_ID=2 \
+        GEN_STATE=active \
+        GEN_TEMPLATE_DIGEST=new \
+        GEN_IMAGE_SHA256=def \
+        GEN_RUNNER_VERSION=2.336.0 \
+        GEN_PROMOTED_AT=2026-08-25T00:00:00Z
+    MAINTAIN_NOW_HHMM=03:00
+
+    run maintain_main
+    [ "$status" -eq 0 ]
+    run maintain_main
+    [ "$status" -eq 0 ]
+
+    [ "$(count_state active)" = "1" ]
+    gen_read 9000
+    [ "$GEN_STATE" = "active" ]
+}
+
+# ---------------------------------------------------------------------------
+# Concurrency (acceptance: a concurrent manual maintain does not kill a bake)
+# ---------------------------------------------------------------------------
+
+# Hold BAKE_LOCK_FILE exclusively from another process, the way a live bake
+# does. flock is deliberately real -- the harness does not stub it -- and the
+# lock lives on the open file description, so the subshell holds it.
+hold_bake_lock() {
+    local ready="$STUB_DIR/bake-holder-ready"
+    rm -f "$ready"
+    mkdir -p "$(dirname "$BAKE_LOCK_FILE")"
+    (
+        exec 220>"$BAKE_LOCK_FILE"
+        flock -x 220 || exit 1
+        : > "$ready"
+        sleep 60
+    ) &
+    BAKE_HOLDER_PID=$!
+    local waited=0
+    while [[ ! -e "$ready" && "$waited" -lt 200 ]]; do
+        sleep 0.05
+        waited=$((waited + 1))
+    done
+    [ -e "$ready" ]
+}
+
+teardown() {
+    [[ -z "${BAKE_HOLDER_PID:-}" ]] || kill "$BAKE_HOLDER_PID" 2>/dev/null || true
+}
+
+@test "a concurrent maintain does not kill an in-flight bake" {
+    stub_digest_ok
+    make_active unknown GEN_CREATED_AT=2026-08-24T00:00:00Z
+    gen_create 8900 \
+        GEN_ID=2 \
+        GEN_STATE=baking \
+        GEN_TEMPLATE_DIGEST=deadbeef \
+        GEN_IMAGE_SHA256=abc \
+        GEN_RUNNER_VERSION=unknown
+    MAINTAIN_NOW_HHMM=03:00
+    hold_bake_lock
+    # GC waits on the same bake lock for 30s; the stage under test is the
+    # reconcile, so skip it rather than sleep out the timeout.
+    run maintain_main --skip-gc
+    [ "$status" -eq 0 ]
+
+    gen_read 8900
+    [ "$GEN_STATE" = "baking" ]
+    refute_called qm 'destroy*'
+    [[ "$output" == *"Bake lock is held"* ]]
 }
