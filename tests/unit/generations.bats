@@ -953,6 +953,28 @@ create_full_record() {
     [ "$status" -eq 1 ]
 }
 
+# gen_rollback_target shares gen_record_is_rollback_eligible with lib/gc.sh's
+# own retention policy (spec 9/15) so the two can never disagree about which
+# generation is "the retained previous one" — see the matching gc.bats test
+# "a pre-field superseded adopted gen-1 remains the rollback target".
+@test "gen_rollback_target accepts a legacy-adopted generation with no promotion timestamp" {
+    apply_generation_defaults
+    gen_create 9000 \
+        GEN_ID=1 \
+        GEN_STATE=superseded \
+        GEN_IMAGE_SHA256=unknown \
+        GEN_TEMPLATE_DIGEST=unknown \
+        GEN_SUPERSEDED_AT=2026-08-20T00:00:00Z
+    gen_create 8903 \
+        GEN_ID=2 \
+        GEN_STATE=active \
+        GEN_PROMOTED_AT=2026-08-20T00:00:00Z
+
+    run gen_rollback_target 2
+    [ "$status" -eq 0 ]
+    [ "$output" = "9000" ]
+}
+
 # ---------------------------------------------------------------------------
 # Generation config defaults (lib/common.sh, applied by load_infra_config)
 # ---------------------------------------------------------------------------

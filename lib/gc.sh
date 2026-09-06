@@ -79,26 +79,10 @@ gc_warn_failure() {
     fi
 }
 
-gc_record_is_legacy_adopted() {
-    local vmid_num
-    [[ "${GEN_ID:-}" == "1" && "${GEN_IMAGE_SHA256:-}" == "unknown" &&
-        "${GEN_TEMPLATE_DIGEST:-}" == "unknown" ]] || return 1
-    gen_is_uint "${GEN_VMID:-}" || return 1
-    vmid_num=$((10#$GEN_VMID))
-    # Adoption alone may keep the old deployment VMID. Every baked candidate
-    # must be inside the generation band, so this positive out-of-band proof
-    # cannot bless an orphan candidate produced by 8298c05.
-    ((vmid_num < TEMPLATE_BAND_MIN || vmid_num > TEMPLATE_BAND_MAX))
-}
-
-gc_record_is_rollback_eligible() {
-    [[ "${GEN_WAS_ACTIVE:-}" == "1" ]] && return 0
-    [[ "${GEN_WAS_ACTIVE:-}" == "0" ]] && return 1
-    # Migration evidence for records written before GEN_WAS_ACTIVE existed.
-    # A promotion timestamp is positive proof; a missing field alone is not.
-    [[ -n "${GEN_PROMOTED_AT:-}" ]] && return 0
-    gc_record_is_legacy_adopted
-}
+# gen_record_is_legacy_adopted / gen_record_is_rollback_eligible live in
+# generations.sh (spec 9/15): they are pure generation-record predicates, and
+# gen_rollback_target needs the exact same eligibility test GC uses so a
+# retained generation and a rollback target can never disagree.
 
 # Re-prove that a VMID still names the generation GC selected. This is called
 # after every potentially slow inventory operation and immediately before qm
@@ -134,7 +118,7 @@ gc_verify_destroy_ownership() {
     # Pre-marker generation 1 was adopted from the legacy deployment under
     # this fixed name and deliberately kept that name. Its two unknown
     # provenance values distinguish it from a baked generation record.
-    if [[ -z "${GEN_TEMPLATE_NAME:-}" ]] && gc_record_is_legacy_adopted &&
+    if [[ -z "${GEN_TEMPLATE_NAME:-}" ]] && gen_record_is_legacy_adopted &&
         [[ "$name" == "ubuntu-cloud-template" ]]; then
         expected_name="$name"
     fi
@@ -306,6 +290,20 @@ gc_reconcile_candidates() {
 gc_collect_superseded() {
     local dry_run="$1" list vmid retain="" retain_id=-1 id blockers age
     local -a superseded=()
+    local active_id=""
+
+    # A rollback re-activates an older generation and leaves the one it
+    # escaped superseded by a later crash-reconcile (maintain_reconcile_two_
+    # actives), never rejected — with a GEN_ID higher than the now-active
+    # pointer's. Capping eligibility at the current active's id keeps that
+    # leftover from ever outranking the real previous generation here, the
+    # same guard gen_rollback_target applies via its own current-id argument
+    # (spec 15, issue #19) -- so GC's "newest superseded" and rollback's
+    # target can never name different VMIDs.
+    if [[ -n "${TEMPLATE_ID:-}" ]] && gen_exists "$TEMPLATE_ID"; then
+        gen_read "$TEMPLATE_ID" || return 1
+        active_id=$(gen_require_numeric_id "$TEMPLATE_ID") || return 1
+    fi
 
     list=$(gen_list superseded) || return 1
     while read -r vmid; do
@@ -315,7 +313,8 @@ gc_collect_superseded() {
         id=$(gen_require_numeric_id "$vmid") || return 1
         # An orphan candidate is superseded for cleanup, but has never served
         # and therefore cannot displace a known-good rollback generation.
-        if gc_record_is_rollback_eligible && ((id > retain_id)); then
+        if gen_record_is_rollback_eligible && ((id > retain_id)) &&
+            { [[ -z "$active_id" ]] || ((id <= active_id)); }; then
             retain_id="$id"
             retain="$vmid"
         fi
@@ -345,7 +344,7 @@ gc_collect_superseded() {
             fi
             continue
         fi
-        if [[ "$vmid" == "$retain" ]] && gc_record_is_rollback_eligible; then
+        if [[ "$vmid" == "$retain" ]] && gen_record_is_rollback_eligible; then
             log_info "Retaining newest superseded generation $GEN_ID (VMID $vmid) for rollback"
             continue
         fi

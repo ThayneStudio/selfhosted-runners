@@ -159,6 +159,33 @@ EOF
     assert_called qm 'destroy 8901 --purge'
 }
 
+@test "a rollback leftover with a higher GEN_ID than active cannot shadow the real retained generation" {
+    # Rollback restored generation 2 (active, VMID 8903) and a crash before
+    # reject left generation 3 -- the escaped image -- superseded instead of
+    # rejected, with a GEN_ID higher than the active pointer and a later
+    # GEN_SUPERSEDED_AT than the true previous generation 1 (spec 15, issue
+    # #19). "Newest superseded" must never be decided by GEN_ID alone: that
+    # would let GC retain the escaped leftover and destroy the real previous
+    # out from under a future rollback.
+    make_gen 9000 1 superseded
+    gen_update 9000 GEN_WAS_ACTIVE=1
+    gen_update 9000 GEN_SUPERSEDED_AT=2026-08-01T00:00:00Z
+    make_gen 8903 2 active
+    make_gen 8901 3 superseded
+    gen_update 8901 GEN_WAS_ACTIVE=1
+    gen_update 8901 GEN_SUPERSEDED_AT=2026-08-30T00:00:00Z
+    printf '9001\n' > "$STUB_DIR/blockers-3"
+
+    run --separate-stderr gc_main false
+    [ "$status" -eq 0 ]
+    gen_exists 9000
+    [ "$(gen_state_of 9000)" = superseded ]
+    gen_exists 8901
+    [ "$(gen_state_of 8901)" = superseded ]
+    [[ "$stderr" == *"Retaining newest superseded generation 1 (VMID 9000)"* ]]
+    refute_called qm 'destroy *'
+}
+
 @test "an orphan candidate cannot displace the prior-active rollback target" {
     make_gen 8900 1 superseded
     make_gen 8901 2 candidate

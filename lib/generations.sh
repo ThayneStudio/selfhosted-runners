@@ -641,13 +641,46 @@ gen_vmid_for_id() (
     return 1
 )
 
+# True when a generation record is legacy-adopted (spec 8): generation 1,
+# unknown provenance, and a VMID outside the generation band. Adoption alone
+# may keep the old deployment VMID, but every baked candidate must be inside
+# the band, so this positive out-of-band proof cannot bless an orphan
+# candidate. Used only as migration evidence for records written before
+# GEN_WAS_ACTIVE existed — shared by gc.sh's retention policy and
+# gen_rollback_target so a legacy-adopted generation 1 is never destroyed by
+# one and refused by the other.
+gen_record_is_legacy_adopted() {
+    local vmid_num
+    [[ "${GEN_ID:-}" == "1" && "${GEN_IMAGE_SHA256:-}" == "unknown" &&
+        "${GEN_TEMPLATE_DIGEST:-}" == "unknown" ]] || return 1
+    gen_is_uint "${GEN_VMID:-}" || return 1
+    vmid_num=$((10#$GEN_VMID))
+    ((vmid_num < TEMPLATE_BAND_MIN || vmid_num > TEMPLATE_BAND_MAX))
+}
+
+# True when a generation record was ever a clone target — the only
+# generations gc.sh may retain instead of destroying and the only ones
+# gen_rollback_target may return. Single source of truth for that
+# eligibility test so GC's retention and rollback's target selection can
+# never disagree about which generation is "the retained previous one".
+gen_record_is_rollback_eligible() {
+    [[ "${GEN_WAS_ACTIVE:-}" == "1" ]] && return 0
+    [[ "${GEN_WAS_ACTIVE:-}" == "0" ]] && return 1
+    # Migration evidence for records written before GEN_WAS_ACTIVE existed.
+    # A promotion timestamp is positive proof; a missing field alone is not.
+    [[ -n "${GEN_PROMOTED_AT:-}" ]] && return 0
+    gen_record_is_legacy_adopted
+}
+
 # VMID of the retained previous generation (spec 9, 15).
 #
-# Among `superseded` records that were once a clone target (GEN_PROMOTED_AT
-# set), pick the newest GEN_SUPERSEDED_AT, then newest GEN_PROMOTED_AT.
-# Never the highest GEN_ID: after a rollback that is the image the operator
-# just escaped. Optional <current-gen-id> skips leftovers with a higher id
-# (incomplete rollback after reconcile demoted instead of reject).
+# Among `superseded` records that were once a clone target
+# (gen_record_is_rollback_eligible), pick the newest GEN_SUPERSEDED_AT, then
+# newest GEN_PROMOTED_AT. Never the highest GEN_ID: after a rollback that is
+# the image the operator just escaped. Optional <current-gen-id> skips
+# leftovers with a higher id (incomplete rollback after reconcile demoted
+# instead of reject) — the same cap gc.sh's own retention applies against the
+# active generation's id, so the two never pick different VMIDs.
 # `rejected` is not in this list; it is never a rollback target.
 #
 # Usage: gen_rollback_target [current-gen-id]
@@ -667,7 +700,7 @@ gen_rollback_target() (
         [[ -n "$vmid" ]] || continue
         gen_read "$vmid" || return 1
         [[ "$GEN_STATE" == "superseded" ]] || continue
-        [[ -n "$GEN_PROMOTED_AT" ]] || continue
+        gen_record_is_rollback_eligible || continue
         id=$(gen_require_numeric_id "$vmid") || return 1
         if [[ -n "$current_id" && "$id" -gt "$((10#$current_id))" ]]; then
             continue
