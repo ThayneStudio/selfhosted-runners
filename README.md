@@ -360,12 +360,26 @@ with the canonical copy before dispatching and refuse the run instead.
 
 The canary gate dispatches the workflow with the generation id as the
 `generation` input, and the job targets `gen-<generation>-canary` -- **that label
-alone, with no `self-hosted`**. The canary registers with `--no-default-labels`
-so it carries nothing else. GitHub assigns a queued job to any idle runner whose
-labels are a superset of `runs-on`, so adding `self-hosted` here would make the
-canary eligible for real production jobs: it would run one on an unvalidated
-image and then destroy itself (it is `--ephemeral`), leaving the canary dispatch
-with no runner and rejecting a good image.
+alone, with no `self-hosted`**. Runner registration is JIT: the config a canary
+clone boots with is minted on the Proxmox host (`fetch_jit_config` in
+`lib/common.sh`) with `RUNNER_LABELS=gen-<generation>-canary`, and GitHub does
+not add default labels to a JIT-registered runner, so that is exactly what the
+canary carries -- there is no guest-side `config.sh`/`--no-default-labels` step
+to opt out of defaults with. GitHub assigns a queued job to any idle runner
+whose labels are a superset of `runs-on`, so adding `self-hosted` here would
+make the canary eligible for real production jobs: it would run one on an
+unvalidated image and then destroy itself (it is `--ephemeral`), leaving the
+canary dispatch with no runner and rejecting a good image.
+
+That "GitHub adds no default labels to a JIT-registered runner" is not just
+trusted -- `fetch_jit_config` enforces it for every canary mint by comparing
+the labels the `generate-jitconfig` response actually attached to the runner
+against exactly what was requested. If GitHub ever does start attaching a
+default (a read-only `self-hosted`/`Linux`/`X64`, say), the canary mint
+deregisters that runner immediately and the clone fails closed -- **the
+canary refuses to start rather than run unisolated**. This check applies to
+canary mints only; a production mint is never second-guessed over a
+legitimate read-only default GitHub attaches there.
 
 The label decides who *may* answer the dispatch, not who did. Every toolchain
 assertion below passes on any healthy runner of any generation, because the

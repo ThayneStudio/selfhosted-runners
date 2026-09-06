@@ -201,6 +201,37 @@ EOF
     [ "$(cat "$STUB_DIR/curl-stdin")" = 'header = "Authorization: token ghp_secret_pat"' ]
 }
 
+# _github_runner_delete is the DELETE call github_runner_deregister_id
+# resolves org-config credentials for and fetch_jit_config's canary
+# label-mismatch path (#21) calls directly with credentials it already has
+# loaded -- one place for the HTTP call and its PAT-transport contract,
+# pinned here independently of either caller's own credential resolution.
+@test "_github_runner_delete sends the PAT config on stdin, never on argv" {
+    curl() {
+        printf '%s\n' "$*" > "$STUB_DIR/curl-argv"
+        cat > "$STUB_DIR/curl-stdin"
+    }
+
+    run _github_runner_delete acme-org ghp_secret_pat 42
+    [ "$status" -eq 0 ]
+
+    [[ "$(cat "$STUB_DIR/curl-argv")" != *ghp_secret_pat* ]]
+    [[ "$(cat "$STUB_DIR/curl-argv")" != */dev/fd/* ]]
+    [[ "$(cat "$STUB_DIR/curl-argv")" == *"--config -"* ]]
+    [[ "$(cat "$STUB_DIR/curl-argv")" == *"orgs/acme-org/actions/runners/42"* ]]
+    [ "$(cat "$STUB_DIR/curl-stdin")" = 'header = "Authorization: token ghp_secret_pat"' ]
+}
+
+@test "_github_runner_delete rejects a non-numeric or empty runner id without calling curl" {
+    curl() { printf 'curl should not run\n' >> "$STUB_DIR/unexpected-curl-calls"; return 1; }
+
+    run _github_runner_delete acme-org ghp_secret_pat not-a-number
+    [ "$status" -ne 0 ]
+    run _github_runner_delete acme-org ghp_secret_pat ""
+    [ "$status" -ne 0 ]
+    [ ! -f "$STUB_DIR/unexpected-curl-calls" ]
+}
+
 # fetch_jit_config is the one of the three that already used every other
 # channel: the request body on argv (--data), the response body in a -o file,
 # and the HTTP code on stdout. Assert the config took stdin without displacing

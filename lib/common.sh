@@ -1109,7 +1109,8 @@ recover_rollover_pending() {
         fi
         rollover_pending_identity_matches "$vmid" "$name" "$org" "$gen" "$nonce" || { exec 209>&-; continue; }
         if qm destroy "$vmid" --purge 200>&- 209>&- 2>/dev/null; then
-            rm -f "${SNIPPETS_DIR}/runner-${vmid}-meta.yaml" "${SNIPPETS_DIR}/runner-${vmid}-user-"*.yaml "${SNIPPETS_DIR}/runner-${vmid}-vendor.yaml" "$file"
+            cleanup_clone_snippets "$vmid"
+            rm -f "$file"
             log_info "[rollover-recovery] destroyed pending VMID $vmid ($name)"
         fi
         exec 209>&-
@@ -1135,23 +1136,33 @@ github_runner_lookup() {
 
 # Strict counterpart to deregister_runner for callers whose next operation is
 # destructive.  Failure is meaningful: they must leave the VM alone.
-github_runner_deregister_id() {
-    local org="$1" runner_id="$2" credentials github_org pat auth_config
+# DELETE a runner by numeric id. PAT on stdin, never argv or a <( ) fd — see
+# github_runners_snapshot for why. Shared by github_runner_deregister_id
+# (which resolves org-config credentials first) and fetch_jit_config's canary
+# label-mismatch path (which already has GITHUB_ORG/GITHUB_PAT loaded and has
+# no org-config slug to re-derive them from) — one place for this HTTP call.
+# stdout suppressed: DELETE returns 204 (empty), but callers run this from
+# inside $(...) capture (deregister_runner from clone_runner's JIT mint-retry
+# path, fetch_jit_config's own mismatch path), so keep any surprise body off
+# the captured stdout. The exit status still propagates — destructive callers
+# depend on it.
+_github_runner_delete() {
+    local github_org="$1" pat="$2" runner_id="$3" auth_config
     [[ "$runner_id" =~ ^[0-9]+$ ]] || return 1
-    credentials=$(github_runner_credentials "$org") || return 1
-    IFS=$'\t' read -r github_org pat <<< "$credentials"
-    # Config on stdin, not on a <( ) fd — see github_runners_snapshot.
     printf -v auth_config 'header = "Authorization: token %s"\n' "$pat"
-
-    # stdout suppressed: DELETE returns 204 (empty), but deregister_runner calls
-    # this from inside $(clone_runner) on the JIT mint-retry path, so keep any
-    # surprise body off the captured stdout. The exit status still propagates —
-    # destructive callers depend on it.
     curl -sf --max-time 10 -X DELETE \
         -H "Accept: application/vnd.github+json" \
         --config - \
         "https://api.github.com/orgs/${github_org}/actions/runners/${runner_id}" \
         >/dev/null 2>&1 <<< "$auth_config"
+}
+
+github_runner_deregister_id() {
+    local org="$1" runner_id="$2" credentials github_org pat
+    [[ "$runner_id" =~ ^[0-9]+$ ]] || return 1
+    credentials=$(github_runner_credentials "$org") || return 1
+    IFS=$'\t' read -r github_org pat <<< "$credentials"
+    _github_runner_delete "$github_org" "$pat" "$runner_id"
 }
 
 deregister_runner() {
@@ -1171,8 +1182,22 @@ deregister_runner() {
 # load_org_config). The PAT is passed via curl --config to keep it off argv; the
 # request body (name/labels/group) is not sensitive. RUNNER_GROUP_ID (default 1
 # = the org's "Default" group) and RUNNER_LABELS may be set in the org config.
+# clone_runner --canary shadows RUNNER_LABELS with a local before calling this,
+# so a canary's minted config carries only gen-<N>-canary (#21) — this function
+# has no canary-specific branch of its own.
+#
+# JIT_ENFORCE_EXACT_LABELS=1 (set by clone_runner --canary alongside its
+# RUNNER_LABELS shadow) turns "GitHub adds no default labels to a
+# JIT-registered runner" from an assumption into an enforced invariant: the
+# mint response's runner.labels[] is compared against exactly what was
+# requested, and ANY extra label (e.g. a read-only self-hosted/Linux/X64
+# GitHub decided to attach) deregisters the runner immediately and fails
+# closed — clone_runner never clones a VM for it. Left unset (or 0) for every
+# production mint, where GitHub legitimately attaching a read-only default
+# label must never block a clone.
 # Prints the base64 encoded_jit_config on stdout.
-# Returns 0 on success, 2 on HTTP 409 (duplicate runner name), 1 on any other failure.
+# Returns 0 on success, 2 on HTTP 409 (duplicate runner name), 1 on any other
+# failure (including the label-mismatch fail-closed path above).
 fetch_jit_config() {
     local name="$1"
     local group="${RUNNER_GROUP_ID:-1}"
@@ -1215,6 +1240,39 @@ fetch_jit_config() {
     # Must be a single base64 token — rejects anything with quotes/newlines that
     # could break out of the YAML string it gets rendered into.
     [[ -n "$jit" && "$jit" =~ ^[A-Za-z0-9+/=_-]+$ ]] || return 1
+
+    # Canary isolation invariant (issue #21): the whole point of shadowing
+    # RUNNER_LABELS is worthless if GitHub silently attaches a label we
+    # didn't ask for. Compare what the response actually attached to the
+    # runner against exactly what was requested — never the other way
+    # around, so a legitimate production default (JIT_ENFORCE_EXACT_LABELS
+    # unset) is never second-guessed.
+    if [[ "${JIT_ENFORCE_EXACT_LABELS:-0}" == "1" ]]; then
+        local requested_json returned_json unexpected runner_id
+        requested_json=$(jq -n --arg labels "$labels" \
+            '$labels | split(",") | map(gsub("^\\s+|\\s+$";"")) | map(select(length > 0)) | sort') || return 1
+        # .runner.labels[] may be absent on a malformed/unexpected response
+        # shape; falling back to [] treats that as "nothing observed" rather
+        # than erroring, since the base64 config itself already validated
+        # above.
+        returned_json=$(jq -c '[.runner.labels[]?.name] | sort' <<<"$body" 2>/dev/null) || returned_json="[]"
+        unexpected=$(jq -rn --argjson requested "$requested_json" --argjson returned "$returned_json" \
+            '($returned - $requested) | join(", ")' 2>/dev/null)
+        if [[ -n "$unexpected" ]]; then
+            runner_id=$(jq -r '.runner.id // empty' <<<"$body" 2>/dev/null)
+            log_error "JIT mint for '$name' returned unexpected label(s) [$unexpected] beyond the requested set ($labels) — GitHub may have attached a default label to this JIT runner. Deregistering; refusing to start an unisolated canary."
+            # _github_runner_delete itself rejects a non-numeric/empty
+            # runner_id, so this one check covers both "nothing to delete"
+            # and "the DELETE failed" — either way the operator must not be
+            # told the canary is isolated when a labeled runner is still
+            # sitting on GitHub.
+            if ! _github_runner_delete "$GITHUB_ORG" "$GITHUB_PAT" "$runner_id"; then
+                log_error "failed to deregister runner ${runner_id:-<unknown>} — an unisolated runner is still registered on GitHub; remove it manually"
+            fi
+            return 1
+        fi
+    fi
+
     printf '%s' "$jit"
 }
 
@@ -1252,6 +1310,35 @@ generate_mac() {
     echo -n "$1" | md5sum | sed 's/\(..\)\(..\)\(..\)\(..\)\(..\).*/02:\1:\2:\3:\4:\5/'
 }
 
+# Remove every per-VM cloud-init snippet for a clone: meta, the per-VM JIT
+# user snippet (runner-<vmid>-user-<org>.yaml — org unknown here, hence the
+# glob), and a defensive sweep of a vendor snippet. Canary label isolation is
+# expressed in the JIT config minted on the host (see the RUNNER_LABELS
+# override next to clone_runner's fetch_jit_config call), not via cloud-init
+# vendor-data, so nothing writes runner-<vmid>-vendor.yaml today — the glob
+# stays so a later occupant of the same VMID can never inherit a stray one.
+# Proven by "cleanup_clone_snippets removes meta, user, and vendor files".
+cleanup_clone_snippets() {
+    local vmid="${1:-}"
+    [[ "$vmid" =~ ^[0-9]+$ ]] || return 0
+    rm -f "${SNIPPETS_DIR}/runner-${vmid}-meta.yaml" \
+          "${SNIPPETS_DIR}/runner-${vmid}-user-"*.yaml \
+          "${SNIPPETS_DIR}/runner-${vmid}-vendor.yaml"
+}
+
+_ensure_generations_lib() {
+    if declare -F gen_list >/dev/null 2>&1; then
+        return 0
+    fi
+    if [[ -r "$LIB_DIR/generations.sh" ]]; then
+        # generations.sh sources common.sh; RUNNER_COMMON_LOADED makes that
+        # a no-op. source=/dev/null so shellcheck does not follow the cycle.
+        # shellcheck source=/dev/null
+        source "$LIB_DIR/generations.sh" || return 1
+    fi
+    declare -F gen_list >/dev/null 2>&1
+}
+
 # GEN_ID whose record names this template VMID. Scans every record matching
 # GEN_VMID rather than "the currently active generation": a promotion can land
 # between a caller reading the pointer and clone_runner running, and tagging
@@ -1274,29 +1361,33 @@ clone_generation_id_for_vmid() (
 )
 
 # Tag a fresh clone from the VMID actually cloned. Missing store or record is
-# a warning, not a failed clone.
+# a warning, not a failed clone — unless extra_tag is set (canary), which is
+# fail-closed so an untagged canary cannot register with production labels.
 clone_tag_generation() {
-    local clone_vmid="$1" template_vmid="$2" gen_id=""
+    local clone_vmid="$1" template_vmid="$2" extra_tag="${3:-}"
+    local gen_id="" tags
 
-    if ! declare -F gen_list >/dev/null 2>&1; then
-        if [[ -r "$LIB_DIR/generations.sh" ]]; then
-            # generations.sh sources common.sh; RUNNER_COMMON_LOADED makes that
-            # a no-op. source=/dev/null so shellcheck does not follow the cycle.
-            # shellcheck source=/dev/null
-            source "$LIB_DIR/generations.sh" || true
+    if ! _ensure_generations_lib; then
+        if [[ -n "$extra_tag" ]]; then
+            log_error "clone_runner: generation store unavailable — cannot tag $clone_vmid as $extra_tag"
+            return 1
         fi
-    fi
-    if ! declare -F gen_list >/dev/null 2>&1; then
         log_warn "clone_runner: generation store unavailable — clone $clone_vmid untagged"
         return 0
     fi
 
     gen_id=$(clone_generation_id_for_vmid "$template_vmid") || gen_id=""
     if [[ -z "$gen_id" ]]; then
+        if [[ -n "$extra_tag" ]]; then
+            log_error "clone_runner: no generation record for template VMID $template_vmid — cannot tag $clone_vmid as $extra_tag"
+            return 1
+        fi
         log_warn "clone_runner: no generation record for template VMID $template_vmid — clone $clone_vmid untagged"
         return 0
     fi
-    if ! qm set "$clone_vmid" --tags "runner,gen-${gen_id}" \
+    tags="runner,gen-${gen_id}"
+    [[ -n "$extra_tag" ]] && tags="${tags},${extra_tag}"
+    if ! qm set "$clone_vmid" --tags "$tags" \
         200>&- \
         201>&- \
         202>&- \
@@ -1308,6 +1399,26 @@ clone_tag_generation() {
     return 0
 }
 
+# Canary clone of a specific template VMID (typically a candidate). Production
+# callers stay on clone_runner name/org and never pass --canary.
+# Proven by "clone_canary_runner clones the candidate template not TEMPLATE_ID".
+clone_canary_runner() {
+    local name="${1:-}" org="${2:-}" template_vmid="${3:-}" vmid="${4:-}"
+    if [[ -z "$name" || -z "$org" || -z "$template_vmid" ]]; then
+        log_error "clone_canary_runner: usage: clone_canary_runner <name> <org> <template-vmid> [vmid]"
+        return 1
+    fi
+    if [[ ! "$template_vmid" =~ ^[0-9]+$ ]]; then
+        log_error "clone_canary_runner: invalid template VMID $template_vmid"
+        return 1
+    fi
+    if [[ -n "$vmid" ]]; then
+        clone_runner --canary --template "$template_vmid" "$name" "$org" "$vmid"
+    else
+        clone_runner --canary --template "$template_vmid" "$name" "$org"
+    fi
+}
+
 # Clone template, configure cloud-init, set hookscript, start VM.
 # Returns VMID on stdout.
 # Returns 1 on failure (cleans up partial clone).
@@ -1315,12 +1426,74 @@ clone_tag_generation() {
 # (CLONE_PAUSE_RETRY_MAX_SECONDS, default 130 — longer than promote's 120s
 # exclusive-lock wait). Distinct from 1 so reclone.sh / watch.sh retry
 # without notifying clone.failed. Tests set the bound to 0 to skip the wait.
+#
+# --canary mints its JIT config with RUNNER_LABELS=gen-N-canary so the guest
+# registers with only that label (GitHub does not add default labels to a
+# JIT-registered runner), and tags runner,gen-N,runner-canary. --template
+# clones that VMID instead of the active pointer; it is rejected without
+# --canary so production call sites stay byte-identical (user= + meta= only,
+# and the RUNNER_LABELS an org config may set is never shadowed).
 clone_runner() {
-    local name="$1" org="$2" vmid="${3:-}"
+    local name="" org="" vmid=""
+    local canary=0 template_override="" clone_src="" canary_gen_id="" extra_tag=""
+    # Declared unconditionally (unlike RUNNER_LABELS, which a production org
+    # config may legitimately set and must pass through untouched) so that an
+    # exported env var or an org .conf that happens to set
+    # JIT_ENFORCE_EXACT_LABELS=1 can never leak into a production mint and
+    # fail it over a legitimate GitHub default. Only the canary branch below
+    # turns it on.
+    local JIT_ENFORCE_EXACT_LABELS=0
     local RESERVED_VMID=""
     local pause_waited=0
     local pause_max="${CLONE_PAUSE_RETRY_MAX_SECONDS:-130}"
     local pool_lock_owned=0
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --canary)
+                canary=1
+                shift
+                ;;
+            --template)
+                if [[ $# -lt 2 || -z "$2" || "$2" == --* ]]; then
+                    log_error "clone_runner: --template requires a VMID"
+                    return 1
+                fi
+                template_override="$2"
+                shift 2
+                ;;
+            --template=*)
+                template_override="${1#--template=}"
+                shift
+                ;;
+            --)
+                shift
+                break
+                ;;
+            -*)
+                log_error "clone_runner: unknown option $1"
+                return 1
+                ;;
+            *)
+                break
+                ;;
+        esac
+    done
+    name="${1:-}"
+    org="${2:-}"
+    vmid="${3:-}"
+    if [[ -z "$name" || -z "$org" ]]; then
+        log_error "clone_runner: usage: clone_runner [--canary] [--template VMID] <name> <org> [vmid]"
+        return 1
+    fi
+    if [[ -n "$template_override" && "$canary" -ne 1 ]]; then
+        log_error "clone_runner: --template is only valid with --canary"
+        return 1
+    fi
+    if [[ -n "$template_override" && ! "$template_override" =~ ^[0-9]+$ ]]; then
+        log_error "clone_runner: invalid template VMID $template_override"
+        return 1
+    fi
 
     # GITHUB_PAT/GITHUB_ORG must be in scope (caller ran load_org_config).
     if [[ -z "${GITHUB_PAT:-}" || -z "${GITHUB_ORG:-}" ]]; then
@@ -1409,11 +1582,35 @@ clone_runner() {
     # Re-read after the shared lock so a promotion that ran after the caller
     # sourced CONFIG_FILE is visible before qm clone.
     # Proven by "clone_runner re-reads TEMPLATE_ID after the shared lock".
-    TEMPLATE_ID=$(reload_active_template_id) || {
-        log_error "clone_runner: failed to re-read TEMPLATE_ID"
-        _pool_lock_release
-        return 1
-    }
+    # --template (canary only) clones that VMID instead of the active pointer.
+    if [[ -n "$template_override" ]]; then
+        clone_src="$template_override"
+    else
+        TEMPLATE_ID=$(reload_active_template_id) || {
+            log_error "clone_runner: failed to re-read TEMPLATE_ID"
+            _pool_lock_release
+            return 1
+        }
+        clone_src="$TEMPLATE_ID"
+    fi
+
+    # A canary without a generation id cannot isolate labels — refuse before
+    # allocating a VMID. Proven by "clone_runner --canary fails closed without
+    # a generation record".
+    if [[ "$canary" -eq 1 ]]; then
+        if ! _ensure_generations_lib; then
+            log_error "clone_runner: generation store unavailable — refusing canary clone"
+            _pool_lock_release
+            return 1
+        fi
+        canary_gen_id=$(clone_generation_id_for_vmid "$clone_src") || canary_gen_id=""
+        if [[ -z "$canary_gen_id" ]]; then
+            log_error "clone_runner: canary clone requires a generation record for template $clone_src"
+            _pool_lock_release
+            return 1
+        fi
+        extra_tag="runner-canary"
+    fi
 
     # Cleanup helper: destroy VM (only if it belongs to us), remove snippet, and
     # sweep orphan zvols at this VMID. The ownership check prevents touching
@@ -1429,7 +1626,7 @@ clone_runner() {
             return 0
         fi
 
-        rm -f "${SNIPPETS_DIR}/runner-${vmid}-meta.yaml" "${SNIPPETS_DIR}/runner-${vmid}-user-"*.yaml "${SNIPPETS_DIR}/runner-${vmid}-vendor.yaml"
+        cleanup_clone_snippets "$vmid"
 
         if [[ "$owner" == "$name" ]]; then
             local destroy_err; destroy_err=$(mktemp)
@@ -1456,6 +1653,27 @@ clone_runner() {
     # crashed VM left a stale entry). A healthy ephemeral runner auto-removes
     # after its job, so the common path mints in one call; only on failure do we
     # deregister the stale entry (mirrors config.sh --replace) and retry once.
+    #
+    # Canary label isolation happens right here, not via cloud-init: fetch_jit_config
+    # reads RUNNER_LABELS from its environment, and a `local` in bash is visible to
+    # every function called from this point in the call stack (including a retry
+    # after a 409), so shadowing it for a canary clone makes the minted JIT config
+    # carry only gen-<N>-canary — never self-hosted/linux/x64 — without touching
+    # whatever RUNNER_LABELS a production org config may set. GitHub does not add
+    # default labels to a JIT-registered runner, so this label set is exact. Proven
+    # by "clone_runner --canary mints a JIT config carrying only gen-N-canary".
+    #
+    # JIT_ENFORCE_EXACT_LABELS turns that "GitHub adds no default labels"
+    # assumption into an enforced invariant instead of a trusted one:
+    # fetch_jit_config compares the labels GitHub's response actually
+    # attached to the runner against exactly what was requested, and fails
+    # closed (deregistering the runner it just minted) on any mismatch.
+    # Canary-only: production must never fail a clone over a legitimate
+    # read-only default GitHub may attach there.
+    if [[ "$canary" -eq 1 ]]; then
+        local RUNNER_LABELS="gen-${canary_gen_id}-canary"
+        JIT_ENFORCE_EXACT_LABELS=1
+    fi
     local jit_config mint_rc=0
     jit_config=$(fetch_jit_config "$name") && mint_rc=0 || mint_rc=$?
     if [[ $mint_rc -eq 2 ]]; then
@@ -1546,7 +1764,7 @@ clone_runner() {
     # `journalctl -t github-runner` instead of being buried under the service
     # unit log (which the operator does not look at first).
     local clone_err; clone_err=$(mktemp)
-    if ! qm clone "$TEMPLATE_ID" "$vmid" --name "$name" 200>&- 201>&- 202>&- 203>&- 204>&- 2>"$clone_err"; then
+    if ! qm clone "$clone_src" "$vmid" --name "$name" 200>&- 201>&- 202>&- 203>&- 204>&- 2>"$clone_err"; then
         while IFS= read -r line; do
             [[ -n "$line" ]] && log_error "qm clone $vmid: $line"
         done < "$clone_err"
@@ -1560,7 +1778,7 @@ clone_runner() {
     rm -f "$clone_err"
     release_clone_slot
 
-    if ! clone_tag_generation "$vmid" "$TEMPLATE_ID"; then
+    if ! clone_tag_generation "$vmid" "$clone_src" "$extra_tag"; then
         _fail
         release_vmid_reservation "$vmid"
         _pool_lock_release
@@ -1597,7 +1815,11 @@ clone_runner() {
     chmod 600 "${SNIPPETS_DIR}/runner-${vmid}-meta.yaml" || { _fail; _pool_lock_release; return 1; }
 
     # Per-VM user snippet carrying the single-use JIT config (must exist before
-    # qm set --cicustom, which validates the referenced volume).
+    # qm set --cicustom, which validates the referenced volume). Canary label
+    # isolation does not need a vendor-data snippet here: the JIT config minted
+    # above already carries the canary-only label set (see the RUNNER_LABELS
+    # override next to the fetch_jit_config call), so this cicustom stays
+    # user=+meta= for both production and canary clones.
     render_user_snippet "$vmid" "$org" "$jit_config" || { _fail; _pool_lock_release; return 1; }
 
     qm set "$vmid" --cicustom "user=local:snippets/runner-${vmid}-user-${org}.yaml,meta=local:snippets/runner-${vmid}-meta.yaml" \
