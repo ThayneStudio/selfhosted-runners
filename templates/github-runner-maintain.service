@@ -7,8 +7,11 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 ExecStart=/usr/local/bin/runner maintain
-# Bake timeout is 90m (BAKE_TIMEOUT); leave headroom for download and detect.
-TimeoutStartSec=7200
+# One cycle can bake and then canary the image it baked: BAKE_TIMEOUT (90m) +
+# CANARY_REGISTER_TIMEOUT (10m) + CANARY_TIMEOUT (30m) = 130m worst case, plus
+# the cloud-image download, detect, GC and the drift check. 4h leaves headroom;
+# tests/unit/maintain.bats recomputes the sum from the defaults.
+TimeoutStartSec=14400
 MemoryMax=512M
 CPUQuota=200%
 SyslogIdentifier=github-runner-maintain

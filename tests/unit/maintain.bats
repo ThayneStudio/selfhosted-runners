@@ -177,6 +177,24 @@ notify_log() {
     grep -q 'maintain' "$REPO_ROOT/runner"
 }
 
+@test "the maintain service allows a bake and a canary in one run" {
+    # The cycle bakes and then gates the image it baked, in one invocation, so
+    # the unit has to survive BAKE_TIMEOUT + CANARY_REGISTER_TIMEOUT +
+    # CANARY_TIMEOUT. Recomputed from the defaults rather than hard-coded, so a
+    # raised budget fails here instead of getting a healthy run SIGTERMed.
+    local unit="$REPO_ROOT/templates/github-runner-maintain.service"
+    local timeout worst
+    timeout=$(sed -n 's/^TimeoutStartSec=\([0-9]*\)$/\1/p' "$unit")
+    [ -n "$timeout" ]
+    apply_generation_defaults
+    worst=$(( BAKE_TIMEOUT + CANARY_REGISTER_TIMEOUT + CANARY_TIMEOUT ))
+    if (( timeout <= worst )); then
+        printf 'TimeoutStartSec=%s does not cover bake+canary worst case %s\n' \
+            "$timeout" "$worst" >&2
+        return 1
+    fi
+}
+
 @test "runner help documents the maintain cycle and its skip flags" {
     grep -q -- '--skip-canary' "$REPO_ROOT/runner"
     grep -q -- '--skip-bake' "$REPO_ROOT/runner"
