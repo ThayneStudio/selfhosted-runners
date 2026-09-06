@@ -333,10 +333,11 @@ the acceptance test for everything the bake installs.
 ### The gate (`runner canary <id>`)
 
 `runner canary <generation-id>` is what turns a `candidate` generation into the
-`active` one, and it is the only unattended path to promotion. It is written to
-be called on every `runner maintain` cycle, so it is safe to run at any time:
-a second run while one is in flight does nothing, an already-active generation
-is a no-op, and a canary that cannot be attempted changes nothing at all.
+`active` one, and it is the only path to promotion that needs no human. It is
+written to be run unattended on every `runner maintain` cycle -- maintain does
+not call it yet -- so it is safe to run at any time: a second run while one is
+in flight does nothing, an already-active generation is a no-op, and a canary
+that cannot be attempted changes nothing at all.
 
 One attempt is:
 
@@ -356,7 +357,7 @@ One attempt is:
 6. Destroy the canary VM either way. **The candidate template is retained**, so
    a retry is a clone and a dispatch, not a 45-minute rebake.
 
-Its exit status is a contract, because `runner maintain` branches on it:
+Its exit status is a contract, because the unattended cycle will branch on it:
 
 | Code | Meaning |
 |---|---|
