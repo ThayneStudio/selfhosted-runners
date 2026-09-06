@@ -1808,12 +1808,62 @@ EOF
     # No twin: without the pointer reload, detect would still read generation
     # 1's olddigest, call it digest-changed and bake the image just promoted.
     refute_bake_main_called
-    # The gate closes fd 218 on the way out, which also closes the fd bats
-    # captures on, so only what it logged before that survives. It is enough
-    # to show the real gate ran end to end; the store assertions above carry
-    # the rest.
     # shellcheck disable=SC2154  # $stderr is set by bats run --separate-stderr
     [[ "$stderr" == *"generation 2 passed"* ]]
+    # And the cycle keeps its voice after the gate returns. _canary_unlock used
+    # to close its lock fd with `exec 218>&- 2>/dev/null`, which is a permanent
+    # redirection of the *shell's* fd 2 -- not a redirection scoped to the exec
+    # -- so with the gate running in-process everything the rest of the cycle
+    # logged went to /dev/null: the promotion line, a failed pointer reload, a
+    # failed GC, the bake decision, the drift check.
+    [[ "$stderr" == *"canary passed: generation 2 was promoted"* ]]
+    [[ "$stderr" == *"nothing to do: up-to-date"* ]]
+    drift_called
+}
+
+@test "no library silences the shell by closing a descriptor with 2>/dev/null" {
+    # `exec N>&- 2>/dev/null` does not scope the redirection to the exec: with
+    # no command, `exec` applies the redirection to the shell itself, so fd 2
+    # points at /dev/null for the rest of the process. maintain runs
+    # canary_main, promote_generation and gc_main in-process, so one of these
+    # anywhere in lib/ costs the journal every later line of the cycle.
+    # `exec N>&-` alone is silent even when N was never open, and `|| true`
+    # already covers the status.
+    run grep -rnE '^[[:space:]]*exec .*[[:space:]]2>' "$REPO_ROOT"/lib
+    if [ "$status" -eq 0 ]; then
+        printf 'permanent stderr redirection on a bare exec:\n%s\n' "$output" >&2
+        return 1
+    fi
+}
+
+@test "a pointer reload failure after the post-bake gate halts without clobbering TEMPLATE_ID" {
+    # `TEMPLATE_ID=$(reload_active_template_id) || ...` assigns the empty
+    # output before the || runs, so a failed reload used to leave the pointer
+    # empty; drift_fleet_version then silently falls back to probing a clone
+    # instead of reading the generation record.
+    stub_digest_ok
+    make_active unknown GEN_CREATED_AT=2026-08-24T00:00:00Z
+    CANARY_ENABLED=true
+    CANARY_REPO=acme/canary
+    set_canary_rc 0
+    MAINTAIN_NOW_HHMM=03:00
+    gc_main() { return 0; }
+    bake_main() {
+        printf 'called\n' >> "$STUB_DIR/bake_main.log"
+        make_candidate 8901 2
+    }
+    reload_active_template_id() { log_error "pointer unreadable"; return 1; }
+
+    run maintain_main
+    [ "$status" -ne 0 ]
+    bake_main_called
+    canary_log | grep -qx '2'
+    [[ "$output" == *"Could not re-read the active pointer"* ]]
+    # halt, so the post-bake failure reads the same as the pre-bake one.
+    [[ "$output" == *"cycle halted"* ]]
+    # The pointer this shell came in with, not an empty string.
+    drift_called
+    grep -q 'template_id=9000' "$STUB_DIR/drift.log"
 }
 
 @test "the drift stage runs the real drift check against the active generation" {

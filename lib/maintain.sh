@@ -454,7 +454,7 @@ maintain_read_candidate() {
 # the record is what the bake stage reads next: a promoted candidate is gone,
 # so the bake stage stops holding; a candidate still standing keeps holding.
 maintain_canary_stage() {
-    local vmid gen_id rc=0
+    local vmid gen_id rc=0 new_pointer
 
     maintain_read_candidate || return 1
     vmid="$MAINTAIN_CANDIDATE_VMID"
@@ -497,10 +497,17 @@ maintain_canary_stage() {
             # compare against the generation it had just superseded, bake a
             # twin of the image it had just promoted, and then report drift
             # against the version it had just replaced.
-            TEMPLATE_ID=$(reload_active_template_id) || {
+            #
+            # Assigned through a temporary: `TEMPLATE_ID=$(...)` assigns the
+            # empty output *before* the `||` runs, so a failed reload would
+            # leave the pointer empty and drift_fleet_version would silently
+            # fall back to probing a running clone instead of reading the
+            # generation record.
+            new_pointer=$(reload_active_template_id) || {
                 log_error "Could not re-read the active pointer after promoting generation $gen_id"
                 return 1
             }
+            TEMPLATE_ID="$new_pointer"
             ;;
         2)
             # Already notified by the gate. Not an attempt, so nothing was
@@ -716,12 +723,23 @@ maintain_main() {
             # double the work and the log lines for nothing.
             if (( skip_canary == 0 )) && [[ -n "$after" && "$after" != "$before" ]]; then
                 log_info "gating the candidate this cycle baked"
-                maintain_canary_stage || rc=1
+                # halt here too, so a gate error or a failed pointer reload
+                # reads the same whichever call site produced it. Nothing but
+                # the drift check follows, and that is outside every guard.
+                maintain_canary_stage || { rc=1; halt=1; }
             fi
         else
             log_error "Cannot read the generation store before the bake decision"
             rc=1
         fi
+    fi
+
+    # One line saying the cycle stopped acting, so the journal distinguishes
+    # "a stage reported a problem and the cycle carried on" from "the cycle
+    # gave up on this store". Logged before the drift check, which runs either
+    # way.
+    if (( halt != 0 )); then
+        log_warn "cycle halted: the stages after the failure above were skipped (the drift check still runs)"
     fi
 
     if (( skip_drift == 0 )); then
