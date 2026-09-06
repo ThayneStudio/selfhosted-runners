@@ -112,6 +112,55 @@ cloned() {
     [ "$elapsed" -lt 15 ]
 }
 
+# ---------------------------------------------------------------------------
+# Canary VMs (spec 7.4, issue #22 item 7). The hookscript fires this script
+# when the canary powers off after its one job. Re-cloning it would resurrect
+# the canary forever -- and every resurrection carries gen-<N>-canary, so it
+# would keep absorbing the gate's dispatches.
+# ---------------------------------------------------------------------------
+
+# The canary branch runs between the per-slot lock and the org lock: it needs
+# the slot lock so it cannot race lib/canary.sh's own destroy of the same VM,
+# and has no business waiting on org capacity locks it will never use.
+run_reclone_canary_branch() {
+    local slice
+    slice=$(awk '/^# A canary VM \(tagged/,/^fi$/' "$REPO_ROOT/lib/reclone.sh")
+    [ -n "$slice" ]
+    run --separate-stderr eval "set -euo pipefail
+$slice"
+}
+
+@test "reclone destroys a canary VM and never re-clones it" {
+    VMID="9501"
+    NAME="canary-gen5"
+    VM_CFG='name: canary-gen5
+tags: gen-5;runner;runner-canary
+cicustom: user=local:snippets/runner-9501-user-acme.yaml,meta=local:snippets/runner-9501-meta.yaml'
+    mkdir -p "$SNIPPETS_DIR"
+    : > "$SNIPPETS_DIR/runner-9501-meta.yaml"
+    : > "$SNIPPETS_DIR/runner-9501-user-acme.yaml"
+
+    run_reclone_canary_branch
+    [ "$status" -eq 0 ]
+    assert_called qm 'destroy 9501 --purge'
+    ! cloned
+    [ ! -f "$SNIPPETS_DIR/runner-9501-meta.yaml" ]
+    [ ! -f "$SNIPPETS_DIR/runner-9501-user-acme.yaml" ]
+}
+
+@test "reclone leaves a normal pool runner to the re-clone path" {
+    VM_CFG='name: runner-1
+tags: gen-5;runner
+cicustom: user=local:snippets/runner-9001-user-acme.yaml'
+
+    run_reclone_canary_branch
+    [ "$status" -eq 0 ]
+    refute_called qm 'destroy *'
+    # The slice ends before the destroy/re-clone the tail does; the point is
+    # that it did not swallow a pool runner on the way past.
+    ! cloned
+}
+
 @test "reclone leaves the pool activity lock free for the exclusive waiter" {
     # Nothing else holds it, so reclone takes it shared and releases it on exit.
     run_reclone_tail

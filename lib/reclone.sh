@@ -40,6 +40,36 @@ fi
 exec 200>"${RUNNER_SLOT_LOCK_PREFIX}-${NAME}.lock"
 flock -n 200 || { log_info "reclone: another process is handling $NAME"; exit 0; }
 
+# A canary VM (tagged runner-canary) is not a pool slot. It exists for exactly
+# one dispatched job and must never be re-cloned: every resurrection would
+# carry gen-<N>-canary and absorb the gate's next dispatch, so the canary would
+# outlive the generation it was testing (spec 7.4). Destroy it, free its
+# volumes with --purge, and stop.
+#
+# Deliberately above the org lock and the pool-activity block below: a canary
+# occupies no org capacity, and this needs only the per-slot lock already held
+# on fd 200 — the same lock lib/canary.sh's own destroy takes, so the two
+# cannot race on one VM. watch.sh fills slots by ${RUNNER_PREFIX}-N name match
+# and canary-gen<N> matches none, so nothing else recreates it either.
+# Proven by "reclone destroys a canary VM and never re-clones it".
+if vm_config_is_canary "$VM_CFG"; then
+    logger -t github-runner "reclone: $NAME is a canary (runner-canary), destroying without re-clone"
+    cleanup_clone_snippets "$VMID"
+    for attempt in 1 2 3; do
+        destroy_output=$(qm destroy "$VMID" --purge 200>&- 2>&1) && destroy_rc=0 || destroy_rc=$?
+        printf '%s\n' "$destroy_output" | logger -t github-runner || true
+        if [[ $destroy_rc -eq 0 ]]; then
+            break
+        fi
+        if [[ $attempt -eq 3 ]]; then
+            log_error "reclone: failed to destroy canary VM $VMID after 3 attempts"
+            exit 1
+        fi
+        sleep 2
+    done
+    exit 0
+fi
+
 exec 209>"${ROLLOVER_ORG_LOCK_PREFIX}-${ORG}.lock"
 flock 209
 
