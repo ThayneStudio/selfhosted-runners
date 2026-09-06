@@ -122,14 +122,21 @@ EOF
     api_response '*/actions/workflows/runner-canary.yml' 200 <<'EOF'
 {"id": 4242, "state": "active", "path": ".github/workflows/runner-canary.yml"}
 EOF
-    api_response '*/actions/workflows/runner-canary.yml/dispatches' 204 < /dev/null
+    # The dispatch is the one call made with -D -, so its fixture carries a
+    # header block: GitHub's Date is the instant every run is compared against.
+    stub_out curl '*/actions/workflows/runner-canary.yml/dispatches' <<'EOF'
+HTTP/2 204
+date: Sun, 06 Sep 2026 07:00:00 GMT
+
+204
+EOF
     # The baseline read (per_page=1) runs before the dispatch, the search
     # (per_page=30) after it, so one static rule each is enough.
     api_response '*per_page=1' 200 <<'EOF'
-{"workflow_runs": []}
+{"workflow_runs": [{"id": 9000, "created_at": "2026-09-06T06:00:00Z"}]}
 EOF
     api_response '*per_page=30' 200 <<'EOF'
-{"workflow_runs": [{"id": 9911, "display_title": "Runner canary gen-2", "status": "completed", "conclusion": "success", "html_url": "https://github.com/acme-org/canary-repo/actions/runs/9911"}]}
+{"workflow_runs": [{"id": 9911, "display_title": "Runner canary gen-2", "created_at": "2026-09-06T07:00:05Z", "status": "completed", "conclusion": "success", "html_url": "https://github.com/acme-org/canary-repo/actions/runs/9911"}]}
 EOF
     api_response '*/actions/runs/9911' 200 <<'EOF'
 {"id": 9911, "status": "completed", "conclusion": "success", "html_url": "https://github.com/acme-org/canary-repo/actions/runs/9911"}
@@ -496,21 +503,119 @@ EOF
     # The baseline read happens before the dispatch: a run already at the top
     # of the list is not this dispatch's run, however recent it looks.
     api_response '*per_page=1' 200 <<'EOF'
-{"workflow_runs": [{"id": 9911}]}
+{"workflow_runs": [{"id": 9911, "created_at": "2026-09-06T06:59:00Z"}]}
 EOF
     CANARY_TIMEOUT=0
 
     run --separate-stderr canary_main 2
     [ "$status" -eq 3 ]
     refute_called curl '*/actions/runs/9911'
-    [[ "$stderr" == *"no workflow run appeared"* ]]
+    [[ "$stderr" == *"no workflow run naming generation 2 appeared"* ]]
+}
+
+# The same hole from the other side: the baseline is right, but a run with
+# this generation's own title is already sitting in the list because a
+# previous attempt made it. Its id is above a *stale* baseline only if the
+# baseline read failed -- so here it is excluded by its timestamp instead,
+# which is the guard that survives a racing hand-dispatch between the
+# baseline read and ours.
+@test "a pre-existing run with this generation's title is not adopted" {
+    api_response '*per_page=1' 200 <<'EOF'
+{"workflow_runs": []}
+EOF
+    # Same title, concluded success, but created a minute before the dispatch
+    # GitHub timestamped at 07:00:00.
+    api_response '*per_page=30' 200 <<'EOF'
+{"workflow_runs": [{"id": 9911, "display_title": "Runner canary gen-2", "created_at": "2026-09-06T06:59:00Z", "status": "completed", "conclusion": "success", "html_url": "https://github.com/acme-org/canary-repo/actions/runs/9911"}]}
+EOF
+    CANARY_TIMEOUT=0
+
+    run --separate-stderr canary_main 2
+    [ "$status" -eq 3 ]
+    refute_called curl '*/actions/runs/9911'
+    [ ! -f "$STUB_DIR/promote.log" ]
+    gen_read 8901
+    [ "$GEN_STATE" = "candidate" ]
+}
+
+# Critical #1: the baseline read is what stops every run in the list from
+# looking new. A non-200, a timeout, or garbage JSON must stop the attempt
+# before the dispatch, not fall back to 0.
+@test "a baseline read that fails does not dispatch and costs no attempt" {
+    api_response '*per_page=1' 500 <<'EOF'
+{"message": "Server Error"}
+EOF
+    run --separate-stderr canary_main 2
+    [ "$status" -eq 2 ]
+    refute_called curl '*/dispatches'
+    [ "$(attempts_of 8901)" = "0" ]
+    gen_read 8901
+    [ "$GEN_STATE" = "candidate" ]
+    notify_log | grep -q 'warn canary.unconfigured'
+    notify_log | grep -q 'baseline'
+}
+
+@test "a baseline read that never completes does not dispatch" {
+    stub_out curl '*per_page=1' <<'EOF'
+
+000
+EOF
+    run --separate-stderr canary_main 2
+    [ "$status" -eq 2 ]
+    refute_called curl '*/dispatches'
+    [ "$(attempts_of 8901)" = "0" ]
+}
+
+@test "a baseline read that returns garbage does not dispatch" {
+    api_response '*per_page=1' 200 <<'EOF'
+not json at all
+EOF
+    run --separate-stderr canary_main 2
+    [ "$status" -eq 2 ]
+    refute_called curl '*/dispatches'
+    [ "$(attempts_of 8901)" = "0" ]
+}
+
+# Important #2: a run that does not name this generation is never polled --
+# a concurrent hand-dispatch (README documents `gh workflow run`) or, once
+# maintain drives this on a second host, another host's canary.
+@test "a newer untitled run does not win over the titled run that follows it" {
+    api_response '*per_page=30' 200 <<'EOF'
+{"workflow_runs": [
+  {"id": 9999, "display_title": "Runner canary gen-7", "created_at": "2026-09-06T07:00:09Z", "html_url": "https://github.com/acme-org/canary-repo/actions/runs/9999"},
+  {"id": 9911, "display_title": "Runner canary gen-2", "created_at": "2026-09-06T07:00:05Z", "html_url": "https://github.com/acme-org/canary-repo/actions/runs/9911"}
+]}
+EOF
+    run --separate-stderr canary_main 2
+    [ "$status" -eq 0 ]
+    assert_called curl '*/actions/runs/9911'
+    refute_called curl '*/actions/runs/9999'
+}
+
+@test "a run that names no generation of ours is reported, never polled or promoted" {
+    api_response '*per_page=30' 200 <<'EOF'
+{"workflow_runs": [{"id": 9999, "display_title": "Some other workflow", "created_at": "2026-09-06T07:00:09Z", "html_url": "https://github.com/acme-org/canary-repo/actions/runs/9999"}]}
+EOF
+    CANARY_TIMEOUT=0
+
+    run --separate-stderr canary_main 2
+    # Not attempted: the gate has no evidence about this image either way, so
+    # the budget is handed back rather than spent on someone else's run.
+    [ "$status" -eq 2 ]
+    refute_called curl '*/actions/runs/9999'
+    [ ! -f "$STUB_DIR/promote.log" ]
+    [ "$(attempts_of 8901)" = "0" ]
+    gen_read 8901
+    [ "$GEN_STATE" = "candidate" ]
+    notify_log | grep -q 'warn canary.unconfigured'
+    notify_log | grep -q '9999'
 }
 
 @test "the new run whose title names this generation is the one watched" {
     api_response '*per_page=30' 200 <<'EOF'
 {"workflow_runs": [
-  {"id": 9912, "display_title": "Runner canary gen-3", "html_url": "https://github.com/acme-org/canary-repo/actions/runs/9912"},
-  {"id": 9911, "display_title": "Runner canary gen-2", "html_url": "https://github.com/acme-org/canary-repo/actions/runs/9911"}
+  {"id": 9912, "display_title": "Runner canary gen-3", "created_at": "2026-09-06T07:00:06Z", "html_url": "https://github.com/acme-org/canary-repo/actions/runs/9912"},
+  {"id": 9911, "display_title": "Runner canary gen-2", "created_at": "2026-09-06T07:00:05Z", "html_url": "https://github.com/acme-org/canary-repo/actions/runs/9911"}
 ]}
 EOF
     run --separate-stderr canary_main 2
@@ -744,6 +849,38 @@ EOF
     [ "$(attempts_of 8901)" = "0" ]
     gen_read 8901
     [ "$GEN_STATE" = "candidate" ]
+}
+
+@test "a spent budget is not finalised while another canary holds the lock" {
+    # Finalising outside the lock lets two concurrent invocations both reject
+    # the generation, both memo the digest and both page an operator.
+    gen_update 8901 GEN_CANARY_ATTEMPTS=3
+    hold_canary_lock
+    CANARY_LOCK_WAIT_SECONDS=0
+
+    run --separate-stderr canary_main 2
+    [ "$status" -eq 2 ]
+    gen_read 8901
+    [ "$GEN_STATE" = "candidate" ]
+    run digest_is_memoed newdigest
+    [ "$status" -ne 0 ]
+    [ ! -f "$STUB_DIR/notify.log" ]
+}
+
+@test "a spent budget is finalised exactly once across repeated invocations" {
+    gen_update 8901 GEN_CANARY_ATTEMPTS=3
+
+    run --separate-stderr canary_main 2
+    [ "$status" -eq 4 ]
+    run --separate-stderr canary_main 2
+    [ "$status" -eq 4 ]
+    run --separate-stderr canary_main 2
+    [ "$status" -eq 4 ]
+
+    [ "$(grep -c 'error canary.failed' "$STUB_DIR/notify.log")" = "1" ]
+    [ "$(grep -c '^newdigest$' "$FAILED_DIGESTS_FILE")" = "1" ]
+    gen_read 8901
+    [ "$GEN_STATE" = "failed" ]
 }
 
 @test "the canary lock is released when the gate finishes" {

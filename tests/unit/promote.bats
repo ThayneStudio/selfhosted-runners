@@ -27,6 +27,14 @@ file_mode() {
     stat -c '%a' "$1" 2>/dev/null || stat -f '%OLp' "$1"
 }
 
+# What lib/canary.sh stamps on a generation whose canary run concluded
+# success, and what --canary-passed checks for.
+record_canary_pass() {
+    gen_update "$1" \
+        GEN_CANARY_ATTEMPTS=1 \
+        GEN_CANARY_RUN_URL=https://github.com/acme-org/canary-repo/actions/runs/9911
+}
+
 seed_active_and_candidate() {
     gen_store_init
     gen_create 9000 \
@@ -323,8 +331,58 @@ EOF
     grep -q 'TEMPLATE_ID="9000"' "$CONFIG_FILE"
 }
 
+# --canary-passed skips both the canary requirement and the confirmation, so
+# it has to be backed by evidence rather than by the caller's word: the gate
+# stamps GEN_CANARY_RUN_URL and GEN_CANARY_ATTEMPTS on the record before it
+# promotes (lib/canary.sh), and this refuses the flag without them.
+@test "promote --canary-passed refuses a generation with no recorded canary run" {
+    seed_active_and_candidate
+
+    run --separate-stderr promote_generation 2 --canary-passed </dev/null
+    [ "$status" -ne 0 ]
+    [[ "$stderr" == *"no canary evidence"* ]]
+    [[ "$stderr" == *"runner canary 2"* ]]
+    gen_read 8900
+    [ "$GEN_STATE" = "candidate" ]
+    gen_read 9000
+    [ "$GEN_STATE" = "active" ]
+    grep -q 'TEMPLATE_ID="9000"' "$CONFIG_FILE"
+    [ ! -e "$PROMOTION_PAUSE_FILE" ]
+}
+
+@test "promote --canary-passed refuses a run URL with no attempt recorded" {
+    seed_active_and_candidate
+    gen_update 8900 GEN_CANARY_RUN_URL=https://github.com/o/r/actions/runs/1
+
+    run --separate-stderr promote_generation 2 --canary-passed </dev/null
+    [ "$status" -ne 0 ]
+    gen_read 8900
+    [ "$GEN_STATE" = "candidate" ]
+}
+
+@test "promote --canary-passed refuses an attempt with no run URL" {
+    seed_active_and_candidate
+    gen_update 8900 GEN_CANARY_ATTEMPTS=1
+
+    run --separate-stderr promote_generation 2 --canary-passed </dev/null
+    [ "$status" -ne 0 ]
+    gen_read 8900
+    [ "$GEN_STATE" = "candidate" ]
+}
+
+@test "promote --canary-passed notifies that a canary, not a human, cleared it" {
+    seed_active_and_candidate
+    record_canary_pass 8900
+
+    run --separate-stderr promote_generation 2 --canary-passed </dev/null
+    [ "$status" -eq 0 ]
+    grep -q 'info promote.canary_passed' "$STUB_DIR/notify.log"
+    grep -q 'runs/9911' "$STUB_DIR/notify.log"
+}
+
 @test "promote --canary-passed promotes without a tty confirmation" {
     seed_active_and_candidate
+    record_canary_pass 8900
 
     run --separate-stderr promote_generation 2 --canary-passed </dev/null
     [ "$status" -eq 0 ]
@@ -339,6 +397,7 @@ EOF
 @test "promote --canary-passed still refuses a non-candidate generation" {
     gen_store_init
     gen_create 8900 GEN_ID=2 GEN_STATE=baking
+    record_canary_pass 8900
 
     run --separate-stderr promote_generation 2 --canary-passed </dev/null
     [ "$status" -ne 0 ]

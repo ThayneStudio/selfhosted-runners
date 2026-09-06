@@ -77,6 +77,10 @@ CANARY_API_MAX_TIME="${CANARY_API_MAX_TIME:-20}"
 # work is done either way.
 CANARY_DESTROY_LOCK_WAIT="${CANARY_DESTROY_LOCK_WAIT:-30}"
 CANARY_DESTROY_RETRY_SECONDS="${CANARY_DESTROY_RETRY_SECONDS:-2}"
+# Only used when GitHub's response carries no readable Date header and the
+# host clock has to stand in for the dispatch instant. Wide enough to absorb
+# a badly set clock, far narrower than the gap between two canary attempts.
+CANARY_CLOCK_SKEW_SECONDS="${CANARY_CLOCK_SKEW_SECONDS:-300}"
 
 # Set by canary_preflight for the rest of the run.
 CANARY_RUN_ORG=""
@@ -87,6 +91,8 @@ CANARY_RUN_URL=""
 CANARY_FAIL_REASON=""
 CANARY_VMID=""
 CANARY_UNCONFIGURED_REASON=""
+# GitHub's clock at the moment it accepted the dispatch.
+CANARY_DISPATCH_EPOCH=""
 
 canary_usage() {
     echo "Usage: runner canary <generation-id>"
@@ -170,11 +176,14 @@ canary_repo_full_name() {
 # github_runners_snapshot for why the fd is the wrong shape.
 # Proven by "the canary PAT never reaches curl argv".
 #
-# Usage: _canary_api <method> <url> [json-body]
+# Usage: _canary_api <method> <url> [json-body] [with-headers]
 # stdout: the response body, then the HTTP status code on its own last line.
 # "000" means the request never completed (DNS, timeout, connection refused).
+# A non-empty <with-headers> prepends the response header block (curl -D -),
+# which the dispatch needs for GitHub's own Date — see canary_dispatch.
 _canary_api() {
-    local method="${1:-GET}" url="${2:-}" data="${3:-}" pat auth_config out
+    local method="${1:-GET}" url="${2:-}" data="${3:-}" with_headers="${4:-}"
+    local pat auth_config out
     local -a args
 
     [[ -n "$url" ]] || return 1
@@ -189,6 +198,7 @@ _canary_api() {
         -H "Accept: application/vnd.github+json"
         -H "X-GitHub-Api-Version: 2022-11-28"
         --config -)
+    [[ -z "$with_headers" ]] || args+=(-D -)
     [[ -z "$data" ]] || args+=(-H "Content-Type: application/json" --data "$data")
     args+=("$url")
 
@@ -208,6 +218,35 @@ _canary_api_body() {
     local resp="${1:-}"
     [[ "$resp" == *$'\n'* ]] || { printf ''; return 0; }
     printf '%s' "${resp%$'\n'*}"
+}
+
+# Payload of a response captured with headers: everything after the last
+# header-block terminator. GitHub's JSON bodies carry no blank line of their
+# own, which is what makes the last-blank-line split safe here.
+_canary_http_payload() {
+    printf '%s\n' "${1:-}" | awk '
+        { line[NR] = $0 }
+        /^\r?$/ { last = NR }
+        END { for (i = last + 1; i <= NR; i++) print line[i] }'
+}
+
+# GitHub's own clock, from the response Date header, as epoch seconds. Used
+# instead of the host clock so a skewed Proxmox host cannot make the gate
+# reject the very run it just dispatched (or accept an older one).
+# python3 is the same dependency gen_iso_to_epoch already takes.
+_canary_http_date_epoch() {
+    local head="${1:-}" line
+    line=$(grep -i '^date:' <<< "$head" | tail -n 1) || return 1
+    line="${line#*:}"
+    line="${line//$'\r'/}"
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    [[ -n "$line" ]] || return 1
+    python3 -c '
+import sys, email.utils
+d = email.utils.parsedate_to_datetime(sys.argv[1])
+print(int(d.timestamp()))
+' "$line" 2>/dev/null
 }
 
 # Classic PATs advertise their scopes in X-OAuth-Scopes on any authenticated
@@ -446,7 +485,7 @@ canary_latest_run_id() {
 # all (scope, missing workflow, inputs the installed copy does not have), 1 a
 # failure that is worth a retry.
 canary_dispatch() {
-    local gen_id="$1" data resp code body message
+    local gen_id="$1" data resp code head_and_body body message epoch
 
     data=$(jq -cn --arg ref "$CANARY_RUN_REF" --arg gen "$gen_id" \
         '{ref: $ref, inputs: {generation: $gen}}') || {
@@ -455,10 +494,28 @@ canary_dispatch() {
     }
     resp=$(_canary_api POST \
         "https://api.github.com/repos/${CANARY_RUN_REPO}/actions/workflows/${CANARY_WORKFLOW}/dispatches" \
-        "$data") || return 1
+        "$data" headers) || return 1
     code=$(_canary_api_code "$resp")
-    body=$(_canary_api_body "$resp")
+    head_and_body=$(_canary_api_body "$resp")
+    body=$(_canary_http_payload "$head_and_body")
     message=$(jq -r '.message // empty' <<< "$body" 2>/dev/null) || message=""
+
+    # The instant the dispatch was accepted, by GitHub's clock, so
+    # canary_find_run can refuse a run that already existed when we asked.
+    # Falling back to the host clock costs a skew allowance: better to admit a
+    # run a few minutes too old than to reject the run we just caused. Runs
+    # from an earlier attempt are whole maintain cycles away, not minutes.
+    epoch=$(_canary_http_date_epoch "$head_and_body") || epoch=""
+    if [[ ! "$epoch" =~ ^[0-9]+$ ]]; then
+        epoch=$(date -u +%s) || epoch=""
+        if [[ "$epoch" =~ ^[0-9]+$ ]]; then
+            epoch=$(( epoch - CANARY_CLOCK_SKEW_SECONDS ))
+            log_info "canary: GitHub sent no readable Date header; using the host clock less ${CANARY_CLOCK_SKEW_SECONDS}s as the dispatch instant"
+        else
+            epoch=""
+        fi
+    fi
+    CANARY_DISPATCH_EPOCH="$epoch"
 
     case "$code" in
         204)
@@ -484,43 +541,85 @@ canary_dispatch() {
     esac
 }
 
-# The run the dispatch created: newer than the pre-dispatch baseline, and
-# preferring the one whose run-name names this generation. Proven by "the new
-# run whose title names this generation is the one watched".
-# stdout: "<run-id>\t<html-url>".
+# True when a run started at or after the instant GitHub accepted our
+# dispatch. A timestamp we cannot read passes: the id-above-baseline and
+# exact-title guards already bound the choice, and refusing a run because a
+# clock could not be parsed would time out a canary that is running fine.
+canary_run_started_after_dispatch() {
+    local created="${1:-}" epoch
+    [[ "${CANARY_DISPATCH_EPOCH:-}" =~ ^[0-9]+$ ]] || return 0
+    [[ -n "$created" ]] || return 0
+    epoch=$(gen_iso_to_epoch "$created") || return 0
+    [[ "$epoch" =~ ^-?[0-9]+$ ]] || return 0
+    (( epoch >= CANARY_DISPATCH_EPOCH ))
+}
+
+# Rows "<id>\t<url>\t<created_at>", newest id first, for runs newer than the
+# pre-dispatch baseline. mode=titled keeps only runs whose run-name is exactly
+# this generation's; mode=other keeps only the rest.
+canary_run_rows() {
+    local body="${1:-}" baseline="${2:-0}" title="${3:-}" mode="${4:-titled}"
+    jq -r --argjson base "$baseline" --arg title "$title" --arg mode "$mode" '
+        [ .workflow_runs[]?
+          | select((.id // 0) > $base)
+          | select(if $mode == "titled" then (.display_title // "") == $title
+                   else (.display_title // "") != $title end) ]
+        | sort_by(.id) | reverse
+        | .[]
+        | "\(.id)\t\(.html_url // "")\t\(.created_at // .run_started_at // "")"
+    ' <<< "$body" 2>/dev/null
+}
+
+# The run this dispatch created. Three conditions, all required: an id above
+# the pre-dispatch baseline, a run-name that names *this* generation, and a
+# start at or after the dispatch instant. Anything less adopts someone else's
+# run — a previous attempt's (same title, and a stale `success` would promote
+# without a fresh canary) or a concurrent hand-dispatch's — and then promotes
+# or rejects the image on it.
+# Proven by "a pre-existing run with this generation's title is not adopted"
+# and "a newer untitled run does not win over the titled run that follows it".
+#
+# stdout: "<run-id>\t<html-url>" — this canary's run on 0, and the foreign
+# run on 2, purely so the caller can name it. Returns 0 found, 1 nothing new
+# appeared before the deadline, 2 something new appeared that does not name
+# this generation, which the caller must not attribute to this canary.
+# (stdout, not a global: this function is called inside $( ).)
 canary_find_run() {
     local gen_id="$1" baseline="$2" deadline="$3"
-    local resp code body picked title run_id run_url run_title
+    local title="Runner canary gen-${gen_id}"
+    local resp code body="" rows id url created
 
-    title="Runner canary gen-${gen_id}"
     while :; do
         resp=$(_canary_api GET "https://api.github.com/repos/${CANARY_RUN_REPO}/actions/workflows/${CANARY_WORKFLOW}/runs?event=workflow_dispatch&per_page=30") || resp=""
         code=$(_canary_api_code "$resp")
-        body=$(_canary_api_body "$resp")
         if [[ "$code" == "200" ]]; then
-            picked=$(jq -r --argjson base "$baseline" --arg title "$title" '
-                [.workflow_runs[]? | select((.id // 0) > $base)] as $new
-                | ((($new | map(select(.display_title == $title))) | max_by(.id))
-                   // ($new | max_by(.id)))
-                | if . == null then empty
-                  else "\(.id)\t\(.html_url // "")\t\(.display_title // "")" end
-            ' <<< "$body" 2>/dev/null) || picked=""
-            if [[ -n "$picked" ]]; then
-                IFS=$'\t' read -r run_id run_url run_title <<< "$picked"
-                if [[ "$run_title" != "$title" ]]; then
-                    # The gate still watches it: the alternative is timing out
-                    # a run that is probably ours. Worth saying out loud —
-                    # a workflow whose run-name does not name the generation
-                    # cannot be bound to this dispatch by name.
-                    log_warn "canary: run $run_id is titled '${run_title}', not '${title}' — the installed workflow may predate run-name"
-                fi
-                printf '%s\t%s\n' "$run_id" "$run_url"
+            body=$(_canary_api_body "$resp")
+            rows=$(canary_run_rows "$body" "$baseline" "$title" titled) || rows=""
+            while IFS=$'\t' read -r id url created; do
+                [[ -n "$id" ]] || continue
+                canary_run_started_after_dispatch "$created" || continue
+                printf '%s\t%s\n' "$id" "$url"
                 return 0
-            fi
+            done <<< "$rows"
         fi
-        (( $(date +%s) < deadline )) || return 1
+        (( $(date +%s) < deadline )) || break
         sleep "$CANARY_POLL_SECONDS"
     done
+
+    # Nothing named this generation before the deadline. If something else ran,
+    # say which — but never poll it: promoting or rejecting an image on a run
+    # this gate did not cause is the failure this whole function guards.
+    if [[ -n "$body" ]]; then
+        rows=$(canary_run_rows "$body" "$baseline" "$title" other) || rows=""
+        while IFS=$'\t' read -r id url created; do
+            [[ -n "$id" ]] || continue
+            canary_run_started_after_dispatch "$created" || continue
+            log_warn "canary: run $id (${url:-no url}) is the only new run and does not name generation $gen_id — refusing to attribute it to this canary"
+            printf '%s\t%s\n' "$id" "$url"
+            return 2
+        done <<< "$rows"
+    fi
+    return 1
 }
 
 # Poll one run to conclusion. stdout: the conclusion (success, failure,
@@ -675,7 +774,16 @@ canary_attempt() {
         return 1
     fi
 
-    baseline=$(canary_latest_run_id) || baseline=0
+    # Fail closed. A baseline of 0 would make every run in the list look new,
+    # and canary_find_run would then adopt a previous attempt's run for this
+    # same generation — promoting on a stale success, or rejecting the image
+    # on a stale failure in milliseconds. Nothing has been dispatched yet, so
+    # this costs no attempt.
+    # Proven by "a baseline read that fails does not dispatch and costs no attempt".
+    baseline=$(canary_latest_run_id) || {
+        CANARY_FAIL_REASON="could not read ${CANARY_WORKFLOW}'s run list to establish a baseline before dispatching"
+        return 2
+    }
     rc=0
     canary_dispatch "$gen_id" || rc=$?
     if [[ "$rc" -eq 2 ]]; then
@@ -690,11 +798,17 @@ canary_attempt() {
     # One budget from the dispatch to the conclusion, as spec 7.1 step 5 puts
     # it: queue latency is part of what the canary is testing.
     deadline=$(( $(date +%s) + CANARY_TIMEOUT ))
-    if ! found=$(canary_find_run "$gen_id" "$baseline" "$deadline"); then
-        CANARY_FAIL_REASON="no workflow run appeared for the dispatch within ${CANARY_TIMEOUT}s"
+    rc=0
+    found=$(canary_find_run "$gen_id" "$baseline" "$deadline") || rc=$?
+    IFS=$'\t' read -r run_id run_url <<< "$found"
+    if [[ "$rc" -eq 2 ]]; then
+        CANARY_FAIL_REASON="the only new workflow run (id ${run_id:-unknown}, ${run_url:-no url}) does not name generation $gen_id — it is not this canary's run"
+        return 2
+    fi
+    if [[ "$rc" -ne 0 ]]; then
+        CANARY_FAIL_REASON="no workflow run naming generation $gen_id appeared within ${CANARY_TIMEOUT}s of the dispatch"
         return 1
     fi
-    IFS=$'\t' read -r run_id run_url <<< "$found"
     CANARY_RUN_URL="$run_url"
     log_info "canary: watching run $run_id (${run_url:-no url})"
 
@@ -832,11 +946,12 @@ canary_main() {
     fi
 
     # A previous attempt that died between charging the budget and finalising
-    # leaves the record here. Finish it rather than canarying forever.
+    # leaves the record here. Note it and fall through to the lock: finalising
+    # from outside the lock lets two concurrent invocations both reject the
+    # generation, both memo the digest, and both page an operator.
+    # Proven by "a spent budget is not finalised while another canary holds the lock".
     if (( attempts >= max )); then
-        canary_finalize_failed "$vmid" "$gen_id" "$digest" "$attempts" \
-            "the attempt budget ($max) was already spent" || return 1
-        return 4
+        log_warn "canary: generation $gen_id has already spent its attempt budget ($max) — finalising under the canary lock"
     fi
 
     lock_wait="${CANARY_LOCK_WAIT_SECONDS:-0}"
@@ -868,9 +983,14 @@ canary_main() {
     attempts="${GEN_CANARY_ATTEMPTS:-0}"
     [[ "$attempts" =~ ^[0-9]+$ ]] || attempts=0
     if (( attempts >= max )); then
-        _canary_unlock
+        # Under the lock, so exactly one invocation transitions the record,
+        # memoes the digest and notifies; the next one reads `failed` above
+        # and returns 4 having done nothing.
+        rc=0
         canary_finalize_failed "$vmid" "$gen_id" "$digest" "$attempts" \
-            "the attempt budget ($max) was already spent" || return 1
+            "the attempt budget ($max) was already spent" || rc=$?
+        _canary_unlock
+        [[ "$rc" -eq 0 ]] || return 1
         return 4
     fi
 
@@ -888,6 +1008,11 @@ canary_main() {
     rc=0
     canary_attempt "$vmid" "$gen_id" || rc=$?
 
+    # Stamp the run on the record before anything else looks at it. This is
+    # the evidence promote --canary-passed checks (lib/promote.sh), so it has
+    # to be written before the promotion below, not after.
+    # Proven by "promote --canary-passed refuses a generation with no recorded
+    # canary run" in tests/unit/promote.bats.
     url="${CANARY_RUN_URL:-}"
     if [[ -n "$url" && "$url" != *[[:space:]]* ]]; then
         gen_update "$vmid" GEN_CANARY_RUN_URL="$url" \

@@ -16,6 +16,15 @@
 # and it is deliberately absent from promote_usage — an operator promoting by
 # hand has --skip-canary, which asks.
 #
+# It is not a bare assertion: the flag is refused unless the generation record
+# carries the evidence the gate writes — GEN_CANARY_RUN_URL and at least one
+# GEN_CANARY_ATTEMPTS — so a hand-typed `runner promote <id> --canary-passed`
+# cannot skip both the canary and the confirmation on a generation no canary
+# ever ran against. Accepting it is notified at info, because a promotion that
+# no human confirmed should still be visible.
+# Proven by "promote --canary-passed refuses a generation with no recorded
+# canary run" and "promote --canary-passed proceeds on a recorded canary run".
+#
 # GEN_* fields are loaded via gen_read in this shell; gen_transition is a
 # subshell, so SC2030/SC2031 are false positives here as in generations.sh.
 # shellcheck disable=SC2030,SC2031,SC2034
@@ -104,6 +113,16 @@ promote_generation() {
     if [[ "$skip_canary" -eq 0 && "$canary_passed" -eq 0 ]]; then
         log_error "Generation $gen_id has not passed a canary — run 'runner canary $gen_id', or pass --skip-canary to promote without one"
         return 1
+    fi
+    if [[ "$canary_passed" -eq 1 && "$skip_canary" -eq 0 ]]; then
+        # GEN_* are in scope from the gen_read above.
+        if [[ -z "${GEN_CANARY_RUN_URL:-}" ]] || [[ ! "${GEN_CANARY_ATTEMPTS:-0}" =~ ^[1-9][0-9]*$ ]]; then
+            log_error "Generation $gen_id carries no canary evidence (GEN_CANARY_RUN_URL='${GEN_CANARY_RUN_URL:-}', GEN_CANARY_ATTEMPTS='${GEN_CANARY_ATTEMPTS:-}') — refusing --canary-passed; run 'runner canary $gen_id'"
+            return 1
+        fi
+        NOTIFY_GENERATION="$gen_id" notify info promote.canary_passed \
+            "Promoting generation $gen_id on a passed canary (attempt ${GEN_CANARY_ATTEMPTS})" \
+            "run ${GEN_CANARY_RUN_URL}"
     fi
     # The canary gate is the confirmation: it just watched a real job succeed
     # on this image, so there is no question to ask an operator.
