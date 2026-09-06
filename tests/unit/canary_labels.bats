@@ -118,9 +118,15 @@ stub_jit_mint_curl() {
                 --data) printf '%s' "${args[$((i + 1))]}" > "$STUB_DIR/jit-request-body.json" ;;
             esac
         done
-        [[ -n "$out_file" ]] || return 0
-        cp "$STUB_DIR/jit-response.json" "$out_file"
-        printf '201'
+        if [[ -n "$out_file" ]]; then
+            cp "$STUB_DIR/jit-response.json" "$out_file"
+            printf '201'
+            return 0
+        fi
+        # No -o file means this is the deregister DELETE, not the mint POST.
+        # A test can make it fail by touching $STUB_DIR/jit-delete-fails.
+        [[ -f "$STUB_DIR/jit-delete-fails" ]] && return 1
+        return 0
     }
     export -f curl_stub
 }
@@ -288,6 +294,67 @@ write_jit_response() {
     run --separate-stderr fetch_jit_config runner-acme-1
     [ "$status" -eq 0 ]
     [ "$output" = "AAAAjitconfigAAAA" ]
+    refute_called curl '*DELETE*'
+}
+
+# A deregister that fails, or that never runs because the response carried no
+# usable runner id, must not leave the operator thinking the canary is
+# isolated -- the preceding log_error already says "refusing to start an
+# unisolated canary", which is only true once the GitHub-side registration is
+# actually gone.
+@test "fetch_jit_config warns distinctly when the deregister DELETE itself fails" {
+    use_real_jq
+    stub_jit_mint_curl
+    : > "$STUB_DIR/jit-delete-fails"
+    write_jit_response 42 gen-5-canary self-hosted
+    RUNNER_LABELS="gen-5-canary"
+    JIT_ENFORCE_EXACT_LABELS=1
+    run --separate-stderr fetch_jit_config canary-gen5
+    [ "$status" -ne 0 ]
+    [[ "$stderr" == *"unexpected label"* ]]
+    [[ "$stderr" == *"failed to deregister runner 42"* ]]
+    [[ "$stderr" == *"remove it manually"* ]]
+    assert_called curl '*DELETE*runners/42*'
+}
+
+@test "fetch_jit_config warns distinctly when the response carries no usable runner id" {
+    use_real_jq
+    stub_jit_mint_curl
+    # write_jit_response with no runner_id argument the code can parse as
+    # numeric -- omit .runner.id entirely.
+    /usr/bin/jq -n --argjson labels '[{"name":"gen-5-canary"},{"name":"self-hosted"}]' \
+        '{runner: {labels: $labels}, encoded_jit_config: "AAAAjitconfigAAAA"}' \
+        > "$STUB_DIR/jit-response.json"
+    RUNNER_LABELS="gen-5-canary"
+    JIT_ENFORCE_EXACT_LABELS=1
+    run --separate-stderr fetch_jit_config canary-gen5
+    [ "$status" -ne 0 ]
+    [[ "$stderr" == *"unexpected label"* ]]
+    [[ "$stderr" == *"failed to deregister runner <unknown>"* ]]
+    [[ "$stderr" == *"remove it manually"* ]]
+    refute_called curl '*DELETE*'
+}
+
+# clone_runner declares JIT_ENFORCE_EXACT_LABELS=0 unconditionally (not just
+# inside the canary branch) precisely so that this cannot happen for real:
+# an org .conf or an inherited exported env var must never subject a
+# production mint to the canary-only check. Uses the real fetch_jit_config
+# (via use_real_jq/stub_jit_mint_curl) because a stubbed one would not
+# exercise the check either way -- this has to prove the leak is actually
+# closed, not just that clone_runner still returns 0.
+@test "an org conf exporting JIT_ENFORCE_EXACT_LABELS=1 does not subject a production mint to the label check" {
+    use_real_jq
+    stub_jit_mint_curl
+    printf 'GITHUB_ORG="acme-org"\nGITHUB_PAT="ghp_test"\nJIT_ENFORCE_EXACT_LABELS=1\n' \
+        > "$ORG_CONFIG_DIR/acme.conf"
+    load_org_config acme
+    seed_generation 9000 5
+    # A response beyond the production defaults would fail closed if the
+    # canary-only check applied here.
+    write_jit_response 7 self-hosted linux x64 gpu-node
+    run --separate-stderr clone_runner runner-acme-1 acme
+    [ "$status" -eq 0 ]
+    [ "$output" = "9001" ]
     refute_called curl '*DELETE*'
 }
 

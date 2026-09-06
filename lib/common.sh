@@ -1136,23 +1136,33 @@ github_runner_lookup() {
 
 # Strict counterpart to deregister_runner for callers whose next operation is
 # destructive.  Failure is meaningful: they must leave the VM alone.
-github_runner_deregister_id() {
-    local org="$1" runner_id="$2" credentials github_org pat auth_config
+# DELETE a runner by numeric id. PAT on stdin, never argv or a <( ) fd — see
+# github_runners_snapshot for why. Shared by github_runner_deregister_id
+# (which resolves org-config credentials first) and fetch_jit_config's canary
+# label-mismatch path (which already has GITHUB_ORG/GITHUB_PAT loaded and has
+# no org-config slug to re-derive them from) — one place for this HTTP call.
+# stdout suppressed: DELETE returns 204 (empty), but callers run this from
+# inside $(...) capture (deregister_runner from clone_runner's JIT mint-retry
+# path, fetch_jit_config's own mismatch path), so keep any surprise body off
+# the captured stdout. The exit status still propagates — destructive callers
+# depend on it.
+_github_runner_delete() {
+    local github_org="$1" pat="$2" runner_id="$3" auth_config
     [[ "$runner_id" =~ ^[0-9]+$ ]] || return 1
-    credentials=$(github_runner_credentials "$org") || return 1
-    IFS=$'\t' read -r github_org pat <<< "$credentials"
-    # Config on stdin, not on a <( ) fd — see github_runners_snapshot.
     printf -v auth_config 'header = "Authorization: token %s"\n' "$pat"
-
-    # stdout suppressed: DELETE returns 204 (empty), but deregister_runner calls
-    # this from inside $(clone_runner) on the JIT mint-retry path, so keep any
-    # surprise body off the captured stdout. The exit status still propagates —
-    # destructive callers depend on it.
     curl -sf --max-time 10 -X DELETE \
         -H "Accept: application/vnd.github+json" \
         --config - \
         "https://api.github.com/orgs/${github_org}/actions/runners/${runner_id}" \
         >/dev/null 2>&1 <<< "$auth_config"
+}
+
+github_runner_deregister_id() {
+    local org="$1" runner_id="$2" credentials github_org pat
+    [[ "$runner_id" =~ ^[0-9]+$ ]] || return 1
+    credentials=$(github_runner_credentials "$org") || return 1
+    IFS=$'\t' read -r github_org pat <<< "$credentials"
+    _github_runner_delete "$github_org" "$pat" "$runner_id"
 }
 
 deregister_runner() {
@@ -1251,11 +1261,13 @@ fetch_jit_config() {
         if [[ -n "$unexpected" ]]; then
             runner_id=$(jq -r '.runner.id // empty' <<<"$body" 2>/dev/null)
             log_error "JIT mint for '$name' returned unexpected label(s) [$unexpected] beyond the requested set ($labels) — GitHub may have attached a default label to this JIT runner. Deregistering; refusing to start an unisolated canary."
-            if [[ "$runner_id" =~ ^[0-9]+$ ]]; then
-                curl -sf --max-time 10 -X DELETE \
-                    -H "Accept: application/vnd.github+json" \
-                    --config <(printf 'header = "Authorization: token %s"\n' "$GITHUB_PAT") \
-                    "https://api.github.com/orgs/${GITHUB_ORG}/actions/runners/${runner_id}" >/dev/null 2>&1 || true
+            # _github_runner_delete itself rejects a non-numeric/empty
+            # runner_id, so this one check covers both "nothing to delete"
+            # and "the DELETE failed" — either way the operator must not be
+            # told the canary is isolated when a labeled runner is still
+            # sitting on GitHub.
+            if ! _github_runner_delete "$GITHUB_ORG" "$GITHUB_PAT" "$runner_id"; then
+                log_error "failed to deregister runner ${runner_id:-<unknown>} — an unisolated runner is still registered on GitHub; remove it manually"
             fi
             return 1
         fi
@@ -1424,6 +1436,13 @@ clone_canary_runner() {
 clone_runner() {
     local name="" org="" vmid=""
     local canary=0 template_override="" clone_src="" canary_gen_id="" extra_tag=""
+    # Declared unconditionally (unlike RUNNER_LABELS, which a production org
+    # config may legitimately set and must pass through untouched) so that an
+    # exported env var or an org .conf that happens to set
+    # JIT_ENFORCE_EXACT_LABELS=1 can never leak into a production mint and
+    # fail it over a legitimate GitHub default. Only the canary branch below
+    # turns it on.
+    local JIT_ENFORCE_EXACT_LABELS=0
     local RESERVED_VMID=""
     local pause_waited=0
     local pause_max="${CLONE_PAUSE_RETRY_MAX_SECONDS:-130}"
@@ -1653,7 +1672,7 @@ clone_runner() {
     # read-only default GitHub may attach there.
     if [[ "$canary" -eq 1 ]]; then
         local RUNNER_LABELS="gen-${canary_gen_id}-canary"
-        local JIT_ENFORCE_EXACT_LABELS=1
+        JIT_ENFORCE_EXACT_LABELS=1
     fi
     local jit_config mint_rc=0
     jit_config=$(fetch_jit_config "$name") && mint_rc=0 || mint_rc=$?
