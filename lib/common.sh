@@ -892,15 +892,38 @@ github_runner_credentials() {
 # page 1, and additionally fails closed on a duplicate exact name instead of
 # picking one to DELETE. rollover needs the whole org snapshot anyway.
 github_runners_snapshot() {
-    local org="$1" credentials github_org pat json total="" page=1 pages page_total
+    local org="$1" credentials github_org pat auth_config json total="" page=1 pages page_total
     credentials=$(github_runner_credentials "$org") || return 1
     IFS=$'\t' read -r github_org pat <<< "$credentials"
+    # The PAT goes to curl in a config read from stdin, never on argv, where
+    # /proc/PID/cmdline hands it to any local user.
+    #
+    # A process-substitution fd would keep it off argv too, but it is the wrong
+    # shape: bash forks the <( ) writer asynchronously and closes the read end
+    # as soon as the command returns, so a curl that exits before it opens
+    # /dev/fd/N leaves the writer holding a pipe with no reader. Where SIGPIPE
+    # is fatal the writer dies silently; where it is ignored — everything under
+    # systemd inherits that, IgnoreSIGPIPE=yes being the default, as do shell
+    # steps under a CI runner — the write fails instead and bash prints
+    # "printf: write error: Broken pipe" on the *caller's* stderr. The
+    # 2>/dev/null below cannot suppress it, because the writer is forked during
+    # word expansion, before this command's redirections are applied.
+    #
+    # A here-string has no writer to race: bash fills the redirection itself,
+    # synchronously, before curl is exec'd. What bash backs it with — a pipe or
+    # a temporary file it creates for this command alone and unlinks before the
+    # command runs — varies by version and platform, and the guarantee here
+    # does not rest on which: either way the PAT is never on argv, never in
+    # curl's environment, and never reachable by another process through a
+    # filesystem path.
+    printf -v auth_config 'header = "Authorization: token %s"\n' "$pat"
 
     while :; do
         json=$(curl -sf --max-time 10 \
             -H "Accept: application/vnd.github+json" \
-            --config <(printf 'header = "Authorization: token %s"\n' "$pat") \
-            "https://api.github.com/orgs/${github_org}/actions/runners?per_page=100&page=${page}" 2>/dev/null) || return 1
+            --config - \
+            "https://api.github.com/orgs/${github_org}/actions/runners?per_page=100&page=${page}" \
+            2>/dev/null <<< "$auth_config") || return 1
         page_total=$(jq -er 'select((.total_count | type) == "number" and (.runners | type) == "array") | .total_count' <<< "$json" 2>/dev/null) || return 1
         [[ "$page_total" =~ ^[0-9]+$ ]] || return 1
         if [[ -z "$total" ]]; then
@@ -1113,10 +1136,12 @@ github_runner_lookup() {
 # Strict counterpart to deregister_runner for callers whose next operation is
 # destructive.  Failure is meaningful: they must leave the VM alone.
 github_runner_deregister_id() {
-    local org="$1" runner_id="$2" credentials github_org pat
+    local org="$1" runner_id="$2" credentials github_org pat auth_config
     [[ "$runner_id" =~ ^[0-9]+$ ]] || return 1
     credentials=$(github_runner_credentials "$org") || return 1
     IFS=$'\t' read -r github_org pat <<< "$credentials"
+    # Config on stdin, not on a <( ) fd — see github_runners_snapshot.
+    printf -v auth_config 'header = "Authorization: token %s"\n' "$pat"
 
     # stdout suppressed: DELETE returns 204 (empty), but deregister_runner calls
     # this from inside $(clone_runner) on the JIT mint-retry path, so keep any
@@ -1124,8 +1149,9 @@ github_runner_deregister_id() {
     # destructive callers depend on it.
     curl -sf --max-time 10 -X DELETE \
         -H "Accept: application/vnd.github+json" \
-        --config <(printf 'header = "Authorization: token %s"\n' "$pat") \
-        "https://api.github.com/orgs/${github_org}/actions/runners/${runner_id}" >/dev/null 2>&1
+        --config - \
+        "https://api.github.com/orgs/${github_org}/actions/runners/${runner_id}" \
+        >/dev/null 2>&1 <<< "$auth_config"
 }
 
 deregister_runner() {
@@ -1154,19 +1180,22 @@ fetch_jit_config() {
     [[ -n "$labels" ]] || labels="self-hosted,linux,x64"
     # Group IDs are >=1 (1 = Default); clamp anything else to 1.
     [[ "$group" =~ ^[1-9][0-9]*$ ]] || group=1
-    local body http_code jit tmp
+    local body http_code jit tmp auth_config
     # split → trim each label → drop empties, so a hand-edited RUNNER_LABELS with
     # spaces or a trailing comma still yields clean labels.
     body=$(jq -n --arg name "$name" --argjson group "$group" --arg labels "$labels" \
         '{name: $name, runner_group_id: $group,
           labels: ($labels | split(",") | map(gsub("^\\s+|\\s+$";"")) | map(select(length > 0)))}') || return 1
     tmp=$(mktemp) || return 1
+    # Config on stdin, not on a <( ) fd — see github_runners_snapshot.
+    printf -v auth_config 'header = "Authorization: token %s"\n' "$GITHUB_PAT"
     http_code=$(curl -sS -o "$tmp" -w "%{http_code}" --max-time 15 --retry 3 -X POST \
         -H "Accept: application/vnd.github+json" \
         -H "Content-Type: application/json" \
-        --config <(printf 'header = "Authorization: token %s"\n' "$GITHUB_PAT") \
+        --config - \
         --data "$body" \
-        "https://api.github.com/orgs/${GITHUB_ORG}/actions/runners/generate-jitconfig") || http_code="000"
+        "https://api.github.com/orgs/${GITHUB_ORG}/actions/runners/generate-jitconfig" \
+        <<< "$auth_config") || http_code="000"
     body=$(cat "$tmp")
     rm -f "$tmp"
     if [[ "$http_code" == "409" ]]; then
