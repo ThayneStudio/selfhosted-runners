@@ -702,10 +702,20 @@ EOF
       VMID NAME                 STATUS     MEM(MB)    BOOTDISK(GB) PID
       9502 canary-gen2          running    2048              30.00 1234
 EOF
+    # Order matters, not just the fact of the destroy: a leftover canary still
+    # carries gen-2-canary and would absorb this attempt's dispatch. Snapshot
+    # the qm calls at clone time to prove the destroy came first.
+    clone_canary_runner() {
+        printf '%s %s %s\n' "$1" "$2" "$3" >> "$STUB_DIR/clone.log"
+        stub_calls qm > "$STUB_DIR/qm-at-clone"
+        printf '9501\n'
+    }
+
     run --separate-stderr canary_main 2
     [ "$status" -eq 0 ]
     assert_called qm 'destroy 9502 --purge'
     cloned
+    grep -q 'destroy 9502 --purge' "$STUB_DIR/qm-at-clone"
 }
 
 @test "a canary VM that already powered off and vanished is not an error" {
