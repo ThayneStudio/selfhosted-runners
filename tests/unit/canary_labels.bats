@@ -86,19 +86,89 @@ record_jit_labels() {
 }
 
 # ---------------------------------------------------------------------------
+# fetch_jit_config itself, unstubbed: the jq encoding that turns RUNNER_LABELS
+# into the generate-jitconfig request body, and the response-side invariant
+# check, are both real code paths that record_jit_labels above never touches
+# (it replaces fetch_jit_config wholesale). These tests call the real
+# function against a stubbed curl instead.
+# ---------------------------------------------------------------------------
+
+# tests/stubs/bin/jq is a fake (strict-stub) like every other command here;
+# shadow it with a function that shells out to the real binary so
+# fetch_jit_config's actual jq expressions run for real. Same convention as
+# tests/unit/rollover.bats.
+use_real_jq() {
+    jq() { /usr/bin/jq "$@"; }
+}
+
+# Stand in for curl at fetch_jit_config's only two call sites: the
+# generate-jitconfig POST (has -o and --data) and, when the label-invariant
+# check below fails a canary, the deregister DELETE (has neither). Captures
+# the POST's --data payload to $STUB_DIR/jit-request-body.json so a test can
+# inspect exactly what was requested, and serves the response prepared at
+# $STUB_DIR/jit-response.json. The DELETE call is left to the normal stub
+# call-log (assert_called curl 'pattern') since curl_stub runs after that log
+# line, not instead of it.
+stub_jit_mint_curl() {
+    curl_stub() {
+        local args=("$@") i out_file=""
+        for ((i = 0; i < ${#args[@]}; i++)); do
+            case "${args[$i]}" in
+                -o) out_file="${args[$((i + 1))]}" ;;
+                --data) printf '%s' "${args[$((i + 1))]}" > "$STUB_DIR/jit-request-body.json" ;;
+            esac
+        done
+        [[ -n "$out_file" ]] || return 0
+        cp "$STUB_DIR/jit-response.json" "$out_file"
+        printf '201'
+    }
+    export -f curl_stub
+}
+
+# Write a generate-jitconfig-shaped response: a runner id, its labels (each
+# {name}, mirroring GitHub's real {id,name,type} per-label shape), and a
+# fixed encoded_jit_config. Extra label names beyond what a test requested
+# simulate GitHub attaching a read-only default.
+write_jit_response() {
+    local runner_id="$1"; shift
+    local labels_json='[]'
+    if [[ $# -gt 0 ]]; then
+        labels_json=$(printf '%s\n' "$@" | /usr/bin/jq -R '{name: .}' | /usr/bin/jq -s '.')
+    fi
+    /usr/bin/jq -n --argjson id "$runner_id" --argjson labels "$labels_json" \
+        '{runner: {id: $id, labels: $labels}, encoded_jit_config: "AAAAjitconfigAAAA"}' \
+        > "$STUB_DIR/jit-response.json"
+}
+
+# ---------------------------------------------------------------------------
 # The old vendor-data/config.sh mechanism is gone, not dead code
 # ---------------------------------------------------------------------------
 
+# A bare `! command` line does not trip `set -e` (POSIX: a pipeline negated
+# with ! is exempt from errexit), so these negative assertions have to run
+# under `run` and check $status explicitly -- a bare `!`-prefixed line here
+# would assert nothing beyond "the test function's last statement passed".
+# Scoped to non-comment lines (`^[[:space:]]*[^#[:space:]]`) because the
+# explanatory comment a few lines above this in runner-user-data.yaml names
+# config.sh/labels.env/no-default-labels to say they are NOT used -- an
+# unscoped grep would match that comment and pass even if a real config.sh
+# invocation were reintroduced.
 @test "register-runner.sh has no config.sh step and reads no labels.env" {
-    ! grep -q 'config\.sh' "$REPO_ROOT/templates/runner-user-data.yaml"
-    ! grep -q 'labels\.env' "$REPO_ROOT/templates/runner-user-data.yaml"
-    ! grep -q 'no-default-labels' "$REPO_ROOT/templates/runner-user-data.yaml"
-    ! grep -q 'RUNNER_NO_DEFAULT_LABELS' "$REPO_ROOT/templates/runner-user-data.yaml"
+    run grep -E '^[[:space:]]*[^#[:space:]].*config\.sh' "$REPO_ROOT/templates/runner-user-data.yaml"
+    [ "$status" -ne 0 ]
+    run grep -E '^[[:space:]]*[^#[:space:]].*labels\.env' "$REPO_ROOT/templates/runner-user-data.yaml"
+    [ "$status" -ne 0 ]
+    run grep -E '^[[:space:]]*[^#[:space:]].*no-default-labels' "$REPO_ROOT/templates/runner-user-data.yaml"
+    [ "$status" -ne 0 ]
+    run grep -E '^[[:space:]]*[^#[:space:]].*RUNNER_NO_DEFAULT_LABELS' "$REPO_ROOT/templates/runner-user-data.yaml"
+    [ "$status" -ne 0 ]
 }
 
 @test "write_canary_vendor_snippet no longer exists" {
-    ! declare -F write_canary_vendor_snippet >/dev/null
-    ! grep -rq 'write_canary_vendor_snippet' "$REPO_ROOT/lib"
+    run declare -F write_canary_vendor_snippet
+    [ "$status" -ne 0 ]
+    run grep -rq 'write_canary_vendor_snippet' "$REPO_ROOT/lib"
+    [ "$status" -ne 0 ]
 }
 
 # ---------------------------------------------------------------------------
@@ -129,10 +199,14 @@ record_jit_labels() {
 }
 
 @test "production clone call sites do not pass --canary" {
-    ! grep -E 'clone_runner[[:space:]].*--canary' \
+    # A bare `!` here would assert nothing (see the comment above the
+    # config.sh test) -- a production call site that DID pass --canary must
+    # actually fail this test, so enforce $status explicitly.
+    run grep -E 'clone_runner[[:space:]].*--canary' \
         "$REPO_ROOT/lib/create.sh" \
         "$REPO_ROOT/lib/watch.sh" \
         "$REPO_ROOT/lib/reclone.sh"
+    [ "$status" -ne 0 ]
     grep -q 'clone_runner "\$RUNNER_NAME" "\$SELECTED_ORG"' "$REPO_ROOT/lib/create.sh"
     grep -q 'clone_runner "\$slot" "\$org"' "$REPO_ROOT/lib/watch.sh"
     grep -q 'clone_runner "\$NAME" "\$ORG"' "$REPO_ROOT/lib/reclone.sh"
@@ -144,6 +218,77 @@ record_jit_labels() {
     run --separate-stderr clone_runner --template 8901 runner-acme-1 acme
     [ "$status" -ne 0 ]
     refute_called qm 'clone *'
+}
+
+# ---------------------------------------------------------------------------
+# fetch_jit_config, unstubbed: the request-body encoding record_jit_labels
+# never exercises.
+# ---------------------------------------------------------------------------
+
+@test "fetch_jit_config's real request body carries the production default labels" {
+    use_real_jq
+    stub_jit_mint_curl
+    write_jit_response 1 self-hosted linux x64
+    run --separate-stderr fetch_jit_config runner-acme-1
+    [ "$status" -eq 0 ]
+    [ "$output" = "AAAAjitconfigAAAA" ]
+    run /usr/bin/jq -c '.labels' "$STUB_DIR/jit-request-body.json"
+    [ "$output" = '["self-hosted","linux","x64"]' ]
+}
+
+@test "fetch_jit_config's real request body carries only gen-5-canary for a canary mint" {
+    use_real_jq
+    stub_jit_mint_curl
+    write_jit_response 1 gen-5-canary
+    RUNNER_LABELS="gen-5-canary"
+    run --separate-stderr fetch_jit_config canary-gen5
+    [ "$status" -eq 0 ]
+    [ "$output" = "AAAAjitconfigAAAA" ]
+    run /usr/bin/jq -c '.labels' "$STUB_DIR/jit-request-body.json"
+    [ "$output" = '["gen-5-canary"]' ]
+}
+
+# ---------------------------------------------------------------------------
+# JIT_ENFORCE_EXACT_LABELS: enforcing, not assuming, that GitHub adds no
+# default labels to a JIT-registered runner.
+# ---------------------------------------------------------------------------
+
+@test "fetch_jit_config succeeds when the response labels match the canary request exactly" {
+    use_real_jq
+    stub_jit_mint_curl
+    write_jit_response 42 gen-5-canary
+    RUNNER_LABELS="gen-5-canary"
+    JIT_ENFORCE_EXACT_LABELS=1
+    run --separate-stderr fetch_jit_config canary-gen5
+    [ "$status" -eq 0 ]
+    [ "$output" = "AAAAjitconfigAAAA" ]
+    refute_called curl '*DELETE*'
+}
+
+@test "fetch_jit_config deregisters and fails closed when GitHub attaches an unrequested label" {
+    use_real_jq
+    stub_jit_mint_curl
+    write_jit_response 42 gen-5-canary self-hosted
+    RUNNER_LABELS="gen-5-canary"
+    JIT_ENFORCE_EXACT_LABELS=1
+    run --separate-stderr fetch_jit_config canary-gen5
+    [ "$status" -ne 0 ]
+    [[ "$stderr" == *"self-hosted"* ]]
+    assert_called curl '*DELETE*runners/42*'
+}
+
+@test "fetch_jit_config never applies the label check to a production mint" {
+    use_real_jq
+    stub_jit_mint_curl
+    # A response that adds a label beyond the requested set (self-hosted,
+    # linux, x64) would fail closed on the canary path -- prove production
+    # is not subject to that check at all: JIT_ENFORCE_EXACT_LABELS is unset
+    # here, so this must succeed even though the response is not exact.
+    write_jit_response 7 self-hosted linux x64 gpu-node
+    run --separate-stderr fetch_jit_config runner-acme-1
+    [ "$status" -eq 0 ]
+    [ "$output" = "AAAAjitconfigAAAA" ]
+    refute_called curl '*DELETE*'
 }
 
 # ---------------------------------------------------------------------------

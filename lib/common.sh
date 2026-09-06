@@ -1149,8 +1149,19 @@ deregister_runner() {
 # clone_runner --canary shadows RUNNER_LABELS with a local before calling this,
 # so a canary's minted config carries only gen-<N>-canary (#21) — this function
 # has no canary-specific branch of its own.
+#
+# JIT_ENFORCE_EXACT_LABELS=1 (set by clone_runner --canary alongside its
+# RUNNER_LABELS shadow) turns "GitHub adds no default labels to a
+# JIT-registered runner" from an assumption into an enforced invariant: the
+# mint response's runner.labels[] is compared against exactly what was
+# requested, and ANY extra label (e.g. a read-only self-hosted/Linux/X64
+# GitHub decided to attach) deregisters the runner immediately and fails
+# closed — clone_runner never clones a VM for it. Left unset (or 0) for every
+# production mint, where GitHub legitimately attaching a read-only default
+# label must never block a clone.
 # Prints the base64 encoded_jit_config on stdout.
-# Returns 0 on success, 2 on HTTP 409 (duplicate runner name), 1 on any other failure.
+# Returns 0 on success, 2 on HTTP 409 (duplicate runner name), 1 on any other
+# failure (including the label-mismatch fail-closed path above).
 fetch_jit_config() {
     local name="$1"
     local group="${RUNNER_GROUP_ID:-1}"
@@ -1190,6 +1201,37 @@ fetch_jit_config() {
     # Must be a single base64 token — rejects anything with quotes/newlines that
     # could break out of the YAML string it gets rendered into.
     [[ -n "$jit" && "$jit" =~ ^[A-Za-z0-9+/=_-]+$ ]] || return 1
+
+    # Canary isolation invariant (issue #21): the whole point of shadowing
+    # RUNNER_LABELS is worthless if GitHub silently attaches a label we
+    # didn't ask for. Compare what the response actually attached to the
+    # runner against exactly what was requested — never the other way
+    # around, so a legitimate production default (JIT_ENFORCE_EXACT_LABELS
+    # unset) is never second-guessed.
+    if [[ "${JIT_ENFORCE_EXACT_LABELS:-0}" == "1" ]]; then
+        local requested_json returned_json unexpected runner_id
+        requested_json=$(jq -n --arg labels "$labels" \
+            '$labels | split(",") | map(gsub("^\\s+|\\s+$";"")) | map(select(length > 0)) | sort') || return 1
+        # .runner.labels[] may be absent on a malformed/unexpected response
+        # shape; falling back to [] treats that as "nothing observed" rather
+        # than erroring, since the base64 config itself already validated
+        # above.
+        returned_json=$(jq -c '[.runner.labels[]?.name] | sort' <<<"$body" 2>/dev/null) || returned_json="[]"
+        unexpected=$(jq -rn --argjson requested "$requested_json" --argjson returned "$returned_json" \
+            '($returned - $requested) | join(", ")' 2>/dev/null)
+        if [[ -n "$unexpected" ]]; then
+            runner_id=$(jq -r '.runner.id // empty' <<<"$body" 2>/dev/null)
+            log_error "JIT mint for '$name' returned unexpected label(s) [$unexpected] beyond the requested set ($labels) — GitHub may have attached a default label to this JIT runner. Deregistering; refusing to start an unisolated canary."
+            if [[ "$runner_id" =~ ^[0-9]+$ ]]; then
+                curl -sf --max-time 10 -X DELETE \
+                    -H "Accept: application/vnd.github+json" \
+                    --config <(printf 'header = "Authorization: token %s"\n' "$GITHUB_PAT") \
+                    "https://api.github.com/orgs/${GITHUB_ORG}/actions/runners/${runner_id}" >/dev/null 2>&1 || true
+            fi
+            return 1
+        fi
+    fi
+
     printf '%s' "$jit"
 }
 
@@ -1572,8 +1614,17 @@ clone_runner() {
     # whatever RUNNER_LABELS a production org config may set. GitHub does not add
     # default labels to a JIT-registered runner, so this label set is exact. Proven
     # by "clone_runner --canary mints a JIT config carrying only gen-N-canary".
+    #
+    # JIT_ENFORCE_EXACT_LABELS turns that "GitHub adds no default labels"
+    # assumption into an enforced invariant instead of a trusted one:
+    # fetch_jit_config compares the labels GitHub's response actually
+    # attached to the runner against exactly what was requested, and fails
+    # closed (deregistering the runner it just minted) on any mismatch.
+    # Canary-only: production must never fail a clone over a legitimate
+    # read-only default GitHub may attach there.
     if [[ "$canary" -eq 1 ]]; then
         local RUNNER_LABELS="gen-${canary_gen_id}-canary"
+        local JIT_ENFORCE_EXACT_LABELS=1
     fi
     local jit_config mint_rc=0
     jit_config=$(fetch_jit_config "$name") && mint_rc=0 || mint_rc=$?
