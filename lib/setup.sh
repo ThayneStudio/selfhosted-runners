@@ -349,7 +349,7 @@ systemctl enable --now github-runner-maintain.timer 2>/dev/null || true
 systemctl enable --now github-runner-drift.timer 2>/dev/null || true
 log_info "Pool watcher timer installed (30s interval)"
 log_info "Lifetime guard timer installed (5m interval, ${MAX_VM_LIFETIME_HOURS}h VM ceiling, ${STOPPED_REAP_MINUTES}m stopped reap)"
-log_info "Maintain timer installed (daily 02:30, rebake inside REBAKE_WINDOW)"
+log_info "Maintain timer installed (daily 02:30: reconcile, gc, canary, bake inside REBAKE_WINDOW, drift)"
 log_info "Drift timer installed (every 6h; reports only, never bakes)"
 echo "  Preview what it would destroy:  runner guard --dry-run"
 echo "  Turn it off:                    systemctl disable --now github-runner-guard.timer"
