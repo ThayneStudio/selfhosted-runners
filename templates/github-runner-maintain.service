@@ -7,10 +7,13 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 ExecStart=/usr/local/bin/runner maintain
-# One cycle can bake and then canary the image it baked: BAKE_TIMEOUT (90m) +
-# CANARY_REGISTER_TIMEOUT (10m) + CANARY_TIMEOUT (30m) = 130m worst case, plus
-# the cloud-image download, detect, GC and the drift check. 4h leaves headroom;
-# tests/unit/maintain.bats recomputes the sum from the defaults.
+# One cycle can run the gate TWICE — once on a candidate a previous cycle left
+# behind, and again on the image this cycle baked — so the worst case is
+# BAKE_TIMEOUT (5400) + 2 x (CANARY_REGISTER_TIMEOUT 600 + CANARY_TIMEOUT 1800)
+# = 10200s, plus the ~600 MB cloud-image download, detect, GC and drift.
+# 14400 leaves 4200s (70m) of headroom over that; tests/unit/maintain.bats
+# recomputes the sum from the defaults in lib/common.sh so raising a budget
+# fails there rather than on a host at 04:30.
 TimeoutStartSec=14400
 MemoryMax=512M
 CPUQuota=200%

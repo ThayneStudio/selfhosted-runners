@@ -630,6 +630,33 @@ gen_list() (
     done | sort -n
 )
 
+# VMID of the candidate generation with the highest numeric GEN_ID, empty
+# output when there is none.
+#
+# "Newest" is GEN_ID, never the highest VMID: allocate_generation_vmid hands
+# out the *lowest free* band VMID, so a generation baked after GC freed a lower
+# slot sits below an older one. And it is one function rather than a copy in
+# each caller for the reason lib/gc.sh states about the retention target — two
+# independent selectors can each look locally reasonable and still name
+# different VMIDs, and here that would mean the canary gates one candidate
+# while GC supersedes the other. Shared by gc_reconcile_candidates and the
+# maintain cycle.
+gen_newest_candidate() (
+    local vmid id newest="" newest_id=-1 list
+
+    list=$(gen_list candidate) || return 1
+    while read -r vmid; do
+        [[ -n "$vmid" ]] || continue
+        gen_read "$vmid" || return 1
+        id=$(gen_require_numeric_id "$vmid") || return 1
+        if ((id > newest_id)); then
+            newest_id="$id"
+            newest="$vmid"
+        fi
+    done <<< "$list"
+    printf '%s' "$newest"
+)
+
 # Resolves a generation id to its VMID. Clone attribution (spec 5) works the
 # other way round — record first, id second — but the CLI takes ids, so the
 # lookup is needed in both directions.

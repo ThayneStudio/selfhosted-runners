@@ -20,6 +20,17 @@
 # Every stage is individually skippable (--skip-*) and idempotent: interrupting
 # the cycle anywhere and re-running it completes without duplicating anything.
 #
+# The drift check is the one stage that runs on EVERY exit path, including a
+# failed adoption or reconcile — spec 11.4 wants the alarm firing exactly when
+# the pipeline is broken, so failures record an exit status and fall through
+# rather than returning early.
+#
+# THE POINTER. promote_generation rewrites TEMPLATE_ID in CONFIG_FILE and does
+# not assign the calling shell's copy, so the canary stage re-reads it after a
+# promotion. Everything after that stage — detect_should_bake, drift — reads
+# the in-shell copy, and without the reload the cycle would bake a twin of the
+# image it had just promoted.
+#
 # LOCKS. The cycle takes no lock of its own. Each stage takes exactly the locks
 # its verb takes, so a manual `runner bake|gc|canary|promote|rollback|rollover`
 # running concurrently meets the same lock it always meets and no new ordering
@@ -399,25 +410,41 @@ maintain_note_once() {
 # Cycle stages
 # ---------------------------------------------------------------------------
 
-# VMID of the newest candidate generation, empty when there is none. gen_list
-# sorts numerically and the band is allocated upwards (spec 4.2), so the last
-# line is the newest. More than one candidate is a symptom rather than a normal
-# state — the cycle refuses to bake while any exists — so it is named, not
-# silently ignored.
-maintain_newest_candidate() {
-    local vmid list last=""
-    local -a candidates=()
+# Read the candidate the cycle acts on into MAINTAIN_CANDIDATE_VMID (empty
+# when there is none) and MAINTAIN_CANDIDATE_COUNT.
+#
+# Globals rather than stdout on purpose: the caller needs both values, and the
+# warn-once bookkeeping below would be lost to the subshell a command
+# substitution creates. Callers must therefore invoke this directly, never as
+# $(maintain_read_candidate).
+#
+# "Newest" is gen_newest_candidate — highest GEN_ID, the same selection GC
+# makes. Not the highest VMID: allocate_generation_vmid hands out the lowest
+# free band VMID, so a generation baked after GC freed a lower slot sits below
+# an older one.
+#
+# More than one candidate is a symptom, not a normal state — the bake stage
+# refuses to bake while any exists — so it is named once per cycle rather than
+# once per read.
+maintain_read_candidate() {
+    local vmid list
+
+    MAINTAIN_CANDIDATE_VMID=""
+    MAINTAIN_CANDIDATE_COUNT=0
 
     list=$(gen_list candidate) || return 1
     while read -r vmid; do
         [[ -n "$vmid" ]] || continue
-        candidates+=("$vmid")
-        last="$vmid"
+        MAINTAIN_CANDIDATE_COUNT=$((MAINTAIN_CANDIDATE_COUNT + 1))
     done <<< "$list"
-    if ((${#candidates[@]} > 1)); then
-        log_warn "More than one candidate generation (${candidates[*]}); gating the newest, VMID $last"
+    ((MAINTAIN_CANDIDATE_COUNT > 0)) || return 0
+
+    MAINTAIN_CANDIDATE_VMID=$(gen_newest_candidate) || return 1
+    if ((MAINTAIN_CANDIDATE_COUNT > 1)) && [[ -z "${MAINTAIN_MULTI_CANDIDATE_WARNED:-}" ]]; then
+        MAINTAIN_MULTI_CANDIDATE_WARNED=1
+        log_warn "$MAINTAIN_CANDIDATE_COUNT candidate generations exist; acting on the newest by GEN_ID, VMID $MAINTAIN_CANDIDATE_VMID"
     fi
-    printf '%s' "$last"
+    return 0
 }
 
 # Put a candidate through the canary gate (spec 7.1-7.5). The gate's exit
@@ -429,7 +456,8 @@ maintain_newest_candidate() {
 maintain_canary_stage() {
     local vmid gen_id rc=0
 
-    vmid=$(maintain_newest_candidate) || return 1
+    maintain_read_candidate || return 1
+    vmid="$MAINTAIN_CANDIDATE_VMID"
     if [[ -z "$vmid" ]]; then
         maintain_set_note candidate_pending ""
         return 0
@@ -459,6 +487,20 @@ maintain_canary_stage() {
     case "$rc" in
         0)
             log_info "canary passed: generation $gen_id was promoted"
+            # promote_generation rewrites TEMPLATE_ID in CONFIG_FILE
+            # (lib/promote.sh) and deliberately does not assign this shell's
+            # copy; lib/upgrade.sh compensates the same way after its own
+            # promote. Everything downstream reads the in-shell copy —
+            # detect_should_bake compares the input digest against the record
+            # TEMPLATE_ID names (lib/detect.sh), and drift_fleet_version reads
+            # its GEN_RUNNER_VERSION — so without this reload the cycle would
+            # compare against the generation it had just superseded, bake a
+            # twin of the image it had just promoted, and then report drift
+            # against the version it had just replaced.
+            TEMPLATE_ID=$(reload_active_template_id) || {
+                log_error "Could not re-read the active pointer after promoting generation $gen_id"
+                return 1
+            }
             ;;
         2)
             # Already notified by the gate. Not an attempt, so nothing was
@@ -488,7 +530,8 @@ maintain_canary_stage() {
 # bake_main is never --force here: --force is the operator's override (spec
 # 11.1) and would ignore the window, the memo and the weekly floor.
 maintain_bake_stage() {
-    local decision win_rc=0 candidate
+    local candidate="${1:-}"
+    local decision win_rc=0
 
     decision=$(detect_should_bake) || {
         log_error "detect_should_bake failed"
@@ -510,8 +553,9 @@ maintain_bake_stage() {
 
     # An ungated candidate is already occupying the band. Baking a second image
     # on top of it strands ~30 GB per cycle and leaves the gate two candidates
-    # to choose between. Whatever the gate stage decided above stands.
-    candidate=$(maintain_newest_candidate) || return 1
+    # to choose between. Whatever the gate stage decided above stands. The VMID
+    # is passed in rather than re-derived so the whole cycle acts on one
+    # reading of the store.
     if [[ -n "$candidate" ]]; then
         log_info "not starting a bake: the candidate at VMID $candidate is waiting on the canary gate"
         return 0
@@ -541,13 +585,18 @@ maintain_bake_stage() {
 
 # Spec 11.1 lists the drift check as a stage of the cycle; spec 11.4 makes the
 # alarm independent of the bake pipeline "so it still fires when the pipeline is
-# broken". Both are honored: the check runs last and unconditionally — after a
-# deferred bake, after REBAKE_ENABLED=false, after a stage that failed — and
-# github-runner-drift.timer keeps its own 6-hourly schedule, because an alarm
-# that only fired from the cycle would go quiet exactly when the cycle wedges.
-# drift_main reports only, never bakes, dedupes its own API-failure warning
-# through DRIFT_FAIL_FILE, and returns 0 after any completed check, so running
-# it from both places costs one extra GitHub call a day.
+# broken". Both are honored: the check runs last and on *every* exit path — a
+# deferred bake, REBAKE_ENABLED=false, a failed GC, a gate error, a failed
+# adoption, a failed reconcile — because those are precisely the broken-pipeline
+# states 11.4 names. github-runner-drift.timer keeps its own 6-hourly schedule
+# too, because an alarm that only fired from the cycle would go quiet exactly
+# when the cycle wedges.
+#
+# drift_main reports only and never bakes. Its *prolonged-API-failure* warning
+# is deduped through DRIFT_FAIL_FILE, but drift.warning / drift.critical are
+# not deduped at all, so an in-window fleet produces one extra alert per day on
+# top of the timer's four. That is the price of the 11.4 guarantee and is
+# deliberate; if it becomes noise, dedupe belongs in drift_notify, not here.
 maintain_drift_stage() {
     drift_main || log_warn "Drift check did not complete"
     return 0
@@ -602,56 +651,76 @@ maintain_main() {
     done
 
     apply_generation_defaults
+    MAINTAIN_MULTI_CANDIDATE_WARNED=""
 
+    # `halt` stops the stages that would act on a store this cycle can no
+    # longer trust. It never skips the drift check: spec 11.4 wants the alarm
+    # firing in exactly these states, so every failure below records rc and
+    # falls through rather than returning.
     if (( skip_adopt == 0 )); then
         adopt_deployed_template || {
             log_error "Adoption failed"
-            return 1
+            rc=1
+            halt=1
         }
     fi
 
     # Spec 15: reconciliation is at the front so every later stage reads a
     # store that means what it says.
-    if (( skip_reconcile == 0 )); then
+    if (( skip_reconcile == 0 && halt == 0 )); then
         maintain_clear_stale_promotion_pause
 
-        maintain_reconcile_two_actives || {
+        if maintain_reconcile_two_actives; then
+            maintain_reconcile_baking || {
+                log_error "Failed to reconcile interrupted bakes"
+                rc=1
+                halt=1
+            }
+        else
             log_error "Failed to reconcile multiple active generations"
-            return 1
-        }
-        maintain_reconcile_baking || {
-            log_error "Failed to reconcile interrupted bakes"
-            return 1
-        }
+            rc=1
+            halt=1
+        fi
     fi
 
     # A GC that cannot run — most often because a manual bake or upgrade holds
     # the bake lock it waits on — must not silence the stages after it. The
     # failure lands in the cycle's exit status; the cycle carries on.
-    if (( skip_gc == 0 )); then
+    if (( skip_gc == 0 && halt == 0 )); then
         gc_main false || {
             log_error "Generation garbage collection failed"
             rc=1
         }
     fi
 
-    if (( skip_canary == 0 )); then
+    if (( skip_canary == 0 && halt == 0 )); then
         maintain_canary_stage || { rc=1; halt=1; }
     fi
 
     # A gate error means the store is in a state this cycle does not
     # understand. Baking on top of that would only add to it.
     if (( skip_bake == 0 && halt == 0 )); then
-        before=$(maintain_newest_candidate) || before=""
-        maintain_bake_stage || rc=1
-        after=$(maintain_newest_candidate) || after=""
-        # Acceptance: a stale generation goes bake -> canary -> promote in one
-        # unattended cycle. Only a candidate this cycle produced is re-gated;
-        # re-running the gate on the one it already saw would double the work
-        # and the log lines for nothing.
-        if (( skip_canary == 0 )) && [[ -n "$after" && "$after" != "$before" ]]; then
-            log_info "gating the candidate this cycle baked"
-            maintain_canary_stage || rc=1
+        if maintain_read_candidate; then
+            before="$MAINTAIN_CANDIDATE_VMID"
+            maintain_bake_stage "$before" || rc=1
+            after=""
+            if maintain_read_candidate; then
+                after="$MAINTAIN_CANDIDATE_VMID"
+            else
+                log_error "Cannot read the generation store after the bake"
+                rc=1
+            fi
+            # Acceptance: a stale generation goes bake -> canary -> promote in
+            # one unattended cycle. Only a candidate this cycle produced is
+            # re-gated; re-running the gate on the one it already saw would
+            # double the work and the log lines for nothing.
+            if (( skip_canary == 0 )) && [[ -n "$after" && "$after" != "$before" ]]; then
+                log_info "gating the candidate this cycle baked"
+                maintain_canary_stage || rc=1
+            fi
+        else
+            log_error "Cannot read the generation store before the bake decision"
+            rc=1
         fi
     fi
 

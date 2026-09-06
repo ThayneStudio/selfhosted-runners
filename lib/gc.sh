@@ -223,20 +223,19 @@ gc_destroy_generation() {
 }
 
 gc_reconcile_candidates() {
-    local dry_run="$1" list vmid newest="" newest_id=-1 newest_active_id=-1 age id active_list
+    local dry_run="$1" list vmid newest="" newest_active_id=-1 age id active_list
     local -a candidates=()
 
     list=$(gen_list candidate) || return 1
     while read -r vmid; do
         [[ -n "$vmid" ]] || continue
         candidates+=("$vmid")
-        gen_read "$vmid" || return 1
-        id=$(gen_require_numeric_id "$vmid") || return 1
-        if ((id > newest_id)); then
-            newest_id="$id"
-            newest="$vmid"
-        fi
     done <<< "$list"
+    # Shared selector (lib/generations.sh). maintain's canary gate has to act
+    # on the same candidate GC treats as newest; a private highest-GEN_ID scan
+    # here is exactly the parallel-algorithm trap described below for the
+    # retention target.
+    newest=$(gen_newest_candidate) || return 1
     [[ -n "$newest" ]] || return 0
 
     active_list=$(gen_list active) || return 1
