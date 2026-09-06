@@ -142,6 +142,17 @@ BAKE_LOCK_FILE="/run/lock/github-runner-bake.lock"
 GC_LOCK_FILE="/run/lock/github-runner-gc.lock"
 # shellcheck disable=SC2034  # consumed by bake, detect, promote, rollback, maintain
 PROMOTION_PAUSE_FILE="/run/lock/github-runner-promote.pause"
+# Serializes the canary gate (spec 7.1). Held exclusively for a whole
+# `runner canary` run: two gates at once would fight over the canary-gen<N>
+# name, and a second canary carrying the same gen-<N>-canary label could
+# absorb the first one's dispatch. The gate takes no other lock of its own —
+# see the LOCKS note at the top of lib/canary.sh.
+# shellcheck disable=SC2034  # consumed by lib/canary.sh
+CANARY_LOCK_FILE="/run/lock/github-runner-canary.lock"
+# The Proxmox tag that marks a VM as a canary clone. clone_runner --canary
+# writes it; lib/reclone.sh refuses to re-clone anything carrying it (spec 7.4).
+# shellcheck disable=SC2034  # consumed by lib/canary.sh, lib/reclone.sh
+CANARY_VM_TAG="runner-canary"
 IMG_CACHE_DIR="/var/cache/github-runners"
 # shellcheck disable=SC2034  # consumed by bake, detect, promote, maintain
 BAKE_LOG_DIR="/var/log/github-runners"
@@ -273,7 +284,28 @@ apply_generation_defaults() {
     _generation_uint_or_default BAKE_TIMEOUT 5400
     _generation_uint_or_default BAKE_MIN_FREE_GB 60
     _generation_bool_or_default CANARY_ENABLED false
+    # Canary gate (spec 7.1, 7.5, 14). CANARY_REPO/CANARY_ORG/CANARY_PAT have
+    # no meaningful default — they are operator values (spec 20) — but they are
+    # defaulted to empty here so `set -u` code can read them, and so that
+    # "unconfigured" is a state the gate can detect rather than a crash.
+    _generation_uint_or_default CANARY_MAX_ATTEMPTS 3
+    _generation_uint_or_default CANARY_TIMEOUT 1800
+    _generation_uint_or_default CANARY_REGISTER_TIMEOUT 600
+    CANARY_WORKFLOW="${CANARY_WORKFLOW:-runner-canary.yml}"
+    CANARY_REPO="${CANARY_REPO:-}"
+    CANARY_ORG="${CANARY_ORG:-}"
+    CANARY_PAT="${CANARY_PAT:-}"
     _generation_uint_or_default DETECT_FAIL_WARN_HOURS 24
+}
+
+# True when CANARY_REPO names something. `maintain` refuses to start a bake
+# without it (spec 14) and the canary gate refuses to run: one predicate, so
+# the two cannot disagree about what "configured" means.
+# Proven by "maintain and canary share one CANARY_REPO predicate".
+canary_repo_configured() {
+    local repo="${CANARY_REPO:-}"
+    repo="${repo//[[:space:]]/}"
+    [[ -n "$repo" ]]
 }
 
 validate_generation_band() {
@@ -539,6 +571,26 @@ generation_id_from_tags() {
             printf '%s\n' "$((10#$id))"
             return 0
         fi
+    done
+    return 1
+}
+
+# True when a VM's `qm config` output carries the canary tag. The hookscript
+# re-clone path uses it to tell a canary from a pool runner (spec 7.4); a
+# canary must be destroyed and never re-cloned. Takes the config text rather
+# than a VMID because its callers already have it.
+# Proven by "vm_config_is_canary reads runner-canary out of either separator".
+vm_config_is_canary() {
+    local cfg="${1:-}" tags_line tag
+    local -a tags=()
+
+    tags_line=$(grep -m1 '^tags:' <<< "$cfg") || return 1
+    tags_line="${tags_line#tags:}"
+    tags_line="${tags_line%$'\r'}"
+    IFS=';,' read -ra tags <<< "$tags_line"
+    for tag in "${tags[@]}"; do
+        tag="${tag//[[:space:]]/}"
+        [[ "$tag" == "$CANARY_VM_TAG" ]] && return 0
     done
     return 1
 }
@@ -1609,7 +1661,7 @@ clone_runner() {
             _pool_lock_release
             return 1
         fi
-        extra_tag="runner-canary"
+        extra_tag="$CANARY_VM_TAG"
     fi
 
     # Cleanup helper: destroy VM (only if it belongs to us), remove snippet, and

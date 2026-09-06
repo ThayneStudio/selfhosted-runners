@@ -280,6 +280,21 @@ notify_log() {
     [[ "$output" == *"unknown-digest"* || "$(notify_log)" == *"canary.unconfigured"* ]]
 }
 
+@test "CANARY_ENABLED=true with a whitespace-only CANARY_REPO refuses to bake" {
+    # The gate (lib/canary.sh) and maintain share canary_repo_configured, so a
+    # value that looks set but is not must stop both of them, not just one.
+    stub_digest_ok
+    make_active unknown GEN_CREATED_AT=2026-08-24T00:00:00Z
+    MAINTAIN_NOW_HHMM=03:00
+    CANARY_ENABLED=true
+    CANARY_REPO="   "
+
+    run maintain_main
+    [ "$status" -eq 0 ]
+    ! bake_main_called
+    notify_log | grep -q 'warn canary.unconfigured'
+}
+
 @test "CANARY_ENABLED=true with empty CANARY_REPO notifies even outside REBAKE_WINDOW" {
     stub_digest_ok
     make_active unknown GEN_CREATED_AT=2026-08-24T00:00:00Z

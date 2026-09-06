@@ -148,6 +148,7 @@ After setup, the `runner` command is available globally:
 | `runner watch` | Fill missing runner slots (run by a 30s timer) |
 | `runner guard [--dry-run]` | Reap stopped and over-age runner VMs (normally run by timer) |
 | `runner gc [--dry-run]` | Collect drained template generations according to retention policy |
+| `runner canary <id>` | Run the canary gate against a candidate generation |
 | `runner upgrade [--dry-run] [--force]` | Bake a candidate if needed and promote it |
 | `runner help` | Show available commands |
 
@@ -329,6 +330,114 @@ failure this platform exists to catch, and no local smoke test sees it. The job
 that supplies that evidence is `templates/canary-workflow.yml`, which doubles as
 the acceptance test for everything the bake installs.
 
+### The gate (`runner canary <id>`)
+
+`runner canary <generation-id>` is what turns a `candidate` generation into the
+`active` one, and it is the only path to promotion that needs no human. It is
+written to be run unattended on every `runner maintain` cycle -- maintain does
+not call it yet -- so it is safe to run at any time: a second run while one is
+in flight does nothing, an already-active generation is a no-op, and a canary
+that cannot be attempted changes nothing at all.
+
+One attempt is:
+
+1. Clone `canary-gen<id>` from **that generation's** template -- never from
+   `TEMPLATE_ID` -- tagged `runner,gen-<id>,runner-canary`, with a JIT config
+   carrying only the `gen-<id>-canary` label (see the label contract above).
+2. Wait up to `CANARY_REGISTER_TIMEOUT` (600s) for it to show **Online** in the
+   org's runner list.
+3. `workflow_dispatch` `CANARY_WORKFLOW` in `CANARY_REPO`, on the repository's
+   default branch, with `generation=<id>` as the input.
+4. Poll the run that dispatch created through to a conclusion, up to
+   `CANARY_TIMEOUT` (1800s, measured from the dispatch -- Actions queue latency
+   counts against it). A run is this canary's only if **all three** hold: its
+   id is above the highest run id that existed before the dispatch, its
+   run-name is exactly `Runner canary gen-<id>`, and it started at or after the
+   instant GitHub accepted the dispatch (read from GitHub's own `Date`
+   response header, so a skewed host clock cannot reject the run it just
+   caused). Anything less would let the gate adopt a previous attempt's run for
+   the same generation -- promoting on a stale success -- or a run somebody
+   dispatched by hand. If the baseline read itself fails, the gate does not
+   dispatch at all. A new run that names something else is reported and
+   **not** attributed to this canary.
+5. `success` promotes the generation. Anything else is a failed attempt.
+6. Destroy the canary VM either way. **The candidate template is retained**, so
+   a retry is a clone and a dispatch, not a 45-minute rebake.
+
+Its exit status is a contract, because the unattended cycle will branch on it:
+
+| Code | Meaning |
+|---|---|
+| `0` | passed, and the generation was promoted (or was already active) |
+| `1` | an error in the gate itself: bad arguments, an unreadable store, a generation it cannot act on, or a promotion that failed after a passing canary |
+| `2` | not attempted, and **no attempt was consumed** (including a run that is not this canary's) |
+| `3` | the attempt failed and attempts remain -- retried on a later cycle |
+| `4` | the budget is spent: the generation is `failed` and its digest is memoed |
+
+**A canary failure is not by itself evidence of a bad image.** A GitHub Actions
+incident, queue latency beyond `CANARY_TIMEOUT`, a host reboot mid-canary and
+an expired PAT all look identical to one. So each failure notifies `warn`
+(`canary.attempt_failed`) with the run URL and increments
+`GEN_CANARY_ATTEMPTS`, and only the attempt that reaches `CANARY_MAX_ATTEMPTS`
+(default 3) marks the generation `failed`, notifies `error` (`canary.failed`),
+and **memoizes the digest** so the pipeline stops rebaking an image that cannot
+pass. That is the one path where a canary failure reaches the memo; clearing it
+means editing `/var/lib/github-runners/failed-digests`.
+
+**Anything that cannot be attempted costs nothing.** `CANARY_ENABLED` not
+`true`, an empty `CANARY_REPO`, a `CANARY_ORG` that names no configured
+organization, a PAT GitHub rejects or that lacks the scope to dispatch, a
+workflow that is missing or disabled, an unreachable API, a run list the gate
+could not read before dispatching, a new run that turns out to name some other
+generation, a promotion holding the clone path, or another canary already
+running: all of these leave the candidate `pending` with its attempt budget
+untouched, and all but the last two notify `warn` (`canary.unconfigured`).
+Burning the budget on a misconfiguration -- or on somebody else's workflow run
+-- would reject a perfectly good image.
+
+Configuration (`/etc/github-runners.conf`, all optional -- the defaults are in
+code, not written into the file):
+
+```sh
+CANARY_ENABLED=false              # set true once CANARY_REPO is configured
+CANARY_ORG=                       # org config hosting the canary; the only
+                                  # configured org when there is just one
+CANARY_REPO=                      # <owner>/<repo>, or <repo> under CANARY_ORG
+CANARY_WORKFLOW=runner-canary.yml
+CANARY_PAT=                       # optional; defaults to the org PAT
+CANARY_MAX_ATTEMPTS=3
+CANARY_REGISTER_TIMEOUT=600
+CANARY_TIMEOUT=1800
+```
+
+**PAT scope is validated before the clone, not discovered at the dispatch.**
+`workflow_dispatch` needs `repo` on a classic PAT (`public_repo` suffices for a
+public canary repo) or Actions: read and write on a fine-grained one, while the
+org PAT `runner add-org` collects only needs `admin:org`. A classic PAT
+advertises its scopes in `X-OAuth-Scopes`, so a missing one is named up front
+and no attempt is consumed. Fine-grained tokens send no such header and cannot
+be checked that way -- for those, a dispatch GitHub refuses with 401/403/404 is
+classified the same way (not attempted, budget handed back, `warn`) rather than
+counted as a canary failure. Two different tokens are in play: the canary
+*registers* with the org PAT, like every other runner, and *dispatches* with
+`CANARY_PAT` when one is set.
+
+**Locks.** The gate holds one lock of its own, `/run/lock/github-runner-canary.lock`,
+for the whole run, and takes no other lock directly -- that is what keeps it
+clear of the promotion it exists to trigger. Underneath it, `clone_runner`
+takes the pool activity lock *shared* (and defers while a promotion is paused),
+and `runner promote` takes the promotion pause plus the pool lock
+*exclusively*; neither wants the canary lock. The only other lock it touches is
+the per-slot lock around its own VM destroy -- the same one the hookscript
+re-clone path holds -- with a bounded wait.
+
+**The canary VM is never re-cloned.** It is `--ephemeral`, so it powers off
+after its one job and the hookscript fires `lib/reclone.sh`, which destroys any
+VM tagged `runner-canary` and stops there. Re-cloning it would resurrect the
+canary forever, and every resurrection would carry `gen-<id>-canary` and absorb
+the next dispatch. `lib/watch.sh` needs no such rule: it fills slots by
+`<RUNNER_PREFIX>-N` name match, and `canary-gen<N>` matches none.
+
 ### Installing it into `CANARY_REPO`
 
 The copy in this repo is canonical; it has to be installed into whichever repo
@@ -353,8 +462,8 @@ only needs `admin:org`, so a separate `CANARY_PAT` may be required.
 Edit the copy in this repo and reinstall it, **bumping
 `CANARY_WORKFLOW_REVISION` in the same change**. A stale installed copy fails
 an image for a reason that reads, in the log, exactly like a bad image; the
-revision is echoed into the job log and step summary so the gate can compare it
-with the canonical copy before dispatching and refuse the run instead.
+revision is echoed into the job log and step summary so an operator reading a
+red run can tell the two apart at a glance.
 
 ### The label contract
 

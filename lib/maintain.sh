@@ -301,12 +301,6 @@ maintain_reconcile_two_actives() {
     return 0
 }
 
-_canary_repo_configured() {
-    local repo="${CANARY_REPO:-}"
-    repo="${repo//[[:space:]]/}"
-    [[ -n "$repo" ]]
-}
-
 # Ordered cycle. Does not canary, promote, or GC. bake_main is not --force.
 maintain_main() {
     local decision win_rc=0
@@ -341,7 +335,9 @@ maintain_main() {
     case "$decision" in
         yes\ *)
             log_info "bake needed: ${decision#yes }"
-            if [[ "${CANARY_ENABLED}" == "true" ]] && ! _canary_repo_configured; then
+            # canary_repo_configured lives in common.sh so this and the gate
+            # itself (lib/canary.sh) cannot disagree about "configured".
+            if [[ "${CANARY_ENABLED}" == "true" ]] && ! canary_repo_configured; then
                 notify warn canary.unconfigured \
                     "CANARY_ENABLED=true but CANARY_REPO is empty — refusing to bake"
                 log_warn "Refusing to start a bake: CANARY_ENABLED=true but CANARY_REPO is empty"
