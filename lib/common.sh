@@ -52,6 +52,10 @@ INSTALL_DIR="${INSTALL_DIR:-/opt/selfhosted-runners}"
 # production always uses the default.
 RUNNER_STATE_DIR="${RUNNER_STATE_DIR:-/var/lib/github-runners}"
 GENERATIONS_DIR="${GENERATIONS_DIR:-$RUNNER_STATE_DIR/generations}"
+# Optional last-sent notification line, written by notify if it ever records one.
+# status reads this; it never creates it.
+# shellcheck disable=SC2034  # consumed by lib/status.sh
+LAST_NOTIFY_FILE="$RUNNER_STATE_DIR/last-notify"
 # One mode for everything under RUNNER_STATE_DIR. `install -d -m` re-applies the
 # mode to an existing directory, so two callers disagreeing about it would flip
 # the permissions depending on which ran last.
@@ -78,6 +82,9 @@ GUARD_STATE_DIR="/run/github-runner-guard"
 # clone_runner holds a shared lock for its full lifecycle; runner stop takes an
 # exclusive lock so it can wait until all clone activity is quiesced.
 POOL_ACTIVITY_LOCK_FILE="/run/lock/github-runner-pool.lock"
+# Linearizes maintenance entry with rollover's destructive transaction without
+# putting network waits under the clone/promotion pool lock.
+POOL_DRAIN_COORD_LOCK_FILE="/run/lock/github-runner-drain-coord.lock"
 # Global lock serializing VMID allocation across reclone.sh/watch.sh/create.sh.
 # Scope is narrow: "pick free VMID -> reserve it". A per-VMID reservation
 # stays held until qm clone returns, so clone tasks can run with bounded
@@ -93,6 +100,10 @@ CLONE_SLOT_LOCK_PREFIX="/run/lock/runner-clone-slot"
 # guard would stop coordinating with the clone path and destroy mid-clone.
 # shellcheck disable=SC2034  # consumed by sourcing scripts (reclone.sh, watch.sh, guard.sh)
 RUNNER_SLOT_LOCK_PREFIX="/run/lock/runner"
+# Serializes capacity decisions and destruction within one organization.
+# shellcheck disable=SC2034  # consumed by lib/rollover.sh
+ROLLOVER_ORG_LOCK_PREFIX="/run/lock/github-runner-rollover-org"
+ROLLOVER_PENDING_DIR="$RUNNER_STATE_DIR/rollover-pending"
 # Per-slot reclone bookkeeping (last-processed timestamp, rapid-death streak).
 # shellcheck disable=SC2034  # consumed by sourcing scripts (lib/reclone.sh)
 RECLONE_STATE_PREFIX="/run/runner"
@@ -124,6 +135,11 @@ GUARD_DEFER_WARN_RUNS=3
 # hang off RUNNER_STATE_DIR so relocating state relocates them too.
 # shellcheck disable=SC2034  # consumed by bake, detect, promote, maintain
 BAKE_LOCK_FILE="/run/lock/github-runner-bake.lock"
+# Serializes manual and timer-driven garbage collection runs. GC makes several
+# decisions from one generation snapshot; overlapping runs must not both try to
+# destroy and archive the same record.
+# shellcheck disable=SC2034  # consumed by lib/gc.sh
+GC_LOCK_FILE="/run/lock/github-runner-gc.lock"
 # shellcheck disable=SC2034  # consumed by bake, detect, promote, rollback, maintain
 PROMOTION_PAUSE_FILE="/run/lock/github-runner-promote.pause"
 IMG_CACHE_DIR="/var/cache/github-runners"
@@ -133,6 +149,9 @@ BAKE_LOG_DIR="/var/log/github-runners"
 FAILED_DIGESTS_FILE="$RUNNER_STATE_DIR/failed-digests"
 # shellcheck disable=SC2034  # consumed by bake, detect, promote, maintain
 DETECT_FAIL_FILE="$RUNNER_STATE_DIR/detect-fail"
+# Consecutive GitHub API failures for the drift alarm (lib/drift.sh).
+# shellcheck disable=SC2034
+DRIFT_FAIL_FILE="$RUNNER_STATE_DIR/drift-fail"
 CLOUD_IMG="noble-server-cloudimg-amd64.img"
 # shellcheck disable=SC2034  # consumed by bake, detect, promote, maintain
 CLOUD_IMG_URL="https://cloud-images.ubuntu.com/noble/current/${CLOUD_IMG}"
@@ -245,6 +264,7 @@ apply_generation_defaults() {
     _generation_uint_or_default TEMPLATE_BAND_MAX 8999
     _generation_uint_or_default GENERATION_RETAIN 1
     _generation_uint_or_default FAILED_GEN_RETAIN_DAYS 7
+    _generation_uint_or_default GC_STUCK_WARN_HOURS 12
     _generation_uint_or_default CANDIDATE_MAX_AGE_DAYS 3
     _generation_bool_or_default REBAKE_ENABLED true
     _generation_uint_or_default REBAKE_MAX_AGE_DAYS 7
@@ -377,6 +397,8 @@ ensure_state_dir() {
 }
 
 enable_pool_drain() {
+    exec 212>"$POOL_DRAIN_COORD_LOCK_FILE"
+    flock -x 212
     local state_dir
     state_dir="$(dirname "$POOL_DRAIN_FILE")"
 
@@ -386,10 +408,12 @@ enable_pool_drain() {
     # drained when the watcher is still cloning.
     if ! ensure_state_dir "$state_dir"; then
         log_error "Failed to create $state_dir — maintenance mode NOT entered"
+        exec 212>&-
         return 1
     fi
     if ! : > "$POOL_DRAIN_FILE"; then
         log_error "Failed to write $POOL_DRAIN_FILE — maintenance mode NOT entered"
+        exec 212>&-
         return 1
     fi
 
@@ -400,6 +424,7 @@ enable_pool_drain() {
     if ! : > "$POOL_DRAIN_FILE_LEGACY" 2>/dev/null; then
         log_warn "Could not write $POOL_DRAIN_FILE_LEGACY — a rollback to an older release would not see this drain"
     fi
+    exec 212>&-
 }
 
 disable_pool_drain() {
@@ -466,14 +491,68 @@ select_org() {
     done
 }
 
-get_vm_org() {
-    local cicustom
-    cicustom=$(qm config "$1" 2>/dev/null | grep "^cicustom:" || true)
-    if [[ "$cicustom" =~ runner-user-data-([^.]+)\.yaml ]]; then
-        echo "${BASH_REMATCH[1]}"
+# Org named by a runner VM's cloud-init snippet, given a `qm config` body or
+# just its cicustom line. Single source of truth for the snippet naming, because
+# rollover and the generation inventory have to recognise the same VMs this does.
+#
+# New per-VM snippet: runner-<vmid>-user-<org>.yaml (org has no dots).
+# Legacy per-org snippet: runner-user-data-<org>.yaml (kept as a fallback so
+# VMs created before the token refactor stay identifiable/destroyable).
+# The two are mutually exclusive: legacy names have no digits after "runner-".
+# Prints the org; returns 1 when the config names neither snippet.
+org_from_vm_config() {
+    local cfg="${1:-}"
+    if [[ "$cfg" =~ runner-[0-9]+-user-([a-zA-Z0-9-]+)\.yaml ]]; then
+        printf '%s\n' "${BASH_REMATCH[1]}"
+    elif [[ "$cfg" =~ runner-user-data-([^.]+)\.yaml ]]; then
+        printf '%s\n' "${BASH_REMATCH[1]}"
     else
-        echo "unknown"
+        return 1
     fi
+}
+
+get_vm_org() {
+    local cicustom org
+    cicustom=$(qm config "$1" 2>/dev/null | grep "^cicustom:" || true)
+    org=$(org_from_vm_config "$cicustom") || org="unknown"
+    echo "$org"
+}
+
+# GEN_ID encoded in a Proxmox tags value (`runner;gen-5` or `runner,gen-5`).
+# First well-formed gen-<digits> tag wins. Proven by
+# "get_vm_generation reads gen-N from semicolon-separated tags" and
+# "get_vm_generation ignores a gen- prefix that is not a generation id".
+generation_id_from_tags() {
+    local current="${1:-}" tag id
+    local -a tags=()
+
+    current="${current#tags:}"
+    current="${current%$'\r'}"
+    IFS=';,' read -ra tags <<< "$current"
+    for tag in "${tags[@]}"; do
+        tag="${tag//[[:space:]]/}"
+        [[ -n "$tag" ]] || continue
+        if [[ "$tag" =~ ^gen-([0-9]+)$ ]]; then
+            id="${BASH_REMATCH[1]}"
+            # Same bound as gen_is_uint: keep the value inside arithmetic.
+            [[ ${#id} -le 18 ]] || continue
+            printf '%s\n' "$((10#$id))"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# GEN_ID from a VM's `tags:` line in `qm config`. Uniform across storage
+# backends; the ZFS origin cross-check lives in generation_refcount.
+# Proven by "get_vm_generation reads gen-N from semicolon-separated tags".
+get_vm_generation() {
+    local vmid="${1:-}" cfg tags_line
+
+    [[ -n "$vmid" ]] || return 1
+    cfg=$(qm config "$vmid" 2>/dev/null) || return 1
+    tags_line=$(grep -m1 '^tags:' <<< "$cfg" || true)
+    generation_id_from_tags "$tags_line"
 }
 
 vm_config_path() {
@@ -559,15 +638,49 @@ release_clone_slot() {
     exec 204>&- 2>/dev/null || true
 }
 
+# Base volume ids of a template VM. Defaults to the active TEMPLATE_ID so
+# existing GC callers stay unchanged; generation_refcount passes a generation
+# VMID to cross-check origin against a superseded template.
 list_template_base_volids() {
-    qm config "$TEMPLATE_ID" 2>/dev/null | awk -F': ' -v storage="$VM_STORAGE:" '
-        $1 ~ /^(ide|sata|scsi|virtio)[0-9]+$/ {
-            split($2, parts, ",")
-            if (index(parts[1], storage "base-") == 1) {
-                print parts[1]
+    local vmid="${1:-$TEMPLATE_ID}"
+    local config bases storage_list config_path
+
+    if config=$(qm config "$vmid" 2>/dev/null); then
+        bases=$(awk -F': ' -v storage="$VM_STORAGE:" '
+            $1 ~ /^(ide|sata|scsi|virtio)[0-9]+$/ {
+                split($2, parts, ",")
+                if (index(parts[1], storage "base-") == 1) {
+                    print parts[1]
+                }
             }
-        }
-    '
+        ' <<< "$config")
+        if [[ -n "$bases" ]]; then
+            printf '%s\n' "$bases"
+            return 0
+        fi
+        # The config was read positively. A diskless/non-base config has no
+        # linked-clone ancestry to report; ownership checks decide separately
+        # whether it is a destroyable generation template.
+        return 0
+    fi
+
+    # A config read failure is not proof of absence: quorum, permissions, or
+    # an API fault can all make qm config fail for a live template. Only use
+    # storage recovery when both the cluster config path and qm status say the
+    # VM is absent.
+    config_path=$(vm_config_path "$vmid")
+    if [[ -n "$config_path" ]] || qm status "$vmid" >/dev/null 2>&1; then
+        log_error "Cannot read config for live template VMID $vmid"
+        return 1
+    fi
+
+    # A previous GC attempt may have removed the VM config before failing to
+    # free every residual child. Recover the base name from storage so the next
+    # run can finish instead of stranding the record and volumes forever.
+    storage_list=$(pvesm list "$VM_STORAGE" 2>/dev/null) || return 1
+    awk -v storage="$VM_STORAGE:" -v vmid="$vmid" '
+        $1 ~ ("^" storage "([^/]+/)?base-" vmid "-disk-") { print $1 }
+    ' <<< "$storage_list"
 }
 
 linked_clone_child_vmid() {
@@ -593,13 +706,15 @@ zfs_dataset_from_volid() {
 }
 
 list_template_linked_clone_volids() {
-    local storage_list base_volid base_path prefix volid child_name base_dataset dataset origin
+    local template_vmid="${1:-$TEMPLATE_ID}"
+    local storage_list base_list base_volid base_path prefix volid child_name base_dataset dataset origin path
     local -A seen=()
 
     if ! storage_list=$(pvesm list "$VM_STORAGE" 2>/dev/null); then
         log_error "Failed to list storage volumes on $VM_STORAGE"
         return 1
     fi
+    base_list=$(list_template_base_volids "$template_vmid") || return 1
     [[ -n "$storage_list" ]] || return 0
 
     while read -r base_volid; do
@@ -615,44 +730,74 @@ list_template_linked_clone_volids() {
             seen["$volid"]=1
             printf '%s\n' "$volid"
         done <<< "$storage_list"
-    done < <(list_template_base_volids)
+    done <<< "$base_list"
 
     # ZFS linked clones are sibling zvols, not nested volids. They point at
     # the template base volume snapshot via the ZFS origin property.
     while read -r base_volid; do
         [[ -n "$base_volid" ]] || continue
-        base_dataset=$(zfs_dataset_from_volid "$base_volid") || continue
+        if ! path=$(pvesm path "$base_volid" 2>/dev/null); then
+            log_error "Cannot resolve storage path for template volume $base_volid"
+            return 1
+        fi
+        [[ "$path" == /dev/zvol/* ]] || continue
+        if ! command -v zfs >/dev/null 2>&1; then
+            log_error "Cannot inspect ZFS origin for template volume $base_volid"
+            return 1
+        fi
+        base_dataset="${path#/dev/zvol/}"
+        if ! zfs list -H -o name "$base_dataset" >/dev/null 2>&1; then
+            log_error "Cannot inspect ZFS dataset $base_dataset for template volume $base_volid"
+            return 1
+        fi
 
         while read -r volid _; do
             [[ "$volid" == "$VM_STORAGE:vm-"* ]] || continue
             [[ -n "${seen[$volid]:-}" ]] && continue
 
-            dataset=$(zfs_dataset_from_volid "$volid") || continue
-            origin=$(zfs get -H -o value origin "$dataset" 2>/dev/null || true)
+            if ! path=$(pvesm path "$volid" 2>/dev/null); then
+                log_error "Cannot resolve storage path for possible clone volume $volid"
+                return 1
+            fi
+            [[ "$path" == /dev/zvol/* ]] || continue
+            dataset="${path#/dev/zvol/}"
+            if ! zfs list -H -o name "$dataset" >/dev/null 2>&1; then
+                log_error "Cannot inspect ZFS dataset $dataset for possible clone volume $volid"
+                return 1
+            fi
+            if ! origin=$(zfs get -H -o value origin "$dataset" 2>/dev/null); then
+                log_error "Cannot read ZFS origin for possible clone volume $volid"
+                return 1
+            fi
             [[ "$origin" == "$base_dataset@"* ]] || continue
 
             seen["$volid"]=1
             printf '%s\n' "$volid"
         done <<< "$storage_list"
-    done < <(list_template_base_volids)
+    done <<< "$base_list"
 }
 
 cleanup_template_orphan_volumes() {
-    local child_vmid config_path volid
+    local template_vmid="${1:-$TEMPLATE_ID}" child_vmid config_path volid
+    shift 2>/dev/null || true
     local -a child_volids=()
     local -a blocked_volids=()
     local -a freed_volids=()
 
-    local child_list
-    if ! child_list=$(list_template_linked_clone_volids); then
-        return 1
-    fi
-    if [[ -n "$child_list" ]]; then
-        mapfile -t child_volids <<< "$child_list"
+    local child_list=""
+    if [[ $# -gt 0 ]]; then
+        child_volids=("$@")
+    else
+        if ! child_list=$(list_template_linked_clone_volids "$template_vmid"); then
+            return 1
+        fi
+        if [[ -n "$child_list" ]]; then
+            mapfile -t child_volids <<< "$child_list"
+        fi
     fi
     [[ ${#child_volids[@]} -gt 0 ]] || return 0
 
-    log_info "Checking ${#child_volids[@]} linked-clone child volume(s) for template $TEMPLATE_ID..."
+    log_info "Checking ${#child_volids[@]} linked-clone child volume(s) for template $template_vmid..."
 
     for volid in "${child_volids[@]}"; do
         child_vmid=$(linked_clone_child_vmid "$volid")
@@ -674,11 +819,11 @@ cleanup_template_orphan_volumes() {
     done
 
     if [[ ${#freed_volids[@]} -gt 0 ]]; then
-        log_info "Freed ${#freed_volids[@]} orphaned linked-clone volume(s) for template $TEMPLATE_ID."
+        log_info "Freed ${#freed_volids[@]} orphaned linked-clone volume(s) for template $template_vmid."
     fi
 
     if [[ ${#blocked_volids[@]} -gt 0 ]]; then
-        log_error "Template $TEMPLATE_ID still has linked-clone child volume(s) with VM configs."
+        log_error "Template $template_vmid still has linked-clone child volume(s) with VM configs."
         log_error "Destroy those VMs/templates before deleting the template."
         return 2
     fi
@@ -722,34 +867,356 @@ cleanup_runner_orphan_volumes() {
     exec 202>&-
 }
 
-deregister_runner() {
-    local org="$1" runner_name="$2"
+github_runner_credentials() {
+    local org="$1"
+    validate_org_name "$org" || return 1
     local org_file="$ORG_CONFIG_DIR/${org}.conf"
-    [[ -f "$org_file" ]] || return 0
+    [[ -f "$org_file" ]] || return 1
 
     local pat="" github_org=""
     # shellcheck source=/dev/null  # per-org config, written by add-org at runtime
-    pat=$(source "$org_file" && echo "$GITHUB_PAT") || return 0
+    pat=$(source "$org_file" && echo "$GITHUB_PAT") || return 1
     # shellcheck source=/dev/null  # per-org config, written by add-org at runtime
-    github_org=$(source "$org_file" && echo "$GITHUB_ORG") || return 0
-    [[ -n "$pat" && -n "$github_org" ]] || return 0
+    github_org=$(source "$org_file" && echo "$GITHUB_ORG") || return 1
+    [[ -n "$pat" && -n "$github_org" ]] || return 1
+    printf '%s\t%s\n' "$github_org" "$pat"
+}
 
-    local runner_id
-    runner_id=$(curl -sf --max-time 10 \
-        -H "Accept: application/vnd.github.v3+json" \
-        --config <(printf 'header = "Authorization: token %s"\n' "$pat") \
-        "https://api.github.com/orgs/${github_org}/actions/runners?per_page=100" 2>/dev/null \
-        | jq --arg name "$runner_name" -r '.runners[] | select(.name == $name) | .id' 2>/dev/null) || return 0
+# Print "<runner-id>\t<busy>\t<status>" after a complete paginated scan.
+# Missing/duplicate names, malformed fields, API errors, and a changing
+# total_count all fail closed.
+# Emit name, id, busy, status for one stable paginated organization snapshot.
+#
+# This supersedes the ?name= single-shot lookup the JIT work added to
+# deregister_runner: the full scan also reaches a stale runner that sits past
+# page 1, and additionally fails closed on a duplicate exact name instead of
+# picking one to DELETE. rollover needs the whole org snapshot anyway.
+github_runners_snapshot() {
+    local org="$1" credentials github_org pat json total="" page=1 pages page_total
+    credentials=$(github_runner_credentials "$org") || return 1
+    IFS=$'\t' read -r github_org pat <<< "$credentials"
 
-    [[ -n "$runner_id" && "$runner_id" != "null" && "$runner_id" =~ ^[0-9]+$ ]] || return 0
+    while :; do
+        json=$(curl -sf --max-time 10 \
+            -H "Accept: application/vnd.github+json" \
+            --config <(printf 'header = "Authorization: token %s"\n' "$pat") \
+            "https://api.github.com/orgs/${github_org}/actions/runners?per_page=100&page=${page}" 2>/dev/null) || return 1
+        page_total=$(jq -er 'select((.total_count | type) == "number" and (.runners | type) == "array") | .total_count' <<< "$json" 2>/dev/null) || return 1
+        [[ "$page_total" =~ ^[0-9]+$ ]] || return 1
+        if [[ -z "$total" ]]; then
+            total="$page_total"
+            pages=$(((total + 99) / 100))
+            (( pages > 0 )) || pages=1
+        elif [[ "$page_total" != "$total" ]]; then
+            return 1
+        fi
+        jq -e 'all(.runners[]; (.name | type) == "string" and (.id | type) == "number"
+            and (.busy | type) == "boolean" and (.status == "online" or .status == "offline"))' \
+            <<< "$json" >/dev/null 2>&1 || return 1
+        jq -r '
+            .runners[]
+            | "\(.name)\t\(.id)\t\(.busy)\t\(.status)"
+        ' <<< "$json" 2>/dev/null || return 1
+        (( page >= pages )) && break
+        page=$((page + 1))
+    done
+}
 
+github_runner_lookup_details() {
+    local org="$1" runner_name="$2" snapshot matches
+    snapshot=$(github_runners_snapshot "$org") || return 1
+    matches=$(awk -F '\t' -v n="$runner_name" '$1 == n {print $2 "\t" $3 "\t" $4}' <<< "$snapshot")
+
+    [[ "$matches" =~ ^[0-9]+$'\t'(true|false)$'\t'(online|offline)$ ]] || return 1
+    printf '%s\n' "$matches"
+}
+
+resume_runner_cgroup() {
+    local vmid="$1" expected="${2:-}" result exitcode out ack
+    if [[ -n "$expected" ]]; then
+        [[ "$expected" =~ ^/[a-zA-Z0-9_./:@-]+$ && "$expected" != / && "$expected" != *'..'* && "$expected" != *$'\n'* ]] || return 1
+    fi
+    # shellcheck disable=SC2016  # guest-side program expands in the guest
+    result=$(qm guest exec "$vmid" -- /bin/bash -c '
+set -eu
+cgroup_root=${RUNNER_CGROUP_ROOT:-/sys/fs/cgroup}
+proc_root=${RUNNER_PROC_ROOT:-/proc}
+marker=${RUNNER_ROLLOVER_MARKER:-/run/github-runner-rollover-cgroup}
+expected=${1:-}
+pids=$(pgrep -x Runner.Listener || true)
+[ "$(printf "%s\n" "$pids" | sed "/^$/d" | wc -l)" -eq 1 ]
+pid=$pids
+lines=$(grep "^0::" "${proc_root}/${pid}/cgroup" || true)
+[ "$(printf "%s\n" "$lines" | sed "/^$/d" | wc -l)" -eq 1 ]
+cg=${lines#0::}
+case "$cg" in /|*[!a-zA-Z0-9_./:@-]*|*..*) exit 1;; /*) ;; *) exit 1;; esac
+[ -r "$marker" ]
+saved=$(cat "$marker")
+[ "$saved" = "$cg" ]
+[ -z "$expected" ] || [ "$expected" = "$cg" ]
+[ -w "${cgroup_root}${cg}/cgroup.freeze" ]
+echo 0 > "${cgroup_root}${cg}/cgroup.freeze"
+grep -q "^0$" "${cgroup_root}${cg}/cgroup.freeze"
+rm -f "$marker"
+echo "THAWED:${cg}"
+' rollover-thaw "$expected" 2>/dev/null) || return 1
+    exitcode=$(jq -er '.exitcode | select(type == "number")' <<< "$result" 2>/dev/null) || return 1
+    out=$(jq -er '.["out-data"] | select(type == "string")' <<< "$result" 2>/dev/null) || return 1
+    [[ "$exitcode" -eq 0 ]] || return 1
+    ack=$(sed -n 's/^THAWED:\(\/[a-zA-Z0-9_./:@-]*\)$/\1/p' <<< "$out")
+    [[ "$ack" =~ ^/[a-zA-Z0-9_./:@-]+$ && "$ack" != / && "$ack" != *'..'* && "$ack" != *$'\n'* ]] || return 1
+    [[ -z "$expected" || "$ack" == "$expected" ]]
+}
+
+runner_rollover_marker_state() {
+    local vmid="$1" result exitcode out state
+    # shellcheck disable=SC2016  # guest-side program expands in the guest
+    result=$(qm guest exec "$vmid" -- /bin/bash -c '
+set -eu
+marker=${RUNNER_ROLLOVER_MARKER:-/run/github-runner-rollover-cgroup}
+if [ ! -e "$marker" ]; then echo MARKER_ABSENT; exit 0; fi
+[ -f "$marker" ] && [ -r "$marker" ]
+saved=$(cat "$marker")
+case "$saved" in /|*[!a-zA-Z0-9_./:@-]*|*..*) exit 1;; /*) ;; *) exit 1;; esac
+echo "MARKER:${saved}"
+' 2>/dev/null) || return 1
+    exitcode=$(jq -er '.exitcode | select(type == "number")' <<< "$result" 2>/dev/null) || return 1
+    out=$(jq -er '.["out-data"] | select(type == "string")' <<< "$result" 2>/dev/null) || return 1
+    [[ "$exitcode" -eq 0 ]] || return 1
+    if [[ "$out" == MARKER_ABSENT || "$out" == $'MARKER_ABSENT\n' || "$out" == $'MARKER_ABSENT\r\n' ]]; then
+        printf 'absent\n'
+        return 0
+    fi
+    state=$(sed -n 's/^MARKER:\(\/[a-zA-Z0-9_./:@-]*\)$/\1/p' <<< "$out")
+    [[ "$state" =~ ^/[a-zA-Z0-9_./:@-]+$ && "$state" != / && "$state" != *'..'* && "$state" != *$'\n'* ]] || return 1
+    printf '%s\n' "$state"
+}
+
+rollover_clear_identity_nonce() {
+    local vmid="$1" name="$2" org="$3" gen="$4" nonce="$5" cfg tags tag new=""
+    rollover_pending_identity_matches "$vmid" "$name" "$org" "$gen" "$nonce" || return 1
+    cfg=$(qm config "$vmid" 2>/dev/null </dev/null) || return 1
+    tags=$(awk -F ': ' '/^tags:/{print $2; exit}' <<< "$cfg")
+    tags=${tags//;/,}
+    while IFS= read -r tag; do
+        tag=${tag#"${tag%%[![:space:]]*}"}; tag=${tag%"${tag##*[![:space:]]}"}
+        [[ -n "$tag" && "$tag" != "rollover-${nonce}" ]] || continue
+        new+="${new:+;}${tag}"
+    done < <(tr ',' '\n' <<< "$tags")
+    qm set "$vmid" --tags "$new" >/dev/null 2>&1
+}
+
+rollover_pending_identity_matches() {
+    local vmid="$1" expected_name="$2" expected_org="$3" expected_gen="$4" nonce="$5"
+    local cfg name org tags
+    cfg=$(qm config "$vmid" 2>/dev/null </dev/null) || return 1
+    name=$(awk '/^name:/{print $2; exit}' <<< "$cfg")
+    org=$(org_from_vm_config "$cfg") || return 1
+    tags=$(awk -F ': ' '/^tags:/{print $2; exit}' <<< "$cfg")
+    [[ "$name" == "$expected_name" && "$org" == "$expected_org" ]] || return 1
+    [[ ",$tags," =~ [,\;]gen-${expected_gen}([,\;]|$) ]] || return 1
+    [[ ",$tags," =~ [,\;]rollover-${nonce}([,\;]|$) ]]
+}
+
+rollover_vmid_absent_verified() {
+    local vmid="$1" all
+    all=$(qm list 2>/dev/null) || return 1
+    ! awk -v v="$vmid" 'NR > 1 && $1 == v {found=1} END {exit !found}' <<< "$all"
+}
+
+# Retry committed rollover destroys. A committed VM is already frozen and
+# deregistered; leaving the record makes recovery durable across process/host
+# crashes. Failure is non-fatal so the watcher can still refill its slot.
+recover_rollover_pending() {
+    local file phase vmid name org gen runner_id nonce cgroup status marker_state recovered
+    [[ -d "$ROLLOVER_PENDING_DIR" ]] || return 0
+    for file in "$ROLLOVER_PENDING_DIR"/*.pending; do
+        [[ -f "$file" ]] || continue
+        IFS='|' read -r phase vmid name org gen runner_id nonce cgroup < "$file" || continue
+        [[ "$vmid" =~ ^[0-9]+$ ]] || continue
+        validate_org_name "$org" || continue
+        exec 209>"${ROLLOVER_ORG_LOCK_PREFIX}-${org}.lock"
+        flock -n 209 || { exec 209>&-; continue; }
+        if ! qm status "$vmid" >/dev/null 2>&1; then
+            rollover_vmid_absent_verified "$vmid" && rm -f "$file"
+            exec 209>&-
+            continue
+        fi
+        if ! rollover_pending_identity_matches "$vmid" "$name" "$org" "$gen" "$nonce"; then
+            log_warn "[rollover-recovery] stale identity for pending VMID $vmid — leaving it untouched"
+            exec 209>&-
+            continue
+        fi
+        if [[ "$phase" == preparing ]]; then
+            marker_state=$(runner_rollover_marker_state "$vmid") || { exec 209>&-; continue; }
+            recovered=false
+            if [[ "$marker_state" == absent ]]; then
+                recovered=true
+            elif resume_runner_cgroup "$vmid" "$marker_state"; then
+                recovered=true
+            fi
+            if [[ "$recovered" == true ]] && rollover_clear_identity_nonce "$vmid" "$name" "$org" "$gen" "$nonce"; then
+                rm -f "$file"
+            fi
+            exec 209>&-
+            continue
+        fi
+        if [[ "$phase" == owned ]]; then
+            marker_state=$(runner_rollover_marker_state "$vmid") || { exec 209>&-; continue; }
+            recovered=false
+            if [[ "$marker_state" == absent ]]; then
+                recovered=true
+            elif [[ "$marker_state" == "$cgroup" ]] && resume_runner_cgroup "$vmid" "$cgroup"; then
+                recovered=true
+            fi
+            if [[ "$recovered" == true ]] \
+                && rollover_clear_identity_nonce "$vmid" "$name" "$org" "$gen" "$nonce"; then
+                rm -f "$file"
+            fi
+            exec 209>&-
+            continue
+        fi
+        [[ "$phase" == committed ]] || { exec 209>&-; continue; }
+        github_runner_deregister_id "$org" "$runner_id" >/dev/null 2>&1 || true
+        status=$(qm status "$vmid" 2>/dev/null | awk '{print $2}') || { exec 209>&-; continue; }
+        if [[ "$status" == running ]]; then
+            qm stop "$vmid" --timeout 30 200>&- 209>&- >/dev/null 2>&1 || { exec 209>&-; continue; }
+            status=$(qm status "$vmid" 2>/dev/null | awk '{print $2}') || { exec 209>&-; continue; }
+            [[ "$status" == stopped ]] || { exec 209>&-; continue; }
+        fi
+        rollover_pending_identity_matches "$vmid" "$name" "$org" "$gen" "$nonce" || { exec 209>&-; continue; }
+        if qm destroy "$vmid" --purge 200>&- 209>&- 2>/dev/null; then
+            rm -f "${SNIPPETS_DIR}/runner-${vmid}-meta.yaml" "${SNIPPETS_DIR}/runner-${vmid}-user-"*.yaml "${SNIPPETS_DIR}/runner-${vmid}-vendor.yaml" "$file"
+            log_info "[rollover-recovery] destroyed pending VMID $vmid ($name)"
+        fi
+        exec 209>&-
+    done
+}
+
+rollover_vmid_is_committed_pending() {
+    local vmid="$1" file phase record_vmid name org gen _runner_id nonce _cgroup
+    file="$ROLLOVER_PENDING_DIR/${vmid}.pending"
+    [[ "$vmid" =~ ^[0-9]+$ && -f "$file" ]] || return 1
+    IFS='|' read -r phase record_vmid name org gen _runner_id nonce _cgroup < "$file" || return 1
+    [[ "$phase" == committed && "$record_vmid" == "$vmid" ]] || return 1
+    rollover_pending_identity_matches "$vmid" "$name" "$org" "$gen" "$nonce"
+}
+
+# Compatibility wrapper for callers that only need id/busy.
+github_runner_lookup() {
+    local details id busy _status
+    details=$(github_runner_lookup_details "$1" "$2") || return 1
+    IFS=$'\t' read -r id busy _status <<< "$details"
+    printf '%s\t%s\n' "$id" "$busy"
+}
+
+# Strict counterpart to deregister_runner for callers whose next operation is
+# destructive.  Failure is meaningful: they must leave the VM alone.
+github_runner_deregister_id() {
+    local org="$1" runner_id="$2" credentials github_org pat
+    [[ "$runner_id" =~ ^[0-9]+$ ]] || return 1
+    credentials=$(github_runner_credentials "$org") || return 1
+    IFS=$'\t' read -r github_org pat <<< "$credentials"
+
+    # stdout suppressed: DELETE returns 204 (empty), but deregister_runner calls
+    # this from inside $(clone_runner) on the JIT mint-retry path, so keep any
+    # surprise body off the captured stdout. The exit status still propagates —
+    # destructive callers depend on it.
     curl -sf --max-time 10 -X DELETE \
-        -H "Accept: application/vnd.github.v3+json" \
+        -H "Accept: application/vnd.github+json" \
         --config <(printf 'header = "Authorization: token %s"\n' "$pat") \
-        "https://api.github.com/orgs/${github_org}/actions/runners/${runner_id}" 2>/dev/null || return 0
+        "https://api.github.com/orgs/${github_org}/actions/runners/${runner_id}" >/dev/null 2>&1
+}
+
+deregister_runner() {
+    local org="$1" runner_name="$2" runner id _busy
+
+    runner=$(github_runner_lookup "$org" "$runner_name") || return 0
+    IFS=$'\t' read -r id _busy <<< "$runner"
+    github_runner_deregister_id "$org" "$id" || return 0
 }
 
 # --- Shared runner VM helpers ---
+
+# Mint a single-use JIT (just-in-time) runner config on the host. The runner
+# registers and auto-removes using this config, and it CANNOT be reused to
+# register another runner — so even if a job reads it from the cloud-init drive
+# it cannot be replayed. Requires GITHUB_PAT and GITHUB_ORG in scope (caller ran
+# load_org_config). The PAT is passed via curl --config to keep it off argv; the
+# request body (name/labels/group) is not sensitive. RUNNER_GROUP_ID (default 1
+# = the org's "Default" group) and RUNNER_LABELS may be set in the org config.
+# Prints the base64 encoded_jit_config on stdout.
+# Returns 0 on success, 2 on HTTP 409 (duplicate runner name), 1 on any other failure.
+fetch_jit_config() {
+    local name="$1"
+    local group="${RUNNER_GROUP_ID:-1}"
+    local labels="${RUNNER_LABELS:-self-hosted,linux,x64}"
+    [[ -n "$labels" ]] || labels="self-hosted,linux,x64"
+    # Group IDs are >=1 (1 = Default); clamp anything else to 1.
+    [[ "$group" =~ ^[1-9][0-9]*$ ]] || group=1
+    local body http_code jit tmp
+    # split → trim each label → drop empties, so a hand-edited RUNNER_LABELS with
+    # spaces or a trailing comma still yields clean labels.
+    body=$(jq -n --arg name "$name" --argjson group "$group" --arg labels "$labels" \
+        '{name: $name, runner_group_id: $group,
+          labels: ($labels | split(",") | map(gsub("^\\s+|\\s+$";"")) | map(select(length > 0)))}') || return 1
+    tmp=$(mktemp) || return 1
+    http_code=$(curl -sS -o "$tmp" -w "%{http_code}" --max-time 15 --retry 3 -X POST \
+        -H "Accept: application/vnd.github+json" \
+        -H "Content-Type: application/json" \
+        --config <(printf 'header = "Authorization: token %s"\n' "$GITHUB_PAT") \
+        --data "$body" \
+        "https://api.github.com/orgs/${GITHUB_ORG}/actions/runners/generate-jitconfig") || http_code="000"
+    body=$(cat "$tmp")
+    rm -f "$tmp"
+    if [[ "$http_code" == "409" ]]; then
+        log_warn "JIT mint conflict: a runner named '$name' already exists"
+        return 2
+    fi
+    if [[ "$http_code" != "201" && "$http_code" != "200" ]]; then
+        case "$http_code" in
+            401|403) log_error "JIT mint failed for '$name' (HTTP $http_code) — PAT needs runner write access" ;;
+            404) log_error "JIT mint failed for '$name' (HTTP $http_code) — org or runner group $group not found" ;;
+            422) log_error "JIT mint failed for '$name' (HTTP $http_code) — invalid name, labels, or group" ;;
+            *) log_error "JIT mint failed for '$name' (HTTP $http_code)" ;;
+        esac
+        return 1
+    fi
+    jit=$(jq -r '.encoded_jit_config // empty' <<<"$body" 2>/dev/null) || return 1
+    # Must be a single base64 token — rejects anything with quotes/newlines that
+    # could break out of the YAML string it gets rendered into.
+    [[ -n "$jit" && "$jit" =~ ^[A-Za-z0-9+/=_-]+$ ]] || return 1
+    printf '%s' "$jit"
+}
+
+# Render a per-VM cloud-init user snippet carrying only the single-use JIT
+# config and org (never the PAT). Uses awk with the config passed via ENVIRON so
+# it never appears in the process list.
+# Usage: render_user_snippet <vmid> <org> <jit_config>
+render_user_snippet() {
+    local vmid="$1" org="$2" jit_config="$3"
+    local tmp
+    tmp=$(mktemp "$SNIPPETS_DIR/.runner-${vmid}-user.XXXXXX") || return 1
+    chmod 600 "$tmp"
+    JIT_CONFIG="$jit_config" GITHUB_ORG="$GITHUB_ORG" DOCKER_MIRROR_URL="${DOCKER_MIRROR_URL:-}" awk '
+    # Literal string replace (avoids gsub special chars: & and \)
+    function lreplace(str, old, new,    i, result) {
+        result = ""
+        while ((i = index(str, old)) > 0) {
+            result = result substr(str, 1, i - 1) new
+            str = substr(str, i + length(old))
+        }
+        return result str
+    }
+    {
+        $0 = lreplace($0, "{{JIT_CONFIG}}", ENVIRON["JIT_CONFIG"])
+        $0 = lreplace($0, "{{GITHUB_ORG}}", ENVIRON["GITHUB_ORG"])
+        $0 = lreplace($0, "{{DOCKER_MIRROR_URL}}", ENVIRON["DOCKER_MIRROR_URL"])
+        print
+    }' "$INSTALL_DIR/templates/runner-user-data.yaml" > "$tmp" || { rm -f "$tmp"; return 1; }
+    mv "$tmp" "$SNIPPETS_DIR/runner-${vmid}-user-${org}.yaml" || { rm -f "$tmp"; return 1; }
+    chmod 600 "$SNIPPETS_DIR/runner-${vmid}-user-${org}.yaml"
+}
 
 # Deterministic MAC from name. Locally-administered unicast (02:xx:xx:xx:xx:xx).
 generate_mac() {
@@ -824,9 +1291,33 @@ clone_runner() {
     local RESERVED_VMID=""
     local pause_waited=0
     local pause_max="${CLONE_PAUSE_RETRY_MAX_SECONDS:-130}"
+    local pool_lock_owned=0
 
-    exec 202>"$POOL_ACTIVITY_LOCK_FILE"
-    flock -s 202
+    # GITHUB_PAT/GITHUB_ORG must be in scope (caller ran load_org_config).
+    if [[ -z "${GITHUB_PAT:-}" || -z "${GITHUB_ORG:-}" ]]; then
+        log_error "clone_runner: org config not loaded (GITHUB_PAT/GITHUB_ORG unset)"
+        return 1
+    fi
+
+    # reclone.sh holds fd 202 for its whole lifetime (POOL_ACTIVITY_LOCK_HELD=1)
+    # so runner stop's exclusive 202 waits out destroy+mint, not just qm clone.
+    # Do not exec 202> in that case — it would drop the caller's lock.
+    _pool_lock_acquire() {
+        if [[ "${POOL_ACTIVITY_LOCK_HELD:-0}" == "1" ]]; then
+            return 0
+        fi
+        exec 202>"$POOL_ACTIVITY_LOCK_FILE"
+        flock -s 202
+        pool_lock_owned=1
+    }
+    _pool_lock_release() {
+        if [[ "$pool_lock_owned" == "1" ]]; then
+            exec 202>&-
+            pool_lock_owned=0
+        fi
+    }
+
+    _pool_lock_acquire
 
     # Pause file lets promote acquire the exclusive lock: Linux flock has no
     # writer preference, so new shared holders would otherwise starve it.
@@ -834,14 +1325,25 @@ clone_runner() {
     # then return 3 (not 1). Proven by "clone_runner returns 3 without cloning
     # when PROMOTION_PAUSE_FILE remains" and "clone_runner clones the re-read
     # TEMPLATE_ID when the pause file clears mid-wait".
+    #
+    # When the caller owns fd 202 (reclone.sh, POOL_ACTIVITY_LOCK_HELD=1) the
+    # wait cannot work: dropping the lock here would break the caller's promise
+    # that `runner stop` waits out its whole destroy+mint, and holding it would
+    # just starve promote for the full wait. Defer immediately instead — the
+    # caller exits, which releases fd 202 and lets promote through, and the
+    # watcher refills the slot on the next tick.
     [[ "$pause_max" =~ ^[0-9]+$ ]] || pause_max=130
+    if [[ "${POOL_ACTIVITY_LOCK_HELD:-0}" == "1" && -e "$PROMOTION_PAUSE_FILE" ]]; then
+        log_info "clone_runner: promotion in progress, will retry"
+        return 3
+    fi
     while [[ -e "$PROMOTION_PAUSE_FILE" ]]; do
         if (( pause_waited >= pause_max )); then
             # Unflocked pause is leftover (SIGKILL). A live promote holds
             # exclusive 211 on this file. Proven by "clone_runner returns 3
             # without cloning when PROMOTION_PAUSE_FILE remains".
             exec 211>>"$PROMOTION_PAUSE_FILE" || {
-                exec 202>&-
+                _pool_lock_release
                 return 3
             }
             if flock -n 211; then
@@ -852,13 +1354,13 @@ clone_runner() {
             fi
             exec 211>&- 2>/dev/null || true
             log_info "clone_runner: promotion in progress, will retry"
-            exec 202>&-
+            _pool_lock_release
             return 3
         fi
         if (( pause_waited == 0 )); then
             log_info "clone_runner: promotion in progress, waiting to retry $name"
         fi
-        exec 202>&-
+        _pool_lock_release
         sleep 2
         pause_waited=$((pause_waited + 2))
         exec 202>"$POOL_ACTIVITY_LOCK_FILE" || {
@@ -866,11 +1368,12 @@ clone_runner() {
             return 1
         }
         flock -s 202
+        pool_lock_owned=1
     done
 
     if pool_is_draining; then
         log_warn "clone_runner: pool drain active, refusing to create $name"
-        exec 202>&-
+        _pool_lock_release
         return 1
     fi
 
@@ -879,7 +1382,7 @@ clone_runner() {
     # Proven by "clone_runner re-reads TEMPLATE_ID after the shared lock".
     TEMPLATE_ID=$(reload_active_template_id) || {
         log_error "clone_runner: failed to re-read TEMPLATE_ID"
-        exec 202>&-
+        _pool_lock_release
         return 1
     }
 
@@ -897,7 +1400,7 @@ clone_runner() {
             return 0
         fi
 
-        rm -f "${SNIPPETS_DIR}/runner-${vmid}-meta.yaml"
+        rm -f "${SNIPPETS_DIR}/runner-${vmid}-meta.yaml" "${SNIPPETS_DIR}/runner-${vmid}-user-"*.yaml "${SNIPPETS_DIR}/runner-${vmid}-vendor.yaml"
 
         if [[ "$owner" == "$name" ]]; then
             local destroy_err; destroy_err=$(mktemp)
@@ -917,6 +1420,29 @@ clone_runner() {
         )
     }
 
+    # Mint the single-use JIT config BEFORE cloning so the PAT never enters the
+    # VM. Fail fast here (return 1, not _fail): nothing has been created yet, and
+    # on a VMID collision _fail's name match could destroy a foreign VM.
+    # generate-jitconfig 409s if a runner of this name still exists (e.g. a
+    # crashed VM left a stale entry). A healthy ephemeral runner auto-removes
+    # after its job, so the common path mints in one call; only on failure do we
+    # deregister the stale entry (mirrors config.sh --replace) and retry once.
+    local jit_config mint_rc=0
+    jit_config=$(fetch_jit_config "$name") && mint_rc=0 || mint_rc=$?
+    if [[ $mint_rc -eq 2 ]]; then
+        # Duplicate name: deregister the stale GitHub-side runner and mint once more.
+        deregister_runner "$org" "$name" || true
+        jit_config=$(fetch_jit_config "$name") && mint_rc=0 || mint_rc=$?
+        if [[ $mint_rc -ne 0 ]]; then
+            log_error "Failed to mint JIT config for org '$GITHUB_ORG' after removing a stale runner named '$name'"
+            _pool_lock_release
+            return 1
+        fi
+    elif [[ $mint_rc -ne 0 ]]; then
+        _pool_lock_release
+        return 1
+    fi
+
     # Acquire global VMID allocation lock only long enough to reserve one VMID.
     # The per-VMID reservation stays held until qm clone returns, which lets
     # other workers reserve different VMIDs and clone with bounded parallelism.
@@ -928,14 +1454,14 @@ clone_runner() {
     if ! flock -w 300 201; then
         log_error "clone_runner: timed out acquiring VMID lock for $name"
         exec 201>&-
-        exec 202>&-
+        _pool_lock_release
         return 1
     fi
 
     if [[ -z "$vmid" ]]; then
         if ! reserve_vmid; then
             exec 201>&-
-            exec 202>&-
+            _pool_lock_release
             return 1
         fi
         vmid="$RESERVED_VMID"
@@ -944,7 +1470,7 @@ clone_runner() {
         # could have grabbed it between the caller's check and now.
         if ! reserve_vmid "$vmid"; then
             exec 201>&-
-            exec 202>&-
+            _pool_lock_release
             return 1
         fi
         vmid="$RESERVED_VMID"
@@ -954,7 +1480,7 @@ clone_runner() {
         log_warn "clone_runner: pool drain became active before cloning $name"
         exec 201>&-
         release_vmid_reservation "$vmid"
-        exec 202>&-
+        _pool_lock_release
         return 1
     fi
 
@@ -967,13 +1493,13 @@ clone_runner() {
     if (( slot_rc == 3 )); then
         log_info "clone_runner: promotion in progress, will retry"
         release_vmid_reservation "$vmid"
-        exec 202>&-
+        _pool_lock_release
         return 3
     fi
     if (( slot_rc != 0 )); then
         log_warn "clone_runner: pool drain became active before cloning $name"
         release_vmid_reservation "$vmid"
-        exec 202>&-
+        _pool_lock_release
         return 1
     fi
 
@@ -981,7 +1507,7 @@ clone_runner() {
         log_warn "clone_runner: pool drain became active before cloning $name"
         release_clone_slot
         release_vmid_reservation "$vmid"
-        exec 202>&-
+        _pool_lock_release
         return 1
     fi
 
@@ -999,7 +1525,7 @@ clone_runner() {
         release_clone_slot
         _fail
         release_vmid_reservation "$vmid"
-        exec 202>&-
+        _pool_lock_release
         return 1
     fi
     rm -f "$clone_err"
@@ -1008,7 +1534,7 @@ clone_runner() {
     if ! clone_tag_generation "$vmid" "$TEMPLATE_ID"; then
         _fail
         release_vmid_reservation "$vmid"
-        exec 202>&-
+        _pool_lock_release
         return 1
     fi
 
@@ -1016,7 +1542,7 @@ clone_runner() {
         log_warn "clone_runner: pool drain became active after cloning $name, cleaning up VM $vmid"
         _fail
         release_vmid_reservation "$vmid"
-        exec 202>&-
+        _pool_lock_release
         return 1
     fi
 
@@ -1030,44 +1556,49 @@ clone_runner() {
     if [[ -n "$net0" ]]; then
         # shellcheck disable=SC2001  # pattern is a regex; ${//} only does literals
         net0=$(echo "$net0" | sed "s/virtio=[^,]*/virtio=$mac/")
-        qm set "$vmid" --net0 "$net0" 200>&- 201>&- 202>&- 203>&- 204>&- || { _fail; exec 202>&-; return 1; }
+        qm set "$vmid" --net0 "$net0" 200>&- 201>&- 202>&- 203>&- 204>&- || { _fail; _pool_lock_release; return 1; }
     fi
 
-    # Cloud-init
-    cat > "${SNIPPETS_DIR}/runner-${vmid}-meta.yaml" << EOF
-instance-id: "$name"
-local-hostname: "$name"
-EOF
-    chmod 600 "${SNIPPETS_DIR}/runner-${vmid}-meta.yaml"
+    # Cloud-init meta (instance-id / hostname). Guard the write itself — a brace
+    # group's exit status is its LAST command, so a failed write (e.g. ENOSPC mid
+    # clone) followed by a successful chmod would be masked and boot a VM with a
+    # truncated meta snippet.
+    printf 'instance-id: "%s"\nlocal-hostname: "%s"\n' "$name" "$name" \
+        > "${SNIPPETS_DIR}/runner-${vmid}-meta.yaml" || { _fail; _pool_lock_release; return 1; }
+    chmod 600 "${SNIPPETS_DIR}/runner-${vmid}-meta.yaml" || { _fail; _pool_lock_release; return 1; }
 
-    qm set "$vmid" --cicustom "user=local:snippets/runner-user-data-${org}.yaml,meta=local:snippets/runner-${vmid}-meta.yaml" \
+    # Per-VM user snippet carrying the single-use JIT config (must exist before
+    # qm set --cicustom, which validates the referenced volume).
+    render_user_snippet "$vmid" "$org" "$jit_config" || { _fail; _pool_lock_release; return 1; }
+
+    qm set "$vmid" --cicustom "user=local:snippets/runner-${vmid}-user-${org}.yaml,meta=local:snippets/runner-${vmid}-meta.yaml" \
         200>&- \
         201>&- \
         202>&- \
         203>&- \
         204>&- \
-        || { _fail; exec 202>&-; return 1; }
+        || { _fail; _pool_lock_release; return 1; }
     qm set "$vmid" --ipconfig0 ip=dhcp \
         200>&- \
         201>&- \
         202>&- \
         203>&- \
         204>&- \
-        || { _fail; exec 202>&-; return 1; }
+        || { _fail; _pool_lock_release; return 1; }
     [[ -z "${DNS_SERVERS:-}" ]] || qm set "$vmid" --nameserver "$DNS_SERVERS" \
         200>&- \
         201>&- \
         202>&- \
         203>&- \
         204>&- \
-        || { _fail; exec 202>&-; return 1; }
+        || { _fail; _pool_lock_release; return 1; }
     qm set "$vmid" --ciuser runner \
         200>&- \
         201>&- \
         202>&- \
         203>&- \
         204>&- \
-        || { _fail; exec 202>&-; return 1; }
+        || { _fail; _pool_lock_release; return 1; }
 
     # Hookscript for auto-destroy on shutdown
     if [[ -f "$SNIPPETS_DIR/runner-hookscript.sh" ]]; then
@@ -1083,17 +1614,17 @@ EOF
     if pool_is_draining; then
         log_warn "clone_runner: pool drain became active while configuring $name, cleaning up VM $vmid"
         _fail
-        exec 202>&-
+        _pool_lock_release
         return 1
     fi
 
     # Start
     if ! qm start "$vmid" 200>&- 201>&- 202>&- 203>&- 204>&-; then
         _fail
-        exec 202>&-
+        _pool_lock_release
         return 1
     fi
 
-    exec 202>&-
+    _pool_lock_release
     echo "$vmid"
 }

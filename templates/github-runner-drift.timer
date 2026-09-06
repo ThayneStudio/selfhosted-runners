@@ -1,0 +1,12 @@
+[Unit]
+Description=GitHub Actions runner drift alarm timer
+
+[Timer]
+# Low-frequency on purpose: watch is already 30s. The 30-day window only
+# needs to be checked often enough to catch the 10-day and 3-day thresholds.
+OnCalendar=*-*-* 00/6:00:00
+Persistent=true
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

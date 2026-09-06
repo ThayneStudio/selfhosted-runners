@@ -98,11 +98,14 @@ if [[ -f /etc/github-runners.conf ]]; then
         cp "$INSTALL_DIR/templates/github-runner-guard.timer" "$SYSTEMD_UNIT_DIR/"
         cp "$INSTALL_DIR/templates/github-runner-maintain.service" "$SYSTEMD_UNIT_DIR/"
         cp "$INSTALL_DIR/templates/github-runner-maintain.timer" "$SYSTEMD_UNIT_DIR/"
+        cp "$INSTALL_DIR/templates/github-runner-drift.service" "$SYSTEMD_UNIT_DIR/"
+        cp "$INSTALL_DIR/templates/github-runner-drift.timer" "$SYSTEMD_UNIT_DIR/"
         cp "$INSTALL_DIR/templates/github-runner-upgrade.service" "$SYSTEMD_UNIT_DIR/"
         systemctl daemon-reload
         # New in this release, so an existing install has it disabled.
         systemctl enable --now github-runner-guard.timer 2>/dev/null || true
         systemctl enable --now github-runner-maintain.timer 2>/dev/null || true
+        systemctl enable --now github-runner-drift.timer 2>/dev/null || true
     fi
     # Backfill settings added after this host was set up. The guard falls back
     # to the same defaults, but an operator can only tune what they can see.
@@ -131,43 +134,23 @@ if [[ -f /etc/github-runners.conf ]]; then
     echo "    Preview: runner guard --dry-run   Disable: systemctl disable --now github-runner-guard.timer"
     echo "  Daily maintain timer: 02:30 (detect + rebake inside REBAKE_WINDOW)."
     echo "    Disable: systemctl disable --now github-runner-maintain.timer"
+    echo "  Drift alarm: every 6h (runner version vs the 30-day upstream window)."
+    echo "    Disable: systemctl disable --now github-runner-drift.timer"
     echo "  To bake a new generation and start cloning it (does not destroy TEMPLATE_ID):"
     echo "    runner upgrade --dry-run"
     echo "    runner upgrade"
-    # Regenerate per-org cloud-init snippets from updated template
-    if [[ -d /etc/github-runners.d ]]; then
-        for org_conf in /etc/github-runners.d/*.conf; do
-            [[ -f "$org_conf" ]] || continue
-            org=$(basename "$org_conf" .conf)
-            # Source org config to get PAT and org name
-            GITHUB_PAT="" GITHUB_ORG=""
-            # shellcheck source=/dev/null  # per-org config, written by add-org at runtime
-            source "$org_conf"
-            [[ -n "$GITHUB_PAT" && -n "$GITHUB_ORG" ]] || continue
-            # Re-render the snippet using the same awk substitution as add-org.sh
-            snippet_tmp=$(mktemp "/var/lib/vz/snippets/.runner-user-data-${org}.XXXXXX")
-            chmod 600 "$snippet_tmp"
-            DOCKER_MIRROR_URL="${DOCKER_MIRROR_URL:-}"
-            GITHUB_PAT="$GITHUB_PAT" GITHUB_ORG="$GITHUB_ORG" DOCKER_MIRROR_URL="$DOCKER_MIRROR_URL" awk '
-            function lreplace(str, old, new,    i, result) {
-                result = ""
-                while ((i = index(str, old)) > 0) {
-                    result = result substr(str, 1, i - 1) new
-                    str = substr(str, i + length(old))
-                }
-                return result str
-            }
-            {
-                $0 = lreplace($0, "{{GITHUB_PAT}}", ENVIRON["GITHUB_PAT"])
-                $0 = lreplace($0, "{{GITHUB_ORG}}", ENVIRON["GITHUB_ORG"])
-                $0 = lreplace($0, "{{DOCKER_MIRROR_URL}}", ENVIRON["DOCKER_MIRROR_URL"])
-                print
-            }' "$INSTALL_DIR/templates/runner-user-data.yaml" > "$snippet_tmp"
-            mv "$snippet_tmp" "/var/lib/vz/snippets/runner-user-data-${org}.yaml"
-            echo "  Updated snippet for $org"
-        done
+    # Prune obsolete per-org snippets. These embedded the org PAT; the PAT now
+    # stays on the host and a single-use JIT config is rendered per-VM at clone time.
+    if compgen -G "$SNIPPETS_DIR/runner-user-data-*.yaml" > /dev/null; then
+        rm -f "$SNIPPETS_DIR"/runner-user-data-*.yaml
+        echo "  Removed obsolete per-org PAT snippets"
     fi
     echo "Done. No need to re-run setup."
+    echo ""
+    echo "WARNING: VMs that are already running still have the old PAT on their"
+    echo "cloud-init drive until they are destroyed. Recycle the pool before the"
+    echo "next job or any workflow can still read it:"
+    echo "  runner stop && runner start"
 else
     echo ""
     echo "Run the setup wizard:"

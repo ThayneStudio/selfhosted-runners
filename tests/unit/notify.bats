@@ -266,6 +266,44 @@ CALLER
     [[ "$output" == *"caller survived"* ]]
 }
 
+# --- last-notify recording (issue #16, `runner status`) --------------------
+
+@test "notify records the redacted last severity/event/message for status to read" {
+    RUNNER_STATE_DIR="$NOTIFY_TEST_DIR/state"
+    LAST_NOTIFY_FILE="$RUNNER_STATE_DIR/last-notify"
+    GITHUB_PAT="ghp_AbCdEf0123456789AbCdEf0123456789AbCd"
+    NOTIFY_WEBHOOK_URL="https://example.invalid/hook"
+
+    run notify warn drift.warning "PAT $GITHUB_PAT is expiring" "fleet=2.334.0"
+    [ "$status" -eq 0 ]
+
+    [ -f "$LAST_NOTIFY_FILE" ]
+    run cat "$LAST_NOTIFY_FILE"
+    [[ "$output" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z\ warn\ drift\.warning\ PAT\ \[REDACTED\]\ is\ expiring$ ]]
+}
+
+@test "notify never records anything when LAST_NOTIFY_FILE is unset" {
+    unset LAST_NOTIFY_FILE
+    NOTIFY_WEBHOOK_URL="https://example.invalid/hook"
+
+    run notify warn drift.warning "behind upstream" "fleet=2.334.0"
+    [ "$status" -eq 0 ]
+    [ -f "$CURL_BODY" ]
+}
+
+@test "a failure to record the last notification does not fail notify" {
+    RUNNER_STATE_DIR="$NOTIFY_TEST_DIR/state"
+    # A regular file sits where the directory needs to be, so mkdir -p fails.
+    : > "$NOTIFY_TEST_DIR/blocked"
+    LAST_NOTIFY_FILE="$NOTIFY_TEST_DIR/blocked/last-notify"
+    NOTIFY_WEBHOOK_URL="https://example.invalid/hook"
+
+    run notify warn clone.failed "watcher could not fill 1 runner slot" ""
+    [ "$status" -eq 0 ]
+    [ -f "$CURL_BODY" ]
+    [ ! -e "$NOTIFY_TEST_DIR/blocked/last-notify" ]
+}
+
 @test "notify with no arguments at all does nothing and returns 0" {
     NOTIFY_WEBHOOK_URL="https://example.invalid/hook"
     run notify

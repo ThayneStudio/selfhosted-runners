@@ -118,9 +118,9 @@ create_full_record() {
     gen_create 8903 GEN_ID=1 GEN_STATE=baking
     gen_transition 8903 failed "$(printf 'bake timed out\nafter 5400s')"
 
-    # One line per field, still thirteen of them: an unfolded newline would
+    # One line per field, still sixteen of them: an unfolded newline would
     # split the record and the next read would report it as malformed.
-    [ "$(grep -c '^GEN_' "$GENERATIONS_DIR/8903.conf")" = "13" ]
+    [ "$(grep -c '^GEN_' "$GENERATIONS_DIR/8903.conf")" = "16" ]
     gen_read 8903
     [ "$GEN_FAILED_REASON" = "bake timed out after 5400s" ]
 }
@@ -759,6 +759,7 @@ create_full_record() {
     gen_read 8903
     [ "$GEN_STATE" = "failed" ]
     [ "$GEN_FAILED_REASON" = "image checksum mismatch after retry" ]
+    [[ "$GEN_TERMINAL_AT" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]
 }
 
 @test "a transition with no reason does not erase one already recorded" {
@@ -786,6 +787,7 @@ create_full_record() {
     [ "$GEN_STATE" = "rejected" ]
     [ "$GEN_FAILED_REASON" = "rolled back by ops: playwright browsers missing" ]
     [[ "$GEN_SUPERSEDED_AT" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]
+    [ "$GEN_TERMINAL_AT" = "$GEN_SUPERSEDED_AT" ]
 }
 
 # ---------------------------------------------------------------------------
@@ -1042,4 +1044,18 @@ after 5400s"
     run gen_archive_append "six" 8902 destroyed
     [ "$status" -eq 1 ]
     [ ! -e "$GENERATION_ARCHIVE_LOG" ]
+}
+
+@test "gen_age_days is 10 for a stamp 10 days before gen_now" {
+    gen_now() { printf '%s\n' '2026-08-25T00:00:00Z'; }
+    run gen_age_days '2026-08-15T00:00:00Z'
+    [ "$status" -eq 0 ]
+    [ "$output" = "10" ]
+}
+
+@test "gen_age_days strips fractional seconds from GitHub timestamps" {
+    gen_now() { printf '%s\n' '2026-08-11T00:00:00Z'; }
+    run gen_age_days '2026-08-01T12:00:00.123Z'
+    [ "$status" -eq 0 ]
+    [ "$output" = "9" ]
 }

@@ -12,16 +12,21 @@ case "$COMMAND" in
     start)     exec "$SCRIPT_DIR/lib/start.sh" "$@" ;;
     stop)      exec "$SCRIPT_DIR/lib/stop.sh" "$@" ;;
     list)      exec "$SCRIPT_DIR/lib/list.sh" "$@" ;;
+    status)    exec "$SCRIPT_DIR/lib/status.sh" "$@" ;;
+    generations) exec "$SCRIPT_DIR/lib/generations.sh" "$@" ;;
     setup)     exec "$SCRIPT_DIR/lib/setup.sh" "$@" ;;
     add-org)   exec "$SCRIPT_DIR/lib/add-org.sh" "$@" ;;
     remove-org) exec "$SCRIPT_DIR/lib/remove-org.sh" "$@" ;;
     list-orgs) exec "$SCRIPT_DIR/lib/list-orgs.sh" "$@" ;;
     watch)     exec "$SCRIPT_DIR/lib/watch.sh" "$@" ;;
     guard)     exec "$SCRIPT_DIR/lib/guard.sh" "$@" ;;
+    gc)        exec "$SCRIPT_DIR/lib/gc.sh" "$@" ;;
     bake)      exec "$SCRIPT_DIR/lib/bake.sh" "$@" ;;
     promote)   exec "$SCRIPT_DIR/lib/promote.sh" "$@" ;;
     rollback)  exec "$SCRIPT_DIR/lib/rollback.sh" "$@" ;;
+    rollover)  exec "$SCRIPT_DIR/lib/rollover.sh" "$@" ;;
     maintain)  exec "$SCRIPT_DIR/lib/maintain.sh" "$@" ;;
+    drift)     exec "$SCRIPT_DIR/lib/drift.sh" "$@" ;;
     upgrade)   exec "$SCRIPT_DIR/lib/upgrade.sh" "$@" ;;
     help|--help|-h)
         echo "Usage: runner <command> [args]"
@@ -36,12 +41,17 @@ case "$COMMAND" in
         echo "  start                       Exit maintenance mode and resume watcher"
         echo "  stop [options]              Enter maintenance mode and stop managed runners"
         echo "  list                        List all runner VMs"
+        echo "  status                      Fleet health overview"
+        echo "  generations                 List runner generations"
         echo "  watch                       Fill runner pools (run by timer)"
         echo "  guard [--dry-run]           Reap stopped and over-age runner VMs (run by timer)"
+        echo "  gc [--dry-run]              Garbage-collect drained template generations"
         echo "  bake [--force] [--dry-run]  Bake a new candidate generation"
         echo "  promote <id> [--skip-canary] Promote a candidate generation to active"
         echo "  rollback [--reason <text>]  Restore the previous generation and reject the current"
+        echo "  rollover [--force]          Report or recycle idle old-generation runners"
         echo "  maintain                    Unattended adopt/detect/bake cycle (run by timer)"
+        echo "  drift                       Report runner version vs the 30-day window (run by timer)"
         echo "  upgrade [--dry-run] [--force] [--foreground]  Bake if needed and promote"
         echo ""
         echo "Runners are ephemeral: one job, shutdown, auto-destroy, watcher recreates."

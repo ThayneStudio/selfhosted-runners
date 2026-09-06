@@ -42,9 +42,14 @@ load_org_config "$SELECTED_ORG"
 qm config "$TEMPLATE_ID" 2>/dev/null | grep -q "^template: 1" || {
     log_error "Template $TEMPLATE_ID not ready. Run 'runner upgrade' (or 'runner setup' on a host with no template)."; exit 1; }
 
-# Verify snippet exists
-[[ -f "$SNIPPETS_DIR/runner-user-data-${SELECTED_ORG}.yaml" ]] || {
-    log_error "Cloud-init for '$SELECTED_ORG' missing. Run 'runner add-org'."; exit 1; }
+# Verify runner cloud-init template exists (rendered per-VM at clone time)
+[[ -f "$INSTALL_DIR/templates/runner-user-data.yaml" ]] || {
+    log_error "Runner template missing at $INSTALL_DIR/templates/runner-user-data.yaml. Re-run install."; exit 1; }
+
+# Take the per-slot lock so watch/reclone don't race us — clone_runner requires
+# callers to hold fd 200 before entering (lock-order inversion vs VMID lock).
+exec 200>"${RUNNER_SLOT_LOCK_PREFIX}-${RUNNER_NAME}.lock"
+flock -n 200 || { log_error "Another process is managing '$RUNNER_NAME'"; exit 1; }
 
 # Check name not taken
 EXISTING=$(qm list | awk -v n="$RUNNER_NAME" '$2==n {print $1}')

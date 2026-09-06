@@ -2,6 +2,11 @@
 set -euo pipefail
 # List all runner VMs.
 
+if [[ -n "${RUNNER_LIST_LOADED:-}" ]]; then
+    return 0
+fi
+RUNNER_LIST_LOADED=1
+
 # shellcheck source=common.sh
 source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/common.sh"
 
@@ -9,32 +14,46 @@ TEMPLATE_ID=""
 # shellcheck source=/dev/null  # host config, written by setup at runtime
 [[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
 
-echo ""
-printf "%-8s %-25s %-15s %-10s\n" "VMID" "NAME" "ORG" "STATUS"
-printf "%-8s %-25s %-15s %-10s\n" "----" "----" "---" "------"
+list_runners() {
+    local COUNT=0 ALL_VMS line vmid name status org gen
 
-COUNT=0
-ALL_VMS=$(qm list 2>/dev/null | tail -n +2) || true
-while read -r line; do
-    [[ -z "$line" ]] && continue
-    vmid=$(echo "$line" | awk '{print $1}')
-    name=$(echo "$line" | awk '{print $2}')
-    status=$(echo "$line" | awk '{print $3}')
+    echo ""
+    printf "%-8s %-25s %-15s %-10s %-8s\n" "VMID" "NAME" "ORG" "STATUS" "GEN"
+    printf "%-8s %-25s %-15s %-10s %-8s\n" "----" "----" "---" "------" "---"
 
-    [[ -n "$TEMPLATE_ID" && "$vmid" == "$TEMPLATE_ID" ]] && continue
+    ALL_VMS=$(qm list 2>/dev/null | tail -n +2) || true
+    while read -r line; do
+        [[ -z "$line" ]] && continue
+        vmid=$(echo "$line" | awk '{print $1}')
+        name=$(echo "$line" | awk '{print $2}')
+        status=$(echo "$line" | awk '{print $3}')
 
-    # Only show VMs with a runner cloud-init snippet
-    org=$(get_vm_org "$vmid")
-    [[ "$org" != "unknown" ]] || continue
+        [[ -n "$TEMPLATE_ID" && "$vmid" == "$TEMPLATE_ID" ]] && continue
 
-    printf "%-8s %-25s %-15s %-10s\n" "$vmid" "$name" "$org" "$status"
-    COUNT=$((COUNT + 1))
-done <<< "$ALL_VMS"
+        # Only show VMs with a runner cloud-init snippet
+        org=$(get_vm_org "$vmid")
+        [[ "$org" != "unknown" ]] || continue
 
-echo ""
-if [[ $COUNT -gt 0 ]]; then
-    echo "Total: $COUNT runner(s)"
-else
-    echo "(no runners found)"
+        # get_vm_generation (lib/common.sh) fails on an untagged VM -- the
+        # common case before adoption/generations tagging runs -- so this must
+        # be guarded the same way generations.sh guards it, or an untagged
+        # runner would abort `runner list` under set -e.
+        gen=$(get_vm_generation "$vmid" || true)
+        [[ -n "$gen" ]] || gen="-"
+
+        printf "%-8s %-25s %-15s %-10s %-8s\n" "$vmid" "$name" "$org" "$status" "$gen"
+        COUNT=$((COUNT + 1))
+    done <<< "$ALL_VMS"
+
+    echo ""
+    if [[ $COUNT -gt 0 ]]; then
+        echo "Total: $COUNT runner(s)"
+    else
+        echo "(no runners found)"
+    fi
+    echo ""
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    list_runners "$@"
 fi
-echo ""

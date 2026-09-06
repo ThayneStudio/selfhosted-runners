@@ -23,6 +23,8 @@ source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/common.sh"
 # bake.sh pulls generations.sh (adopt, gen_list, gen_transition) and detect.sh.
 # shellcheck source=bake.sh
 source "$LIB_DIR/bake.sh"
+# shellcheck source=gc.sh
+source "$LIB_DIR/gc.sh"
 
 # True (0) when local time is inside REBAKE_WINDOW (HH:MM-HH:MM, inclusive).
 # Invalid window, wrap-past-midnight, or an unreadable clock → log_error and
@@ -324,6 +326,11 @@ maintain_main() {
     }
     maintain_reconcile_baking || {
         log_error "Failed to reconcile interrupted bakes"
+        return 1
+    }
+
+    gc_main false || {
+        log_error "Generation garbage collection failed"
         return 1
     }
 
