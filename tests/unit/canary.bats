@@ -145,9 +145,45 @@ cloned() {
     [[ -f "$STUB_DIR/clone.log" ]]
 }
 
+# Take CANARY_LOCK_FILE exclusively from another process, the way a canary
+# already running would. flock is deliberately real (the harness does not stub
+# it), and the lock lives on the open file description, so it is held for as
+# long as the subshell lives.
+hold_canary_lock() {
+    local ready="$STUB_DIR/canary-holder-ready"
+    rm -f "$ready"
+    mkdir -p "$(dirname "$CANARY_LOCK_FILE")"
+    (
+        exec 218>"$CANARY_LOCK_FILE"
+        flock -x 218 || exit 1
+        : > "$ready"
+        sleep 60
+    ) &
+    CANARY_HOLDER_PID=$!
+    local waited=0
+    while [[ ! -e "$ready" && "$waited" -lt 200 ]]; do
+        sleep 0.05
+        waited=$((waited + 1))
+    done
+    [ -e "$ready" ]
+}
+
+teardown() {
+    [[ -z "${CANARY_HOLDER_PID:-}" ]] || kill "$CANARY_HOLDER_PID" 2>/dev/null || true
+}
+
+# GEN_CANARY_ATTEMPTS, with "never recorded" reported as 0 so a test can say
+# "no attempt was consumed" without caring which of the two it is.
 attempts_of() {
     gen_read "$1"
-    printf '%s\n' "${GEN_CANARY_ATTEMPTS:-}"
+    printf '%s\n' "${GEN_CANARY_ATTEMPTS:-0}"
+}
+
+# Keep a copy of a function under another name, so an override can delegate
+# the calls it does not care about back to the real implementation.
+copy_function() {
+    local from="$1" to="$2"
+    eval "$(declare -f "$from" | sed "1s/^$from/$to/")"
 }
 
 # ---------------------------------------------------------------------------
@@ -265,7 +301,7 @@ attempts_of() {
     run --separate-stderr canary_main 2
     [ "$status" -eq 2 ]
     ! cloned
-    [ -z "$(attempts_of 8901)" ]
+    [ "$(attempts_of 8901)" = "0" ]
     [ ! -f "$STUB_DIR/notify.log" ]
 }
 
@@ -274,7 +310,7 @@ attempts_of() {
     run --separate-stderr canary_main 2
     [ "$status" -eq 2 ]
     ! cloned
-    [ -z "$(attempts_of 8901)" ]
+    [ "$(attempts_of 8901)" = "0" ]
     notify_log | grep -q 'warn canary.unconfigured'
     gen_read 8901
     [ "$GEN_STATE" = "candidate" ]
@@ -285,7 +321,7 @@ attempts_of() {
     run --separate-stderr canary_main 2
     [ "$status" -eq 2 ]
     ! cloned
-    [ -z "$(attempts_of 8901)" ]
+    [ "$(attempts_of 8901)" = "0" ]
     notify_log | grep -q 'warn canary.unconfigured'
 }
 
@@ -313,7 +349,7 @@ EOF
     run --separate-stderr canary_main 2
     [ "$status" -eq 2 ]
     ! cloned
-    [ -z "$(attempts_of 8901)" ]
+    [ "$(attempts_of 8901)" = "0" ]
     notify_log | grep -q 'warn canary.unconfigured'
     notify_log | grep -q 'runner-canary.yml'
 }
@@ -335,7 +371,7 @@ EOF
     run --separate-stderr canary_main 2
     [ "$status" -eq 2 ]
     ! cloned
-    [ -z "$(attempts_of 8901)" ]
+    [ "$(attempts_of 8901)" = "0" ]
     notify_log | grep -q 'warn canary.unconfigured'
 }
 
@@ -348,7 +384,7 @@ EOF
     run --separate-stderr canary_main 2
     [ "$status" -eq 2 ]
     ! cloned
-    [ -z "$(attempts_of 8901)" ]
+    [ "$(attempts_of 8901)" = "0" ]
     notify_log | grep -q 'warn canary.unconfigured'
     notify_log | grep -q "'repo' scope"
     [[ "$stderr" == *"'repo' scope"* ]]
@@ -391,7 +427,7 @@ EOF
     run --separate-stderr canary_main 2
     [ "$status" -eq 2 ]
     ! cloned
-    [ -z "$(attempts_of 8901)" ]
+    [ "$(attempts_of 8901)" = "0" ]
     notify_log | grep -q 'warn canary.unconfigured'
 }
 
@@ -403,4 +439,350 @@ EOF
     # A process-substitution fd would keep it off argv too, and is banned:
     # see the comment on github_runners_snapshot.
     ! grep -q 'config <(' "$REPO_ROOT/lib/canary.sh"
+}
+
+# ---------------------------------------------------------------------------
+# Issue 22 item 1: clone, wait for Online, dispatch, poll to conclusion.
+# ---------------------------------------------------------------------------
+
+@test "the canary clones canary-gen<N> from the candidate, not from the active template" {
+    run --separate-stderr canary_main 2
+    [ "$status" -eq 0 ]
+    grep -qx 'canary-gen2 acme 8901' "$STUB_DIR/clone.log"
+    ! grep -q ' 9000$' "$STUB_DIR/clone.log"
+}
+
+@test "the canary waits for the runner to come Online before dispatching" {
+    github_runner_lookup_details() {
+        local n
+        n=$(( $(cat "$STUB_DIR/online-polls" 2>/dev/null || echo 0) + 1 ))
+        printf '%s' "$n" > "$STUB_DIR/online-polls"
+        if (( n < 3 )); then
+            printf '77\tfalse\toffline\n'
+        else
+            printf '77\tfalse\tonline\n'
+        fi
+    }
+    CANARY_REGISTER_TIMEOUT=60
+
+    run --separate-stderr canary_main 2
+    [ "$status" -eq 0 ]
+    [ "$(cat "$STUB_DIR/online-polls")" = "3" ]
+    assert_called curl '*/dispatches'
+}
+
+@test "a runner that never comes Online fails the attempt without dispatching" {
+    github_runner_lookup_details() { printf '77\tfalse\toffline\n'; }
+    CANARY_REGISTER_TIMEOUT=0
+
+    run --separate-stderr canary_main 2
+    [ "$status" -eq 3 ]
+    refute_called curl '*/dispatches'
+    # Registering is part of what the canary tests, so this is a real attempt.
+    [ "$(attempts_of 8901)" = "1" ]
+    gen_read 8901
+    [ "$GEN_STATE" = "candidate" ]
+    assert_called qm 'destroy 9501 --purge'
+    notify_log | grep -q 'warn canary.attempt_failed'
+}
+
+@test "the dispatch carries the workflow, the repo, the default branch and the generation" {
+    run --separate-stderr canary_main 2
+    [ "$status" -eq 0 ]
+    assert_called curl '*-X POST*{"ref":"main","inputs":{"generation":"2"}}*https://api.github.com/repos/acme-org/canary-repo/actions/workflows/runner-canary.yml/dispatches'
+}
+
+@test "a workflow run that predates the dispatch is never adopted" {
+    # The baseline read happens before the dispatch: a run already at the top
+    # of the list is not this dispatch's run, however recent it looks.
+    api_response '*per_page=1' 200 <<'EOF'
+{"workflow_runs": [{"id": 9911}]}
+EOF
+    CANARY_TIMEOUT=0
+
+    run --separate-stderr canary_main 2
+    [ "$status" -eq 3 ]
+    refute_called curl '*/actions/runs/9911'
+    [[ "$stderr" == *"no workflow run appeared"* ]]
+}
+
+@test "the new run whose title names this generation is the one watched" {
+    api_response '*per_page=30' 200 <<'EOF'
+{"workflow_runs": [
+  {"id": 9912, "display_title": "Runner canary gen-3", "html_url": "https://github.com/acme-org/canary-repo/actions/runs/9912"},
+  {"id": 9911, "display_title": "Runner canary gen-2", "html_url": "https://github.com/acme-org/canary-repo/actions/runs/9911"}
+]}
+EOF
+    run --separate-stderr canary_main 2
+    [ "$status" -eq 0 ]
+    assert_called curl '*/actions/runs/9911'
+    refute_called curl '*/actions/runs/9912'
+}
+
+@test "the gate polls a queued run until it concludes" {
+    copy_function _canary_api _canary_api_orig
+    _canary_api() {
+        local n
+        case "${2:-}" in
+            */actions/runs/9911)
+                n=$(( $(cat "$STUB_DIR/run-polls" 2>/dev/null || echo 0) + 1 ))
+                printf '%s' "$n" > "$STUB_DIR/run-polls"
+                case "$n" in
+                    1) printf '{"status":"queued"}\n200\n' ;;
+                    2) printf '{"status":"in_progress"}\n200\n' ;;
+                    *) printf '{"status":"completed","conclusion":"success"}\n200\n' ;;
+                esac
+                ;;
+            *) _canary_api_orig "$@" ;;
+        esac
+    }
+    CANARY_TIMEOUT=60
+
+    run --separate-stderr canary_main 2
+    [ "$status" -eq 0 ]
+    [ "$(cat "$STUB_DIR/run-polls")" = "3" ]
+    [ -f "$STUB_DIR/promote.log" ]
+}
+
+@test "a run that never concludes is a failed attempt, not a promotion" {
+    api_response '*/actions/runs/9911' 200 <<'EOF'
+{"id": 9911, "status": "in_progress", "conclusion": null, "html_url": "https://github.com/acme-org/canary-repo/actions/runs/9911"}
+EOF
+    CANARY_TIMEOUT=0
+
+    run --separate-stderr canary_main 2
+    [ "$status" -eq 3 ]
+    [ ! -f "$STUB_DIR/promote.log" ]
+    notify_log | grep -q 'warn canary.attempt_failed'
+    gen_read 8901
+    [ "$GEN_STATE" = "candidate" ]
+}
+
+# ---------------------------------------------------------------------------
+# Issue 22 items 2, 3 and 4: promote on success, retry on anything else, and
+# reject on the last attempt.
+# ---------------------------------------------------------------------------
+
+@test "a successful canary promotes the candidate and destroys the canary VM" {
+    run --separate-stderr canary_main 2
+    [ "$status" -eq 0 ]
+    grep -q -- '2 --canary-passed' "$STUB_DIR/promote.log"
+    assert_called qm 'destroy 9501 --purge'
+    gen_read 8901
+    [ "$GEN_STATE" = "active" ]
+    [ "$GEN_CANARY_ATTEMPTS" = "1" ]
+    [ "$GEN_CANARY_RUN_URL" = "https://github.com/acme-org/canary-repo/actions/runs/9911" ]
+    run digest_is_memoed newdigest
+    [ "$status" -ne 0 ]
+}
+
+@test "a failed run keeps the candidate template and destroys only the canary VM" {
+    api_response '*/actions/runs/9911' 200 <<'EOF'
+{"id": 9911, "status": "completed", "conclusion": "failure", "html_url": "https://github.com/acme-org/canary-repo/actions/runs/9911"}
+EOF
+    run --separate-stderr canary_main 2
+    [ "$status" -eq 3 ]
+    gen_read 8901
+    [ "$GEN_STATE" = "candidate" ]
+    [ "$GEN_CANARY_ATTEMPTS" = "1" ]
+    [ "$GEN_CANARY_RUN_URL" = "https://github.com/acme-org/canary-repo/actions/runs/9911" ]
+    assert_called qm 'destroy 9501 --purge'
+    refute_called qm 'destroy 8901*'
+    [ ! -f "$STUB_DIR/promote.log" ]
+}
+
+@test "each failed attempt notifies warn with the run URL" {
+    api_response '*/actions/runs/9911' 200 <<'EOF'
+{"id": 9911, "status": "completed", "conclusion": "failure", "html_url": "https://github.com/acme-org/canary-repo/actions/runs/9911"}
+EOF
+    run --separate-stderr canary_main 2
+    [ "$status" -eq 3 ]
+    notify_log | grep -q 'warn canary.attempt_failed'
+    notify_log | grep -q 'runs/9911'
+    notify_log | grep -q "concluded 'failure'"
+    ! notify_log | grep -q 'error canary.failed'
+}
+
+@test "a non-final failure does not memo the digest" {
+    api_response '*/actions/runs/9911' 200 <<'EOF'
+{"id": 9911, "status": "completed", "conclusion": "failure"}
+EOF
+    run --separate-stderr canary_main 2
+    [ "$status" -eq 3 ]
+    run digest_is_memoed newdigest
+    [ "$status" -ne 0 ]
+}
+
+@test "the third failure marks the generation failed, memos the digest and notifies error" {
+    gen_update 8901 GEN_CANARY_ATTEMPTS=2
+    api_response '*/actions/runs/9911' 200 <<'EOF'
+{"id": 9911, "status": "completed", "conclusion": "failure", "html_url": "https://github.com/acme-org/canary-repo/actions/runs/9911"}
+EOF
+    run --separate-stderr canary_main 2
+    [ "$status" -eq 4 ]
+    gen_read 8901
+    [ "$GEN_STATE" = "failed" ]
+    [ "$GEN_CANARY_ATTEMPTS" = "3" ]
+    [[ "$GEN_FAILED_REASON" == *canary* ]]
+    run digest_is_memoed newdigest
+    [ "$status" -eq 0 ]
+    notify_log | grep -q 'error canary.failed'
+    notify_log | grep -q 'runs/9911'
+    [ ! -f "$STUB_DIR/promote.log" ]
+}
+
+@test "an attempt budget already spent is finalised without another clone" {
+    # A previous attempt that died between charging the budget and finishing
+    # leaves the record here; canarying it forever would be the other bug.
+    gen_update 8901 GEN_CANARY_ATTEMPTS=3
+    run --separate-stderr canary_main 2
+    [ "$status" -eq 4 ]
+    ! cloned
+    gen_read 8901
+    [ "$GEN_STATE" = "failed" ]
+    run digest_is_memoed newdigest
+    [ "$status" -eq 0 ]
+    notify_log | grep -q 'error canary.failed'
+}
+
+@test "a transient failure retries on a later run and succeeds" {
+    api_response '*/actions/runs/9911' 200 <<'EOF'
+{"id": 9911, "status": "completed", "conclusion": "failure", "html_url": "https://github.com/acme-org/canary-repo/actions/runs/9911"}
+EOF
+    run --separate-stderr canary_main 2
+    [ "$status" -eq 3 ]
+    gen_read 8901
+    [ "$GEN_STATE" = "candidate" ]
+
+    # The next maintain cycle: same candidate, same template, GitHub healthy.
+    api_response '*/actions/runs/9911' 200 <<'EOF'
+{"id": 9911, "status": "completed", "conclusion": "success", "html_url": "https://github.com/acme-org/canary-repo/actions/runs/9911"}
+EOF
+    run --separate-stderr canary_main 2
+    [ "$status" -eq 0 ]
+    gen_read 8901
+    [ "$GEN_STATE" = "active" ]
+    [ "$GEN_CANARY_ATTEMPTS" = "2" ]
+    run digest_is_memoed newdigest
+    [ "$status" -ne 0 ]
+}
+
+@test "a promotion in progress does not consume an attempt and stays quiet" {
+    # clone_runner returns 3 while PROMOTION_PAUSE_FILE is set. Nothing about
+    # the image was tested, so charging the budget for it could reject a good
+    # generation after three promotions.
+    clone_canary_runner() { return 3; }
+    run --separate-stderr canary_main 2
+    [ "$status" -eq 2 ]
+    [ "$(attempts_of 8901)" = "0" ]
+    gen_read 8901
+    [ "$GEN_STATE" = "candidate" ]
+    [ ! -f "$STUB_DIR/notify.log" ]
+}
+
+@test "a dispatch GitHub refuses hands the attempt back" {
+    api_response '*/actions/workflows/runner-canary.yml/dispatches' 403 <<'EOF'
+{"message": "Resource not accessible by personal access token"}
+EOF
+    run --separate-stderr canary_main 2
+    [ "$status" -eq 2 ]
+    [ "$(attempts_of 8901)" = "0" ]
+    gen_read 8901
+    [ "$GEN_STATE" = "candidate" ]
+    notify_log | grep -q 'warn canary.unconfigured'
+    assert_called qm 'destroy 9501 --purge'
+}
+
+# ---------------------------------------------------------------------------
+# The canary VM (spec 7.4) and the gate's own lock.
+# ---------------------------------------------------------------------------
+
+@test "a leftover canary VM from a killed attempt is destroyed before the clone" {
+    stub_out qm 'list*' <<'EOF'
+      VMID NAME                 STATUS     MEM(MB)    BOOTDISK(GB) PID
+      9502 canary-gen2          running    2048              30.00 1234
+EOF
+    run --separate-stderr canary_main 2
+    [ "$status" -eq 0 ]
+    assert_called qm 'destroy 9502 --purge'
+    cloned
+}
+
+@test "a canary VM that already powered off and vanished is not an error" {
+    # The common case: the VM is --ephemeral, so the hookscript re-clone path
+    # destroyed it the moment its job finished.
+    stub_status qm 'status *' 2
+    run --separate-stderr canary_main 2
+    [ "$status" -eq 0 ]
+    refute_called qm 'destroy *'
+    grep -q -- '--canary-passed' "$STUB_DIR/promote.log"
+}
+
+@test "the canary deregisters its runner before destroying the VM" {
+    run --separate-stderr canary_main 2
+    [ "$status" -eq 0 ]
+    grep -qx 'acme canary-gen2' "$STUB_DIR/deregister.log"
+}
+
+@test "two canaries do not run at once" {
+    hold_canary_lock
+    CANARY_LOCK_WAIT_SECONDS=0
+
+    run --separate-stderr canary_main 2
+    [ "$status" -eq 2 ]
+    ! cloned
+    [ "$(attempts_of 8901)" = "0" ]
+    gen_read 8901
+    [ "$GEN_STATE" = "candidate" ]
+}
+
+@test "the canary lock is released when the gate finishes" {
+    run --separate-stderr canary_main 2
+    [ "$status" -eq 0 ]
+    exec 219>"$CANARY_LOCK_FILE"
+    run flock -n -x 219
+    exec 219>&-
+    [ "$status" -eq 0 ]
+}
+
+@test "the gate takes no pool lock of its own" {
+    # Spec 7.3: promotion needs the pool lock exclusively and clone_runner
+    # holds it shared. A gate that took it as well would deadlock against the
+    # promotion it exists to trigger.
+    # Scoped to code lines: the header comment explains the composition, and
+    # an unscoped grep would match that instead of an actual acquisition.
+    run grep -nE '^[[:space:]]*[^#[:space:]].*(POOL_ACTIVITY_LOCK_FILE|PROMOTION_PAUSE_FILE)' \
+        "$REPO_ROOT/lib/canary.sh"
+    [ "$status" -ne 0 ]
+}
+
+@test "only the canary gate passes --canary-passed" {
+    run grep -l -- '--canary-passed' "$REPO_ROOT"/lib/*.sh
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"lib/canary.sh"* ]]
+    [[ "$output" == *"lib/promote.sh"* ]]
+    run bash -c "grep -l -- '--canary-passed' $REPO_ROOT/lib/*.sh | grep -vE 'lib/(canary|promote)\.sh$'"
+    [ "$status" -ne 0 ]
+}
+
+@test "vm_config_is_canary reads runner-canary out of either separator" {
+    run vm_config_is_canary 'name: canary-gen5
+tags: gen-5;runner;runner-canary'
+    [ "$status" -eq 0 ]
+
+    run vm_config_is_canary 'name: canary-gen5
+tags: runner,gen-5,runner-canary'
+    [ "$status" -eq 0 ]
+
+    run vm_config_is_canary 'name: runner-1
+tags: runner;gen-5'
+    [ "$status" -ne 0 ]
+
+    run vm_config_is_canary 'name: runner-1'
+    [ "$status" -ne 0 ]
+
+    # A tag that merely starts with the canary tag is a different tag.
+    run vm_config_is_canary 'name: runner-1
+tags: runner;runner-canary-old'
+    [ "$status" -ne 0 ]
 }

@@ -619,7 +619,8 @@ canary_destroy_leftover() {
 
 # Returns 0 the run concluded success, 1 the attempt failed (a real data point
 # about this image or about GitHub — retried per spec 7.5), 2 the attempt could
-# not be made at all and must not be charged to the budget.
+# not be made at all and must not be charged to the budget, 5 the same but for
+# an ordinary reason nobody needs paging about.
 # Sets CANARY_VMID, CANARY_RUN_URL and CANARY_FAIL_REASON.
 canary_attempt() {
     local template_vmid="$1" gen_id="$2"
@@ -639,9 +640,11 @@ canary_attempt() {
     clone_vmid="${clone_vmid//[[:space:]]/}"
     if [[ "$rc" -eq 3 ]]; then
         # clone_runner refuses to clone while a promotion is paused. Nothing
-        # about the image was tested, so this cannot cost an attempt.
+        # about the image was tested, so this cannot cost an attempt — and a
+        # promotion window is routine, so it is not worth a notification
+        # either: the next maintain cycle picks the canary up again.
         CANARY_FAIL_REASON="a promotion is in progress"
-        return 2
+        return 5
     fi
     if [[ "$rc" -ne 0 || ! "$clone_vmid" =~ ^[0-9]+$ ]]; then
         CANARY_FAIL_REASON="the canary clone from template $template_vmid failed"
@@ -888,14 +891,18 @@ canary_main() {
             fi
             return 0
             ;;
-        2)
+        2|5)
             # Never attempted: hand the budget back so a misconfiguration or a
             # promotion window cannot reject a good image (spec 7.5).
             gen_update "$vmid" GEN_CANARY_ATTEMPTS="$attempts" \
                 || log_warn "canary: could not restore the attempt count for generation $gen_id"
-            NOTIFY_GENERATION="$gen_id" notify warn canary.unconfigured \
-                "Canary for generation $gen_id was not attempted: ${CANARY_FAIL_REASON:-unknown}"
-            log_warn "canary: generation $gen_id was not attempted: ${CANARY_FAIL_REASON:-unknown}"
+            if [[ "$rc" -eq 2 ]]; then
+                NOTIFY_GENERATION="$gen_id" notify warn canary.unconfigured \
+                    "Canary for generation $gen_id was not attempted: ${CANARY_FAIL_REASON:-unknown}"
+                log_warn "canary: generation $gen_id was not attempted: ${CANARY_FAIL_REASON:-unknown}"
+            else
+                log_info "canary: generation $gen_id was not attempted: ${CANARY_FAIL_REASON:-unknown}"
+            fi
             return 2
             ;;
     esac

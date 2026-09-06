@@ -309,3 +309,39 @@ EOF
     grep -A8 '^_promote_release()' "$REPO_ROOT/lib/promote.sh" \
         | grep -qE "^[[:space:]]*trap - EXIT[[:space:]]*$"
 }
+
+# The canary gate (#22) is the other way into promotion: it has just watched a
+# real job succeed on this image, so there is nothing left to confirm.
+@test "promote without a canary tells the operator to run the gate" {
+    seed_active_and_candidate
+
+    run --separate-stderr promote_generation 2 </dev/null
+    [ "$status" -ne 0 ]
+    [[ "$stderr" == *"runner canary 2"* ]]
+    gen_read 8900
+    [ "$GEN_STATE" = "candidate" ]
+    grep -q 'TEMPLATE_ID="9000"' "$CONFIG_FILE"
+}
+
+@test "promote --canary-passed promotes without a tty confirmation" {
+    seed_active_and_candidate
+
+    run --separate-stderr promote_generation 2 --canary-passed </dev/null
+    [ "$status" -eq 0 ]
+    gen_read 8900
+    [ "$GEN_STATE" = "active" ]
+    gen_read 9000
+    [ "$GEN_STATE" = "superseded" ]
+    grep -qE '^TEMPLATE_ID=["'\'']?8900["'\'']?$' "$CONFIG_FILE"
+    grep -q 'generation.promoted' "$STUB_DIR/notify.log"
+}
+
+@test "promote --canary-passed still refuses a non-candidate generation" {
+    gen_store_init
+    gen_create 8900 GEN_ID=2 GEN_STATE=baking
+
+    run --separate-stderr promote_generation 2 --canary-passed </dev/null
+    [ "$status" -ne 0 ]
+    gen_read 8900
+    [ "$GEN_STATE" = "baking" ]
+}
