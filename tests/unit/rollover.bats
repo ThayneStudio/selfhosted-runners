@@ -153,6 +153,32 @@ EOF
     assert_output_is $'42\tfalse'
 }
 
+# Two properties in one, because they trade against each other: the PAT must
+# stay off argv (any local user can read /proc/PID/cmdline), and it must not
+# arrive on a process-substitution fd either. A <( ) writer is asynchronous, so
+# a curl that never opens /dev/fd/N — every stubbed curl in this file, and a
+# real curl that dies early — leaves it writing to a pipe with no reader; where
+# SIGPIPE is ignored, as it is under systemd and on CI runners, bash then
+# prints "printf: write error: Broken pipe" onto the caller's stderr, which
+# bats merges into $output. That is what made the lookup test above flaky.
+@test "the PAT reaches curl as a config on stdin, never on argv or a procsub fd" {
+    write_org_config acme ghp_secret_pat acme-org
+    jq() { /usr/bin/jq "$@"; }
+    curl() {
+        printf '%s\n' "$*" > "$STUB_DIR/curl-argv"
+        cat > "$STUB_DIR/curl-stdin"
+        printf '{"total_count":0,"runners":[]}\n'
+    }
+
+    run github_runners_snapshot acme
+    [ "$status" -eq 0 ]
+
+    [[ "$(cat "$STUB_DIR/curl-argv")" != *ghp_secret_pat* ]]
+    [[ "$(cat "$STUB_DIR/curl-argv")" != */dev/fd/* ]]
+    [[ "$(cat "$STUB_DIR/curl-argv")" == *"--config -"* ]]
+    [ "$(cat "$STUB_DIR/curl-stdin")" = 'header = "Authorization: token ghp_secret_pat"' ]
+}
+
 @test "GitHub lookup fails closed for a missing runner or malformed busy state" {
     write_org_config acme ghp_test acme-org
     jq() { /usr/bin/jq "$@"; }
