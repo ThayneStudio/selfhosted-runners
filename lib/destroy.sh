@@ -114,7 +114,8 @@ fi
 log_info "Destroying $RUNNER_NAME (VMID $VMID)..."
 qm destroy "$VMID" --purge 200>&- 201>&- 202>&- || { log_error "Failed to destroy $VMID"; exit 1; }
 
-# Clean up per-VM cloud-init snippets (meta + canary vendor-data).
+# Clean up per-VM cloud-init snippets (meta, JIT user snippet, and a
+# defensive sweep for any vendor-data snippet).
 cleanup_clone_snippets "$VMID"
 
 log_info "$RUNNER_NAME destroyed."

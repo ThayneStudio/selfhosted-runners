@@ -17,13 +17,15 @@
 # never assigned work is the exact failure this platform exists to catch,
 # and no local smoke test sees it.
 #
-# LABEL TARGETING IS LOAD-BEARING. The canary registers with
-# --no-default-labels and carries only gen-<GEN_ID>-canary, so runs-on
-# names that label ALONE. GitHub assigns a queued job to any idle runner
-# whose labels are a superset of runs-on, so adding self-hosted here would
-# make the canary eligible for real production jobs: it would run one on an
-# unvalidated image and then destroy itself (it is --ephemeral), leaving
-# this dispatch with no runner and timing out a good generation.
+# LABEL TARGETING IS LOAD-BEARING. The canary's JIT config is minted on the
+# Proxmox host with RUNNER_LABELS=gen-<GEN_ID>-canary (clone_runner --canary,
+# lib/common.sh), and GitHub does not add default labels to a JIT-registered
+# runner, so it carries only that label -- runs-on names that label ALONE.
+# GitHub assigns a queued job to any idle runner whose labels are a superset
+# of runs-on, so adding self-hosted here would make the canary eligible for
+# real production jobs: it would run one on an unvalidated image and then
+# destroy itself (it is --ephemeral), leaving this dispatch with no runner
+# and timing out a good generation.
 #
 # The label decides who MAY answer, never who did. Every toolchain
 # assertion below passes on any healthy runner of any generation, because
@@ -200,8 +202,8 @@ jobs:
           # any healthy runner of any generation, so a run that cannot be
           # tied to the candidate proves nothing -- and the gate would
           # promote an image that never ran a job. Two ways a foreign runner
-          # answers this dispatch: an operator hand-labels one, or the
-          # canary's vendor-data snippet survives onto a production clone.
+          # answers this dispatch: an operator hand-labels one, or a stray
+          # gen-N-canary tag/registration survives onto a production clone.
           #
           # Prefer a generation stamp written by the bake, which survives any
           # label mix-up. Until the bake writes one, fall back to the clone

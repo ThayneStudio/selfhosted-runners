@@ -147,6 +147,14 @@ write_files:
       # lives on the attached cloud-init drive (/dev/sr0) and is on run.sh's
       # command line while the runner is up, both readable in-guest — but it is
       # SINGLE-USE, so a job that recovers it cannot register another runner.
+      #
+      # Labels (including a canary's gen-N-canary-only set, #21) are baked into
+      # this JIT config by fetch_jit_config on the host at mint time — GitHub
+      # does not add default labels to a JIT-registered runner, so whatever the
+      # host asked for is exactly what this runner carries. There is no
+      # config.sh step here to pass --no-default-labels to, and nothing in this
+      # guest reads a labels.env: that mechanism belonged to the pre-JIT
+      # registration flow and no longer has any effect.
       JIT="$JIT_CONFIG"
       rm -f /etc/github-runner/config.env
       rm -f /var/lib/cloud/instance/user-data.txt* /var/lib/cloud/instances/*/user-data.txt* 2>/dev/null || true

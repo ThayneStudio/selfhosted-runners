@@ -1086,7 +1086,8 @@ recover_rollover_pending() {
         fi
         rollover_pending_identity_matches "$vmid" "$name" "$org" "$gen" "$nonce" || { exec 209>&-; continue; }
         if qm destroy "$vmid" --purge 200>&- 209>&- 2>/dev/null; then
-            rm -f "${SNIPPETS_DIR}/runner-${vmid}-meta.yaml" "${SNIPPETS_DIR}/runner-${vmid}-user-"*.yaml "${SNIPPETS_DIR}/runner-${vmid}-vendor.yaml" "$file"
+            cleanup_clone_snippets "$vmid"
+            rm -f "$file"
             log_info "[rollover-recovery] destroyed pending VMID $vmid ($name)"
         fi
         exec 209>&-
@@ -1145,6 +1146,9 @@ deregister_runner() {
 # load_org_config). The PAT is passed via curl --config to keep it off argv; the
 # request body (name/labels/group) is not sensitive. RUNNER_GROUP_ID (default 1
 # = the org's "Default" group) and RUNNER_LABELS may be set in the org config.
+# clone_runner --canary shadows RUNNER_LABELS with a local before calling this,
+# so a canary's minted config carries only gen-<N>-canary (#21) — this function
+# has no canary-specific branch of its own.
 # Prints the base64 encoded_jit_config on stdout.
 # Returns 0 on success, 2 on HTTP 409 (duplicate runner name), 1 on any other failure.
 fetch_jit_config() {
@@ -1223,33 +1227,14 @@ generate_mac() {
     echo -n "$1" | md5sum | sed 's/\(..\)\(..\)\(..\)\(..\)\(..\).*/02:\1:\2:\3:\4:\5/'
 }
 
-# Per-VM cloud-init vendor-data for a canary clone. register-runner.sh sources
-# /etc/github-runner/labels.env when present, so the guest registers with only
-# gen-<id>-canary and --no-default-labels. Proven by "write_canary_vendor_snippet
-# emits labels.env for gen-N-canary".
-write_canary_vendor_snippet() {
-    local vmid="${1:-}" gen_id="${2:-}" snippet
-    if [[ ! "$vmid" =~ ^[0-9]+$ || ! "$gen_id" =~ ^[0-9]+$ ]]; then
-        log_error "write_canary_vendor_snippet: vmid and gen id must be numeric"
-        return 1
-    fi
-    snippet="${SNIPPETS_DIR}/runner-${vmid}-vendor.yaml"
-    cat > "$snippet" <<EOF || return 1
-#cloud-config
-write_files:
-  - path: /etc/github-runner/labels.env
-    permissions: '0600'
-    content: |
-      RUNNER_LABELS="gen-${gen_id}-canary"
-      RUNNER_NO_DEFAULT_LABELS=true
-EOF
-    chmod 600 "$snippet" || return 1
-}
-
-# Remove per-VM cloud-init snippets. Vendor is canary-only; rm -f all three so a
-# later occupant of the same VMID cannot inherit gen-N-canary labels or a stale
-# JIT user snippet. Proven by "cleanup_clone_snippets removes meta, user, and
-# vendor files".
+# Remove every per-VM cloud-init snippet for a clone: meta, the per-VM JIT
+# user snippet (runner-<vmid>-user-<org>.yaml — org unknown here, hence the
+# glob), and a defensive sweep of a vendor snippet. Canary label isolation is
+# expressed in the JIT config minted on the host (see the RUNNER_LABELS
+# override next to clone_runner's fetch_jit_config call), not via cloud-init
+# vendor-data, so nothing writes runner-<vmid>-vendor.yaml today — the glob
+# stays so a later occupant of the same VMID can never inherit a stray one.
+# Proven by "cleanup_clone_snippets removes meta, user, and vendor files".
 cleanup_clone_snippets() {
     local vmid="${1:-}"
     [[ "$vmid" =~ ^[0-9]+$ ]] || return 0
@@ -1359,13 +1344,15 @@ clone_canary_runner() {
 # exclusive-lock wait). Distinct from 1 so reclone.sh / watch.sh retry
 # without notifying clone.failed. Tests set the bound to 0 to skip the wait.
 #
-# --canary writes vendor-data so the guest registers with only gen-N-canary
-# and --no-default-labels, and tags runner,gen-N,runner-canary. --template
+# --canary mints its JIT config with RUNNER_LABELS=gen-N-canary so the guest
+# registers with only that label (GitHub does not add default labels to a
+# JIT-registered runner), and tags runner,gen-N,runner-canary. --template
 # clones that VMID instead of the active pointer; it is rejected without
-# --canary so production call sites stay byte-identical (user= + meta= only).
+# --canary so production call sites stay byte-identical (user= + meta= only,
+# and the RUNNER_LABELS an org config may set is never shadowed).
 clone_runner() {
     local name="" org="" vmid=""
-    local canary=0 template_override="" clone_src="" canary_gen_id="" extra_tag="" cicustom=""
+    local canary=0 template_override="" clone_src="" canary_gen_id="" extra_tag=""
     local RESERVED_VMID=""
     local pause_waited=0
     local pause_max="${CLONE_PAUSE_RETRY_MAX_SECONDS:-130}"
@@ -1576,6 +1563,18 @@ clone_runner() {
     # crashed VM left a stale entry). A healthy ephemeral runner auto-removes
     # after its job, so the common path mints in one call; only on failure do we
     # deregister the stale entry (mirrors config.sh --replace) and retry once.
+    #
+    # Canary label isolation happens right here, not via cloud-init: fetch_jit_config
+    # reads RUNNER_LABELS from its environment, and a `local` in bash is visible to
+    # every function called from this point in the call stack (including a retry
+    # after a 409), so shadowing it for a canary clone makes the minted JIT config
+    # carry only gen-<N>-canary — never self-hosted/linux/x64 — without touching
+    # whatever RUNNER_LABELS a production org config may set. GitHub does not add
+    # default labels to a JIT-registered runner, so this label set is exact. Proven
+    # by "clone_runner --canary mints a JIT config carrying only gen-N-canary".
+    if [[ "$canary" -eq 1 ]]; then
+        local RUNNER_LABELS="gen-${canary_gen_id}-canary"
+    fi
     local jit_config mint_rc=0
     jit_config=$(fetch_jit_config "$name") && mint_rc=0 || mint_rc=$?
     if [[ $mint_rc -eq 2 ]]; then
@@ -1717,18 +1716,14 @@ clone_runner() {
     chmod 600 "${SNIPPETS_DIR}/runner-${vmid}-meta.yaml" || { _fail; _pool_lock_release; return 1; }
 
     # Per-VM user snippet carrying the single-use JIT config (must exist before
-    # qm set --cicustom, which validates the referenced volume).
+    # qm set --cicustom, which validates the referenced volume). Canary label
+    # isolation does not need a vendor-data snippet here: the JIT config minted
+    # above already carries the canary-only label set (see the RUNNER_LABELS
+    # override next to the fetch_jit_config call), so this cicustom stays
+    # user=+meta= for both production and canary clones.
     render_user_snippet "$vmid" "$org" "$jit_config" || { _fail; _pool_lock_release; return 1; }
 
-    if [[ "$canary" -eq 1 ]]; then
-        write_canary_vendor_snippet "$vmid" "$canary_gen_id" || { _fail; _pool_lock_release; return 1; }
-    fi
-
-    cicustom="user=local:snippets/runner-${vmid}-user-${org}.yaml,meta=local:snippets/runner-${vmid}-meta.yaml"
-    if [[ "$canary" -eq 1 ]]; then
-        cicustom="${cicustom},vendor=local:snippets/runner-${vmid}-vendor.yaml"
-    fi
-    qm set "$vmid" --cicustom "$cicustom" \
+    qm set "$vmid" --cicustom "user=local:snippets/runner-${vmid}-user-${org}.yaml,meta=local:snippets/runner-${vmid}-meta.yaml" \
         200>&- \
         201>&- \
         202>&- \
