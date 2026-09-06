@@ -50,6 +50,11 @@ setup() {
     github_runner_lookup_details() { printf '77\tfalse\tonline\n'; }
     promote_generation() {
         printf '%s\n' "$*" >> "$STUB_DIR/promote.log"
+        # The real promote refuses --canary-passed unless the record already
+        # carries the gate's evidence, so capture what it would have read.
+        gen_read 8901
+        printf '%s|%s\n' "${GEN_CANARY_RUN_URL:-}" "${GEN_CANARY_ATTEMPTS:-}" \
+            > "$STUB_DIR/evidence-at-promote"
         gen_transition 8901 active
         gen_transition 9000 superseded
     }
@@ -672,6 +677,12 @@ EOF
     run --separate-stderr canary_main 2
     [ "$status" -eq 0 ]
     grep -q -- '2 --canary-passed' "$STUB_DIR/promote.log"
+    # The evidence promote --canary-passed checks has to be on the record
+    # *before* the call, or the real promote refuses the gate's own promotion.
+    # Its half of the handshake is "promote --canary-passed refuses a
+    # generation with no recorded canary run" in tests/unit/promote.bats.
+    grep -qx 'https://github.com/acme-org/canary-repo/actions/runs/9911|1' \
+        "$STUB_DIR/evidence-at-promote"
     assert_called qm 'destroy 9501 --purge'
     gen_read 8901
     [ "$GEN_STATE" = "active" ]
