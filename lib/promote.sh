@@ -10,6 +10,12 @@
 # --yes is for setup bootstrap, tests, and `runner upgrade` (an operator-invoked
 # verb). It is not a way to bypass canary from unattended maintain.
 #
+# --canary-passed is the opposite of --skip-canary: it says the gate ran and
+# the run concluded success, so there is nothing to confirm. lib/canary.sh is
+# its only caller (proven by "only the canary gate passes --canary-passed"),
+# and it is deliberately absent from promote_usage — an operator promoting by
+# hand has --skip-canary, which asks.
+#
 # GEN_* fields are loaded via gen_read in this shell; gen_transition is a
 # subshell, so SC2030/SC2031 are false positives here as in generations.sh.
 # shellcheck disable=SC2030,SC2031,SC2034
@@ -38,9 +44,9 @@ _promote_release() {
     exec 202>&- 2>/dev/null || true
 }
 
-# Usage: promote_generation <gen_id> [--skip-canary] [--yes]
+# Usage: promote_generation <gen_id> [--skip-canary] [--yes] [--canary-passed]
 promote_generation() {
-    local gen_id="" skip_canary=0 yes=0
+    local gen_id="" skip_canary=0 yes=0 canary_passed=0
     local new_vmid state rc confirm="" pointer="" prev_list
     local -a previous=()
     local prev
@@ -49,6 +55,7 @@ promote_generation() {
         case "$1" in
             --skip-canary) skip_canary=1; shift ;;
             --yes) yes=1; shift ;;
+            --canary-passed) canary_passed=1; shift ;;
             -h|--help)
                 promote_usage
                 return 0
@@ -94,11 +101,13 @@ promote_generation() {
         return 1
     fi
 
-    if [[ "$skip_canary" -eq 0 ]]; then
-        log_error "Canary promotion is not implemented; pass --skip-canary"
+    if [[ "$skip_canary" -eq 0 && "$canary_passed" -eq 0 ]]; then
+        log_error "Generation $gen_id has not passed a canary — run 'runner canary $gen_id', or pass --skip-canary to promote without one"
         return 1
     fi
-    if [[ "$yes" -eq 0 ]]; then
+    # The canary gate is the confirmation: it just watched a real job succeed
+    # on this image, so there is no question to ask an operator.
+    if [[ "$skip_canary" -eq 1 && "$yes" -eq 0 ]]; then
         # --skip-canary without --yes or a tty confirm aborts. Proven by
         # "promote --skip-canary without --yes on a non-tty fails".
         if [[ ! -t 0 ]]; then

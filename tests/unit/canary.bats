@@ -1,0 +1,406 @@
+#!/usr/bin/env bats
+# Canary orchestration (issue #22, spec 7.1/7.3/7.4/7.5): clone, wait for the
+# runner to come Online, workflow_dispatch, poll to conclusion, promote or
+# retry, and clean the canary VM up either way.
+#
+# Everything that talks to GitHub goes through curl, which the harness fakes.
+# The canary PAT is passed to curl in a config read from stdin, so it never
+# appears in the stub's call log -- which is exactly the property
+# "the canary PAT never reaches curl argv" asserts.
+#
+# jq is faked too, so the tests that exercise the real JSON handling shadow it
+# with the real binary (use_real_jq), the same convention rollover.bats and
+# canary_labels.bats use.
+
+load test_helper
+bats_require_minimum_version 1.5.0
+
+setup() {
+    # clone_canary_runner renders a cloud-init snippet from the installed
+    # templates. Must precede load_lib: common.sh only defaults INSTALL_DIR
+    # when it is unset.
+    INSTALL_DIR="$REPO_ROOT"
+    load_lib canary.sh
+    MIN_VMID=9001
+    TEMPLATE_ID=9000
+    write_infra_config
+    MIN_VMID=9001
+    TEMPLATE_ID=9000
+    CANARY_ENABLED=true
+    CANARY_ORG=acme
+    CANARY_REPO=acme-org/canary-repo
+    CANARY_WORKFLOW=runner-canary.yml
+    CANARY_PAT=""
+    apply_generation_defaults
+    # No real waiting anywhere in the suite.
+    CANARY_POLL_SECONDS=0
+    CANARY_REGISTER_POLL_SECONDS=0
+
+    write_org_config acme ghp_test acme-org
+    seed_generations
+    use_real_jq
+    notify() { printf '%s\n' "$*" >> "$STUB_DIR/notify.log"; }
+
+    # Seams the orchestration tests drive directly. A test that wants the real
+    # thing redefines it back or asserts on the stub log.
+    clone_canary_runner() {
+        printf '%s %s %s\n' "$1" "$2" "$3" >> "$STUB_DIR/clone.log"
+        printf '9501\n'
+    }
+    github_runner_lookup_details() { printf '77\tfalse\tonline\n'; }
+    promote_generation() {
+        printf '%s\n' "$*" >> "$STUB_DIR/promote.log"
+        gen_transition 8901 active
+        gen_transition 9000 superseded
+    }
+    stub_out qm 'destroy *' < /dev/null
+    stub_out qm 'set *' < /dev/null
+    stub_out qm 'status *' <<'EOF'
+status: stopped
+EOF
+    stub_out qm 'list*' <<'EOF'
+      VMID NAME                 STATUS
+EOF
+    deregister_runner() { printf '%s %s\n' "$1" "$2" >> "$STUB_DIR/deregister.log"; }
+    stub_api_ok
+}
+
+# tests/stubs/bin/jq is a strict-stub fake like every other command here;
+# shadow it with the real binary so the canary's own jq expressions run.
+use_real_jq() {
+    jq() { /usr/bin/jq "$@"; }
+}
+
+seed_generations() {
+    gen_store_init
+    gen_create 9000 \
+        GEN_ID=1 \
+        GEN_STATE=active \
+        GEN_TEMPLATE_DIGEST=olddigest \
+        GEN_IMAGE_SHA256=abc \
+        GEN_RUNNER_VERSION=2.335.0
+    gen_create 8901 \
+        GEN_ID=2 \
+        GEN_STATE=candidate \
+        GEN_TEMPLATE_DIGEST=newdigest \
+        GEN_IMAGE_SHA256=def \
+        GEN_RUNNER_VERSION=2.336.0
+}
+
+# api_response <arg-glob> <http-code>, body on stdin. Mirrors what
+# _canary_api reads back: the body, then the status code on the last line.
+api_response() {
+    local pattern="$1" code="$2" body
+    body=$(cat)
+    stub_out curl "$pattern" <<EOF
+$body
+$code
+EOF
+}
+
+# stub_scopes <value>, or no argument for a fine-grained token that carries no
+# X-OAuth-Scopes header at all.
+stub_scopes() {
+    local header=""
+    [[ $# -eq 0 ]] || header="x-oauth-scopes: $1"
+    stub_out curl '*-D -*api.github.com/' <<EOF
+HTTP/2 200
+x-github-api-version-selected: 2022-11-28
+$header
+
+200
+EOF
+}
+
+# Every call answers "configured, reachable, and the run passed" unless a test
+# re-registers one of these (the newest matching rule wins).
+stub_api_ok() {
+    stub_scopes 'admin:org, repo'
+    api_response '*/repos/acme-org/canary-repo' 200 <<'EOF'
+{"default_branch": "main", "private": true, "full_name": "acme-org/canary-repo"}
+EOF
+    api_response '*/actions/workflows/runner-canary.yml' 200 <<'EOF'
+{"id": 4242, "state": "active", "path": ".github/workflows/runner-canary.yml"}
+EOF
+    api_response '*/actions/workflows/runner-canary.yml/dispatches' 204 < /dev/null
+    # The baseline read (per_page=1) runs before the dispatch, the search
+    # (per_page=30) after it, so one static rule each is enough.
+    api_response '*per_page=1' 200 <<'EOF'
+{"workflow_runs": []}
+EOF
+    api_response '*per_page=30' 200 <<'EOF'
+{"workflow_runs": [{"id": 9911, "display_title": "Runner canary gen-2", "status": "completed", "conclusion": "success", "html_url": "https://github.com/acme-org/canary-repo/actions/runs/9911"}]}
+EOF
+    api_response '*/actions/runs/9911' 200 <<'EOF'
+{"id": 9911, "status": "completed", "conclusion": "success", "html_url": "https://github.com/acme-org/canary-repo/actions/runs/9911"}
+EOF
+}
+
+notify_log() {
+    [[ -f "$STUB_DIR/notify.log" ]] && cat "$STUB_DIR/notify.log"
+    return 0
+}
+
+cloned() {
+    [[ -f "$STUB_DIR/clone.log" ]]
+}
+
+attempts_of() {
+    gen_read "$1"
+    printf '%s\n' "${GEN_CANARY_ATTEMPTS:-}"
+}
+
+# ---------------------------------------------------------------------------
+# Wiring
+# ---------------------------------------------------------------------------
+
+@test "lib/canary.sh is syntactically valid and runner dispatches the canary verb" {
+    bash -n "$REPO_ROOT/lib/canary.sh"
+    grep -Eq '^[[:space:]]*canary\)' "$REPO_ROOT/runner"
+}
+
+@test "runner help lists the canary verb" {
+    run bash "$REPO_ROOT/runner" help
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"canary <id>"* ]]
+}
+
+@test "lib/canary.sh documents its exit-status contract" {
+    # maintain (#24) branches on these codes; they are API, not an accident.
+    local code
+    for code in 0 1 2 3 4; do
+        grep -Eq "^#[[:space:]]+$code[[:space:]]+[a-z]" "$REPO_ROOT/lib/canary.sh" || {
+            printf 'exit code %s is not documented in lib/canary.sh\n' "$code" >&2
+            return 1
+        }
+    done
+    grep -q 'EXIT STATUS CONTRACT' "$REPO_ROOT/lib/canary.sh"
+}
+
+@test "apply_generation_defaults supplies the canary keys spec 14 names" {
+    unset CANARY_MAX_ATTEMPTS CANARY_TIMEOUT CANARY_REGISTER_TIMEOUT CANARY_WORKFLOW
+    CANARY_ENABLED="" CANARY_REPO="" CANARY_ORG="" CANARY_PAT=""
+    apply_generation_defaults
+    [ "$CANARY_ENABLED" = "false" ]
+    [ "$CANARY_MAX_ATTEMPTS" = "3" ]
+    [ "$CANARY_TIMEOUT" = "1800" ]
+    [ "$CANARY_REGISTER_TIMEOUT" = "600" ]
+    [ "$CANARY_WORKFLOW" = "runner-canary.yml" ]
+}
+
+@test "an out-of-range CANARY_MAX_ATTEMPTS falls back to the default" {
+    CANARY_MAX_ATTEMPTS=nonsense
+    run --separate-stderr apply_generation_defaults
+    [ "$status" -eq 0 ]
+    apply_generation_defaults 2>/dev/null
+    [ "$CANARY_MAX_ATTEMPTS" = "3" ]
+}
+
+@test "maintain and canary share one CANARY_REPO predicate" {
+    # Two copies of "is the canary configured" is how maintain comes to refuse
+    # a bake for a canary the gate would happily have run, or the reverse.
+    grep -q 'canary_repo_configured' "$REPO_ROOT/lib/common.sh"
+    grep -q 'canary_repo_configured' "$REPO_ROOT/lib/maintain.sh"
+    grep -q 'canary_repo_configured' "$REPO_ROOT/lib/canary.sh"
+
+    CANARY_REPO=""
+    run canary_repo_configured
+    [ "$status" -ne 0 ]
+    CANARY_REPO="   "
+    run canary_repo_configured
+    [ "$status" -ne 0 ]
+    CANARY_REPO="acme-org/canary-repo"
+    run canary_repo_configured
+    [ "$status" -eq 0 ]
+}
+
+@test "canary_token prefers CANARY_PAT and falls back to the org PAT" {
+    GITHUB_PAT=ghp_org
+    CANARY_PAT=""
+    run canary_token
+    [ "$output" = "ghp_org" ]
+    CANARY_PAT=ghp_canary
+    run canary_token
+    [ "$output" = "ghp_canary" ]
+}
+
+# ---------------------------------------------------------------------------
+# State gating: what `runner canary <gen>` does with a generation that is not
+# a promotable candidate. maintain calls this unattended on every cycle.
+# ---------------------------------------------------------------------------
+
+@test "canary of an already-active generation is a no-op success" {
+    run --separate-stderr canary_main 1
+    [ "$status" -eq 0 ]
+    ! cloned
+    [ ! -f "$STUB_DIR/promote.log" ]
+}
+
+@test "canary of a failed generation reports failed-final without re-running" {
+    gen_transition 8901 failed "earlier canary"
+    run --separate-stderr canary_main 2
+    [ "$status" -eq 4 ]
+    ! cloned
+}
+
+@test "canary of a baking generation is an error, not a canary" {
+    gen_create 8902 GEN_ID=3 GEN_STATE=baking
+    run --separate-stderr canary_main 3
+    [ "$status" -eq 1 ]
+    ! cloned
+}
+
+@test "canary of an unknown generation id is an error" {
+    run --separate-stderr canary_main 99
+    [ "$status" -eq 1 ]
+    ! cloned
+}
+
+# ---------------------------------------------------------------------------
+# Issue 22 item 5: a canary that cannot be attempted consumes no attempt.
+# ---------------------------------------------------------------------------
+
+@test "CANARY_ENABLED=false does not attempt a canary and stays quiet" {
+    CANARY_ENABLED=false
+    run --separate-stderr canary_main 2
+    [ "$status" -eq 2 ]
+    ! cloned
+    [ -z "$(attempts_of 8901)" ]
+    [ ! -f "$STUB_DIR/notify.log" ]
+}
+
+@test "an empty CANARY_REPO notifies canary.unconfigured and consumes no attempt" {
+    CANARY_REPO=""
+    run --separate-stderr canary_main 2
+    [ "$status" -eq 2 ]
+    ! cloned
+    [ -z "$(attempts_of 8901)" ]
+    notify_log | grep -q 'warn canary.unconfigured'
+    gen_read 8901
+    [ "$GEN_STATE" = "candidate" ]
+}
+
+@test "an unresolvable canary org consumes no attempt" {
+    CANARY_ORG=nosuchorg
+    run --separate-stderr canary_main 2
+    [ "$status" -eq 2 ]
+    ! cloned
+    [ -z "$(attempts_of 8901)" ]
+    notify_log | grep -q 'warn canary.unconfigured'
+}
+
+@test "an empty CANARY_ORG falls back to the only configured org" {
+    CANARY_ORG=""
+    run --separate-stderr canary_main 2
+    [ "$status" -eq 0 ]
+    grep -q 'canary-gen2 acme 8901' "$STUB_DIR/clone.log"
+}
+
+@test "an empty CANARY_ORG with several orgs configured is unconfigured, not a guess" {
+    write_org_config beta ghp_beta beta-org
+    CANARY_ORG=""
+    run --separate-stderr canary_main 2
+    [ "$status" -eq 2 ]
+    ! cloned
+    notify_log | grep -q 'warn canary.unconfigured'
+    [[ "$stderr" == *"CANARY_ORG"* ]]
+}
+
+@test "a missing workflow file consumes no attempt and names the workflow" {
+    api_response '*/repos/acme-org/canary-repo/actions/workflows/runner-canary.yml' 404 <<'EOF'
+{"message": "Not Found"}
+EOF
+    run --separate-stderr canary_main 2
+    [ "$status" -eq 2 ]
+    ! cloned
+    [ -z "$(attempts_of 8901)" ]
+    notify_log | grep -q 'warn canary.unconfigured'
+    notify_log | grep -q 'runner-canary.yml'
+}
+
+@test "a disabled workflow consumes no attempt" {
+    api_response '*/repos/acme-org/canary-repo/actions/workflows/runner-canary.yml' 200 <<'EOF'
+{"id": 4242, "state": "disabled_manually", "path": ".github/workflows/runner-canary.yml"}
+EOF
+    run --separate-stderr canary_main 2
+    [ "$status" -eq 2 ]
+    ! cloned
+    notify_log | grep -q 'warn canary.unconfigured'
+}
+
+@test "a repo the PAT cannot see consumes no attempt" {
+    api_response '*/repos/acme-org/canary-repo' 404 <<'EOF'
+{"message": "Not Found"}
+EOF
+    run --separate-stderr canary_main 2
+    [ "$status" -eq 2 ]
+    ! cloned
+    [ -z "$(attempts_of 8901)" ]
+    notify_log | grep -q 'warn canary.unconfigured'
+}
+
+# ---------------------------------------------------------------------------
+# Issue 22 item 8: PAT scope validated up front, naming the missing scope.
+# ---------------------------------------------------------------------------
+
+@test "a classic PAT without repo scope is refused by name before any clone" {
+    stub_scopes 'admin:org'
+    run --separate-stderr canary_main 2
+    [ "$status" -eq 2 ]
+    ! cloned
+    [ -z "$(attempts_of 8901)" ]
+    notify_log | grep -q 'warn canary.unconfigured'
+    notify_log | grep -q "'repo' scope"
+    [[ "$stderr" == *"'repo' scope"* ]]
+}
+
+@test "public_repo is enough for a public canary repo" {
+    stub_scopes 'admin:org, public_repo'
+    api_response '*/repos/acme-org/canary-repo' 200 <<'EOF'
+{"default_branch": "main", "private": false, "full_name": "acme-org/canary-repo"}
+EOF
+    run --separate-stderr canary_main 2
+    [ "$status" -eq 0 ]
+    cloned
+}
+
+@test "public_repo is not enough for a private canary repo" {
+    stub_scopes 'admin:org, public_repo'
+    run --separate-stderr canary_main 2
+    [ "$status" -eq 2 ]
+    ! cloned
+    notify_log | grep -q 'warn canary.unconfigured'
+}
+
+@test "a fine-grained PAT that exposes no scope header is not refused" {
+    # Fine-grained tokens carry no X-OAuth-Scopes at all. Refusing them here
+    # would make the canary unusable for every least-privilege token; the
+    # dispatch response is what classifies them instead.
+    stub_scopes
+    run --separate-stderr canary_main 2
+    [ "$status" -eq 0 ]
+    cloned
+}
+
+@test "a PAT GitHub rejects outright consumes no attempt" {
+    stub_out curl '*-D -*api.github.com/' <<'EOF'
+HTTP/2 401
+
+401
+EOF
+    run --separate-stderr canary_main 2
+    [ "$status" -eq 2 ]
+    ! cloned
+    [ -z "$(attempts_of 8901)" ]
+    notify_log | grep -q 'warn canary.unconfigured'
+}
+
+@test "the canary PAT never reaches curl argv" {
+    run --separate-stderr canary_main 2
+    [ "$status" -eq 0 ]
+    ! stub_calls curl | grep -q 'ghp_'
+    stub_calls curl | grep -q -- '--config -'
+    # A process-substitution fd would keep it off argv too, and is banned:
+    # see the comment on github_runners_snapshot.
+    ! grep -q 'config <(' "$REPO_ROOT/lib/canary.sh"
+}

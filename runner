@@ -22,6 +22,7 @@ case "$COMMAND" in
     guard)     exec "$SCRIPT_DIR/lib/guard.sh" "$@" ;;
     gc)        exec "$SCRIPT_DIR/lib/gc.sh" "$@" ;;
     bake)      exec "$SCRIPT_DIR/lib/bake.sh" "$@" ;;
+    canary)    exec "$SCRIPT_DIR/lib/canary.sh" "$@" ;;
     promote)   exec "$SCRIPT_DIR/lib/promote.sh" "$@" ;;
     rollback)  exec "$SCRIPT_DIR/lib/rollback.sh" "$@" ;;
     rollover)  exec "$SCRIPT_DIR/lib/rollover.sh" "$@" ;;
@@ -47,6 +48,7 @@ case "$COMMAND" in
         echo "  guard [--dry-run]           Reap stopped and over-age runner VMs (run by timer)"
         echo "  gc [--dry-run]              Garbage-collect drained template generations"
         echo "  bake [--force] [--dry-run]  Bake a new candidate generation"
+        echo "  canary <id>                 Run the canary gate against a candidate generation"
         echo "  promote <id> [--skip-canary] Promote a candidate generation to active"
         echo "  rollback [--reason <text>]  Restore the previous generation and reject the current"
         echo "  rollover [--force]          Report or recycle idle old-generation runners"
