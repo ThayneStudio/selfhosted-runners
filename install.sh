@@ -132,7 +132,7 @@ if [[ -f /etc/github-runners.conf ]]; then
          "$(conf_value MAX_VM_LIFETIME_HOURS)h, and ones stopped longer than" \
          "$(conf_value STOPPED_REAP_MINUTES)m."
     echo "    Preview: runner guard --dry-run   Disable: systemctl disable --now github-runner-guard.timer"
-    echo "  Daily maintain timer: 02:30 (detect + rebake inside REBAKE_WINDOW)."
+    echo "  Daily maintain timer: 02:30 (reconcile, gc, canary, bake inside REBAKE_WINDOW, drift)."
     echo "    Disable: systemctl disable --now github-runner-maintain.timer"
     echo "  Drift alarm: every 6h (runner version vs the 30-day upstream window)."
     echo "    Disable: systemctl disable --now github-runner-drift.timer"

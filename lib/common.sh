@@ -163,6 +163,11 @@ DETECT_FAIL_FILE="$RUNNER_STATE_DIR/detect-fail"
 # Consecutive GitHub API failures for the drift alarm (lib/drift.sh).
 # shellcheck disable=SC2034
 DRIFT_FAIL_FILE="$RUNNER_STATE_DIR/drift-fail"
+# Steady-state cycle notices already sent (lib/maintain.sh). A daily timer that
+# re-notified an unchanged condition every run would train the operator to
+# ignore the webhook, so each notice is keyed and only re-sent when it changes.
+# shellcheck disable=SC2034
+MAINTAIN_NOTICE_FILE="$RUNNER_STATE_DIR/maintain-notices"
 CLOUD_IMG="noble-server-cloudimg-amd64.img"
 # shellcheck disable=SC2034  # consumed by bake, detect, promote, maintain
 CLOUD_IMG_URL="https://cloud-images.ubuntu.com/noble/current/${CLOUD_IMG}"
@@ -656,7 +661,7 @@ reserve_vmid() {
 
 release_vmid_reservation() {
     local vmid="${1:-${RESERVED_VMID:-}}"
-    exec 203>&- 2>/dev/null || true
+    exec 203>&- || true
     [[ -n "$vmid" ]] && rm -f "$(vmid_reservation_lock_file "$vmid")" 2>/dev/null || true
 }
 
@@ -687,7 +692,7 @@ acquire_clone_slot() {
 }
 
 release_clone_slot() {
-    exec 204>&- 2>/dev/null || true
+    exec 204>&- || true
 }
 
 # Base volume ids of a template VM. Defaults to the active TEMPLATE_ID so
@@ -1602,11 +1607,11 @@ clone_runner() {
             }
             if flock -n 211; then
                 rm -f "$PROMOTION_PAUSE_FILE"
-                exec 211>&- 2>/dev/null || true
+                exec 211>&- || true
                 log_warn "clone_runner: removed stale promotion pause file"
                 break
             fi
-            exec 211>&- 2>/dev/null || true
+            exec 211>&- || true
             log_info "clone_runner: promotion in progress, will retry"
             _pool_lock_release
             return 3

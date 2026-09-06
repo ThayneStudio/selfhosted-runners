@@ -149,6 +149,8 @@ After setup, the `runner` command is available globally:
 | `runner guard [--dry-run]` | Reap stopped and over-age runner VMs (normally run by timer) |
 | `runner gc [--dry-run]` | Collect drained template generations according to retention policy |
 | `runner canary <id>` | Run the canary gate against a candidate generation |
+| `runner maintain [--skip-<stage>]` | Run one unattended cycle (run by a daily timer) |
+| `runner drift` | Report the fleet runner version against the 30-day window |
 | `runner upgrade [--dry-run] [--force]` | Bake a candidate if needed and promote it |
 | `runner help` | Show available commands |
 
@@ -693,6 +695,50 @@ the host-side freeze is the assignment boundary; the REST `busy` field is not
 treated as a lock. Interrupted operations are recovered from
 `/var/lib/github-runners/rollover-pending`, and the watcher may refill a slot
 while it keeps retrying destruction of a deregistered residual by VMID.
+
+## Unattended Maintenance (`runner maintain`)
+
+`github-runner-maintain.timer` runs `runner maintain` daily at 02:30 — inside
+the default `REBAKE_WINDOW` — with `Persistent=true`, so a run missed while the
+host was down fires once it comes back. One cycle does, in order:
+
+1. **Adopt** a deployed template that is not yet in the generation store.
+2. **Reconcile** interrupted states: a stale promotion pause, two generations
+   marked active, and `baking` records whose bake lock is free (a held lock
+   means a bake is genuinely still running, so the record is left alone).
+3. **Garbage-collect** drained generations.
+4. **Canary-gate** a candidate. On a pass it is promoted; a failed attempt is
+   retried on the next cycle up to `CANARY_MAX_ATTEMPTS`; a spent budget fails
+   the generation and memoes its digest. With `CANARY_ENABLED=false` the
+   candidate is left for the operator and reported once, not every cycle.
+5. **Detect and bake** if the digest changed or the weekly floor is due — and
+   canary the image it just baked, in the same cycle.
+6. **Drift check** against the 30-day `actions/runner` window.
+
+Only the bake *start* is gated: outside `REBAKE_WINDOW`, or with
+`REBAKE_ENABLED=false`, every other stage still runs and the bake defers to the
+next window rather than being skipped for the day. A bake is never started on
+top of a candidate that has not been through the gate.
+
+Every stage is idempotent and individually skippable for a manual run:
+
+```bash
+runner maintain --skip-bake      # reconcile, gc, canary and drift only
+runner maintain --help           # all six --skip-<stage> flags
+```
+
+The cycle takes no lock of its own; each stage takes the same lock its own verb
+takes, so a manual `runner bake`, `gc`, `canary` or `promote` running at the
+same time is serialized rather than clobbered.
+
+```bash
+systemctl list-timers github-runner-maintain.timer
+journalctl -u github-runner-maintain.service -n 200
+systemctl disable --now github-runner-maintain.timer   # stop automated bakes
+```
+
+The drift alarm also keeps its own 6-hourly `github-runner-drift.timer`, so it
+still fires if the maintain cycle itself is wedged.
 
 ## Generation Garbage Collection
 
