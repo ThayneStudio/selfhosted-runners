@@ -262,40 +262,12 @@ CONF_TMP=$(mktemp "${CONFIG_FILE}.XXXXXX")
 chmod 600 "$CONF_TMP"
 mv "$CONF_TMP" "$CONFIG_FILE"
 
-# Re-render any existing org snippets from the current runner-user-data template.
-# This keeps cloned runners aligned with updated bootstrap settings and mirror config.
-if compgen -G "$ORG_CONFIG_DIR/*.conf" > /dev/null; then
-    log_info "Refreshing existing runner cloud-init snippets..."
-    for org_conf in "$ORG_CONFIG_DIR"/*.conf; do
-        [[ -f "$org_conf" ]] || continue
-        GITHUB_PAT="" GITHUB_ORG=""
-        # shellcheck source=/dev/null
-        source "$org_conf"
-        [[ -n "$GITHUB_PAT" && -n "$GITHUB_ORG" ]] || continue
-
-        snippet_tmp=$(mktemp "$SNIPPETS_DIR/.runner-user-data-${GITHUB_ORG}.XXXXXX")
-        chmod 600 "$snippet_tmp"
-        GITHUB_PAT="$GITHUB_PAT" GITHUB_ORG="$GITHUB_ORG" DOCKER_MIRROR_URL="${DOCKER_MIRROR_URL:-}" awk '
-        function lreplace(str, old, new,    i, result) {
-            result = ""
-            while ((i = index(str, old)) > 0) {
-                result = result substr(str, 1, i - 1) new
-                str = substr(str, i + length(old))
-            }
-            return result str
-        }
-        {
-            $0 = lreplace($0, "{{GITHUB_PAT}}", ENVIRON["GITHUB_PAT"])
-            $0 = lreplace($0, "{{GITHUB_ORG}}", ENVIRON["GITHUB_ORG"])
-            $0 = lreplace($0, "{{DOCKER_MIRROR_URL}}", ENVIRON["DOCKER_MIRROR_URL"])
-            print
-        }' "$INSTALL_DIR/templates/runner-user-data.yaml" > "$snippet_tmp" || {
-            log_error "Failed to regenerate cloud-init snippet for $GITHUB_ORG"
-            exit 1
-        }
-        mv "$snippet_tmp" "$SNIPPETS_DIR/runner-user-data-${GITHUB_ORG}.yaml"
-        log_info "  Updated snippet for $GITHUB_ORG"
-    done
+# Prune obsolete per-org snippets that embedded the org PAT. Cloud-init is now
+# rendered per-VM at clone time with a single-use JIT config; the PAT stays
+# on the host.
+if compgen -G "$SNIPPETS_DIR/runner-user-data-*.yaml" > /dev/null; then
+    rm -f "$SNIPPETS_DIR"/runner-user-data-*.yaml
+    log_info "Removed obsolete per-org PAT snippets"
 fi
 
 # Check if template already exists
@@ -358,13 +330,15 @@ else
     fi
 fi
 
-log_info "[5/5] Installing pool watcher, lifetime guard, and maintain timers..."
+log_info "[5/5] Installing pool watcher, lifetime guard, maintain, and drift timers..."
 cp "$INSTALL_DIR/templates/github-runner-watch.service" "$SYSTEMD_UNIT_DIR/"
 cp "$INSTALL_DIR/templates/github-runner-watch.timer" "$SYSTEMD_UNIT_DIR/"
 cp "$INSTALL_DIR/templates/github-runner-guard.service" "$SYSTEMD_UNIT_DIR/"
 cp "$INSTALL_DIR/templates/github-runner-guard.timer" "$SYSTEMD_UNIT_DIR/"
 cp "$INSTALL_DIR/templates/github-runner-maintain.service" "$SYSTEMD_UNIT_DIR/"
 cp "$INSTALL_DIR/templates/github-runner-maintain.timer" "$SYSTEMD_UNIT_DIR/"
+cp "$INSTALL_DIR/templates/github-runner-drift.service" "$SYSTEMD_UNIT_DIR/"
+cp "$INSTALL_DIR/templates/github-runner-drift.timer" "$SYSTEMD_UNIT_DIR/"
 cp "$INSTALL_DIR/templates/github-runner-upgrade.service" "$SYSTEMD_UNIT_DIR/"
 mkdir -p "$LOGROTATE_DIR"
 cp "$INSTALL_DIR/templates/github-runners.logrotate" "$LOGROTATE_DIR/github-runners"
@@ -372,12 +346,15 @@ systemctl daemon-reload
 systemctl enable --now github-runner-watch.timer 2>/dev/null || true
 systemctl enable --now github-runner-guard.timer 2>/dev/null || true
 systemctl enable --now github-runner-maintain.timer 2>/dev/null || true
+systemctl enable --now github-runner-drift.timer 2>/dev/null || true
 log_info "Pool watcher timer installed (30s interval)"
 log_info "Lifetime guard timer installed (5m interval, ${MAX_VM_LIFETIME_HOURS}h VM ceiling, ${STOPPED_REAP_MINUTES}m stopped reap)"
 log_info "Maintain timer installed (daily 02:30, rebake inside REBAKE_WINDOW)"
+log_info "Drift timer installed (every 6h; reports only, never bakes)"
 echo "  Preview what it would destroy:  runner guard --dry-run"
 echo "  Turn it off:                    systemctl disable --now github-runner-guard.timer"
 echo "  Disable daily maintain:         systemctl disable --now github-runner-maintain.timer"
+echo "  Disable drift alarm:            systemctl disable --now github-runner-drift.timer"
 echo "  Bake and promote a new generation:"
 echo "    runner upgrade --dry-run"
 echo "    runner upgrade"
@@ -400,9 +377,7 @@ else
     echo "To add another org:  runner add-org"
     echo "To list orgs:        runner list-orgs"
     echo ""
-    echo "Usage:"
-    echo "  runner create runner-01"
-    echo "  runner list"
-    echo "  runner help"
+    log_warn "Running VMs still have the old PAT on their cloud-init drive until recycled."
+    log_warn "Recycle the pool before the next job: runner stop && runner start"
     echo ""
 fi

@@ -42,11 +42,9 @@ if [[ -n "$ALL_VMS" ]]; then
         if [[ -n "$TEMPLATE_ID" && "$VMID" == "$TEMPLATE_ID" ]]; then
             continue
         fi
-        # Only count VMs with runner cloud-init config
-        VM_CONFIG=$(qm config "$VMID" 2>/dev/null || true)
-        CICUSTOM=$(echo "$VM_CONFIG" | grep "^cicustom:" || true)
-        if [[ "$CICUSTOM" == *"runner-user-data"* ]]; then
-            VM_ORG=$(get_vm_org "$VMID")
+        # Only count VMs identifiable as runners (have a runner cloud-init snippet)
+        VM_ORG=$(get_vm_org "$VMID")
+        if [[ "$VM_ORG" != "unknown" ]]; then
             org_runner_counts[$VM_ORG]=$(( ${org_runner_counts[$VM_ORG]:-0} + 1 ))
         fi
     done <<< "$ALL_VMS"

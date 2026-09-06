@@ -23,9 +23,17 @@ qm config "$TEMPLATE_ID" 2>/dev/null | grep -q "^template: 1" || exit 0
 # Reap zvols left behind by failed clones before computing missing slots, so
 # VMIDs whose only residue was an orphan zvol become available for refill.
 cleanup_runner_orphan_volumes
+recover_rollover_pending
 
-# Snapshot all VM names once
-ALL_VM_NAMES=$(qm list 2>/dev/null | awk 'NR>1 {print $2}') || exit 0
+# Snapshot all VM names once. A committed rollover residual is already frozen
+# and deregistered, so it does not occupy its logical slot while durable
+# recovery keeps retrying the physical destroy.
+ALL_VM_NAMES=$(qm list 2>/dev/null | awk 'NR>1 {print $1 "|" $2}' | while IFS='|' read -r vmid name; do
+    if rollover_vmid_is_committed_pending "$vmid"; then
+        continue
+    fi
+    printf '%s\n' "$name"
+done) || exit 0
 
 # Collect ALL missing slots across ALL orgs
 MISSING=()
@@ -39,7 +47,6 @@ for org in "${ORGS[@]}"; do
     count="${count:-0}"
     prefix="${prefix:-runner}"
     [[ "$count" =~ ^[0-9]+$ && "$count" -gt 0 ]] || continue
-    [[ -f "$SNIPPETS_DIR/runner-user-data-${org}.yaml" ]] || continue
 
     for n in $(seq 1 "$count"); do
         slot="${prefix}-${n}"

@@ -118,9 +118,9 @@ create_full_record() {
     gen_create 8903 GEN_ID=1 GEN_STATE=baking
     gen_transition 8903 failed "$(printf 'bake timed out\nafter 5400s')"
 
-    # One line per field, still thirteen of them: an unfolded newline would
+    # One line per field, still sixteen of them: an unfolded newline would
     # split the record and the next read would report it as malformed.
-    [ "$(grep -c '^GEN_' "$GENERATIONS_DIR/8903.conf")" = "13" ]
+    [ "$(grep -c '^GEN_' "$GENERATIONS_DIR/8903.conf")" = "16" ]
     gen_read 8903
     [ "$GEN_FAILED_REASON" = "bake timed out after 5400s" ]
 }
@@ -610,7 +610,8 @@ create_full_record() {
         "candidate failed" \
         "active superseded" \
         "active rejected" \
-        "superseded active"; do
+        "superseded active" \
+        "superseded rejected"; do
         from="${pair% *}"
         to="${pair#* }"
 
@@ -630,7 +631,7 @@ create_full_record() {
                 baking:candidate|baking:failed) continue ;;
                 candidate:active|candidate:superseded|candidate:failed) continue ;;
                 active:superseded|active:rejected) continue ;;
-                superseded:active) continue ;;
+                superseded:active|superseded:rejected) continue ;;
             esac
             run gen_transition_allowed "$from" "$to"
             [ "$status" -eq 1 ]
@@ -758,6 +759,7 @@ create_full_record() {
     gen_read 8903
     [ "$GEN_STATE" = "failed" ]
     [ "$GEN_FAILED_REASON" = "image checksum mismatch after retry" ]
+    [[ "$GEN_TERMINAL_AT" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]
 }
 
 @test "a transition with no reason does not erase one already recorded" {
@@ -785,6 +787,7 @@ create_full_record() {
     [ "$GEN_STATE" = "rejected" ]
     [ "$GEN_FAILED_REASON" = "rolled back by ops: playwright browsers missing" ]
     [[ "$GEN_SUPERSEDED_AT" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]
+    [ "$GEN_TERMINAL_AT" = "$GEN_SUPERSEDED_AT" ]
 }
 
 # ---------------------------------------------------------------------------
@@ -851,6 +854,129 @@ create_full_record() {
     wait "$writer" 2>/dev/null || true
 
     [ ! -e "$record" ]
+}
+
+# ---------------------------------------------------------------------------
+# Rollback target selection (spec 9, 15)
+# ---------------------------------------------------------------------------
+
+@test "gen_rollback_target picks the newest superseded, not the highest GEN_ID" {
+    gen_create 8900 \
+        GEN_ID=9 \
+        GEN_STATE=superseded \
+        GEN_PROMOTED_AT=2026-07-01T00:00:00Z \
+        GEN_SUPERSEDED_AT=2026-08-01T00:00:00Z
+    gen_create 8901 \
+        GEN_ID=1 \
+        GEN_STATE=superseded \
+        GEN_PROMOTED_AT=2026-08-10T00:00:00Z \
+        GEN_SUPERSEDED_AT=2026-08-20T00:00:00Z
+    gen_create 8902 \
+        GEN_ID=2 \
+        GEN_STATE=active \
+        GEN_PROMOTED_AT=2026-08-20T00:00:00Z
+
+    run gen_rollback_target 2
+    [ "$status" -eq 0 ]
+    [ "$output" = "8901" ]
+}
+
+@test "gen_rollback_target never returns a rejected generation" {
+    gen_create 8900 \
+        GEN_ID=99 \
+        GEN_STATE=rejected \
+        GEN_PROMOTED_AT=2026-08-20T00:00:00Z \
+        GEN_SUPERSEDED_AT=2026-08-25T00:00:00Z \
+        GEN_FAILED_REASON='rolled back'
+    gen_create 8901 \
+        GEN_ID=1 \
+        GEN_STATE=superseded \
+        GEN_PROMOTED_AT=2026-08-01T00:00:00Z \
+        GEN_SUPERSEDED_AT=2026-08-10T00:00:00Z
+    gen_create 8902 \
+        GEN_ID=2 \
+        GEN_STATE=active \
+        GEN_PROMOTED_AT=2026-08-25T00:00:00Z
+
+    run gen_rollback_target 2
+    [ "$status" -eq 0 ]
+    [ "$output" = "8901" ]
+}
+
+@test "gen_rollback_target skips a higher GEN_ID leftover from an incomplete rollback" {
+    gen_create 8900 \
+        GEN_ID=99 \
+        GEN_STATE=superseded \
+        GEN_PROMOTED_AT=2026-08-20T00:00:00Z \
+        GEN_SUPERSEDED_AT=2026-08-25T00:00:00Z
+    gen_create 8901 \
+        GEN_ID=1 \
+        GEN_STATE=superseded \
+        GEN_PROMOTED_AT=2026-08-01T00:00:00Z \
+        GEN_SUPERSEDED_AT=2026-08-10T00:00:00Z
+    gen_create 8902 \
+        GEN_ID=2 \
+        GEN_STATE=active \
+        GEN_PROMOTED_AT=2026-08-25T00:00:00Z
+
+    run gen_rollback_target 2
+    [ "$status" -eq 0 ]
+    [ "$output" = "8901" ]
+}
+
+@test "gen_rollback_target fails closed when nothing is retained" {
+    gen_create 8902 \
+        GEN_ID=1 \
+        GEN_STATE=active \
+        GEN_PROMOTED_AT=2026-08-01T00:00:00Z
+    gen_create 8900 \
+        GEN_ID=99 \
+        GEN_STATE=rejected \
+        GEN_PROMOTED_AT=2026-08-20T00:00:00Z
+
+    run gen_rollback_target 1
+    # Exit 2, not a bare 1: distinct from a read/validation failure (issue
+    # #19 review round 2) so a caller that must fail closed on a genuine
+    # error (GC's retention) can still safely treat "nothing retained" as
+    # "collect everything".
+    [ "$status" -eq 2 ]
+    [[ "$output" == *"No retained"* ]]
+}
+
+@test "a superseded generation with no GEN_PROMOTED_AT is not a rollback target" {
+    gen_create 8900 \
+        GEN_ID=9 \
+        GEN_STATE=superseded \
+        GEN_SUPERSEDED_AT=2026-08-20T00:00:00Z
+    gen_create 8902 \
+        GEN_ID=1 \
+        GEN_STATE=active \
+        GEN_PROMOTED_AT=2026-08-20T00:00:00Z
+
+    run gen_rollback_target 1
+    [ "$status" -eq 2 ]
+}
+
+# gen_rollback_target shares gen_record_is_rollback_eligible with lib/gc.sh's
+# own retention policy (spec 9/15) so the two can never disagree about which
+# generation is "the retained previous one" — see the matching gc.bats test
+# "a pre-field superseded adopted gen-1 remains the rollback target".
+@test "gen_rollback_target accepts a legacy-adopted generation with no promotion timestamp" {
+    apply_generation_defaults
+    gen_create 9000 \
+        GEN_ID=1 \
+        GEN_STATE=superseded \
+        GEN_IMAGE_SHA256=unknown \
+        GEN_TEMPLATE_DIGEST=unknown \
+        GEN_SUPERSEDED_AT=2026-08-20T00:00:00Z
+    gen_create 8903 \
+        GEN_ID=2 \
+        GEN_STATE=active \
+        GEN_PROMOTED_AT=2026-08-20T00:00:00Z
+
+    run gen_rollback_target 2
+    [ "$status" -eq 0 ]
+    [ "$output" = "9000" ]
 }
 
 # ---------------------------------------------------------------------------
@@ -944,4 +1070,18 @@ after 5400s"
     run gen_archive_append "six" 8902 destroyed
     [ "$status" -eq 1 ]
     [ ! -e "$GENERATION_ARCHIVE_LOG" ]
+}
+
+@test "gen_age_days is 10 for a stamp 10 days before gen_now" {
+    gen_now() { printf '%s\n' '2026-08-25T00:00:00Z'; }
+    run gen_age_days '2026-08-15T00:00:00Z'
+    [ "$status" -eq 0 ]
+    [ "$output" = "10" ]
+}
+
+@test "gen_age_days strips fractional seconds from GitHub timestamps" {
+    gen_now() { printf '%s\n' '2026-08-11T00:00:00Z'; }
+    run gen_age_days '2026-08-01T12:00:00.123Z'
+    [ "$status" -eq 0 ]
+    [ "$output" = "9" ]
 }

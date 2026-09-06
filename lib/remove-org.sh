@@ -81,8 +81,10 @@ if [[ $RUNNER_COUNT -gt 0 ]]; then
 fi
 
 echo "This will remove:"
-echo "  Config:  $ORG_CONFIG_DIR/${ORG_NAME}.conf"
-echo "  Snippet: $SNIPPETS_DIR/runner-user-data-${ORG_NAME}.yaml"
+echo "  Config:         $ORG_CONFIG_DIR/${ORG_NAME}.conf"
+echo "  Legacy snippet: $SNIPPETS_DIR/runner-user-data-${ORG_NAME}.yaml (if present)"
+echo ""
+echo "Per-VM snippets are cleaned up when each runner is destroyed."
 echo ""
 read -rp "Type 'yes' to confirm removal of '$ORG_NAME': " CONFIRM
 
@@ -92,7 +94,7 @@ if [[ "$CONFIRM" != "yes" ]]; then
 fi
 
 rm -f "$ORG_CONFIG_DIR/${ORG_NAME}.conf"
-rm -f "$SNIPPETS_DIR/runner-user-data-${ORG_NAME}.yaml"
+rm -f "$SNIPPETS_DIR/runner-user-data-${ORG_NAME}.yaml"  # legacy per-org snippet (no-op on new installs)
 
 echo ""
 log_info "Organization '$ORG_NAME' removed."

@@ -1,0 +1,13 @@
+[Unit]
+Description=GitHub Actions runner drift alarm
+# GitHub API plus optional qm guest exec against a running clone.
+After=network-online.target pve-cluster.service pvedaemon.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/runner drift
+TimeoutStartSec=300
+MemoryMax=512M
+CPUQuota=200%
+SyslogIdentifier=github-runner-drift

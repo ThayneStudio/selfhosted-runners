@@ -16,9 +16,8 @@ write_files:
   - path: /etc/github-runner/config.env
     permissions: '0600'
     content: |
-      GITHUB_PAT="{{GITHUB_PAT}}"
+      JIT_CONFIG="{{JIT_CONFIG}}"
       GITHUB_ORG="{{GITHUB_ORG}}"
-      RUNNER_LABELS="self-hosted,linux,x64"
       DOCKER_MIRROR_URL="{{DOCKER_MIRROR_URL}}"
 
   - path: /opt/register-runner.sh
@@ -36,7 +35,7 @@ write_files:
       # EXIT fires on any exit — ERR does NOT fire for handled errors (|| blocks).
       trap 'log "Shutting down VM..."; shutdown -h now' EXIT
 
-      log "=== GitHub Actions Runner Registration ==="
+      log "=== GitHub Actions Runner (JIT) ==="
 
       # Validate environment
       if [[ ! -f /etc/github-runner/config.env ]]; then
@@ -46,15 +45,10 @@ write_files:
 
       source /etc/github-runner/config.env
 
-      # Override labels if vendor-data provided a labels.env
-      if [[ -f /etc/github-runner/labels.env ]]; then
-        source /etc/github-runner/labels.env
-      fi
-
-      # Validate required variables
-      : ${GITHUB_PAT:?GITHUB_PAT not set}
-      : ${GITHUB_ORG:?GITHUB_ORG not set}
-      : ${RUNNER_LABELS:=self-hosted,linux,x64}
+      # The JIT config is minted on the Proxmox host and injected via cloud-init;
+      # the org PAT never enters this VM. Labels and the runner name are baked
+      # into the config, so no config.sh registration step is needed.
+      : ${JIT_CONFIG:?JIT_CONFIG not set}
 
       # Configure Docker mirror if set. Transparent pull-through cache
       # for public.ecr.aws via containerd's per-registry host config.
@@ -114,8 +108,9 @@ write_files:
       RUNNER_USER=runner
 
       # Verify runner binary exists (should be baked into template)
-      if [[ ! -f "$RUNNER_HOME/config.sh" ]]; then
-        log_error "Runner binary not found at $RUNNER_HOME/config.sh"
+      # JIT runners never call config.sh, so run.sh is the binary that must exist.
+      if [[ ! -f "$RUNNER_HOME/run.sh" ]]; then
+        log_error "Runner binary not found at $RUNNER_HOME/run.sh"
         log_error "The VM template may not have been baked correctly. Run 'runner upgrade'."
         exit 1
       fi
@@ -133,7 +128,7 @@ write_files:
       fi
 
       # Wait for network connectivity
-      log "[1/3] Checking network connectivity..."
+      log "[1/2] Checking network connectivity..."
       for i in {1..30}; do
         if curl -sf --max-time 5 https://github.com > /dev/null 2>&1; then
           log "Network connectivity confirmed"
@@ -147,83 +142,29 @@ write_files:
         sleep 2
       done
 
-      log "[2/3] Registering runner with GitHub..."
-      # Get registration token with error details
-      # Pass auth header via file descriptor to avoid leaking PAT in /proc/PID/cmdline
-      REG_RESPONSE=$(curl -sf --retry 3 -X POST \
-        -H "Accept: application/vnd.github.v3+json" \
-        --config <(printf 'header = "Authorization: token %s"\n' "$GITHUB_PAT") \
-        "https://api.github.com/orgs/${GITHUB_ORG}/actions/runners/registration-token" 2>&1) || {
-        log_error "Failed to get registration token from GitHub API"
-        log_error "Response: $REG_RESPONSE"
-        exit 1
-      }
-
-      REG_TOKEN=$(echo "$REG_RESPONSE" | jq -r .token)
-      if [[ "$REG_TOKEN" == "null" || -z "$REG_TOKEN" ]]; then
-        log_error "Invalid registration token received"
-        log_error "Response: $REG_RESPONSE"
-        log_error "Check that your PAT has 'admin:org' scope"
-        exit 1
-      fi
-
-      # Configure runner as ephemeral (retry on timeout — simultaneous VMs can overload the API)
-      #
-      # --disableupdate: these VMs are ephemeral clones of a baked template, so a
-      # runner self-update would re-download the ~225MB runner package on EVERY
-      # job boot until the template is rebaked.
-      #
-      # The trade-off: the template MUST be rebaked within 30 days of a new runner
-      # release (sooner for critical security updates) or GitHub stops queuing jobs
-      # to these runners. Registration still SUCCEEDS -- runners appear Online/Idle
-      # while jobs queue forever, which reads like a GitHub outage rather than a
-      # stale template. Keep the rebake schedule healthy.
-      #
-      # --no-default-labels when labels.env sets RUNNER_NO_DEFAULT_LABELS: config.sh
-      # otherwise adds self-hosted/Linux/X64, which would make a canary eligible
-      # for production jobs. Proven by "register-runner.sh passes --no-default-labels
-      # when RUNNER_NO_DEFAULT_LABELS=true".
-      extra=""
-      if [[ "${RUNNER_NO_DEFAULT_LABELS:-}" == "true" ]]; then
-        extra="--no-default-labels"
-      fi
-      for attempt in 1 2 3; do
-        if sudo -u $RUNNER_USER ./config.sh \
-          --url "https://github.com/${GITHUB_ORG}" \
-          --token "$REG_TOKEN" \
-          --name "$(hostname)" \
-          --labels "$RUNNER_LABELS" \
-          --unattended \
-          --replace \
-          --disableupdate \
-          --ephemeral \
-          ${extra:+"$extra"}; then
-          break
-        fi
-        if [[ $attempt -eq 3 ]]; then
-          log_error "Runner configuration failed after 3 attempts"
-          exit 1
-        fi
-        log "Config attempt $attempt failed, retrying in 10s..."
-        sleep 10
-      done
-      log "Runner configured successfully (ephemeral mode)"
+      # Capture the JIT config, then remove the at-rest filesystem copies before
+      # the job runs (the runner user has NOPASSWD sudo). NOTE: the config still
+      # lives on the attached cloud-init drive (/dev/sr0) and is on run.sh's
+      # command line while the runner is up, both readable in-guest — but it is
+      # SINGLE-USE, so a job that recovers it cannot register another runner.
+      JIT="$JIT_CONFIG"
+      rm -f /etc/github-runner/config.env
+      rm -f /var/lib/cloud/instance/user-data.txt* /var/lib/cloud/instances/*/user-data.txt* 2>/dev/null || true
 
       # Signal that the runner is ready
       touch /opt/.runner-ready
 
-      log "[3/3] Starting runner (ephemeral — will shut down after one job)..."
+      log "[2/2] Starting JIT runner (ephemeral — shuts down after one job)..."
       log "Runner name: $(hostname)"
-      log "Labels: $RUNNER_LABELS"
-      log "Organization: $GITHUB_ORG"
+      log "Organization: ${GITHUB_ORG:-unknown}"
 
-      # Run directly (not as systemd service). When the runner exits
-      # (job complete or error), the VM shuts down immediately.
-      # The Proxmox hookscript then destroys and reclones.
+      # Run directly with the JIT config (no config.sh registration needed; JIT
+      # runners are inherently ephemeral and auto-remove). When run.sh exits
+      # (job complete or error), the VM shuts down and the hookscript reclones.
       if [[ -n "${SUPABASE_IMAGE_REGISTRY:-}" ]]; then
-        sudo -u $RUNNER_USER env SUPABASE_INTERNAL_IMAGE_REGISTRY="$SUPABASE_IMAGE_REGISTRY" INTERNAL_IMAGE_REGISTRY="$SUPABASE_IMAGE_REGISTRY" ./run.sh || true
+        sudo -u $RUNNER_USER env SUPABASE_INTERNAL_IMAGE_REGISTRY="$SUPABASE_IMAGE_REGISTRY" INTERNAL_IMAGE_REGISTRY="$SUPABASE_IMAGE_REGISTRY" ./run.sh --jitconfig "$JIT" || true
       else
-        sudo -u $RUNNER_USER ./run.sh || true
+        sudo -u $RUNNER_USER ./run.sh --jitconfig "$JIT" || true
       fi
       # EXIT trap handles shutdown
 

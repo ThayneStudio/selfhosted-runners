@@ -27,7 +27,8 @@ if pool_is_draining; then
 fi
 
 # Read name and org from the stopped VM's config (still exists, just stopped)
-NAME=$(qm config "$VMID" 2>/dev/null | awk '/^name:/{print $2}') || true
+VM_CFG=$(qm config "$VMID" 2>/dev/null) || true
+NAME=$(awk '/^name:/{print $2}' <<< "$VM_CFG") || true
 ORG=$(get_vm_org "$VMID") || true
 
 if [[ -z "$NAME" || -z "$ORG" || "$ORG" == "unknown" ]]; then
@@ -39,9 +40,45 @@ fi
 exec 200>"${RUNNER_SLOT_LOCK_PREFIX}-${NAME}.lock"
 flock -n 200 || { log_info "reclone: another process is handling $NAME"; exit 0; }
 
+exec 209>"${ROLLOVER_ORG_LOCK_PREFIX}-${ORG}.lock"
+flock 209
+
 if pool_is_draining; then
     logger -t github-runner "reclone: pool drain active for $NAME, skipping"
     exit 0
+fi
+
+# Hold shared pool activity for the rest of this process so `runner stop`
+# (exclusive 202) waits out destroy + mint, not just the later qm clone.
+# clone_runner sees POOL_ACTIVITY_LOCK_HELD and will not reopen fd 202.
+#
+# Non-blocking on purpose. We already hold the slot lock (fd 200) and `runner
+# stop` takes the two the other way round — exclusive 202 first, then fd 200
+# inside destroy.sh — so waiting here would close an ABBA cycle and hang both
+# processes on a VM this script has not destroyed yet.
+#
+# When the lock is busy we still destroy below and skip only the clone. Bailing
+# out with the stopped VM still in place would be worse than useless: watch.sh
+# builds its slot inventory from `qm list`, which lists stopped VMs, so the slot
+# would read as filled and nothing would refill it until the lifetime guard's
+# stopped reap — up to ~15 minutes later, and that reap pages a warn-severity
+# stopped_vm.reaped for what was routine maintenance. `runner stop` is not the
+# common case here either; it sets the drain flag first, so the check above
+# already caught it. The exclusive holders that actually land here are
+# promote.sh, gc.sh, bake.sh and maintain.sh.
+#
+# Destroying without the lock breaks no guarantee: `runner stop` already
+# tolerates a VM vanishing mid-loop, and every exclusive holder is defending
+# against clones being *created* — a destroy only ever lowers a generation's
+# refcount, never raises it. The empty slot is then genuinely the watcher's to
+# refill on its next ~30s tick.
+POOL_ACTIVITY_LOCK_HELD=0
+exec 202>"$POOL_ACTIVITY_LOCK_FILE"
+if flock -s -n 202; then
+    POOL_ACTIVITY_LOCK_HELD=1
+else
+    exec 202>&-
+    log_info "reclone: pool activity locked by another maintenance operation; destroying $NAME without recloning"
 fi
 
 # Backoff: defer to the watcher only after N consecutive rapid deaths.
@@ -109,6 +146,14 @@ fi
 
 if pool_is_draining; then
     logger -t github-runner "reclone: pool drain active after destroy for $NAME, leaving slot empty"
+    exit 0
+fi
+
+# Only clone under the shared pool lock (see the fd 202 block above). The VM is
+# destroyed either way, so the slot is empty now — exactly the state watch.sh
+# exists to fix, on its next tick.
+if [[ "$POOL_ACTIVITY_LOCK_HELD" != 1 ]]; then
+    log_info "reclone: leaving the empty $NAME slot to the watcher"
     exit 0
 fi
 
