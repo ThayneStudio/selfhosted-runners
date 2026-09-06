@@ -288,36 +288,43 @@ gc_reconcile_candidates() {
 }
 
 gc_collect_superseded() {
-    local dry_run="$1" list vmid retain="" retain_id=-1 id blockers age
+    local dry_run="$1" list vmid retain="" blockers age
     local -a superseded=()
-    local active_id=""
+    local pointer active_id=""
 
-    # A rollback re-activates an older generation and leaves the one it
-    # escaped superseded by a later crash-reconcile (maintain_reconcile_two_
-    # actives), never rejected — with a GEN_ID higher than the now-active
-    # pointer's. Capping eligibility at the current active's id keeps that
-    # leftover from ever outranking the real previous generation here, the
-    # same guard gen_rollback_target applies via its own current-id argument
-    # (spec 15, issue #19) -- so GC's "newest superseded" and rollback's
-    # target can never name different VMIDs.
-    if [[ -n "${TEMPLATE_ID:-}" ]] && gen_exists "$TEMPLATE_ID"; then
-        gen_read "$TEMPLATE_ID" || return 1
-        active_id=$(gen_require_numeric_id "$TEMPLATE_ID") || return 1
+    # Retention must be the exact same *selection* gen_rollback_target makes,
+    # not a parallel highest-GEN_ID tiebreak of our own -- two independent
+    # algorithms can each look locally reasonable and still name different
+    # VMIDs as "the retained generation" (issue #19 review round 1). A
+    # rollback re-activates an older generation and leaves the one it escaped
+    # superseded by a later crash-reconcile (maintain_reconcile_two_actives),
+    # never rejected; only gen_rollback_target's own recency tiebreak (never
+    # highest GEN_ID, spec 15) reliably prefers the true previous generation
+    # over that leftover, including across any number of promotions that
+    # happen afterward. Re-reads the pointer with reload_active_template_id
+    # rather than trusting the in-memory TEMPLATE_ID, the same as
+    # gc_verify_destroy_ownership does immediately before a destroy: a
+    # destructive policy must not silently fall back to a less-safe rule just
+    # because its guard input could not be resolved.
+    pointer=$(reload_active_template_id) || pointer=""
+    if [[ -n "$pointer" ]] && gen_exists "$pointer"; then
+        gen_read "$pointer" || return 1
+        active_id=$(gen_require_numeric_id "$pointer") || return 1
+    else
+        log_warn "gc: could not resolve the active generation from TEMPLATE_ID — skipping superseded collection"
+        return 1
     fi
+
+    # Suppressed: "nothing retained" is the ordinary state of a fresh fleet
+    # or one already fully collected, not a gc.sh-level error -- callers that
+    # need to report it as one (gen_rollback_target's own direct callers) get
+    # gen_rollback_target's own log_error undisturbed.
+    retain=$(gen_rollback_target "$active_id" 2>/dev/null) || retain=""
 
     list=$(gen_list superseded) || return 1
     while read -r vmid; do
         [[ -n "$vmid" ]] || continue
         superseded+=("$vmid")
-        gen_read "$vmid" || return 1
-        id=$(gen_require_numeric_id "$vmid") || return 1
-        # An orphan candidate is superseded for cleanup, but has never served
-        # and therefore cannot displace a known-good rollback generation.
-        if gen_record_is_rollback_eligible && ((id > retain_id)) &&
-            { [[ -z "$active_id" ]] || ((id <= active_id)); }; then
-            retain_id="$id"
-            retain="$vmid"
-        fi
     done <<< "$list"
     if [[ "$dry_run" == "true" && ${#GC_PROJECTED_SUPERSEDED[@]} -gt 0 ]]; then
         superseded+=("${GC_PROJECTED_SUPERSEDED[@]}")

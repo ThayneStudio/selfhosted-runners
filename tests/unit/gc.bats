@@ -186,6 +186,83 @@ EOF
     refute_called qm 'destroy *'
 }
 
+@test "GC retention agrees with gen_rollback_target across a later promotion, not the highest GEN_ID" {
+    # Reachable sequence (issue #19 review round 1): generation 2 active,
+    # generation 3 promoted (2 -> superseded). Rollback restores 2 and
+    # crashes before reject, so the two-actives reconcile demotes 3 to
+    # superseded instead (spec 15) -- a leftover whose GEN_ID (3) is *below*
+    # the id of generation 4, promoted afterward by a routine bake/upgrade.
+    # A cap of "id <= active id" alone is not enough once a later promotion
+    # raises the active id past the leftover: retention has to keep matching
+    # gen_rollback_target's own recency tiebreak (generation 2, most
+    # recently superseded), never generation 3 (the escaped image, superseded
+    # earlier) and never generation 1 (lowest GEN_ID, oldest).
+    make_gen 8899 1 superseded
+    gen_update 8899 GEN_WAS_ACTIVE=1
+    gen_update 8899 GEN_SUPERSEDED_AT=2026-08-01T00:00:00Z
+    make_gen 8900 2 superseded
+    gen_update 8900 GEN_WAS_ACTIVE=1
+    gen_update 8900 GEN_PROMOTED_AT=2026-08-25T00:00:00Z
+    gen_update 8900 GEN_SUPERSEDED_AT=2026-08-30T00:00:00Z
+    make_gen 8901 3 superseded
+    gen_update 8901 GEN_WAS_ACTIVE=1
+    gen_update 8901 GEN_SUPERSEDED_AT=2026-08-26T00:00:00Z
+    make_gen 8903 4 active
+    stub_out qm 'status 8899' < /dev/null
+    stub_generation_template 8899 1
+    stub_out qm 'destroy 8899 --purge' < /dev/null
+    stub_out qm 'status 8901' < /dev/null
+    stub_generation_template 8901 3
+    stub_out qm 'destroy 8901 --purge' < /dev/null
+
+    run --separate-stderr gc_main false
+    [ "$status" -eq 0 ]
+    gen_exists 8900
+    [ "$(gen_state_of 8900)" = superseded ]
+    ! gen_exists 8899
+    ! gen_exists 8901
+    [[ "$stderr" == *"Retaining newest superseded generation 2 (VMID 8900)"* ]]
+}
+
+@test "GC retention agrees with gen_rollback_target when a migration-era record has no GEN_SUPERSEDED_AT" {
+    # A record from before GEN_SUPERSEDED_AT existed has nothing to compare;
+    # gen_rollback_target requires positive timestamp evidence and prefers
+    # any timestamped record over it regardless of GEN_ID -- the opposite of
+    # a bare highest-GEN_ID rule, which would prefer the untimestamped
+    # record here for having the higher id.
+    make_gen 8900 5 superseded
+    gen_update 8900 GEN_WAS_ACTIVE=1
+    make_gen 8899 3 superseded
+    gen_update 8899 GEN_WAS_ACTIVE=1
+    gen_update 8899 GEN_SUPERSEDED_AT=2026-08-20T00:00:00Z
+    make_gen 8903 6 active
+    stub_out qm 'status 8900' < /dev/null
+    stub_generation_template 8900 5
+    stub_out qm 'destroy 8900 --purge' < /dev/null
+
+    run --separate-stderr gc_main false
+    [ "$status" -eq 0 ]
+    gen_exists 8899
+    [ "$(gen_state_of 8899)" = superseded ]
+    ! gen_exists 8900
+    [[ "$stderr" == *"Retaining newest superseded generation 3 (VMID 8899)"* ]]
+}
+
+@test "gc skips superseded collection when the active pointer cannot be resolved" {
+    # TEMPLATE_ID (8903, from setup) never got a generation record -- an
+    # unresolvable pointer must not quietly fall back to a highest-GEN_ID
+    # guess for a destructive decision (issue #19 review round 1).
+    make_gen 8900 1 superseded
+    gen_update 8900 GEN_WAS_ACTIVE=1
+
+    run --separate-stderr gc_main false
+    [ "$status" -eq 1 ]
+    [[ "$stderr" == *"could not resolve the active generation"* ]]
+    gen_exists 8900
+    [ "$(gen_state_of 8900)" = superseded ]
+    refute_called qm 'destroy *'
+}
+
 @test "an orphan candidate cannot displace the prior-active rollback target" {
     make_gen 8900 1 superseded
     make_gen 8901 2 candidate
