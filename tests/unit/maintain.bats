@@ -726,3 +726,90 @@ EOF
     [ "$GEN_STATE" = "superseded" ]
     notify_log | grep -q 'warn'
 }
+
+@test "post-rollback two actives keep TEMPLATE_ID, never the highest GEN_ID" {
+    # Crash after rollback rewrote the pointer and re-activated gen 1, before
+    # the escaped generation was rejected. Highest GEN_ID is the image the
+    # operator just left.
+    gen_store_init
+    TEMPLATE_ID=9000
+    gen_create 9000 \
+        GEN_ID=1 \
+        GEN_STATE=active \
+        GEN_TEMPLATE_DIGEST=old \
+        GEN_IMAGE_SHA256=abc \
+        GEN_RUNNER_VERSION=2.335.0 \
+        GEN_PROMOTED_AT=2026-08-25T00:00:00Z
+    gen_create 8900 \
+        GEN_ID=99 \
+        GEN_STATE=active \
+        GEN_TEMPLATE_DIGEST=new \
+        GEN_IMAGE_SHA256=def \
+        GEN_RUNNER_VERSION=2.336.0 \
+        GEN_PROMOTED_AT=2026-08-20T00:00:00Z
+
+    run maintain_reconcile_two_actives
+    [ "$status" -eq 0 ]
+    gen_read 9000
+    [ "$GEN_STATE" = "active" ]
+    gen_read 8900
+    [ "$GEN_STATE" = "superseded" ]
+    notify_log | grep -q 'warn'
+}
+
+@test "reconcile never re-activates a rejected generation after rollback" {
+    gen_store_init
+    TEMPLATE_ID=9000
+    gen_create 9000 \
+        GEN_ID=1 \
+        GEN_STATE=active \
+        GEN_TEMPLATE_DIGEST=old \
+        GEN_IMAGE_SHA256=abc \
+        GEN_RUNNER_VERSION=2.335.0 \
+        GEN_PROMOTED_AT=2026-08-25T00:00:00Z
+    gen_create 8900 \
+        GEN_ID=99 \
+        GEN_STATE=rejected \
+        GEN_TEMPLATE_DIGEST=new \
+        GEN_IMAGE_SHA256=def \
+        GEN_RUNNER_VERSION=2.336.0 \
+        GEN_PROMOTED_AT=2026-08-20T00:00:00Z \
+        GEN_FAILED_REASON='jobs failing on 2.336.0'
+
+    run maintain_reconcile_two_actives
+    [ "$status" -eq 0 ]
+    gen_read 9000
+    [ "$GEN_STATE" = "active" ]
+    gen_read 8900
+    [ "$GEN_STATE" = "rejected" ]
+    [ ! -f "$STUB_DIR/notify.log" ] || ! grep -q 'generation.reconciled' "$STUB_DIR/notify.log"
+}
+
+@test "zero actives after rollback restores TEMPLATE_ID, not the rejected higher GEN_ID" {
+    gen_store_init
+    TEMPLATE_ID=9000
+    gen_create 9000 \
+        GEN_ID=1 \
+        GEN_STATE=superseded \
+        GEN_TEMPLATE_DIGEST=old \
+        GEN_IMAGE_SHA256=abc \
+        GEN_RUNNER_VERSION=2.335.0 \
+        GEN_PROMOTED_AT=2026-08-01T00:00:00Z \
+        GEN_SUPERSEDED_AT=2026-08-20T00:00:00Z
+    gen_create 8900 \
+        GEN_ID=99 \
+        GEN_STATE=rejected \
+        GEN_TEMPLATE_DIGEST=new \
+        GEN_IMAGE_SHA256=def \
+        GEN_RUNNER_VERSION=2.336.0 \
+        GEN_PROMOTED_AT=2026-08-20T00:00:00Z \
+        GEN_FAILED_REASON='rolled back'
+
+    run maintain_reconcile_two_actives
+    [ "$status" -eq 0 ]
+    gen_read 9000
+    [ "$GEN_STATE" = "active" ]
+    gen_read 8900
+    [ "$GEN_STATE" = "rejected" ]
+    notify_log | grep -q 'generation.reconciled'
+}

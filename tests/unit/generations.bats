@@ -610,7 +610,8 @@ create_full_record() {
         "candidate failed" \
         "active superseded" \
         "active rejected" \
-        "superseded active"; do
+        "superseded active" \
+        "superseded rejected"; do
         from="${pair% *}"
         to="${pair#* }"
 
@@ -630,7 +631,7 @@ create_full_record() {
                 baking:candidate|baking:failed) continue ;;
                 candidate:active|candidate:superseded|candidate:failed) continue ;;
                 active:superseded|active:rejected) continue ;;
-                superseded:active) continue ;;
+                superseded:active|superseded:rejected) continue ;;
             esac
             run gen_transition_allowed "$from" "$to"
             [ "$status" -eq 1 ]
@@ -853,6 +854,129 @@ create_full_record() {
     wait "$writer" 2>/dev/null || true
 
     [ ! -e "$record" ]
+}
+
+# ---------------------------------------------------------------------------
+# Rollback target selection (spec 9, 15)
+# ---------------------------------------------------------------------------
+
+@test "gen_rollback_target picks the newest superseded, not the highest GEN_ID" {
+    gen_create 8900 \
+        GEN_ID=9 \
+        GEN_STATE=superseded \
+        GEN_PROMOTED_AT=2026-07-01T00:00:00Z \
+        GEN_SUPERSEDED_AT=2026-08-01T00:00:00Z
+    gen_create 8901 \
+        GEN_ID=1 \
+        GEN_STATE=superseded \
+        GEN_PROMOTED_AT=2026-08-10T00:00:00Z \
+        GEN_SUPERSEDED_AT=2026-08-20T00:00:00Z
+    gen_create 8902 \
+        GEN_ID=2 \
+        GEN_STATE=active \
+        GEN_PROMOTED_AT=2026-08-20T00:00:00Z
+
+    run gen_rollback_target 2
+    [ "$status" -eq 0 ]
+    [ "$output" = "8901" ]
+}
+
+@test "gen_rollback_target never returns a rejected generation" {
+    gen_create 8900 \
+        GEN_ID=99 \
+        GEN_STATE=rejected \
+        GEN_PROMOTED_AT=2026-08-20T00:00:00Z \
+        GEN_SUPERSEDED_AT=2026-08-25T00:00:00Z \
+        GEN_FAILED_REASON='rolled back'
+    gen_create 8901 \
+        GEN_ID=1 \
+        GEN_STATE=superseded \
+        GEN_PROMOTED_AT=2026-08-01T00:00:00Z \
+        GEN_SUPERSEDED_AT=2026-08-10T00:00:00Z
+    gen_create 8902 \
+        GEN_ID=2 \
+        GEN_STATE=active \
+        GEN_PROMOTED_AT=2026-08-25T00:00:00Z
+
+    run gen_rollback_target 2
+    [ "$status" -eq 0 ]
+    [ "$output" = "8901" ]
+}
+
+@test "gen_rollback_target skips a higher GEN_ID leftover from an incomplete rollback" {
+    gen_create 8900 \
+        GEN_ID=99 \
+        GEN_STATE=superseded \
+        GEN_PROMOTED_AT=2026-08-20T00:00:00Z \
+        GEN_SUPERSEDED_AT=2026-08-25T00:00:00Z
+    gen_create 8901 \
+        GEN_ID=1 \
+        GEN_STATE=superseded \
+        GEN_PROMOTED_AT=2026-08-01T00:00:00Z \
+        GEN_SUPERSEDED_AT=2026-08-10T00:00:00Z
+    gen_create 8902 \
+        GEN_ID=2 \
+        GEN_STATE=active \
+        GEN_PROMOTED_AT=2026-08-25T00:00:00Z
+
+    run gen_rollback_target 2
+    [ "$status" -eq 0 ]
+    [ "$output" = "8901" ]
+}
+
+@test "gen_rollback_target fails closed when nothing is retained" {
+    gen_create 8902 \
+        GEN_ID=1 \
+        GEN_STATE=active \
+        GEN_PROMOTED_AT=2026-08-01T00:00:00Z
+    gen_create 8900 \
+        GEN_ID=99 \
+        GEN_STATE=rejected \
+        GEN_PROMOTED_AT=2026-08-20T00:00:00Z
+
+    run gen_rollback_target 1
+    # Exit 2, not a bare 1: distinct from a read/validation failure (issue
+    # #19 review round 2) so a caller that must fail closed on a genuine
+    # error (GC's retention) can still safely treat "nothing retained" as
+    # "collect everything".
+    [ "$status" -eq 2 ]
+    [[ "$output" == *"No retained"* ]]
+}
+
+@test "a superseded generation with no GEN_PROMOTED_AT is not a rollback target" {
+    gen_create 8900 \
+        GEN_ID=9 \
+        GEN_STATE=superseded \
+        GEN_SUPERSEDED_AT=2026-08-20T00:00:00Z
+    gen_create 8902 \
+        GEN_ID=1 \
+        GEN_STATE=active \
+        GEN_PROMOTED_AT=2026-08-20T00:00:00Z
+
+    run gen_rollback_target 1
+    [ "$status" -eq 2 ]
+}
+
+# gen_rollback_target shares gen_record_is_rollback_eligible with lib/gc.sh's
+# own retention policy (spec 9/15) so the two can never disagree about which
+# generation is "the retained previous one" — see the matching gc.bats test
+# "a pre-field superseded adopted gen-1 remains the rollback target".
+@test "gen_rollback_target accepts a legacy-adopted generation with no promotion timestamp" {
+    apply_generation_defaults
+    gen_create 9000 \
+        GEN_ID=1 \
+        GEN_STATE=superseded \
+        GEN_IMAGE_SHA256=unknown \
+        GEN_TEMPLATE_DIGEST=unknown \
+        GEN_SUPERSEDED_AT=2026-08-20T00:00:00Z
+    gen_create 8903 \
+        GEN_ID=2 \
+        GEN_STATE=active \
+        GEN_PROMOTED_AT=2026-08-20T00:00:00Z
+
+    run gen_rollback_target 2
+    [ "$status" -eq 0 ]
+    [ "$output" = "9000" ]
 }
 
 # ---------------------------------------------------------------------------

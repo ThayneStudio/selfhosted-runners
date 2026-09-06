@@ -641,6 +641,106 @@ gen_vmid_for_id() (
     return 1
 )
 
+# True when a generation record is legacy-adopted (spec 8): generation 1,
+# unknown provenance, and a VMID outside the generation band. Adoption alone
+# may keep the old deployment VMID, but every baked candidate must be inside
+# the band, so this positive out-of-band proof cannot bless an orphan
+# candidate. Used only as migration evidence for records written before
+# GEN_WAS_ACTIVE existed — shared by gc.sh's retention policy and
+# gen_rollback_target so a legacy-adopted generation 1 is never destroyed by
+# one and refused by the other.
+gen_record_is_legacy_adopted() {
+    local vmid_num
+    [[ "${GEN_ID:-}" == "1" && "${GEN_IMAGE_SHA256:-}" == "unknown" &&
+        "${GEN_TEMPLATE_DIGEST:-}" == "unknown" ]] || return 1
+    gen_is_uint "${GEN_VMID:-}" || return 1
+    vmid_num=$((10#$GEN_VMID))
+    ((vmid_num < TEMPLATE_BAND_MIN || vmid_num > TEMPLATE_BAND_MAX))
+}
+
+# True when a generation record was ever a clone target — the only
+# generations gc.sh may retain instead of destroying and the only ones
+# gen_rollback_target may return. Single source of truth for that
+# eligibility test so GC's retention and rollback's target selection can
+# never disagree about which generation is "the retained previous one".
+gen_record_is_rollback_eligible() {
+    [[ "${GEN_WAS_ACTIVE:-}" == "1" ]] && return 0
+    [[ "${GEN_WAS_ACTIVE:-}" == "0" ]] && return 1
+    # Migration evidence for records written before GEN_WAS_ACTIVE existed.
+    # A promotion timestamp is positive proof; a missing field alone is not.
+    [[ -n "${GEN_PROMOTED_AT:-}" ]] && return 0
+    gen_record_is_legacy_adopted
+}
+
+# VMID of the retained previous generation (spec 9, 15).
+#
+# Among `superseded` records that were once a clone target
+# (gen_record_is_rollback_eligible), pick the newest GEN_SUPERSEDED_AT, then
+# newest GEN_PROMOTED_AT. Never the highest GEN_ID: after a rollback that is
+# the image the operator just escaped. Optional <current-gen-id> skips
+# leftovers with a higher id (incomplete rollback after reconcile demoted
+# instead of reject) — the same cap gc.sh's own retention applies against the
+# active generation's id, so the two never pick different VMIDs.
+# `rejected` is not in this list; it is never a rollback target.
+#
+# Usage: gen_rollback_target [current-gen-id]
+# stdout: VMID. Exit codes distinguish "nothing to return" from "could not
+# even look": 0 success, 1 a read/validation failure (invalid <current-id>,
+# an unreadable record, or a malformed GEN_ID) -- the answer is unknown, not
+# empty -- 2 nothing is retained (the scan completed and genuinely found no
+# eligible superseded record). A caller that treats "no target" as safe to
+# proceed on (GC's retention, which falls back to "collect everything") must
+# check for 2 specifically and fail closed on 1 (issue #19 review round 2);
+# a caller that always refuses either way (runner rollback's own target
+# selection) can keep treating any non-zero the same.
+gen_rollback_target() (
+    local current_id="${1:-}" vmid id list
+    local keep="" keep_sup="" keep_prom=""
+    local sup prom
+
+    if [[ -n "$current_id" ]] && ! gen_is_uint "$current_id"; then
+        log_error "Invalid generation id: $current_id"
+        return 1
+    fi
+
+    list=$(gen_list superseded) || return 1
+    while read -r vmid; do
+        [[ -n "$vmid" ]] || continue
+        gen_read "$vmid" || return 1
+        [[ "$GEN_STATE" == "superseded" ]] || continue
+        gen_record_is_rollback_eligible || continue
+        id=$(gen_require_numeric_id "$vmid") || return 1
+        if [[ -n "$current_id" && "$id" -gt "$((10#$current_id))" ]]; then
+            continue
+        fi
+        sup="${GEN_SUPERSEDED_AT:-}"
+        prom="${GEN_PROMOTED_AT:-}"
+        if [[ -z "$keep" ]]; then
+            keep="$vmid"
+            keep_sup="$sup"
+            keep_prom="$prom"
+            continue
+        fi
+        if [[ -n "$sup" && ( -z "$keep_sup" || "$sup" > "$keep_sup" ) ]]; then
+            keep="$vmid"
+            keep_sup="$sup"
+            keep_prom="$prom"
+        elif [[ "$sup" == "$keep_sup" ]]; then
+            if [[ -n "$prom" && ( -z "$keep_prom" || "$prom" > "$keep_prom" ) ]]; then
+                keep="$vmid"
+                keep_sup="$sup"
+                keep_prom="$prom"
+            fi
+        fi
+    done <<< "$list"
+
+    if [[ -z "$keep" ]]; then
+        log_error "No retained previous generation to roll back to"
+        return 2
+    fi
+    printf '%s\n' "$keep"
+)
+
 # ---------------------------------------------------------------------------
 # Generation table display (spec 13 / issue #16) — backs the read-only
 # `runner generations` CLI. Clone counts are NOT recomputed here: they come
@@ -822,7 +922,8 @@ gen_next_id() (
 #
 #   baking ──▶ candidate ──▶ active ──▶ superseded ──▶ (destroyed, archived)
 #      │           │            │            │
-#      │           │            │            └──▶ active     (rollback)
+#      │           │            │            ├──▶ active     (rollback)
+#      │           │            │            └──▶ rejected   (complete rollback)
 #      └──▶ failed ┘            └──▶ rejected
 #
 # `failed` and `rejected` have no outgoing edges, and that is load-bearing for
@@ -849,8 +950,9 @@ gen_transition_allowed() {
         # A newer generation took over, or an operator rolled away from this one.
         active:superseded|active:rejected) return 0 ;;
         # Rollback: the retained previous generation becomes the clone target
-        # again.
-        superseded:active) return 0 ;;
+        # again. superseded→rejected completes a rollback after reconcile
+        # demoted the escaped generation instead of rejecting it (spec 15).
+        superseded:active|superseded:rejected) return 0 ;;
         *) return 1 ;;
     esac
 }

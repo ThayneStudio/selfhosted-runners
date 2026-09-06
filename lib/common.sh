@@ -140,7 +140,7 @@ BAKE_LOCK_FILE="/run/lock/github-runner-bake.lock"
 # destroy and archive the same record.
 # shellcheck disable=SC2034  # consumed by lib/gc.sh
 GC_LOCK_FILE="/run/lock/github-runner-gc.lock"
-# shellcheck disable=SC2034  # consumed by bake, detect, promote, maintain
+# shellcheck disable=SC2034  # consumed by bake, detect, promote, rollback, maintain
 PROMOTION_PAUSE_FILE="/run/lock/github-runner-promote.pause"
 IMG_CACHE_DIR="/var/cache/github-runners"
 # shellcheck disable=SC2034  # consumed by bake, detect, promote, maintain
