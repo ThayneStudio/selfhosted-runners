@@ -53,8 +53,8 @@ setup() {
         # The real promote refuses --canary-passed unless the record already
         # carries the gate's evidence, so capture what it would have read.
         gen_read 8901
-        printf '%s|%s\n' "${GEN_CANARY_RUN_URL:-}" "${GEN_CANARY_ATTEMPTS:-}" \
-            > "$STUB_DIR/evidence-at-promote"
+        printf '%s|%s|%s\n' "${GEN_CANARY_RESULT:-}" "${GEN_CANARY_RUN_URL:-}" \
+            "${GEN_CANARY_ATTEMPTS:-}" > "$STUB_DIR/evidence-at-promote"
         gen_transition 8901 active
         gen_transition 9000 superseded
     }
@@ -581,6 +581,31 @@ EOF
     [ "$(attempts_of 8901)" = "0" ]
 }
 
+# The dispatch response's Date and a run's created_at are both whole seconds,
+# so the gate's own run can be stamped in the second before the response that
+# reported the dispatch. Rejecting it there costs a full CANARY_TIMEOUT and an
+# attempt; three of those reject a good image.
+@test "a titled run stamped a second before the dispatch response is still ours" {
+    api_response '*per_page=30' 200 <<'EOF'
+{"workflow_runs": [{"id": 9911, "display_title": "Runner canary gen-2", "created_at": "2026-09-06T06:59:59Z", "status": "completed", "conclusion": "success", "html_url": "https://github.com/acme-org/canary-repo/actions/runs/9911"}]}
+EOF
+    run --separate-stderr canary_main 2
+    [ "$status" -eq 0 ]
+    assert_called curl '*/actions/runs/9911'
+}
+
+@test "a titled run stamped ten seconds earlier is not ours" {
+    api_response '*per_page=30' 200 <<'EOF'
+{"workflow_runs": [{"id": 9911, "display_title": "Runner canary gen-2", "created_at": "2026-09-06T06:59:50Z", "status": "completed", "conclusion": "success", "html_url": "https://github.com/acme-org/canary-repo/actions/runs/9911"}]}
+EOF
+    CANARY_TIMEOUT=0
+
+    run --separate-stderr canary_main 2
+    [ "$status" -eq 3 ]
+    refute_called curl '*/actions/runs/9911'
+    [ ! -f "$STUB_DIR/promote.log" ]
+}
+
 # Important #2: a run that does not name this generation is never polled --
 # a concurrent hand-dispatch (README documents `gh workflow run`) or, once
 # maintain drives this on a second host, another host's canary.
@@ -681,8 +706,10 @@ EOF
     # *before* the call, or the real promote refuses the gate's own promotion.
     # Its half of the handshake is "promote --canary-passed refuses a
     # generation with no recorded canary run" in tests/unit/promote.bats.
-    grep -qx 'https://github.com/acme-org/canary-repo/actions/runs/9911|1' \
+    grep -qx 'success|https://github.com/acme-org/canary-repo/actions/runs/9911|1' \
         "$STUB_DIR/evidence-at-promote"
+    gen_read 8901
+    [ "$GEN_CANARY_RESULT" = "success" ]
     assert_called qm 'destroy 9501 --purge'
     gen_read 8901
     [ "$GEN_STATE" = "active" ]
@@ -705,6 +732,31 @@ EOF
     assert_called qm 'destroy 9501 --purge'
     refute_called qm 'destroy 8901*'
     [ ! -f "$STUB_DIR/promote.log" ]
+}
+
+@test "a failed run records GEN_CANARY_RESULT=failure, not just a run URL" {
+    # The run URL alone only says a canary ran. A failed run has one too, and
+    # `runner promote <id> --canary-passed` would take it as a pass.
+    api_response '*/actions/runs/9911' 200 <<'EOF'
+{"id": 9911, "status": "completed", "conclusion": "failure", "html_url": "https://github.com/acme-org/canary-repo/actions/runs/9911"}
+EOF
+    run --separate-stderr canary_main 2
+    [ "$status" -eq 3 ]
+    gen_read 8901
+    [ "$GEN_CANARY_RESULT" = "failure" ]
+    [ "$GEN_CANARY_RUN_URL" = "https://github.com/acme-org/canary-repo/actions/runs/9911" ]
+}
+
+@test "an attempt that was never made leaves the recorded result alone" {
+    # rc 2/5 conclude nothing, so there is no outcome to record and no earlier
+    # one to invent.
+    gen_update 8901 GEN_CANARY_RESULT=failure GEN_CANARY_RUN_URL=https://example.test/runs/1
+    clone_canary_runner() { return 3; }
+
+    run --separate-stderr canary_main 2
+    [ "$status" -eq 2 ]
+    gen_read 8901
+    [ "$GEN_CANARY_RESULT" = "failure" ]
 }
 
 @test "each failed attempt notifies warn with the run URL" {
@@ -915,12 +967,16 @@ EOF
 }
 
 @test "only the canary gate passes --canary-passed" {
-    run grep -l -- '--canary-passed' "$REPO_ROOT"/lib/*.sh
-    [ "$status" -eq 0 ]
-    [[ "$output" == *"lib/canary.sh"* ]]
-    [[ "$output" == *"lib/promote.sh"* ]]
-    run bash -c "grep -l -- '--canary-passed' $REPO_ROOT/lib/*.sh | grep -vE 'lib/(canary|promote)\.sh$'"
-    [ "$status" -ne 0 ]
+    # Code lines only. Comments elsewhere may name the flag -- the store
+    # documents why it refuses anything but success, for one -- and what
+    # matters is which file actually passes or parses it.
+    local files
+    files=$(grep -lE '^[[:space:]]*[^#[:space:]].*--canary-passed' "$REPO_ROOT"/lib/*.sh \
+        | xargs -n1 basename | sort | tr '\n' ' ')
+    [ "$files" = "canary.sh promote.sh " ] || {
+        printf 'files passing/parsing --canary-passed: %s\n' "$files" >&2
+        return 1
+    }
 }
 
 @test "vm_config_is_canary reads runner-canary out of either separator" {

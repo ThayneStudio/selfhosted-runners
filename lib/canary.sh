@@ -81,6 +81,13 @@ CANARY_DESTROY_RETRY_SECONDS="${CANARY_DESTROY_RETRY_SECONDS:-2}"
 # host clock has to stand in for the dispatch instant. Wide enough to absorb
 # a badly set clock, far narrower than the gap between two canary attempts.
 CANARY_CLOCK_SKEW_SECONDS="${CANARY_CLOCK_SKEW_SECONDS:-300}"
+# Both GitHub's Date header and a run's created_at are whole seconds, so a run
+# created in the second *before* the response that reported the dispatch reads
+# as older than it. Without a grace, that one-second inversion filters out the
+# gate's own run — and since it carries the matching title, the foreign-run
+# pass does not report it either, so the attempt would burn a full
+# CANARY_TIMEOUT and fail. Three of those reject a good image.
+CANARY_DISPATCH_GRACE_SECONDS="${CANARY_DISPATCH_GRACE_SECONDS:-2}"
 
 # Set by canary_preflight for the rest of the run.
 CANARY_RUN_ORG=""
@@ -506,10 +513,13 @@ canary_dispatch() {
     # run a few minutes too old than to reject the run we just caused. Runs
     # from an earlier attempt are whole maintain cycles away, not minutes.
     epoch=$(_canary_http_date_epoch "$head_and_body") || epoch=""
-    if [[ ! "$epoch" =~ ^[0-9]+$ ]]; then
+    if [[ "$epoch" =~ ^[0-9]+$ ]]; then
+        # Both clocks are whole seconds; see CANARY_DISPATCH_GRACE_SECONDS.
+        epoch=$(( epoch - CANARY_DISPATCH_GRACE_SECONDS ))
+    else
         epoch=$(date -u +%s) || epoch=""
         if [[ "$epoch" =~ ^[0-9]+$ ]]; then
-            epoch=$(( epoch - CANARY_CLOCK_SKEW_SECONDS ))
+            epoch=$(( epoch - CANARY_CLOCK_SKEW_SECONDS - CANARY_DISPATCH_GRACE_SECONDS ))
             log_info "canary: GitHub sent no readable Date header; using the host clock less ${CANARY_CLOCK_SKEW_SECONDS}s as the dispatch instant"
         else
             epoch=""
@@ -541,10 +551,14 @@ canary_dispatch() {
     esac
 }
 
-# True when a run started at or after the instant GitHub accepted our
-# dispatch. A timestamp we cannot read passes: the id-above-baseline and
-# exact-title guards already bound the choice, and refusing a run because a
-# clock could not be parsed would time out a canary that is running fine.
+# True when a run started at or after the instant GitHub accepted our dispatch,
+# less CANARY_DISPATCH_GRACE_SECONDS — both timestamps are whole seconds, and
+# rejecting our own run over a one-second inversion costs a whole attempt.
+# A timestamp we cannot read passes: the id-above-baseline and exact-title
+# guards already bound the choice, and refusing a run because a clock could not
+# be parsed would time out a canary that is running fine.
+# Proven by "a titled run stamped a second before the dispatch response is
+# still ours" and "a titled run stamped ten seconds earlier is not ours".
 canary_run_started_after_dispatch() {
     local created="${1:-}" epoch
     [[ "${CANARY_DISPATCH_EPOCH:-}" =~ ^[0-9]+$ ]] || return 0
@@ -866,7 +880,7 @@ canary_finalize_failed() {
 # ---------------------------------------------------------------------------
 
 canary_main() {
-    local gen_id="" vmid state digest attempts max attempt rc=0 url
+    local gen_id="" vmid state digest attempts max attempt rc=0 url result
     local lock_wait
 
     while [[ $# -gt 0 ]]; do
@@ -1008,15 +1022,32 @@ canary_main() {
     rc=0
     canary_attempt "$vmid" "$gen_id" || rc=$?
 
-    # Stamp the run on the record before anything else looks at it. This is
+    # Stamp the outcome on the record before anything else looks at it. This is
     # the evidence promote --canary-passed checks (lib/promote.sh), so it has
     # to be written before the promotion below, not after.
-    # Proven by "promote --canary-passed refuses a generation with no recorded
-    # canary run" in tests/unit/promote.bats.
+    #
+    # GEN_CANARY_RESULT is the half that says the canary *passed*: a run URL
+    # alone only says one ran, and a failed run has one too — which would let
+    # `runner promote <id> --canary-passed` skip both the gate and the
+    # confirmation on an image whose canary had just failed. rc 2/5 leaves the
+    # field alone: nothing concluded, so there is no new outcome to record and
+    # no old one to invent.
+    # Proven by "a failed run records GEN_CANARY_RESULT=failure" here and
+    # "promote --canary-passed refuses a generation whose canary failed" in
+    # tests/unit/promote.bats.
+    case "$rc" in
+        0) result="success" ;;
+        1) result="failure" ;;
+        *) result="" ;;
+    esac
     url="${CANARY_RUN_URL:-}"
     if [[ -n "$url" && "$url" != *[[:space:]]* ]]; then
         gen_update "$vmid" GEN_CANARY_RUN_URL="$url" \
             || log_warn "canary: could not record the run URL on generation $gen_id"
+    fi
+    if [[ -n "$result" ]]; then
+        gen_update "$vmid" GEN_CANARY_RESULT="$result" \
+            || log_warn "canary: could not record the canary result on generation $gen_id"
     fi
 
     # Only the canary VM (spec 7.5): the candidate template stays for a retry.

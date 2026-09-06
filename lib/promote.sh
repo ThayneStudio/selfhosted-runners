@@ -17,13 +17,17 @@
 # hand has --skip-canary, which asks.
 #
 # It is not a bare assertion: the flag is refused unless the generation record
-# carries the evidence the gate writes — GEN_CANARY_RUN_URL and at least one
-# GEN_CANARY_ATTEMPTS — so a hand-typed `runner promote <id> --canary-passed`
-# cannot skip both the canary and the confirmation on a generation no canary
-# ever ran against. Accepting it is notified at info, because a promotion that
-# no human confirmed should still be visible.
-# Proven by "promote --canary-passed refuses a generation with no recorded
-# canary run" and "promote --canary-passed proceeds on a recorded canary run".
+# carries the evidence the gate writes — GEN_CANARY_RESULT=success, a run URL,
+# and at least one attempt — so a hand-typed `runner promote <id>
+# --canary-passed` cannot skip both the canary and the confirmation. The result
+# field is what makes it evidence of a *pass*: a failed canary leaves a run URL
+# and an attempt count behind too, and an empty result is also how a record
+# written before that field existed reads, which refuses as well. Accepting the
+# flag is notified at info, because a promotion no human confirmed should still
+# be visible.
+# Proven by "promote --canary-passed refuses a generation whose canary failed",
+# "… refuses a generation with no recorded canary run" and "… promotes without
+# a tty confirmation".
 #
 # GEN_* fields are loaded via gen_read in this shell; gen_transition is a
 # subshell, so SC2030/SC2031 are false positives here as in generations.sh.
@@ -116,8 +120,10 @@ promote_generation() {
     fi
     if [[ "$canary_passed" -eq 1 && "$skip_canary" -eq 0 ]]; then
         # GEN_* are in scope from the gen_read above.
-        if [[ -z "${GEN_CANARY_RUN_URL:-}" ]] || [[ ! "${GEN_CANARY_ATTEMPTS:-0}" =~ ^[1-9][0-9]*$ ]]; then
-            log_error "Generation $gen_id carries no canary evidence (GEN_CANARY_RUN_URL='${GEN_CANARY_RUN_URL:-}', GEN_CANARY_ATTEMPTS='${GEN_CANARY_ATTEMPTS:-}') — refusing --canary-passed; run 'runner canary $gen_id'"
+        if [[ "${GEN_CANARY_RESULT:-}" != "success" ]] \
+            || [[ -z "${GEN_CANARY_RUN_URL:-}" ]] \
+            || [[ ! "${GEN_CANARY_ATTEMPTS:-0}" =~ ^[1-9][0-9]*$ ]]; then
+            log_error "Generation $gen_id carries no passing canary (GEN_CANARY_RESULT='${GEN_CANARY_RESULT:-}', GEN_CANARY_RUN_URL='${GEN_CANARY_RUN_URL:-}', GEN_CANARY_ATTEMPTS='${GEN_CANARY_ATTEMPTS:-}') — refusing --canary-passed; run 'runner canary $gen_id'"
             return 1
         fi
         NOTIFY_GENERATION="$gen_id" notify info promote.canary_passed \

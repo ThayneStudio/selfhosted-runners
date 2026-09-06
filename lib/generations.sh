@@ -57,6 +57,7 @@ GENERATION_FIELDS=(
     GEN_BAKE_LOG
     GEN_CANARY_RUN_URL
     GEN_CANARY_ATTEMPTS
+    GEN_CANARY_RESULT
 )
 
 GENERATION_STATES=(baking candidate active superseded rejected failed)
@@ -327,6 +328,18 @@ gen_validate_field() {
         GEN_CANARY_ATTEMPTS)
             if [[ -n "$value" ]] && ! gen_is_uint "$value"; then
                 log_error "$key must be a plain number, got: '$value'"
+                return 1
+            fi
+            ;;
+        GEN_CANARY_RESULT)
+            # How the last canary attempt that reached a conclusion ended.
+            # `runner promote --canary-passed` refuses anything but success
+            # (spec 7.3), so the field is closed: a typo must not read as a
+            # pass. Empty means no attempt has concluded on this record —
+            # which is also what a record written before this field existed
+            # reads as, and it refuses too.
+            if [[ -n "$value" && "$value" != "success" && "$value" != "failure" ]]; then
+                log_error "$key must be success or failure, got: '$value'"
                 return 1
             fi
             ;;

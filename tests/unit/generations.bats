@@ -118,9 +118,12 @@ create_full_record() {
     gen_create 8903 GEN_ID=1 GEN_STATE=baking
     gen_transition 8903 failed "$(printf 'bake timed out\nafter 5400s')"
 
-    # One line per field, still sixteen of them: an unfolded newline would
-    # split the record and the next read would report it as malformed.
-    [ "$(grep -c '^GEN_' "$GENERATIONS_DIR/8903.conf")" = "16" ]
+    # One line per field, and exactly as many as the store declares: an
+    # unfolded newline would split the record and the next read would report
+    # it as malformed. Counted against GENERATION_FIELDS rather than a literal
+    # so adding a field is a one-line change in lib/generations.sh.
+    [ "$(grep -c '^GEN_' "$GENERATIONS_DIR/8903.conf")" = "${#GENERATION_FIELDS[@]}" ]
+    [ "${#GENERATION_FIELDS[@]}" -ge 16 ]
     gen_read 8903
     [ "$GEN_FAILED_REASON" = "bake timed out after 5400s" ]
 }

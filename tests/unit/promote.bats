@@ -32,7 +32,17 @@ file_mode() {
 record_canary_pass() {
     gen_update "$1" \
         GEN_CANARY_ATTEMPTS=1 \
-        GEN_CANARY_RUN_URL=https://github.com/acme-org/canary-repo/actions/runs/9911
+        GEN_CANARY_RUN_URL=https://github.com/acme-org/canary-repo/actions/runs/9911 \
+        GEN_CANARY_RESULT=success
+}
+
+# What the gate leaves behind when the run concluded anything but success: a
+# run URL and an attempt, which are not evidence of a pass.
+record_canary_failure() {
+    gen_update "$1" \
+        GEN_CANARY_ATTEMPTS=1 \
+        GEN_CANARY_RUN_URL=https://github.com/acme-org/canary-repo/actions/runs/9911 \
+        GEN_CANARY_RESULT=failure
 }
 
 seed_active_and_candidate() {
@@ -340,7 +350,7 @@ EOF
 
     run --separate-stderr promote_generation 2 --canary-passed </dev/null
     [ "$status" -ne 0 ]
-    [[ "$stderr" == *"no canary evidence"* ]]
+    [[ "$stderr" == *"no passing canary"* ]]
     [[ "$stderr" == *"runner canary 2"* ]]
     gen_read 8900
     [ "$GEN_STATE" = "candidate" ]
@@ -350,9 +360,40 @@ EOF
     [ ! -e "$PROMOTION_PAUSE_FILE" ]
 }
 
+@test "promote --canary-passed refuses a generation whose canary failed" {
+    # The run URL and the attempt count are both there -- a canary ran. It
+    # just did not pass, and this flag skips the confirmation as well as the
+    # gate, so "ran" is not enough.
+    seed_active_and_candidate
+    record_canary_failure 8900
+
+    run --separate-stderr promote_generation 2 --canary-passed </dev/null
+    [ "$status" -ne 0 ]
+    [[ "$stderr" == *"no passing canary"* ]]
+    gen_read 8900
+    [ "$GEN_STATE" = "candidate" ]
+    grep -q 'TEMPLATE_ID="9000"' "$CONFIG_FILE"
+}
+
+# A candidate baked before GEN_CANARY_RESULT existed reads as an empty result,
+# which is the same refusal -- it is not evidence of a pass either.
+@test "promote --canary-passed refuses a record written before the result field" {
+    seed_active_and_candidate
+    gen_update 8900 \
+        GEN_CANARY_ATTEMPTS=1 \
+        GEN_CANARY_RUN_URL=https://github.com/acme-org/canary-repo/actions/runs/9911
+
+    run --separate-stderr promote_generation 2 --canary-passed </dev/null
+    [ "$status" -ne 0 ]
+    [[ "$stderr" == *"GEN_CANARY_RESULT=''"* ]]
+    gen_read 8900
+    [ "$GEN_STATE" = "candidate" ]
+}
+
 @test "promote --canary-passed refuses a run URL with no attempt recorded" {
     seed_active_and_candidate
-    gen_update 8900 GEN_CANARY_RUN_URL=https://github.com/o/r/actions/runs/1
+    gen_update 8900 GEN_CANARY_RESULT=success \
+        GEN_CANARY_RUN_URL=https://github.com/o/r/actions/runs/1
 
     run --separate-stderr promote_generation 2 --canary-passed </dev/null
     [ "$status" -ne 0 ]
@@ -362,7 +403,7 @@ EOF
 
 @test "promote --canary-passed refuses an attempt with no run URL" {
     seed_active_and_candidate
-    gen_update 8900 GEN_CANARY_ATTEMPTS=1
+    gen_update 8900 GEN_CANARY_RESULT=success GEN_CANARY_ATTEMPTS=1
 
     run --separate-stderr promote_generation 2 --canary-passed </dev/null
     [ "$status" -ne 0 ]
