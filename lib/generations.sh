@@ -684,7 +684,15 @@ gen_record_is_rollback_eligible() {
 # `rejected` is not in this list; it is never a rollback target.
 #
 # Usage: gen_rollback_target [current-gen-id]
-# stdout: VMID. Exit 1 if nothing retained.
+# stdout: VMID. Exit codes distinguish "nothing to return" from "could not
+# even look": 0 success, 1 a read/validation failure (invalid <current-id>,
+# an unreadable record, or a malformed GEN_ID) -- the answer is unknown, not
+# empty -- 2 nothing is retained (the scan completed and genuinely found no
+# eligible superseded record). A caller that treats "no target" as safe to
+# proceed on (GC's retention, which falls back to "collect everything") must
+# check for 2 specifically and fail closed on 1 (issue #19 review round 2);
+# a caller that always refuses either way (runner rollback's own target
+# selection) can keep treating any non-zero the same.
 gen_rollback_target() (
     local current_id="${1:-}" vmid id list
     local keep="" keep_sup="" keep_prom=""
@@ -728,7 +736,7 @@ gen_rollback_target() (
 
     if [[ -z "$keep" ]]; then
         log_error "No retained previous generation to roll back to"
-        return 1
+        return 2
     fi
     printf '%s\n' "$keep"
 )

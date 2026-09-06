@@ -935,7 +935,11 @@ create_full_record() {
         GEN_PROMOTED_AT=2026-08-20T00:00:00Z
 
     run gen_rollback_target 1
-    [ "$status" -eq 1 ]
+    # Exit 2, not a bare 1: distinct from a read/validation failure (issue
+    # #19 review round 2) so a caller that must fail closed on a genuine
+    # error (GC's retention) can still safely treat "nothing retained" as
+    # "collect everything".
+    [ "$status" -eq 2 ]
     [[ "$output" == *"No retained"* ]]
 }
 
@@ -950,7 +954,7 @@ create_full_record() {
         GEN_PROMOTED_AT=2026-08-20T00:00:00Z
 
     run gen_rollback_target 1
-    [ "$status" -eq 1 ]
+    [ "$status" -eq 2 ]
 }
 
 # gen_rollback_target shares gen_record_is_rollback_eligible with lib/gc.sh's

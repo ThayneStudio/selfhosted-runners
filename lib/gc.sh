@@ -290,7 +290,7 @@ gc_reconcile_candidates() {
 gc_collect_superseded() {
     local dry_run="$1" list vmid retain="" blockers age
     local -a superseded=()
-    local pointer active_id=""
+    local pointer active_id="" rt_rc=0
 
     # Retention must be the exact same *selection* gen_rollback_target makes,
     # not a parallel highest-GEN_ID tiebreak of our own -- two independent
@@ -315,11 +315,25 @@ gc_collect_superseded() {
         return 1
     fi
 
-    # Suppressed: "nothing retained" is the ordinary state of a fresh fleet
-    # or one already fully collected, not a gc.sh-level error -- callers that
-    # need to report it as one (gen_rollback_target's own direct callers) get
-    # gen_rollback_target's own log_error undisturbed.
-    retain=$(gen_rollback_target "$active_id" 2>/dev/null) || retain=""
+    # gen_rollback_target returns 2 for "nothing retained" (the ordinary
+    # state of a fresh fleet or one already fully collected -- not a gc.sh
+    # error) and 1 for a genuine read/validation failure, e.g. a malformed
+    # GEN_ID on some other superseded record (gen_read does not itself
+    # validate it). Conflating the two here would silently fail open: an
+    # unrelated bad record would make retain="" look like "collect
+    # everything", including the real, still-good previous generation
+    # (issue #19 review round 2). Suppressed stderr: gen_rollback_target's
+    # own log_error is for its direct callers (runner rollback), which
+    # always refuse either way; gc.sh reports failure through log_warn below
+    # instead, distinctly from "nothing retained".
+    rt_rc=0
+    retain=$(gen_rollback_target "$active_id" 2>/dev/null) || rt_rc=$?
+    if [[ "$rt_rc" -eq 2 ]]; then
+        retain=""
+    elif [[ "$rt_rc" -ne 0 ]]; then
+        log_warn "gc: could not determine the retained generation — skipping superseded collection"
+        return 1
+    fi
 
     list=$(gen_list superseded) || return 1
     while read -r vmid; do

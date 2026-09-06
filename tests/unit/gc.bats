@@ -263,6 +263,56 @@ EOF
     refute_called qm 'destroy *'
 }
 
+@test "GC fails closed instead of destroying the true previous when a superseded record has a malformed GEN_ID" {
+    # gen_read does not itself validate GEN_ID, so a corrupted record still
+    # lists fine via gen_list, but gen_require_numeric_id -- and so
+    # gen_rollback_target -- fails on it (exit 1, a genuine read/validation
+    # failure, not exit 2 "nothing retained"). Conflating the two would make
+    # GC treat the still-good true previous generation (8900) as safe to
+    # destroy, right alongside the corrupt record it never should have
+    # trusted (issue #19 review round 2).
+    make_gen 8900 2 superseded
+    gen_update 8900 GEN_WAS_ACTIVE=1
+    make_gen 8901 3 superseded
+    gen_update 8901 GEN_WAS_ACTIVE=1
+    make_gen 8903 4 active
+    # Corrupted only after every record exists: gen_create's own id-in-use
+    # check reads every existing record and would otherwise refuse to create
+    # 8903 over an unparseable GEN_ID it cannot compare against.
+    sed -i.bak 's/^GEN_ID=.*/GEN_ID="x2"/' "$GENERATIONS_DIR/8901.conf"
+
+    run --separate-stderr gc_main false
+    [ "$status" -eq 1 ]
+    [[ "$stderr" == *"could not determine the retained generation"* ]]
+    gen_exists 8900
+    [ "$(gen_state_of 8900)" = superseded ]
+    refute_called qm 'destroy *'
+}
+
+@test "GC still collects everything when genuinely nothing is retained" {
+    # Two orphaned candidates-turned-superseded, neither ever a clone
+    # target: gen_rollback_target correctly returns "nothing retained"
+    # (exit 2), and GC must still treat that as safe to collect both --
+    # distinct from the genuine-failure case above (issue #19 review
+    # round 2).
+    make_gen 8900 1 superseded
+    gen_update 8900 GEN_WAS_ACTIVE=0
+    make_gen 8901 2 superseded
+    gen_update 8901 GEN_WAS_ACTIVE=0
+    make_gen 8903 3 active
+    stub_out qm 'status 8900' < /dev/null
+    stub_generation_template 8900 1
+    stub_out qm 'destroy 8900 --purge' < /dev/null
+    stub_out qm 'status 8901' < /dev/null
+    stub_generation_template 8901 2
+    stub_out qm 'destroy 8901 --purge' < /dev/null
+
+    run --separate-stderr gc_main false
+    [ "$status" -eq 0 ]
+    ! gen_exists 8900
+    ! gen_exists 8901
+}
+
 @test "an orphan candidate cannot displace the prior-active rollback target" {
     make_gen 8900 1 superseded
     make_gen 8901 2 candidate
