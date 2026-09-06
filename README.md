@@ -350,9 +350,16 @@ One attempt is:
    default branch, with `generation=<id>` as the input.
 4. Poll the run that dispatch created through to a conclusion, up to
    `CANARY_TIMEOUT` (1800s, measured from the dispatch -- Actions queue latency
-   counts against it). The run is identified by the highest run id that existed
-   *before* the dispatch, so a previous run can never be mistaken for this one,
-   and preferred by the `Runner canary gen-<id>` run-name.
+   counts against it). A run is this canary's only if **all three** hold: its
+   id is above the highest run id that existed before the dispatch, its
+   run-name is exactly `Runner canary gen-<id>`, and it started at or after the
+   instant GitHub accepted the dispatch (read from GitHub's own `Date`
+   response header, so a skewed host clock cannot reject the run it just
+   caused). Anything less would let the gate adopt a previous attempt's run for
+   the same generation -- promoting on a stale success -- or a run somebody
+   dispatched by hand. If the baseline read itself fails, the gate does not
+   dispatch at all. A new run that names something else is reported and
+   **not** attributed to this canary.
 5. `success` promotes the generation. Anything else is a failed attempt.
 6. Destroy the canary VM either way. **The candidate template is retained**, so
    a retry is a clone and a dispatch, not a 45-minute rebake.
@@ -363,7 +370,7 @@ Its exit status is a contract, because the unattended cycle will branch on it:
 |---|---|
 | `0` | passed, and the generation was promoted (or was already active) |
 | `1` | an error in the gate itself: bad arguments, an unreadable store, a generation it cannot act on, or a promotion that failed after a passing canary |
-| `2` | not attempted, and **no attempt was consumed** |
+| `2` | not attempted, and **no attempt was consumed** (including a run that is not this canary's) |
 | `3` | the attempt failed and attempts remain -- retried on a later cycle |
 | `4` | the budget is spent: the generation is `failed` and its digest is memoed |
 
@@ -380,11 +387,13 @@ means editing `/var/lib/github-runners/failed-digests`.
 **Anything that cannot be attempted costs nothing.** `CANARY_ENABLED` not
 `true`, an empty `CANARY_REPO`, a `CANARY_ORG` that names no configured
 organization, a PAT GitHub rejects or that lacks the scope to dispatch, a
-workflow that is missing or disabled, an unreachable API, a promotion holding
-the clone path, or another canary already running: all of these leave the
-candidate `pending` with its attempt budget untouched, and all but the last two
-notify `warn` (`canary.unconfigured`). Burning the budget on a misconfiguration
-would reject a perfectly good image.
+workflow that is missing or disabled, an unreachable API, a run list the gate
+could not read before dispatching, a new run that turns out to name some other
+generation, a promotion holding the clone path, or another canary already
+running: all of these leave the candidate `pending` with its attempt budget
+untouched, and all but the last two notify `warn` (`canary.unconfigured`).
+Burning the budget on a misconfiguration -- or on somebody else's workflow run
+-- would reject a perfectly good image.
 
 Configuration (`/etc/github-runners.conf`, all optional -- the defaults are in
 code, not written into the file):
