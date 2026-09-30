@@ -93,6 +93,8 @@ set_conf_assignment() {
     local file="$1" key="$2" value="$3" tmp quoted
     printf -v quoted '%q' "$value"
     tmp=$(mktemp "${file}.XXXXXX")
+    # Callers invoke this under `||`, which disables errexit for the whole
+    # function. A failed awk must not chmod and mv a truncated file into place.
     CONF_KEY="$key" CONF_VALUE="$quoted" awk '
         index($0, ENVIRON["CONF_KEY"] "=") == 1 {
             print ENVIRON["CONF_KEY"] "=" ENVIRON["CONF_VALUE"]
@@ -105,7 +107,11 @@ set_conf_assignment() {
                 print ENVIRON["CONF_KEY"] "=" ENVIRON["CONF_VALUE"]
             }
         }
-    ' "$file" > "$tmp"
+    ' "$file" > "$tmp" || {
+        rm -f "$tmp"
+        log_error "Failed to update $key in $file"
+        return 1
+    }
     chmod 600 "$tmp"
     mv -f "$tmp" "$file"
 }
@@ -150,7 +156,9 @@ commit_baked_version() {
     if [[ -n "$json" ]]; then
         published_at=$(printf '%s\n' "$json" | jq -r '.published_at // empty' 2>/dev/null || true)
     fi
-    [[ "$published_at" == "null" ]] && published_at=""
+    if [[ "$published_at" == "null" ]]; then
+        published_at=""
+    fi
     write_baked_record "$version" "$published_at" "$template_id"
 }
 
@@ -162,7 +170,13 @@ fetch_latest_runner_release() {
     LATEST_RUNNER_PUBLISHED_AT=$(printf '%s\n' "$json" | jq -r '.published_at // empty') || return 1
     [[ -n "$LATEST_RUNNER_VERSION" && "$LATEST_RUNNER_VERSION" != "null" ]] || return 1
     LATEST_RUNNER_VERSION=$(normalize_runner_version "$LATEST_RUNNER_VERSION")
-    [[ "$LATEST_RUNNER_PUBLISHED_AT" == "null" ]] && LATEST_RUNNER_PUBLISHED_AT=""
+    # jq -r already turns JSON null into an empty string. This must not be a
+    # trailing `&&` command: a false test would be this function's status, and
+    # rebake_main treats that as "could not read the release".
+    if [[ "$LATEST_RUNNER_PUBLISHED_AT" == "null" ]]; then
+        LATEST_RUNNER_PUBLISHED_AT=""
+    fi
+    return 0
 }
 
 remember_retired_template() {
@@ -179,7 +193,7 @@ remember_retired_template() {
 
 switch_template_id() {
     local new_id="$1" old_id="$TEMPLATE_ID"
-    set_conf_assignment "$CONFIG_FILE" TEMPLATE_ID "$new_id"
+    set_conf_assignment "$CONFIG_FILE" TEMPLATE_ID "$new_id" || return 1
     TEMPLATE_ID="$new_id"
     if [[ -n "$old_id" && "$old_id" != "$new_id" ]]; then
         remember_retired_template "$old_id"
@@ -243,13 +257,23 @@ retire_retired_templates() {
 }
 
 cleanup_rebake() {
-    local rc=$? name
+    local rc=$? name cfg
     trap - EXIT INT TERM
     if [[ "${REBAKE_PUBLISHED:-0}" != 1 && -n "${BAKE_VMID:-}" ]]; then
         if qm_host status "$BAKE_VMID" &>/dev/null; then
-            name=$(qm_host config "$BAKE_VMID" 2>/dev/null | awk '/^name:/{print $2; exit}')
+            cfg=$(qm_host config "$BAKE_VMID" 2>/dev/null || true)
+            name=$(printf '%s\n' "$cfg" | awk '/^name:/{print $2; exit}')
             if [[ "$name" != "ubuntu-cloud-template" ]]; then
                 log_error "Refusing to destroy VM $BAKE_VMID (${name:-unreadable}); it is not the rebake VM"
+            elif printf '%s\n' "$cfg" | grep -q '^template: 1[[:space:]]*$'; then
+                # qm template can finish before REBAKE_PUBLISHED is set. Keep
+                # the pending files so the next run can switch TEMPLATE_ID.
+                # A signal can also leave $? at 0; the oneshot must not
+                # report success while the new template is still unpublished.
+                log_warn "Rebake VM $BAKE_VMID is already a template; leaving it for the next run to publish"
+                if [[ "$rc" -eq 0 ]]; then
+                    rc=1
+                fi
             else
                 log_warn "Rebake failed; destroying partial VM $BAKE_VMID and leaving template ${TEMPLATE_ID} unchanged"
                 qm_host stop "$BAKE_VMID" --timeout 30 2>/dev/null || true
@@ -373,10 +397,11 @@ require_live_template() {
 perform_bake() {
     local new_vmid old_template
     # Checksum failure deletes the cached image and returns before a VM exists.
-    prepare_cloud_image || exit 1
+    # Simple commands, not `|| exit`: `||` disables errexit inside the callee.
+    prepare_cloud_image
     # reserve_vmid starts at MIN_VMID and walks upward. Hold fd 203 until the
     # bake ends so the 30-second watcher cannot take this VMID.
-    reserve_vmid || exit 1
+    reserve_vmid
     new_vmid=$RESERVED_VMID
     BAKE_VMID=$new_vmid
     old_template=$TEMPLATE_ID
@@ -385,13 +410,13 @@ perform_bake() {
     chmod 600 "$PENDING_BAKE_FILE"
     trap cleanup_rebake EXIT INT TERM
     log_info "Baking replacement template on VMID $new_vmid (live template $old_template keeps serving clones)"
-    create_bake_vm "$new_vmid" || { log_error "Failed to create VM $new_vmid"; exit 1; }
+    create_bake_vm "$new_vmid"
     BAKE_WRITE_PENDING_VERSION=1
-    bake_and_publish_vm "$new_vmid" || exit 1
+    bake_and_publish_vm "$new_vmid"
     # qm template succeeded. From here the partial-VM trap must not destroy it.
     REBAKE_PUBLISHED=1
-    switch_template_id "$new_vmid" || exit 1
-    commit_baked_version "$BAKE_RUNNER_VERSION" "$new_vmid" || exit 1
+    switch_template_id "$new_vmid"
+    commit_baked_version "$BAKE_RUNNER_VERSION" "$new_vmid"
     rm -f "$PENDING_BAKE_FILE" "$PENDING_VERSION_FILE"
     release_vmid_reservation "$new_vmid"
     trap - EXIT INT TERM

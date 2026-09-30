@@ -41,9 +41,12 @@ prepare_cloud_image() {
     # A mismatch deletes the cache and fails before any template VM is created.
     log_info "Verifying cloud image checksum..."
     checksum_url="https://cloud-images.ubuntu.com/noble/current/SHA256SUMS"
-    expected=$(wget -q -O - "$checksum_url" | grep -F "$CLOUD_IMG" | head -1 | awk '{print $1}')
+    # head -1 can SIGPIPE the producer. Tolerate that, and a failed checksum
+    # download, so a missing SHA256SUMS still skips verification. Callers run
+    # this function with errexit on.
+    expected=$(wget -q -O - "$checksum_url" | grep -F "$CLOUD_IMG" | head -1 | awk '{print $1}') || true
     if [[ -n "$expected" ]]; then
-        actual=$(sha256sum "$IMG_CACHE_DIR/$CLOUD_IMG" | awk '{print $1}')
+        actual=$(sha256sum "$IMG_CACHE_DIR/$CLOUD_IMG" | awk '{print $1}') || true
         if [[ "$actual" != "$expected" ]]; then
             log_error "Checksum verification failed!"
             log_error "Expected: $expected"

@@ -234,20 +234,28 @@ if qm status "$TEMPLATE_ID" &> /dev/null; then
 else
     log_info "[4/5] Creating baked Ubuntu cloud template..."
     # Checksum mismatch deletes the cached image and returns before qm create.
-    prepare_cloud_image || exit 1
+    # Simple commands, not `|| exit`: `||` disables errexit inside the callee.
+    prepare_cloud_image
 
     log_info "Creating VM template..."
-    create_bake_vm "$TEMPLATE_ID" || { log_error "Failed to create VM"; exit 1; }
+    create_bake_vm "$TEMPLATE_ID"
 
     # Destroy this VM on failure or interrupt. It is not a template yet.
+    # A SIGHUP after qm template succeeds must not purge the live template.
     cleanup_bake() {
+        local cfg
+        cfg=$(qm_host config "$TEMPLATE_ID" 2>/dev/null || true)
+        if printf '%s\n' "$cfg" | grep -q '^template: 1[[:space:]]*$'; then
+            log_warn "VM $TEMPLATE_ID is already a template; leaving it"
+            return 0
+        fi
         log_warn "Baking failed, cleaning up template VM..."
         qm_host stop "$TEMPLATE_ID" --timeout 30 2>/dev/null || true
         qm_host destroy "$TEMPLATE_ID" --purge 2>/dev/null || true
     }
     trap cleanup_bake EXIT
 
-    bake_and_publish_vm "$TEMPLATE_ID" || exit 1
+    bake_and_publish_vm "$TEMPLATE_ID"
     trap - EXIT
 
     if ! commit_baked_version "$BAKE_RUNNER_VERSION" "$TEMPLATE_ID"; then

@@ -277,7 +277,7 @@ zfs_dataset_from_volid() {
     local path dataset
 
     command -v zfs >/dev/null 2>&1 || return 1
-    path=$(pvesm path "$volid" 2>/dev/null) || return 1
+    path=$(pvesm path "$volid" 199>&- 200>&- 201>&- 202>&- 203>&- 204>&- 2>/dev/null) || return 1
     [[ "$path" == /dev/zvol/* ]] || return 1
 
     dataset="${path#/dev/zvol/}"
@@ -287,7 +287,7 @@ zfs_dataset_from_volid() {
 
 list_template_linked_clone_volids() {
     local template_id="${1:-$TEMPLATE_ID}"
-    local storage_list base_volid base_path prefix volid child_name base_dataset dataset origin
+    local storage_list base_volid base_path prefix volid child_name base_dataset dataset origin zfs_path
     local -A seen=()
 
     # An unreadable config must not look like "no linked clones". Callers
@@ -319,17 +319,39 @@ list_template_linked_clone_volids() {
     done < <(list_template_base_volids "$template_id")
 
     # ZFS linked clones are sibling zvols, not nested volids. They point at
-    # the template base volume snapshot via the ZFS origin property.
+    # the template base volume snapshot via the ZFS origin property. A failed
+    # path or origin lookup must fail this function: an empty result is
+    # permission to destroy the template. A path that is not a zvol is dir
+    # or LVM storage, already handled above.
     while read -r base_volid; do
         [[ -n "$base_volid" ]] || continue
-        base_dataset=$(zfs_dataset_from_volid "$base_volid") || continue
+        if ! zfs_path=$(pvesm path "$base_volid" 199>&- 200>&- 201>&- 202>&- 203>&- 204>&- 2>/dev/null); then
+            log_error "Failed to resolve path for template volume $base_volid"
+            return 1
+        fi
+        [[ "$zfs_path" == /dev/zvol/* ]] || continue
+        if ! command -v zfs >/dev/null 2>&1; then
+            log_error "Template volume $base_volid is a zvol but zfs is not available"
+            return 1
+        fi
+        base_dataset="${zfs_path#/dev/zvol/}"
+        if ! zfs list -H -o name "$base_dataset" >/dev/null 2>&1; then
+            log_error "Failed to resolve ZFS dataset for $base_volid"
+            return 1
+        fi
 
         while read -r volid _; do
             [[ "$volid" == "$VM_STORAGE:vm-"* ]] || continue
             [[ -n "${seen[$volid]:-}" ]] && continue
-
-            dataset=$(zfs_dataset_from_volid "$volid") || continue
-            origin=$(zfs get -H -o value origin "$dataset" 2>/dev/null || true)
+            if ! dataset=$(zfs_dataset_from_volid "$volid"); then
+                log_error "Failed to resolve ZFS dataset for $volid"
+                return 1
+            fi
+            if ! origin=$(zfs get -H -o value origin "$dataset" 2>/dev/null); then
+                log_error "Failed to read ZFS origin for $dataset"
+                return 1
+            fi
+            # "-" is a real origin value meaning "not a clone".
             [[ "$origin" == "$base_dataset@"* ]] || continue
 
             seen["$volid"]=1

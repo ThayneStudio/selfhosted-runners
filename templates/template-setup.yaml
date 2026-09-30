@@ -342,11 +342,7 @@ write_files:
       # template, so the version has to be captured while the guest is still up.
       printf '%s\n' "$LISTENER_VERSION" > /opt/.baked-runner-version
 
-      # Completion marker, written LAST. The guest deliberately does NOT power
-      # itself off: a self-poweroff is indistinguishable from a crash or an
-      # operator `qm stop`, which is how a half-baked template used to get
-      # published. The host waits for this marker, confirms it over the guest
-      # agent while the VM is still up, then shuts the VM down itself.
+      # Completion marker, written last. The guest must not power itself off.
       touch /opt/.template-setup-complete
 
 runcmd:

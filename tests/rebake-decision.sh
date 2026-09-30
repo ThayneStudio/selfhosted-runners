@@ -109,4 +109,56 @@ read_baked_record
 [[ -z "$RECORDED_RUNNER_PUBLISHED_AT" ]] || fail "empty published_at did not round-trip: $RECORDED_RUNNER_PUBLISHED_AT"
 rm -rf "$state"
 
+# A real lookup has to return 0. The old last line was `[[ == "null" ]] &&`,
+# which is false for every ISO timestamp and made every rebake exit before
+# the decision. rebake_main calls this under `if !`, same as here.
+curl() {
+    printf '%s\n' '{"tag_name":"v2.329.0","published_at":"2026-09-01T00:00:00Z"}'
+}
+if ! fetch_latest_runner_release; then
+    fail "successful release lookup returned non-zero"
+fi
+[[ "$LATEST_RUNNER_VERSION" == "2.329.0" ]] || fail "tag_name was not normalized: ${LATEST_RUNNER_VERSION}"
+[[ "$LATEST_RUNNER_PUBLISHED_AT" == "2026-09-01T00:00:00Z" ]] || fail "published_at was not kept: ${LATEST_RUNNER_PUBLISHED_AT}"
+
+curl() {
+    printf '%s\n' '{"tag_name":"v2.329.0","published_at":null}'
+}
+if ! fetch_latest_runner_release; then
+    fail "release lookup with a null published_at returned non-zero"
+fi
+[[ "$LATEST_RUNNER_VERSION" == "2.329.0" ]] || fail "null published_at changed the version: ${LATEST_RUNNER_VERSION}"
+[[ -z "$LATEST_RUNNER_PUBLISHED_AT" ]] || fail "null published_at was not cleared: ${LATEST_RUNNER_PUBLISHED_AT}"
+unset -f curl
+
+# awk failing must not replace the config or retire the live template.
+# switch_template_id is invoked under `||`, which is what used to hide the
+# failure and still update TEMPLATE_ID.
+switch_conf=$(mktemp)
+switch_state=$(mktemp -d)
+trap 'rm -f "$fixture" "$fixture".* "$switch_conf" "$switch_conf".*; rm -rf "$switch_state"' EXIT
+printf 'TEMPLATE_ID=9000\nNETWORK_BRIDGE=vmbr0\n' > "$switch_conf"
+cp "$switch_conf" "$switch_conf.orig"
+# shellcheck disable=SC2034 # switch_template_id reads these
+CONFIG_FILE=$switch_conf
+TEMPLATE_ID=9000
+STATE_DIR=$switch_state
+RETIRED_TEMPLATES_FILE=$switch_state/retired-templates
+awk() { return 1; }
+status=0
+switch_template_id 9100 || status=$?
+unset -f awk
+[[ "$status" -ne 0 ]] || fail "switch_template_id returned 0 after awk failed"
+[[ "$TEMPLATE_ID" == "9000" ]] || fail "shell TEMPLATE_ID changed after a failed switch: ${TEMPLATE_ID}"
+cmp -s "$switch_conf" "$switch_conf.orig" || fail "config file changed after a failed TEMPLATE_ID update"
+[[ ! -e "$RETIRED_TEMPLATES_FILE" ]] || fail "retired template list was written after a failed switch"
+shopt -s nullglob
+leftovers=()
+for leftover in "$switch_conf".*; do
+    [[ "$leftover" == "$switch_conf.orig" ]] && continue
+    leftovers+=("$leftover")
+done
+shopt -u nullglob
+[[ ${#leftovers[@]} -eq 0 ]] || fail "failed TEMPLATE_ID update left ${leftovers[*]}"
+
 printf 'rebake-decision: ok\n'
