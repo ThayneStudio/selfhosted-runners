@@ -317,6 +317,13 @@ write_files:
       }
       log "Runner extracted and dependencies installed"
 
+      LISTENER_VERSION=$(./bin/Runner.Listener --version 2>/dev/null | tr -d '[:space:]' || true)
+      if [[ "$LISTENER_VERSION" != "$RUNNER_VERSION" ]]; then
+        log_error "Runner.Listener version ${LISTENER_VERSION:-missing} does not match downloaded ${RUNNER_VERSION}"
+        exit 1
+      fi
+      log "Runner.Listener version ${LISTENER_VERSION}"
+
       log "[12/12] Cleaning up for template conversion..."
       apt-get clean
       rm -rf /tmp/* /var/tmp/*
@@ -330,6 +337,10 @@ write_files:
       truncate -s 0 /etc/machine-id
       rm -f /var/lib/dbus/machine-id
       rm -f /etc/ssh/ssh_host_*
+
+      # Host records this before it stops the VM. qm guest exec cannot read a
+      # template, so the version has to be captured while the guest is still up.
+      printf '%s\n' "$LISTENER_VERSION" > /opt/.baked-runner-version
 
       # Completion marker, written LAST. The guest deliberately does NOT power
       # itself off: a self-poweroff is indistinguishable from a crash or an

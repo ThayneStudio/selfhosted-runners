@@ -252,7 +252,8 @@ release_clone_slot() {
 }
 
 list_template_base_volids() {
-    qm config "$TEMPLATE_ID" 2>/dev/null | awk -F': ' -v storage="$VM_STORAGE:" '
+    local template_id="${1:-$TEMPLATE_ID}"
+    qm config "$template_id" 199>&- 200>&- 201>&- 202>&- 203>&- 204>&- 2>/dev/null | awk -F': ' -v storage="$VM_STORAGE:" '
         $1 ~ /^(ide|sata|scsi|virtio)[0-9]+$/ {
             split($2, parts, ",")
             if (index(parts[1], storage "base-") == 1) {
@@ -285,10 +286,18 @@ zfs_dataset_from_volid() {
 }
 
 list_template_linked_clone_volids() {
+    local template_id="${1:-$TEMPLATE_ID}"
     local storage_list base_volid base_path prefix volid child_name base_dataset dataset origin
     local -A seen=()
 
-    if ! storage_list=$(pvesm list "$VM_STORAGE" 2>/dev/null); then
+    # An unreadable config must not look like "no linked clones". Callers
+    # destroy a template only when this function succeeds and prints nothing.
+    if ! qm config "$template_id" 199>&- 200>&- 201>&- 202>&- 203>&- 204>&- >/dev/null 2>&1; then
+        log_error "Failed to read config for template $template_id"
+        return 1
+    fi
+
+    if ! storage_list=$(pvesm list "$VM_STORAGE" 199>&- 200>&- 201>&- 202>&- 203>&- 204>&- 2>/dev/null); then
         log_error "Failed to list storage volumes on $VM_STORAGE"
         return 1
     fi
@@ -307,7 +316,7 @@ list_template_linked_clone_volids() {
             seen["$volid"]=1
             printf '%s\n' "$volid"
         done <<< "$storage_list"
-    done < <(list_template_base_volids)
+    done < <(list_template_base_volids "$template_id")
 
     # ZFS linked clones are sibling zvols, not nested volids. They point at
     # the template base volume snapshot via the ZFS origin property.
@@ -326,7 +335,7 @@ list_template_linked_clone_volids() {
             seen["$volid"]=1
             printf '%s\n' "$volid"
         done <<< "$storage_list"
-    done < <(list_template_base_volids)
+    done < <(list_template_base_volids "$template_id")
 }
 
 cleanup_template_orphan_volumes() {

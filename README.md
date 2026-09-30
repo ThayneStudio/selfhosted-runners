@@ -270,96 +270,124 @@ The PAT lives only on the Proxmox host in `/etc/github-runners.d/<org>.conf`.
 Re-run `runner add-org`, enter the same org and the new PAT. The new token takes
 effect on the next clone — no runner stores the PAT, so nothing else is needed.
 
-To update prebaked software in the base VM template:
+### Template rebake
 
-1. Edit `/opt/selfhosted-runners/templates/template-setup.yaml`
-2. Stop the watcher, remove managed runners, and free any orphaned linked-clone child volumes that still point at the current template:
-   ```bash
-   runner stop
-   ```
-3. Destroy the existing template VM (default ID `9000`, or your configured template ID):
-   ```bash
-   qm destroy 9000
-   ```
-4. Re-run setup to bake a fresh template:
-   ```bash
-   runner setup
-   ```
-   > **Record your config first.** The wizard re-prompts all eight infrastructure
-   > questions with *hardcoded* defaults -- it does not read your existing
-   > `/etc/github-runners.conf`. Pressing Enter through it silently clears
-   > `DOCKER_MIRROR_URL` and `VLAN_TAG`, for the bake and for every future clone.
-   > Run `cat /etc/github-runners.conf` beforehand and retype every
-   > non-default value. Your PAT and org configs are not touched -- `add-org` only
-   > runs when no orgs exist yet.
-5. Resume the pool and refill it:
-   ```bash
-   runner start
-   ```
+GitHub stops accepting a runner about 30 days after its release. A daily timer,
+`github-runner-rebake.timer`, is separate from `github-runner-watch.timer`. Once
+a day it compares the `Runner.Listener` version recorded on the host with the
+latest `actions/runner` release. It bakes when those versions differ, or when
+that release is 21 days old, whichever comes first. When the recorded release
+is still current, it does not start a bake.
 
-### If the bake fails or appears stuck
+`runner rebake` reads `/etc/github-runners.conf` and does not ask the eight
+setup questions. The bridge, VLAN, storage, minimum VMID, balloon, DNS, and
+Docker mirror stay as they are. It builds a second VM while the current
+template keeps serving clones, and it holds that VMID's reservation for the
+whole bake. `reserve_vmid` starts at `MIN_VMID` and walks upward, and the
+watcher runs every 30 seconds. `TEMPLATE_ID` changes only after `qm template`
+succeeds on the new VM. Running clones finish their current job, or hit the
+6-hour shutdown, and the next clone of that slot comes from the new image.
+The previous template is destroyed only once no linked clone still depends on
+it. A failed bake destroys the partial VM and leaves `TEMPLATE_ID` and the live
+template as they were.
 
-The bake is gated so a partial template can never be published. The guest writes
-its completion marker last and does **not** power itself off; `runner setup`
-confirms that marker over the guest agent while the VM is still running, then
-shuts the VM down itself and only then converts it to a template.
+The runner tarball download stays inside this bake, as do the image pulls the
+template already bakes (Supabase CLI, Playwright, and Docker images via the
+configured mirror). Clones do not gain a download path for any of those.
 
-- **Timeout**: the bake aborts after 90 minutes and prints the last 40 lines from
-  the guest log. A healthy bake runs 30-45 minutes. Override with
-  `BAKE_TIMEOUT=<seconds> runner setup`.
-- **`qm stop` on a stuck bake is safe.** The VM stopping without a confirmed
-  marker is treated as failure -- setup aborts and the cleanup trap destroys the
-  partial VM rather than publishing it.
-- **Ctrl-C is also safe**, and does the same thing.
-- **Run `runner setup` under `tmux` or `screen`.** The wizard is interactive, so it
-  runs over SSH -- and a dropped connection fires the same cleanup trap, throwing
-  away an in-progress bake.
-- Watch progress with
-  `qm guest exec <TEMPLATE_ID> -- cat /var/log/template-setup.log`.
-- **Checksum verification failed?** The cached Ubuntu image at
-  `/var/cache/github-runners/` goes stale whenever upstream rotates
-  `noble/current/`, roughly every 2-4 weeks. Setup deletes the bad file on its way
-  out, so just run `runner setup` again -- it downloads a fresh image. This is not
-  a supply-chain compromise, though the error reads like one.
+Both `run.sh --jitconfig` lines pass `--disableupdate`. That flag is not a
+valid `run` option: the listener warns and continues. What stops GitHub pushing
+a new runner package onto the clone is `disableUpdate: true` in the JIT
+`.runner` document. The clone sets that bit before `run.sh` and exits 1 if the
+patch fails, so it does not start a self-updating runner. A clone that did
+self-update leaves versioned `bin.<version>` and `externals.<version>`
+directories under `/home/runner/actions-runner` and re-downloads the runner
+package on every job.
 
-### The 30-day rebake deadline
+The host records the baked version in
+`/var/lib/github-runners/baked-runner-version` at the end of a successful bake.
+The guest writes it from `Runner.Listener --version` while it is still up. The
+template is stopped afterward, so `qm guest exec` cannot read it later.
 
-Clones start the baked runner with `run.sh --jitconfig` (no `config.sh`, so
-`--disableupdate` is not applied). GitHub still requires a reasonably current
-runner version. **Rebake within 30 days of each new `actions/runner` release**
-(sooner if it is a critical security update).
+`runner rebake` detaches from the SSH session (the systemd service when that
+unit is installed, otherwise `setsid`) so a dropped connection does not kill
+the bake. Follow it with `journalctl -u github-runner-rebake.service -f`, or
+`/var/log/github-runner-rebake.log` when it detached with `setsid`.
+`runner rebake --foreground` stays attached; run that form inside tmux.
 
-Miss it and the failure can be silent: runners show **Online / Idle** in the
-GitHub UI while jobs queue forever — which looks like a GitHub incident, not a
-stale template. Check the baked version against upstream by probing a **running
-runner clone** — the template itself is never running, so `qm guest exec` cannot
-reach it:
+A healthy bake is 30–45 minutes. The bake aborts after 90 minutes
+(`BAKE_TIMEOUT`, default 5400). The guest writes `/opt/.template-setup-complete`
+last and does not power itself off. The host confirms that marker over the
+guest agent, then shuts the VM down, and only then runs `qm template`. Stopping
+the bake VM before that marker is confirmed destroys the partial VM and does
+not publish it.
+
+A Noble checksum mismatch deletes
+`/var/cache/github-runners/noble-server-cloudimg-amd64.img` and exits 1 before
+creating a template VM. Upstream rotates `noble/current/` every few weeks. Run
+the bake again; it downloads a fresh image. The error is a stale cache, not a
+supply-chain alarm.
+
+The first check on a host with no recorded version bakes once. After a template
+baked by an older setup, record the version that bake installed if that extra
+bake should wait. Use the version the bake logged (`Latest runner version`),
+which the guest wipes from its own log before it finishes:
 
 ```bash
-vmid=$(qm list | awk '$3=="running" && $2 ~ /runner/ {print $1; exit}')
-qm guest exec "$vmid" -- /home/runner/actions-runner/bin/Runner.Listener --version | jq -r '."out-data"'
-curl -sf https://api.github.com/repos/actions/runner/releases/latest | jq -r .tag_name
+install -d -m 700 /var/lib/github-runners
+cat > /var/lib/github-runners/baked-runner-version <<'EOF'
+version=2.329.0
+published_at=''
+template_id=9000
+EOF
+chmod 600 /var/lib/github-runners/baked-runner-version
 ```
 
-If those two outputs have drifted, the rebake is overdue. A clone that
-self-updates on boot leaves versioned `bin.<version>` and `externals.<version>`
-directories under `/home/runner/actions-runner` and re-downloads the ~225 MB
-runner package on every job until the template is rebaked.
+`github-runner-rebake.timer` is persistent (`OnCalendar=daily`). Enabling it
+after today's slot has passed can start that check immediately. Enable it only
+after the current template bake has finished.
 
-`runner stop` leaves the pool in maintenance mode until you run `runner start`.
-The maintenance flag lives in `/run/lock/`, which is tmpfs -- it does **not**
-survive a host reboot, and the watcher timer is still enabled, so rebooting
-mid-maintenance silently resumes runner creation. Do not reboot the Proxmox host
-between `runner stop` and `runner start`.
-On full stops, it also frees orphaned linked-clone child volumes for the current
-template when those volumes no longer have a VM config anywhere in the cluster.
-If any child volumes still belong to live VM/template configs, `runner stop`
-fails and tells you to resolve those dependents before deleting the template.
+To refresh prebaked software before the release is stale, edit
+`/opt/selfhosted-runners/templates/template-setup.yaml`, remove
+`/var/lib/github-runners/baked-runner-version`, and run `runner rebake`. That
+reads the saved infra config. It does not re-prompt, and it leaves running
+clones up.
+
+`runner setup` is still the interactive wizard, and it is how you create the
+template the first time. It skips the bake when the configured template VMID
+already exists (`qm status` succeeds), so a second setup does not refresh the
+image. The wizard asks eight questions with hardcoded defaults and does not
+read `/etc/github-runners.conf`. Pressing Enter through it clears
+`DOCKER_MIRROR_URL` and `VLAN_TAG` for the bake and for every later clone.
+Run `cat /etc/github-runners.conf` first and retype every non-default value if
+you do run the wizard again. Org configs and PATs are not touched; `add-org`
+runs only when no orgs exist yet. Run `runner setup` under tmux. It is
+interactive, and a dropped SSH session fires the cleanup trap and throws away
+an in-progress setup bake.
+
+Before running `install.sh` on a host that already has `/opt/selfhosted-runners`,
+diff that tree. `install.sh` replaces it with GitHub master, and the copy on
+the host is not necessarily the commit you last installed.
+
+`runner stop` without `--vmid-range` destroys every managed runner VM for every
+configured org. With three orgs, that is every managed VM across all three.
+The in-progress rebake VM is named `ubuntu-cloud-template` and has no org
+snippet, so stop does not treat it as a managed runner. `runner stop` leaves
+the pool in maintenance mode until `runner start`. The maintenance flag lives
+in `/run/lock/`, which is tmpfs. It does not survive a host reboot, and the
+watcher timer stays enabled, so a reboot mid-maintenance resumes runner
+creation. Do not reboot the Proxmox host between `runner stop` and
+`runner start`. On a full stop it also frees orphaned linked-clone child
+volumes for the current template when those volumes no longer have a VM config
+anywhere in the cluster. If any child volumes still belong to live VM or
+template configs, `runner stop` fails and tells you to resolve those dependents
+before deleting the template.
 
 `runner stop --vmid-range <min:max>` is for partial maintenance windows only.
 Do not use a VMID-limited stop immediately before destroying a linked-clone
 template, because every dependent clone must be removed before `qm destroy`
-will succeed.
+will succeed. `runner stop --watch-only` stops the watcher and leaves the VMs
+up.
 
 ## Troubleshooting
 
@@ -450,6 +478,9 @@ The runner VM might not have network connectivity. Check:
 | `/etc/github-runners.d/<org>.conf` | Per-org config (PAT, prefix, count, runner group ID) — mode 600 |
 | `/var/lib/vz/snippets/runner-<vmid>-user-<org>.yaml` | Per-VM cloud-init (single-use JIT config) |
 | `/var/lib/vz/snippets/runner-<vmid>-meta.yaml` | Per-VM cloud-init metadata |
+| `/var/lib/github-runners/baked-runner-version` | `Runner.Listener` version recorded at the end of a successful bake |
+| `github-runner-watch.timer` | Pool filler, 30 seconds after the previous run |
+| `github-runner-rebake.timer` | Daily template staleness check, separate from the watcher |
 | VM template (default ID 9000) | Ubuntu cloud image template |
 
 ## Security Notes

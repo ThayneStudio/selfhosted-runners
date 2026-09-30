@@ -150,6 +150,30 @@ write_files:
       rm -f /etc/github-runner/config.env
       rm -f /var/lib/cloud/instance/user-data.txt* /var/lib/cloud/instances/*/user-data.txt* 2>/dev/null || true
 
+      # run.sh --disableupdate is not a valid `run` flag (the listener warns and
+      # ignores it). The session reports DisableUpdate from the JIT .runner file
+      # on every get-messages call, which is what stops GitHub pushing a runner
+      # package to this clone. Set that bit here. The flag stays on the command
+      # below so a checkout that drops it fails the regression check.
+      patch_jit_disableupdate() {
+        local decoded patched
+        decoded=$(printf '%s' "$1" | base64 -d) || return 1
+        jq -e 'keys[] | select(endswith(".runner"))' <<<"$decoded" >/dev/null || return 1
+        patched=$(jq -c '
+          with_entries(
+            if (.key | endswith(".runner")) then
+              .value = (.value | @base64d | fromjson | .disableUpdate = true | tojson | @base64)
+            else
+              .
+            end
+          )' <<<"$decoded") || return 1
+        printf '%s' "$patched" | base64 -w0
+      }
+      if ! JIT=$(patch_jit_disableupdate "$JIT"); then
+        log_error "Failed to set disableUpdate on the JIT runner config"
+        exit 1
+      fi
+
       # Signal that the runner is ready
       touch /opt/.runner-ready
 
@@ -160,10 +184,11 @@ write_files:
       # Run directly with the JIT config (no config.sh registration needed; JIT
       # runners are inherently ephemeral and auto-remove). When run.sh exits
       # (job complete or error), the VM shuts down and the hookscript reclones.
+      # --disableupdate is on both branches; clones must not download a runner.
       if [[ -n "${SUPABASE_IMAGE_REGISTRY:-}" ]]; then
-        sudo -u $RUNNER_USER env SUPABASE_INTERNAL_IMAGE_REGISTRY="$SUPABASE_IMAGE_REGISTRY" INTERNAL_IMAGE_REGISTRY="$SUPABASE_IMAGE_REGISTRY" ./run.sh --jitconfig "$JIT" || true
+        sudo -u $RUNNER_USER env SUPABASE_INTERNAL_IMAGE_REGISTRY="$SUPABASE_IMAGE_REGISTRY" INTERNAL_IMAGE_REGISTRY="$SUPABASE_IMAGE_REGISTRY" ./run.sh --jitconfig "$JIT" --disableupdate || true
       else
-        sudo -u $RUNNER_USER ./run.sh --jitconfig "$JIT" || true
+        sudo -u $RUNNER_USER ./run.sh --jitconfig "$JIT" --disableupdate || true
       fi
       # EXIT trap handles shutdown
 

@@ -2,6 +2,8 @@
 set -euo pipefail
 
 source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/common.sh"
+# shellcheck source=rebake.sh
+source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/rebake.sh"
 
 require_root "setup"
 
@@ -226,238 +228,44 @@ fi
 if qm status "$TEMPLATE_ID" &> /dev/null; then
     log_info "[4/5] Template VM $TEMPLATE_ID already exists. Skipping creation."
     log_warn "To recreate: qm destroy $TEMPLATE_ID && runner setup"
+    if [[ ! -f /var/lib/github-runners/baked-runner-version ]]; then
+        log_warn "No baked runner version is recorded. The daily rebake will bake once."
+    fi
 else
-    # Download and create template
     log_info "[4/5] Creating baked Ubuntu cloud template..."
-    CLOUD_IMG="noble-server-cloudimg-amd64.img"
-    CLOUD_IMG_URL="https://cloud-images.ubuntu.com/noble/current/$CLOUD_IMG"
-
-    # Use a root-only cache directory instead of world-writable /tmp/
-    # to prevent symlink attacks or image replacement by unprivileged users
-    IMG_CACHE_DIR="/var/cache/github-runners"
-    mkdir -p "$IMG_CACHE_DIR"
-    chmod 700 "$IMG_CACHE_DIR"
-
-    if [[ ! -f "$IMG_CACHE_DIR/$CLOUD_IMG" ]]; then
-        log_info "Downloading Ubuntu 24.04 cloud image..."
-        if ! wget -q --show-progress -O "$IMG_CACHE_DIR/$CLOUD_IMG" "$CLOUD_IMG_URL"; then
-            log_error "Failed to download cloud image"
-            rm -f "$IMG_CACHE_DIR/$CLOUD_IMG"
-            exit 1
-        fi
-    else
-        log_info "Using cached cloud image from $IMG_CACHE_DIR/$CLOUD_IMG"
-    fi
-
-    # Verify image is valid (basic check)
-    if [[ ! -s "$IMG_CACHE_DIR/$CLOUD_IMG" ]]; then
-        log_error "Cloud image is empty or missing"
-        rm -f "$IMG_CACHE_DIR/$CLOUD_IMG"
-        exit 1
-    fi
-
-    # Verify SHA256 checksum
-    log_info "Verifying cloud image checksum..."
-    CHECKSUM_URL="https://cloud-images.ubuntu.com/noble/current/SHA256SUMS"
-    EXPECTED_SHA256=$(wget -q -O - "$CHECKSUM_URL" | grep -F "$CLOUD_IMG" | head -1 | awk '{print $1}')
-    if [[ -n "$EXPECTED_SHA256" ]]; then
-        ACTUAL_SHA256=$(sha256sum "$IMG_CACHE_DIR/$CLOUD_IMG" | awk '{print $1}')
-        if [[ "$ACTUAL_SHA256" != "$EXPECTED_SHA256" ]]; then
-            log_error "Checksum verification failed!"
-            log_error "Expected: $EXPECTED_SHA256"
-            log_error "Got:      $ACTUAL_SHA256"
-            rm -f "$IMG_CACHE_DIR/$CLOUD_IMG"
-            exit 1
-        fi
-        log_info "Checksum verified"
-    else
-        log_warn "Could not fetch checksum from Ubuntu — skipping verification"
-    fi
+    # Checksum mismatch deletes the cached image and returns before qm create.
+    prepare_cloud_image || exit 1
 
     log_info "Creating VM template..."
-    NET_CONFIG="virtio,bridge=$NETWORK_BRIDGE"
-    if [[ -n "$VLAN_TAG" ]]; then
-        NET_CONFIG="${NET_CONFIG},tag=$VLAN_TAG"
-    fi
-    if ! qm create "$TEMPLATE_ID" --name ubuntu-cloud-template \
-        --memory 8192 --balloon "$BALLOON" --cores 2 --cpu host --net0 "$NET_CONFIG"; then
-        log_error "Failed to create VM"
-        exit 1
-    fi
+    create_bake_vm "$TEMPLATE_ID" || { log_error "Failed to create VM"; exit 1; }
 
-    # Cleanup trap: destroy template VM on any failure or interrupt from this point
+    # Destroy this VM on failure or interrupt. It is not a template yet.
     cleanup_bake() {
         log_warn "Baking failed, cleaning up template VM..."
-        qm stop "$TEMPLATE_ID" --timeout 30 2>/dev/null || true
-        qm destroy "$TEMPLATE_ID" --purge 2>/dev/null || true
+        qm_host stop "$TEMPLATE_ID" --timeout 30 2>/dev/null || true
+        qm_host destroy "$TEMPLATE_ID" --purge 2>/dev/null || true
     }
     trap cleanup_bake EXIT
 
-    IMPORT_OUTPUT=$(qm importdisk "$TEMPLATE_ID" "$IMG_CACHE_DIR/$CLOUD_IMG" "$VM_STORAGE" 2>&1) || {
-        log_error "Failed to import disk"
-        echo "$IMPORT_OUTPUT" >&2
-        exit 1
-    }
-
-    # Extract the disk volume from importdisk output
-    # Typical output: "Successfully imported disk as 'unused0:storage:vm-9000-disk-0'"
-    if [[ "$IMPORT_OUTPUT" =~ unused0:([^\'\"[:space:]]+) ]]; then
-        IMPORTED_DISK="${BASH_REMATCH[1]}"
-    else
-        # Fallback to conventional naming
-        IMPORTED_DISK="${VM_STORAGE}:vm-${TEMPLATE_ID}-disk-0"
-        log_warn "Could not parse imported disk name from importdisk output:"
-        log_warn "$IMPORT_OUTPUT"
-        log_warn "Assuming: $IMPORTED_DISK"
-    fi
-
-    qm set "$TEMPLATE_ID" --scsihw virtio-scsi-pci --scsi0 "$IMPORTED_DISK" \
-        || { log_error "Failed to configure SCSI"; exit 1; }
-    qm set "$TEMPLATE_ID" --ide2 "${VM_STORAGE}:cloudinit" \
-        || { log_error "Failed to add cloud-init drive"; exit 1; }
-    qm set "$TEMPLATE_ID" --boot c --bootdisk scsi0 \
-        || { log_error "Failed to set boot disk"; exit 1; }
-    qm set "$TEMPLATE_ID" --serial0 socket --vga serial0 \
-        || { log_error "Failed to set serial"; exit 1; }
-    qm set "$TEMPLATE_ID" --agent enabled=1 \
-        || { log_error "Failed to enable agent"; exit 1; }
-    qm resize "$TEMPLATE_ID" scsi0 30G \
-        || { log_error "Failed to resize disk"; exit 1; }
-
-    # Copy template-setup cloud-init to snippets and configure
-    log_info "Configuring template cloud-init..."
-    DOCKER_MIRROR_URL="${DOCKER_MIRROR_URL:-}" awk '
-    function lreplace(str, old, new,    i, result) {
-        result = ""
-        while ((i = index(str, old)) > 0) {
-            result = result substr(str, 1, i - 1) new
-            str = substr(str, i + length(old))
-        }
-        return result str
-    }
-    {
-        $0 = lreplace($0, "{{DOCKER_MIRROR_URL}}", ENVIRON["DOCKER_MIRROR_URL"])
-        print
-    }' "$INSTALL_DIR/templates/template-setup.yaml" > "$SNIPPETS_DIR/template-setup.yaml"
-    chmod 600 "$SNIPPETS_DIR/template-setup.yaml"
-
-    qm set "$TEMPLATE_ID" --cicustom "user=local:snippets/template-setup.yaml" \
-        || { log_error "Failed to set cloud-init config"; exit 1; }
-    qm set "$TEMPLATE_ID" --ipconfig0 ip=dhcp \
-        || { log_error "Failed to set IP config"; exit 1; }
-    if [[ -n "${DNS_SERVERS:-}" ]]; then
-        qm set "$TEMPLATE_ID" --nameserver "$DNS_SERVERS" \
-            || { log_error "Failed to set DNS servers"; exit 1; }
-    fi
-    qm set "$TEMPLATE_ID" --ciuser runner \
-        || { log_error "Failed to set cloud-init user"; exit 1; }
-
-    # Boot VM to bake tools into the template
-    log_info "Starting VM to install tools (this can take a while on cold caches)..."
-    if ! qm start "$TEMPLATE_ID"; then
-        log_error "Failed to start template VM"
-        exit 1
-    fi
-
-    # Poll for the guest's completion marker. The guest stays running until we
-    # confirm the marker and shut it down ourselves — see templates/template-setup.yaml.
-    log_info "Waiting for tool installation to complete..."
-    log_info "  (Monitor progress: qm guest exec $TEMPLATE_ID -- cat /var/log/template-setup.log)"
-    BAKE_ELAPSED=0
-    BAKE_INTERVAL=15
-    BAKE_TIMEOUT="${BAKE_TIMEOUT:-5400}"   # 90 min; a healthy bake runs ~30-45
-    BAKE_READY=false
-
-    while true; do
-        sleep $BAKE_INTERVAL
-        BAKE_ELAPSED=$((BAKE_ELAPSED + BAKE_INTERVAL))
-
-        if [[ $BAKE_ELAPSED -ge $BAKE_TIMEOUT ]]; then
-            echo "" >&2
-            log_error "Bake timed out after $((BAKE_TIMEOUT / 60)) minutes (override with BAKE_TIMEOUT=<seconds>)"
-            log_error "Last 40 lines from the guest:"
-            qm guest exec "$TEMPLATE_ID" -- tail -n 40 /var/log/template-setup.log 2>/dev/null \
-                | jq -r '."out-data" // empty' >&2 || true
-            exit 1
-        fi
-
-        # The guest never powers itself off, so a stopped VM means a crash or an
-        # external `qm stop` — never success. Refuse to publish.
-        VM_STATUS=$(qm status "$TEMPLATE_ID" 2>/dev/null | awk '{print $2}') || true
-        if [[ "$VM_STATUS" != "running" ]]; then
-            echo "" >&2
-            log_error "Template VM stopped before setup completion was confirmed"
-            log_error "Refusing to publish a possibly half-baked template."
-            exit 1
-        fi
-
-        # Try to check for completion marker via guest agent
-        EXEC_RESULT=$(qm guest exec "$TEMPLATE_ID" -- test -f /opt/.template-setup-complete 2>&1) || {
-            # Guest agent not ready yet (still installing qemu-guest-agent)
-            MINUTES=$((BAKE_ELAPSED / 60))
-            SECONDS_REM=$((BAKE_ELAPSED % 60))
-            printf '\r  Elapsed: %dm%02ds (waiting for guest agent...)' "$MINUTES" "$SECONDS_REM" >&2
-            continue
-        }
-
-        # Parse exit code from guest exec JSON response
-        EXEC_EXIT=$(echo "$EXEC_RESULT" | jq -r '.exitcode // "1"' 2>/dev/null) || EXEC_EXIT="1"
-        if [[ "$EXEC_EXIT" == "0" ]]; then
-            BAKE_READY=true
-            echo "" >&2
-            log_info "Template setup complete!"
-            break
-        fi
-
-        MINUTES=$((BAKE_ELAPSED / 60))
-        SECONDS_REM=$((BAKE_ELAPSED % 60))
-        printf '\r  Elapsed: %dm%02ds (installing tools...)' "$MINUTES" "$SECONDS_REM" >&2
-    done
-    echo "" >&2
-
-    # Publish gate: never convert a VM whose marker we did not confirm.
-    if [[ "$BAKE_READY" != "true" ]]; then
-        log_error "Internal error: bake loop exited without a confirmed completion marker"
-        exit 1
-    fi
-
-    log_info "Shutting down template VM..."
-    qm shutdown "$TEMPLATE_ID" --timeout 120 || {
-        log_warn "Graceful shutdown failed, forcing..."
-        qm stop "$TEMPLATE_ID" --skiplock 2>/dev/null || true
-    }
-    for i in {1..60}; do
-        VM_STATUS=$(qm status "$TEMPLATE_ID" 2>/dev/null | awk '{print $2}') || true
-        [[ "$VM_STATUS" == "stopped" ]] && break
-        sleep 2
-    done
-    if [[ "$VM_STATUS" != "stopped" ]]; then
-        log_error "Template VM did not reach stopped state; refusing to convert to template"
-        exit 1
-    fi
-
-    # Clear bake-time cloud-init settings so clones start fresh
-    log_info "Preparing template for cloning..."
-    qm set "$TEMPLATE_ID" --delete cicustom 2>/dev/null || true
-    qm set "$TEMPLATE_ID" --delete ciuser 2>/dev/null || true
-    qm set "$TEMPLATE_ID" --delete ipconfig0 2>/dev/null || true
-    qm set "$TEMPLATE_ID" --delete nameserver 2>/dev/null || true
-
-    # Convert to template
-    qm template "$TEMPLATE_ID" || { log_error "Failed to convert to template"; exit 1; }
-
-    # Disable cleanup trap — template created successfully
+    bake_and_publish_vm "$TEMPLATE_ID" || exit 1
     trap - EXIT
 
+    if ! commit_baked_version "$BAKE_RUNNER_VERSION" "$TEMPLATE_ID"; then
+        log_warn "Template was created but the baked runner version was not recorded"
+    fi
     log_info "Template created successfully (tools baked in)"
 fi
 
-log_info "[5/5] Installing pool watcher timer..."
+log_info "[5/5] Installing pool watcher and rebake timers..."
 cp "$INSTALL_DIR/templates/github-runner-watch.service" /etc/systemd/system/
 cp "$INSTALL_DIR/templates/github-runner-watch.timer" /etc/systemd/system/
+cp "$INSTALL_DIR/templates/github-runner-rebake.service" /etc/systemd/system/
+cp "$INSTALL_DIR/templates/github-runner-rebake.timer" /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable --now github-runner-watch.timer 2>/dev/null || true
+systemctl enable --now github-runner-rebake.timer 2>/dev/null || true
 log_info "Pool watcher timer installed (30s interval)"
+log_info "Template rebake timer installed (daily)"
 
 echo ""
 echo "========================================"

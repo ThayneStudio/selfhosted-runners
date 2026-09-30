@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily GitHub Actions runner template rebake check
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+AccuracySec=15min
+
+[Install]
+WantedBy=timers.target
