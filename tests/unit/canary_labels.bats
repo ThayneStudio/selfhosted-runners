@@ -528,3 +528,33 @@ EOF
     [ "$status" -eq 0 ]
     [ "$output" = "1" ]
 }
+
+# ---------------------------------------------------------------------------
+# Lock fds must not reach the clone's kvm
+# ---------------------------------------------------------------------------
+
+# The canary gate holds CANARY_LOCK_FILE on fd 218 while it clones, and a bake
+# holds BAKE_LOCK_FILE on fd 207. qm start forks the long-lived kvm, which
+# would keep that lock for the VM's whole life: a canary VM left behind by a
+# failed destroy would then hold the canary lock and block every later gate.
+@test "clone_runner closes the bake and canary lock fds for qm clone and qm start" {
+    record_jit_labels
+    seed_generation 9000 5
+    qm_stub() {
+        case "$1" in
+            clone|start)
+                local fd
+                for fd in 207 218; do
+                    { true >&"$fd"; } 2>/dev/null && printf '%s %s\n' "$1" "$fd" >> "$STUB_DIR/leaked-fds"
+                done
+                ;;
+        esac
+        return 0
+    }
+    export -f qm_stub
+    exec 207>"$BATS_TEST_TMPDIR/bake.lock" 218>"$BATS_TEST_TMPDIR/canary.lock"
+    run --separate-stderr clone_runner runner-acme-1 acme
+    exec 207>&- 218>&-
+    [ "$status" -eq 0 ]
+    [ ! -s "$STUB_DIR/leaked-fds" ] || { cat "$STUB_DIR/leaked-fds"; false; }
+}

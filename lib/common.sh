@@ -1817,11 +1817,14 @@ clone_runner() {
 
     # Keep maintenance locks in this shell only. Proxmox helper children can
     # spawn long-lived kvm processes; those must not inherit runner lock fds.
+    # That includes the bake (207) and canary (218) locks: a canary VM's kvm
+    # would otherwise hold the canary lock for as long as the VM exists.
     # Capture stderr so the actual ZFS/Proxmox error surfaces under
     # `journalctl -t github-runner` instead of being buried under the service
     # unit log (which the operator does not look at first).
     local clone_err; clone_err=$(mktemp)
-    if ! qm clone "$clone_src" "$vmid" --name "$name" 200>&- 201>&- 202>&- 203>&- 204>&- 2>"$clone_err"; then
+    if ! qm clone "$clone_src" "$vmid" --name "$name" 200>&- 201>&- 202>&- 203>&- 204>&- \
+        205>&- 206>&- 207>&- 208>&- 209>&- 210>&- 211>&- 212>&- 214>&- 215>&- 216>&- 217>&- 218>&- 2>"$clone_err"; then
         while IFS= read -r line; do
             [[ -n "$line" ]] && log_error "qm clone $vmid: $line"
         done < "$clone_err"
@@ -1927,7 +1930,8 @@ clone_runner() {
     fi
 
     # Start
-    if ! qm start "$vmid" 200>&- 201>&- 202>&- 203>&- 204>&-; then
+    if ! qm start "$vmid" 200>&- 201>&- 202>&- 203>&- 204>&- \
+        205>&- 206>&- 207>&- 208>&- 209>&- 210>&- 211>&- 212>&- 214>&- 215>&- 216>&- 217>&- 218>&-; then
         _fail
         _pool_lock_release
         return 1
