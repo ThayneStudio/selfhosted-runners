@@ -231,7 +231,7 @@ fi
 if qm status "$TEMPLATE_ID" &> /dev/null; then
     log_info "[4/5] Template VM $TEMPLATE_ID already exists. Skipping creation."
     log_warn "To recreate: qm destroy $TEMPLATE_ID && runner setup"
-    if [[ ! -f /var/lib/github-runners/baked-runner-version ]]; then
+    if [[ ! -f "$BAKED_VERSION_FILE" ]]; then
         log_warn "No baked runner version is recorded. The daily rebake will bake once."
     fi
 else

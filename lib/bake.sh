@@ -15,49 +15,61 @@ qm_host() {
 }
 
 prepare_cloud_image() {
-    local cloud_img_url checksum_url expected actual
+    local base_url img tmp expected actual
+    local -a progress=()
 
     mkdir -p "$IMG_CACHE_DIR"
     chmod 700 "$IMG_CACHE_DIR"
-    cloud_img_url="https://cloud-images.ubuntu.com/noble/current/$CLOUD_IMG"
+    base_url="https://cloud-images.ubuntu.com/noble/current"
+    img="$IMG_CACHE_DIR/$CLOUD_IMG"
 
-    if [[ ! -f "$IMG_CACHE_DIR/$CLOUD_IMG" ]]; then
-        log_info "Downloading Ubuntu 24.04 cloud image..."
-        if ! wget -q --show-progress -O "$IMG_CACHE_DIR/$CLOUD_IMG" "$cloud_img_url"; then
-            log_error "Failed to download cloud image"
-            rm -f "$IMG_CACHE_DIR/$CLOUD_IMG"
-            return 1
-        fi
-    else
-        log_info "Using cached cloud image from $IMG_CACHE_DIR/$CLOUD_IMG"
-    fi
-
-    if [[ ! -s "$IMG_CACHE_DIR/$CLOUD_IMG" ]]; then
-        log_error "Cloud image is empty or missing"
-        rm -f "$IMG_CACHE_DIR/$CLOUD_IMG"
-        return 1
-    fi
-
-    # A mismatch deletes the cache and fails before any template VM is created.
-    log_info "Verifying cloud image checksum..."
-    checksum_url="https://cloud-images.ubuntu.com/noble/current/SHA256SUMS"
     # head -1 can SIGPIPE the producer. Tolerate that, and a failed checksum
     # download, so a missing SHA256SUMS still skips verification. Callers run
     # this function with errexit on.
-    expected=$(wget -q -O - "$checksum_url" | grep -F "$CLOUD_IMG" | head -1 | awk '{print $1}') || true
+    expected=$(wget -q -O - "$base_url/SHA256SUMS" | grep -F "$CLOUD_IMG" | head -1 | awk '{print $1}') || true
+
+    # Upstream rotates noble/current every few weeks, so a cache from the last
+    # bake is usually stale by the next one. Replace it rather than failing.
+    if [[ -s "$img" ]]; then
+        if [[ -z "$expected" ]]; then
+            log_warn "Could not fetch checksum from Ubuntu — using the cached image unverified"
+            return 0
+        fi
+        actual=$(sha256sum "$img" | awk '{print $1}') || true
+        if [[ "$actual" == "$expected" ]]; then
+            log_info "Using cached cloud image from $img (checksum verified)"
+            return 0
+        fi
+        log_info "Cached cloud image does not match the current release; downloading a fresh one"
+    fi
+    rm -f "$img"
+
+    log_info "Downloading Ubuntu 24.04 cloud image..."
+    [[ -t 2 ]] && progress=(--show-progress)
+    # Download beside the cache so an interrupted transfer never looks cached.
+    tmp=$(mktemp "$img.XXXXXX") || return 1
+    if ! wget -q "${progress[@]}" -O "$tmp" "$base_url/$CLOUD_IMG" || [[ ! -s "$tmp" ]]; then
+        log_error "Failed to download cloud image"
+        rm -f "$tmp"
+        return 1
+    fi
+
+    # A mismatch fails before any template VM is created.
     if [[ -n "$expected" ]]; then
-        actual=$(sha256sum "$IMG_CACHE_DIR/$CLOUD_IMG" | awk '{print $1}') || true
+        actual=$(sha256sum "$tmp" | awk '{print $1}') || true
         if [[ "$actual" != "$expected" ]]; then
             log_error "Checksum verification failed!"
             log_error "Expected: $expected"
             log_error "Got:      $actual"
-            rm -f "$IMG_CACHE_DIR/$CLOUD_IMG"
+            rm -f "$tmp"
             return 1
         fi
         log_info "Checksum verified"
     else
         log_warn "Could not fetch checksum from Ubuntu — skipping verification"
     fi
+    chmod 600 "$tmp"
+    mv -f "$tmp" "$img"
 }
 
 render_template_setup_snippet() {

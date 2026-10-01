@@ -326,11 +326,11 @@ guest agent, then shuts the VM down, and only then runs `qm template`. Stopping
 the bake VM before that marker is confirmed destroys the partial VM and does
 not publish it.
 
-A Noble checksum mismatch deletes
-`/var/cache/github-runners/noble-server-cloudimg-amd64.img` and exits 1 before
-creating a template VM. Upstream rotates `noble/current/` every few weeks. Run
-the bake again; it downloads a fresh image. The error is a stale cache, not a
-supply-chain alarm.
+Upstream rotates `noble/current/` every few weeks. A cached
+`/var/cache/github-runners/noble-server-cloudimg-amd64.img` that no longer
+matches the published checksum is replaced with a fresh download. A freshly
+downloaded image that still fails the checksum exits 1 before a template VM is
+created.
 
 The first check on a host with no recorded version bakes once. After a template
 baked by an older setup, record the version that bake installed if that extra

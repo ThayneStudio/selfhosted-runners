@@ -282,7 +282,8 @@ retire_retired_templates() {
 }
 
 cleanup_rebake() {
-    local rc=$? name cfg
+    # Signal traps pass their status: $? there is the last command's, often 0.
+    local rc=${1:-$?} name cfg
     trap - EXIT INT TERM
     if [[ "${REBAKE_PUBLISHED:-0}" != 1 && -n "${BAKE_VMID:-}" ]]; then
         if qm_host status "$BAKE_VMID" &>/dev/null; then
@@ -450,7 +451,9 @@ perform_bake() {
     install -d -m 700 "$STATE_DIR"
     printf '%s\n' "$new_vmid" > "$PENDING_BAKE_FILE"
     chmod 600 "$PENDING_BAKE_FILE"
-    trap cleanup_rebake EXIT INT TERM
+    trap cleanup_rebake EXIT
+    trap 'cleanup_rebake 130' INT
+    trap 'cleanup_rebake 143' TERM
     log_info "Baking replacement template on VMID $new_vmid (live template $old_template keeps serving clones)"
     create_bake_vm "$new_vmid"
     BAKE_WRITE_PENDING_VERSION=1
