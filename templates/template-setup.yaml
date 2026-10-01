@@ -317,7 +317,11 @@ write_files:
       }
       log "Runner extracted and dependencies installed"
 
-      LISTENER_VERSION=$(./bin/Runner.Listener --version 2>/dev/null | tr -d '[:space:]' || true)
+      # Startup creates _diag and a log before it prints the version. A
+      # root-owned _diag in the image makes the clone's listener die on its
+      # first log line. Probe as the runner user, then chown again.
+      LISTENER_VERSION=$(sudo -u "$RUNNER_USER" ./bin/Runner.Listener --version 2>/dev/null | tr -d '[:space:]' || true)
+      chown -R "$RUNNER_USER:$RUNNER_USER" "$RUNNER_HOME"
       if [[ "$LISTENER_VERSION" != "$RUNNER_VERSION" ]]; then
         log_error "Runner.Listener version ${LISTENER_VERSION:-missing} does not match downloaded ${RUNNER_VERSION}"
         exit 1

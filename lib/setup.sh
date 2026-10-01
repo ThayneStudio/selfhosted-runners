@@ -243,8 +243,16 @@ else
     # Destroy this VM on failure or interrupt. It is not a template yet.
     # A SIGHUP after qm template succeeds must not purge the live template.
     cleanup_bake() {
-        local cfg
-        cfg=$(qm_host config "$TEMPLATE_ID" 2>/dev/null || true)
+        local cfg name
+        if ! cfg=$(qm_host config "$TEMPLATE_ID" 2>/dev/null); then
+            log_error "Could not read config for VM $TEMPLATE_ID; leaving it"
+            return 0
+        fi
+        name=$(printf '%s\n' "$cfg" | awk '/^name:/{print $2; exit}')
+        if [[ "$name" != "ubuntu-cloud-template" ]]; then
+            log_error "Refusing to destroy VM $TEMPLATE_ID (${name:-unnamed}); it is not the template bake VM"
+            return 0
+        fi
         if printf '%s\n' "$cfg" | grep -q '^template: 1[[:space:]]*$'; then
             log_warn "VM $TEMPLATE_ID is already a template; leaving it"
             return 0

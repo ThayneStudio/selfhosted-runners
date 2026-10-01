@@ -261,26 +261,34 @@ cleanup_rebake() {
     trap - EXIT INT TERM
     if [[ "${REBAKE_PUBLISHED:-0}" != 1 && -n "${BAKE_VMID:-}" ]]; then
         if qm_host status "$BAKE_VMID" &>/dev/null; then
-            cfg=$(qm_host config "$BAKE_VMID" 2>/dev/null || true)
-            name=$(printf '%s\n' "$cfg" | awk '/^name:/{print $2; exit}')
-            if [[ "$name" != "ubuntu-cloud-template" ]]; then
-                log_error "Refusing to destroy VM $BAKE_VMID (${name:-unreadable}); it is not the rebake VM"
-            elif printf '%s\n' "$cfg" | grep -q '^template: 1[[:space:]]*$'; then
-                # qm template can finish before REBAKE_PUBLISHED is set. Keep
-                # the pending files so the next run can switch TEMPLATE_ID.
-                # A signal can also leave $? at 0; the oneshot must not
-                # report success while the new template is still unpublished.
-                log_warn "Rebake VM $BAKE_VMID is already a template; leaving it for the next run to publish"
+            if ! cfg=$(qm_host config "$BAKE_VMID" 2>/dev/null); then
+                # Unreadable config is not proof this is a partial VM. A
+                # signal can also leave $? at 0.
+                log_error "Could not read config for VM $BAKE_VMID; leaving it and the pending record"
                 if [[ "$rc" -eq 0 ]]; then
                     rc=1
                 fi
             else
-                log_warn "Rebake failed; destroying partial VM $BAKE_VMID and leaving template ${TEMPLATE_ID} unchanged"
-                qm_host stop "$BAKE_VMID" --timeout 30 2>/dev/null || true
-                if qm_host destroy "$BAKE_VMID" --purge; then
-                    rm -f "$PENDING_BAKE_FILE" "$PENDING_VERSION_FILE"
+                name=$(printf '%s\n' "$cfg" | awk '/^name:/{print $2; exit}')
+                if [[ "$name" != "ubuntu-cloud-template" ]]; then
+                    log_error "Refusing to destroy VM $BAKE_VMID (${name:-unnamed}); it is not the rebake VM"
+                elif printf '%s\n' "$cfg" | grep -q '^template: 1[[:space:]]*$'; then
+                    # qm template can finish before REBAKE_PUBLISHED is set. Keep
+                    # the pending files so the next run can switch TEMPLATE_ID.
+                    # A signal can also leave $? at 0; the oneshot must not
+                    # report success while the new template is still unpublished.
+                    log_warn "Rebake VM $BAKE_VMID is already a template; leaving it for the next run to publish"
+                    if [[ "$rc" -eq 0 ]]; then
+                        rc=1
+                    fi
                 else
-                    log_error "Could not destroy partial VM $BAKE_VMID; it stays recorded in $PENDING_BAKE_FILE"
+                    log_warn "Rebake failed; destroying partial VM $BAKE_VMID and leaving template ${TEMPLATE_ID} unchanged"
+                    qm_host stop "$BAKE_VMID" --timeout 30 2>/dev/null || true
+                    if qm_host destroy "$BAKE_VMID" --purge; then
+                        rm -f "$PENDING_BAKE_FILE" "$PENDING_VERSION_FILE"
+                    else
+                        log_error "Could not destroy partial VM $BAKE_VMID; it stays recorded in $PENDING_BAKE_FILE"
+                    fi
                 fi
             fi
         else

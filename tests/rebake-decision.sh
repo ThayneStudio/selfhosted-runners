@@ -161,4 +161,27 @@ done
 shopt -u nullglob
 [[ ${#leftovers[@]} -eq 0 ]] || fail "failed TEMPLATE_ID update left ${leftovers[*]}"
 
+# Runner.Listener creates _diag before printing --version. The probe has to
+# run as the runner user, and the home has to be chowned again afterward.
+probe=$(awk '
+    /sudo -u "\$RUNNER_USER" \.\/bin\/Runner\.Listener --version/ { probe = NR }
+    probe && /chown -R "\$RUNNER_USER:\$RUNNER_USER" "\$RUNNER_HOME"/ { found = 1; exit }
+    END { exit found ? 0 : 1 }
+' "$root/templates/template-setup.yaml") || fail "listener version probe is not run as the runner user and chowned afterward"
+
+# template_has_linked_clones calls this under if !, which disables errexit
+# inside the function. A failed base-volume listing must still return non-zero.
+qm() { return 0; }
+pvesm() {
+    printf 'nvme-pool:vm-1-disk-0\n'
+    return 0
+}
+list_template_base_volids() { return 1; }
+# shellcheck disable=SC2034
+VM_STORAGE=nvme-pool
+if vols=$(list_template_linked_clone_volids 9000); then
+    fail "failed base-volume listing looked like no linked clones"
+fi
+unset -f qm pvesm list_template_base_volids
+
 printf 'rebake-decision: ok\n'

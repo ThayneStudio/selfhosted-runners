@@ -287,7 +287,7 @@ zfs_dataset_from_volid() {
 
 list_template_linked_clone_volids() {
     local template_id="${1:-$TEMPLATE_ID}"
-    local storage_list base_volid base_path prefix volid child_name base_dataset dataset origin zfs_path
+    local storage_list base_volid base_path prefix volid child_name base_dataset dataset origin zfs_path base_vols
     local -A seen=()
 
     # An unreadable config must not look like "no linked clones". Callers
@@ -303,6 +303,13 @@ list_template_linked_clone_volids() {
     fi
     [[ -n "$storage_list" ]] || return 0
 
+    # An empty result is permission to destroy the template. < <(...) would
+    # discard a failed listing and look like no base volumes.
+    if ! base_vols=$(list_template_base_volids "$template_id"); then
+        log_error "Failed to list base volumes for template $template_id"
+        return 1
+    fi
+
     while read -r base_volid; do
         [[ -n "$base_volid" ]] || continue
         base_path="${base_volid#*:}"
@@ -316,7 +323,7 @@ list_template_linked_clone_volids() {
             seen["$volid"]=1
             printf '%s\n' "$volid"
         done <<< "$storage_list"
-    done < <(list_template_base_volids "$template_id")
+    done <<< "$base_vols"
 
     # ZFS linked clones are sibling zvols, not nested volids. They point at
     # the template base volume snapshot via the ZFS origin property. A failed
@@ -357,7 +364,7 @@ list_template_linked_clone_volids() {
             seen["$volid"]=1
             printf '%s\n' "$volid"
         done <<< "$storage_list"
-    done < <(list_template_base_volids "$template_id")
+    done <<< "$base_vols"
 }
 
 cleanup_template_orphan_volumes() {
