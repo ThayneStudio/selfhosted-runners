@@ -276,8 +276,9 @@ GitHub stops accepting a runner about 30 days after its release. A daily timer,
 `github-runner-rebake.timer`, is separate from `github-runner-watch.timer`. Once
 a day it compares the `Runner.Listener` version recorded on the host with the
 latest `actions/runner` release. It bakes when those versions differ, or when
-that release is 21 days old, whichever comes first. When the recorded release
-is still current, it does not start a bake.
+the template was last successfully baked 21 days ago, whichever comes first.
+A matching runner version in a template younger than 21 days does not start a
+bake. Baking the same release resets the template age.
 
 `runner rebake` reads `/etc/github-runners.conf` and does not ask the eight
 setup questions. The bridge, VLAN, storage, minimum VMID, balloon, DNS, and
@@ -306,8 +307,11 @@ package on every job.
 
 The host records the baked version in
 `/var/lib/github-runners/baked-runner-version` at the end of a successful bake.
-The guest writes it from `Runner.Listener --version` while it is still up. The
-template is stopped afterward, so `qm guest exec` cannot read it later.
+The record also stores `baked_at`, the successful bake time as Unix seconds;
+release publication time is metadata and does not drive template freshness.
+Older records without `baked_at` trigger one refresh to establish that time.
+The guest writes the version from `Runner.Listener --version` while it is still
+up. The template is stopped afterward, so `qm guest exec` cannot read it later.
 
 `runner rebake` detaches from the SSH session (the systemd service when that
 unit is installed, otherwise `setsid`) so a dropped connection does not kill
@@ -331,14 +335,16 @@ supply-chain alarm.
 The first check on a host with no recorded version bakes once. After a template
 baked by an older setup, record the version that bake installed if that extra
 bake should wait. Use the version the bake logged (`Latest runner version`),
-which the guest wipes from its own log before it finishes:
+which the guest wipes from its own log before it finishes. Set `baked_at` to
+the time that manual bake completed:
 
 ```bash
 install -d -m 700 /var/lib/github-runners
-cat > /var/lib/github-runners/baked-runner-version <<'EOF'
+cat > /var/lib/github-runners/baked-runner-version <<EOF
 version=2.329.0
 published_at=''
 template_id=9000
+baked_at=$(date -u +%s)
 EOF
 chmod 600 /var/lib/github-runners/baked-runner-version
 ```
@@ -356,11 +362,12 @@ clones up.
 `runner setup` is still the interactive wizard, and it is how you create the
 template the first time. It skips the bake when the configured template VMID
 already exists (`qm status` succeeds), so a second setup does not refresh the
-image. The wizard asks eight questions with hardcoded defaults and does not
-read `/etc/github-runners.conf`. Pressing Enter through it clears
-`DOCKER_MIRROR_URL` and `VLAN_TAG` for the bake and for every later clone.
-Run `cat /etc/github-runners.conf` first and retype every non-default value if
-you do run the wizard again. Org configs and PATs are not touched; `add-org`
+image. The wizard reads `/etc/github-runners.conf`, when present, and prefills
+its eight prompts with editable saved settings. Press Enter to keep a prefilled
+value, edit it to change the setting, or clear the line with Ctrl-U and press
+Enter to select the standard default shown in brackets. Empty VLAN and Docker
+mirror inputs disable those options. With no saved config, or with piped input,
+an empty line selects the standard default. Org configs and PATs are not touched; `add-org`
 runs only when no orgs exist yet. Run `runner setup` under tmux. It is
 interactive, and a dropped SSH session fires the cleanup trap and throws away
 an in-progress setup bake.

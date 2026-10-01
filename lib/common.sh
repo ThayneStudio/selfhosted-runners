@@ -256,7 +256,8 @@ list_template_base_volids() {
     qm config "$template_id" 199>&- 200>&- 201>&- 202>&- 203>&- 204>&- 2>/dev/null | awk -F': ' -v storage="$VM_STORAGE:" '
         $1 ~ /^(ide|sata|scsi|virtio)[0-9]+$/ {
             split($2, parts, ",")
-            if (index(parts[1], storage "base-") == 1) {
+            volume = substr(parts[1], length(storage) + 1)
+            if (index(parts[1], storage) == 1 && volume ~ /^([0-9]+\/)?base-/) {
                 print parts[1]
             }
         }
@@ -317,7 +318,9 @@ list_template_linked_clone_volids() {
 
         while read -r volid _; do
             [[ "$volid" == "$prefix"* ]] || continue
-            child_name="${volid#$prefix}"
+            child_name="${volid#"$prefix"}"
+            # Directory-backed clones include the child VMID before the filename.
+            child_name="${child_name##*/}"
             [[ "$child_name" =~ ^vm-[0-9]+-disk- ]] || continue
             [[ -n "${seen[$volid]:-}" ]] && continue
             seen["$volid"]=1

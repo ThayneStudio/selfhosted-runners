@@ -27,6 +27,7 @@ LATEST_RUNNER_VERSION=""
 LATEST_RUNNER_PUBLISHED_AT=""
 RECORDED_RUNNER_VERSION=""
 RECORDED_RUNNER_PUBLISHED_AT=""
+RECORDED_BAKED_AT=""
 
 normalize_runner_version() {
     local v="${1:-}"
@@ -38,22 +39,23 @@ normalize_runner_version() {
     printf '%s' "$v"
 }
 
-# 0 = a bake should start. 1 = the recorded release is still current.
-# published_epoch is the actions/runner release time, in seconds.
+# 0 = a bake should start. 1 = the template is still current.
+# baked_epoch is the last successful bake time, in seconds.
 rebake_needed() {
-    local recorded latest published_epoch now_epoch max_age max_age_seconds
+    local recorded latest baked_epoch now_epoch max_age max_age_seconds
     recorded=$(normalize_runner_version "${1:-}")
     latest=$(normalize_runner_version "${2:-}")
-    published_epoch="${3:-}"
+    baked_epoch="${3:-}"
     now_epoch="${4:-}"
     max_age="${5:-$REBAKE_MAX_AGE_DAYS}"
 
     [[ -n "$recorded" && -n "$latest" ]] || return 0
     [[ "$recorded" == "$latest" ]] || return 0
-    [[ "$published_epoch" =~ ^[0-9]+$ && "$now_epoch" =~ ^[0-9]+$ ]] || return 0
+    [[ "$baked_epoch" =~ ^[0-9]+$ && "$now_epoch" =~ ^[0-9]+$ ]] || return 0
+    (( baked_epoch <= now_epoch )) || return 0
     [[ "$max_age" =~ ^[0-9]+$ ]] || return 0
     max_age_seconds=$((max_age * 86400))
-    if (( now_epoch - published_epoch >= max_age_seconds )); then
+    if (( now_epoch - baked_epoch >= max_age_seconds )); then
         return 0
     fi
     return 1
@@ -70,12 +72,12 @@ rebake_apply_decision() {
         elif [[ "$recorded" != "$latest" ]]; then
             log_info "Baked runner ${recorded} differs from actions/runner ${latest}; baking"
         else
-            log_info "Baked actions/runner ${recorded} is ${REBAKE_MAX_AGE_DAYS} days old or its release date is unknown; baking"
+            log_info "Template with runner ${recorded} is ${REBAKE_MAX_AGE_DAYS} days old or its bake time is unknown; baking"
         fi
         perform_bake
         return
     fi
-    log_info "Template runner ${recorded} matches actions/runner ${latest} and is under ${REBAKE_MAX_AGE_DAYS} days old; not baking"
+    log_info "Template runner ${recorded} matches actions/runner ${latest} and the template is under ${REBAKE_MAX_AGE_DAYS} days old; not baking"
 }
 
 unquote_shell_literal() {
@@ -117,22 +119,26 @@ set_conf_assignment() {
 }
 
 write_baked_record() {
-    local version="$1" published_at="$2" template_id="$3" tmp
-    install -d -m 700 "$STATE_DIR"
-    tmp=$(mktemp "$STATE_DIR/.baked-runner.XXXXXX")
-    {
-        printf 'version=%q\n' "$version"
-        printf 'published_at=%q\n' "$published_at"
-        printf 'template_id=%q\n' "$template_id"
-    } > "$tmp"
-    chmod 600 "$tmp"
-    mv -f "$tmp" "$BAKED_VERSION_FILE"
+    local version="$1" published_at="$2" template_id="$3" tmp baked_at
+    baked_at=$(date -u +%s) || return 1
+    install -d -m 700 "$STATE_DIR" || return 1
+    tmp=$(mktemp "$STATE_DIR/.baked-runner.XXXXXX") || return 1
+    if ! printf 'version=%q\npublished_at=%q\ntemplate_id=%q\nbaked_at=%q\n' \
+        "$version" "$published_at" "$template_id" "$baked_at" > "$tmp"; then
+        rm -f "$tmp"
+        return 1
+    fi
+    if ! chmod 600 "$tmp" || ! mv -f "$tmp" "$BAKED_VERSION_FILE"; then
+        rm -f "$tmp"
+        return 1
+    fi
 }
 
 read_baked_record() {
     local line key value
     RECORDED_RUNNER_VERSION=""
     RECORDED_RUNNER_PUBLISHED_AT=""
+    RECORDED_BAKED_AT=""
     [[ -f "$BAKED_VERSION_FILE" ]] || return 0
     while IFS= read -r line || [[ -n "$line" ]]; do
         [[ "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]] || continue
@@ -140,7 +146,12 @@ read_baked_record() {
         value=$(unquote_shell_literal "${BASH_REMATCH[2]}")
         case "$key" in
             version) RECORDED_RUNNER_VERSION="$value" ;;
-            published_at) RECORDED_RUNNER_PUBLISHED_AT="$value" ;;
+            published_at)
+                # Retained as metadata for callers inspecting the record.
+                # shellcheck disable=SC2034
+                RECORDED_RUNNER_PUBLISHED_AT="$value"
+                ;;
+            baked_at) RECORDED_BAKED_AT="$value" ;;
         esac
     done < "$BAKED_VERSION_FILE"
 }
@@ -211,6 +222,16 @@ template_has_linked_clones() {
     [[ -n "$vols" ]]
 }
 
+# A failed qm status is not proof of absence. Only a readable cluster inventory
+# without this VMID lets us discard a recovery record (including other nodes).
+vm_confirmed_absent() {
+    local id="$1" inventory
+    inventory=$(pvesh get /cluster/resources --type vm --output-format json \
+        199>&- 200>&- 201>&- 202>&- 203>&- 204>&- 2>/dev/null) || return 1
+    printf '%s\n' "$inventory" | jq -e --argjson id "$id" \
+        'type == "array" and all(.[]; (.vmid | type) == "number" and .vmid != $id)' >/dev/null 2>&1
+}
+
 retire_retired_templates() {
     local id name kept_file tmp
     [[ -f "$RETIRED_TEMPLATES_FILE" ]] || return 0
@@ -221,6 +242,10 @@ retire_retired_templates() {
             continue
         fi
         if ! qm_host status "$id" &>/dev/null; then
+            if ! vm_confirmed_absent "$id"; then
+                log_warn "Could not confirm retired VM $id is absent; retaining its record"
+                printf '%s\n' "$id" >> "$kept_file"
+            fi
             continue
         fi
         if ! qm_host config "$id" 2>/dev/null | grep -q '^template: 1[[:space:]]*$'; then
@@ -292,7 +317,12 @@ cleanup_rebake() {
                 fi
             fi
         else
-            rm -f "$PENDING_BAKE_FILE" "$PENDING_VERSION_FILE"
+            if vm_confirmed_absent "$BAKE_VMID"; then
+                rm -f "$PENDING_BAKE_FILE" "$PENDING_VERSION_FILE"
+            else
+                log_error "Could not confirm rebake VM $BAKE_VMID is absent; retaining the pending record"
+                [[ "$rc" -ne 0 ]] || rc=1
+            fi
         fi
     fi
     release_vmid_reservation "${BAKE_VMID:-}"
@@ -308,8 +338,12 @@ recover_pending_bake() {
         return 0
     fi
     if ! qm_host status "$id" &>/dev/null; then
-        rm -f "$PENDING_BAKE_FILE" "$PENDING_VERSION_FILE"
-        return 0
+        if vm_confirmed_absent "$id"; then
+            rm -f "$PENDING_BAKE_FILE" "$PENDING_VERSION_FILE"
+            return 0
+        fi
+        log_error "Could not confirm pending bake VM $id is absent; retaining its record"
+        return 1
     fi
     if ! cfg=$(qm_host config "$id" 2>/dev/null); then
         log_error "Could not read config for pending bake VM $id; leaving it"
@@ -462,7 +496,7 @@ detach_rebake_from_ssh() {
 }
 
 rebake_main() {
-    local published_epoch="" now_epoch
+    local now_epoch
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --foreground)
@@ -506,15 +540,8 @@ rebake_main() {
         exit 1
     fi
     read_baked_record
-    if [[ -n "$LATEST_RUNNER_PUBLISHED_AT" ]]; then
-        published_epoch=$(date -u -d "$LATEST_RUNNER_PUBLISHED_AT" +%s 2>/dev/null || true)
-    fi
-    # Versions match, so the date stored at bake time is that same release.
-    if [[ -z "$published_epoch" && "$RECORDED_RUNNER_VERSION" == "$LATEST_RUNNER_VERSION" && -n "$RECORDED_RUNNER_PUBLISHED_AT" ]]; then
-        published_epoch=$(date -u -d "$RECORDED_RUNNER_PUBLISHED_AT" +%s 2>/dev/null || true)
-    fi
     now_epoch=$(date -u +%s)
-    rebake_apply_decision "$RECORDED_RUNNER_VERSION" "$LATEST_RUNNER_VERSION" "$published_epoch" "$now_epoch"
+    rebake_apply_decision "$RECORDED_RUNNER_VERSION" "$LATEST_RUNNER_VERSION" "$RECORDED_BAKED_AT" "$now_epoch"
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then

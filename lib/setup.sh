@@ -4,6 +4,8 @@ set -euo pipefail
 source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/common.sh"
 # shellcheck source=rebake.sh
 source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/rebake.sh"
+# shellcheck source=setup-prompts.sh
+source "$LIB_DIR/setup-prompts.sh"
 
 require_root "setup"
 
@@ -37,6 +39,13 @@ if [[ ! -f "$REPO_DIR/templates/runner-user-data.yaml" ]]; then
     exit 1
 fi
 
+load_setup_prefills
+if [[ -f "$CONFIG_FILE" ]]; then
+    echo "Saved settings are prefilled for editing. Enter keeps the shown value."
+    echo "Clear the input (Ctrl-U), then Enter, to use the default in brackets."
+    echo ""
+fi
+
 # Detect available bridges
 echo "Available network bridges:"
 BRIDGES=$(ip -br link | grep -E '^vmbr' | awk '{print $1}' || true)
@@ -45,8 +54,7 @@ if [[ -z "$BRIDGES" ]]; then
 else
     echo "$BRIDGES" | sed 's/^/  /'
 fi
-read -rp "Network bridge [vmbr0]: " NETWORK_BRIDGE
-NETWORK_BRIDGE=${NETWORK_BRIDGE:-vmbr0}
+prompt_setup_value NETWORK_BRIDGE "Network bridge" vmbr0
 
 # Validate bridge exists
 if ! ip link show "$NETWORK_BRIDGE" &> /dev/null; then
@@ -55,7 +63,7 @@ if ! ip link show "$NETWORK_BRIDGE" &> /dev/null; then
 fi
 
 # VLAN tag (optional)
-read -rp "VLAN tag (leave empty for none): " VLAN_TAG
+prompt_setup_value VLAN_TAG "VLAN tag (empty for none)" ""
 if [[ -n "$VLAN_TAG" ]]; then
     if [[ ! "$VLAN_TAG" =~ ^[0-9]+$ ]] || [[ "$VLAN_TAG" -lt 1 || "$VLAN_TAG" -gt 4094 ]]; then
         log_error "VLAN tag must be a number between 1 and 4094"
@@ -67,8 +75,7 @@ fi
 echo ""
 echo "Available storage pools:"
 pvesm status | grep -E 'zfspool|dir|lvm' | awk '{print "  " $1 " (" $2 ")"}' || true
-read -rp "Storage for VMs [local-zfs]: " VM_STORAGE
-VM_STORAGE=${VM_STORAGE:-local-zfs}
+prompt_setup_value VM_STORAGE "Storage for VMs" local-zfs
 
 # Validate storage exists
 if ! pvesm status | awk '{print $1}' | grep -qxF "$VM_STORAGE"; then
@@ -76,13 +83,21 @@ if ! pvesm status | awk '{print $1}' | grep -qxF "$VM_STORAGE"; then
     exit 1
 fi
 
-read -rp "Template VM ID [9000]: " TEMPLATE_ID
-TEMPLATE_ID=${TEMPLATE_ID:-9000}
+prompt_setup_value TEMPLATE_ID "Template VM ID" 9000
+
+# Validate before computing the minimum VMID default from this answer.
+if [[ ! "$TEMPLATE_ID" =~ ^[0-9]+$ ]]; then
+    log_error "Template ID must be a number"
+    exit 1
+fi
+if [[ "$TEMPLATE_ID" -lt 100 || "$TEMPLATE_ID" -gt 999999999 ]]; then
+    log_error "Template ID must be between 100 and 999999999"
+    exit 1
+fi
 
 # Minimum VM ID for runners (0 = use Proxmox default)
 DEFAULT_MIN_VMID=$((TEMPLATE_ID + 1))
-read -rp "Minimum VM ID for runners (0 = auto) [${DEFAULT_MIN_VMID}]: " MIN_VMID
-MIN_VMID=${MIN_VMID:-$DEFAULT_MIN_VMID}
+prompt_setup_value MIN_VMID "Minimum VM ID for runners (0 = auto)" "$DEFAULT_MIN_VMID"
 if [[ ! "$MIN_VMID" =~ ^[0-9]+$ ]]; then
     log_error "Minimum VM ID must be a non-negative number"
     exit 1
@@ -93,16 +108,14 @@ if [[ "$MIN_VMID" -ne 0 && "$MIN_VMID" -lt 100 ]]; then
 fi
 
 # Memory ballooning (0 = disabled)
-read -rp "Memory balloon, MB (0 = disabled) [0]: " BALLOON
-BALLOON=${BALLOON:-0}
+prompt_setup_value BALLOON "Memory balloon, MB (0 = disabled)" 0
 if [[ ! "$BALLOON" =~ ^[0-9]+$ ]]; then
     log_error "Balloon must be a non-negative number"
     exit 1
 fi
 
 # DNS nameservers (space-separated, applied via cloud-init)
-read -rp "DNS nameservers, space-separated [1.1.1.1 8.8.8.8]: " DNS_SERVERS
-DNS_SERVERS=${DNS_SERVERS:-1.1.1.1 8.8.8.8}
+prompt_setup_value DNS_SERVERS "DNS nameservers, space-separated" "1.1.1.1 8.8.8.8"
 for ns in $DNS_SERVERS; do
     if [[ ! "$ns" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && [[ ! ("$ns" =~ ^[0-9a-fA-F:]+$ && "$ns" =~ :) ]]; then
         log_error "Invalid nameserver: $ns (must be an IPv4 or IPv6 address)"
@@ -116,7 +129,7 @@ echo ""
 echo "Docker mirror: a local OCI registry (e.g., http://lxc-ip:5000 Zot) that caches"
 echo "Supabase public.ecr.aws images. HTTP mirrors are routed through Supabase's image"
 echo "registry override; HTTPS mirrors also configure containerd pull-through hosts."
-read -rp "Supabase Docker mirror URL (empty to disable): " DOCKER_MIRROR_URL
+prompt_setup_value DOCKER_MIRROR_URL "Supabase Docker mirror URL (empty to disable)" ""
 if [[ -n "$DOCKER_MIRROR_URL" ]]; then
     while [[ "$DOCKER_MIRROR_URL" == */ ]]; do
         DOCKER_MIRROR_URL="${DOCKER_MIRROR_URL%/}"
@@ -125,16 +138,6 @@ if [[ -n "$DOCKER_MIRROR_URL" ]]; then
         log_error "Docker mirror URL must be scheme://host[:port], for example http://10.20.1.19:8080"
         exit 1
     fi
-fi
-
-# Validate template ID is a valid Proxmox VM ID (100-999999999)
-if [[ ! "$TEMPLATE_ID" =~ ^[0-9]+$ ]]; then
-    log_error "Template ID must be a number"
-    exit 1
-fi
-if [[ "$TEMPLATE_ID" -lt 100 || "$TEMPLATE_ID" -gt 999999999 ]]; then
-    log_error "Template ID must be between 100 and 999999999"
-    exit 1
 fi
 
 # Confirm

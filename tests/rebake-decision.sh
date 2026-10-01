@@ -39,12 +39,12 @@ just_under=$((exact + 1))
 ver=2.329.0
 
 # 0 = bake, 1 = already current.
-rebake_needed "$ver" "$ver" "$fresh" "$now" && fail "5-day-old matching release was treated as stale"
-rebake_needed "$ver" "$ver" "$just_under" "$now" && fail "a release one second under 21 days was treated as stale"
-rebake_needed "$ver" "$ver" "$exact" "$now" || fail "a release exactly 21 days old was treated as current"
+rebake_needed "$ver" "$ver" "$fresh" "$now" && fail "5-day-old matching template was treated as stale"
+rebake_needed "$ver" "$ver" "$just_under" "$now" && fail "a template one second under 21 days was treated as stale"
+rebake_needed "$ver" "$ver" "$exact" "$now" || fail "a template exactly 21 days old was treated as current"
 rebake_needed "$ver" "2.330.0" "$fresh" "$now" || fail "a version mismatch was treated as current"
 rebake_needed "" "$ver" "$fresh" "$now" || fail "a missing recorded version was treated as current"
-rebake_needed "$ver" "$ver" "" "$now" || fail "an unknown release date was treated as current"
+rebake_needed "$ver" "$ver" "" "$now" || fail "an unknown bake time was treated as current"
 rebake_needed "v$ver" "$ver" "$fresh" "$now" && fail "a leading v was not normalized"
 
 DID_BAKE=0
@@ -57,7 +57,7 @@ rebake_apply_decision "$ver" "2.330.0" "$fresh" "$now"
 [[ "$DID_BAKE" -eq 1 ]] || fail "version mismatch did not start a bake"
 
 rebake_apply_decision "$ver" "$ver" "$exact" "$now"
-[[ "$DID_BAKE" -eq 2 ]] || fail "21-day-old release did not start a bake"
+[[ "$DID_BAKE" -eq 2 ]] || fail "21-day-old template did not start a bake"
 
 rebake_apply_decision "" "$ver" "$fresh" "$now"
 [[ "$DID_BAKE" -eq 3 ]] || fail "missing recorded version did not start a bake"
@@ -100,6 +100,7 @@ state=$(mktemp -d)
 STATE_DIR=$state
 # shellcheck disable=SC2034
 BAKED_VERSION_FILE=$state/baked-runner-version
+date() { printf '%s\n' "$now"; }
 write_baked_record "2.329.0" "2026-09-01T00:00:00Z" "9000"
 read_baked_record
 [[ "$RECORDED_RUNNER_VERSION" == "2.329.0" ]] || fail "recorded version did not round-trip: $RECORDED_RUNNER_VERSION"
@@ -107,6 +108,18 @@ read_baked_record
 write_baked_record "2.329.0" "" "9000"
 read_baked_record
 [[ -z "$RECORDED_RUNNER_PUBLISHED_AT" ]] || fail "empty published_at did not round-trip: $RECORDED_RUNNER_PUBLISHED_AT"
+[[ "$RECORDED_BAKED_AT" == "$now" ]] || fail "successful bake time did not round-trip"
+rebake_apply_decision "$RECORDED_RUNNER_VERSION" "$ver" "$RECORDED_BAKED_AT" "$((now + day))"
+[[ "$DID_BAKE" -eq 3 ]] || fail "fresh bake of an old release baked again the next day"
+rebake_apply_decision "$RECORDED_RUNNER_VERSION" "$ver" "$RECORDED_BAKED_AT" "$((now + 21 * day))"
+[[ "$DID_BAKE" -eq 4 ]] || fail "successful bake did not expire after 21 days"
+unset -f date
+# Older records have no bake time: refresh once rather than trusting release age.
+printf 'version=2.329.0\npublished_at=2026-09-01T00:00:00Z\ntemplate_id=9000\n' > "$BAKED_VERSION_FILE"
+read_baked_record
+[[ -z "$RECORDED_BAKED_AT" ]] || fail "legacy record retained the previous bake time"
+rebake_needed "$RECORDED_RUNNER_VERSION" "$ver" "$RECORDED_BAKED_AT" "$now" || fail "legacy record without bake time did not refresh"
+rebake_needed "$ver" "$ver" "$((now + day))" "$now" || fail "future bake time was accepted"
 rm -rf "$state"
 
 # A real lookup has to return 0. The old last line was `[[ == "null" ]] &&`,
@@ -163,11 +176,11 @@ shopt -u nullglob
 
 # Runner.Listener creates _diag before printing --version. The probe has to
 # run as the runner user, and the home has to be chowned again afterward.
-probe=$(awk '
+awk '
     /sudo -u "\$RUNNER_USER" \.\/bin\/Runner\.Listener --version/ { probe = NR }
     probe && /chown -R "\$RUNNER_USER:\$RUNNER_USER" "\$RUNNER_HOME"/ { found = 1; exit }
     END { exit found ? 0 : 1 }
-' "$root/templates/template-setup.yaml") || fail "listener version probe is not run as the runner user and chowned afterward"
+' "$root/templates/template-setup.yaml" || fail "listener version probe is not run as the runner user and chowned afterward"
 
 # template_has_linked_clones calls this under if !, which disables errexit
 # inside the function. A failed base-volume listing must still return non-zero.
