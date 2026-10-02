@@ -252,10 +252,12 @@ release_clone_slot() {
 }
 
 list_template_base_volids() {
-    qm config "$TEMPLATE_ID" 2>/dev/null | awk -F': ' -v storage="$VM_STORAGE:" '
+    local template_id="${1:-$TEMPLATE_ID}"
+    qm config "$template_id" 199>&- 200>&- 201>&- 202>&- 203>&- 204>&- 2>/dev/null | awk -F': ' -v storage="$VM_STORAGE:" '
         $1 ~ /^(ide|sata|scsi|virtio)[0-9]+$/ {
             split($2, parts, ",")
-            if (index(parts[1], storage "base-") == 1) {
+            volume = substr(parts[1], length(storage) + 1)
+            if (index(parts[1], storage) == 1 && volume ~ /^([0-9]+\/)?base-/) {
                 print parts[1]
             }
         }
@@ -276,7 +278,7 @@ zfs_dataset_from_volid() {
     local path dataset
 
     command -v zfs >/dev/null 2>&1 || return 1
-    path=$(pvesm path "$volid" 2>/dev/null) || return 1
+    path=$(pvesm path "$volid" 199>&- 200>&- 201>&- 202>&- 203>&- 204>&- 2>/dev/null) || return 1
     [[ "$path" == /dev/zvol/* ]] || return 1
 
     dataset="${path#/dev/zvol/}"
@@ -285,14 +287,29 @@ zfs_dataset_from_volid() {
 }
 
 list_template_linked_clone_volids() {
-    local storage_list base_volid base_path prefix volid child_name base_dataset dataset origin
+    local template_id="${1:-$TEMPLATE_ID}"
+    local storage_list base_volid base_path prefix volid child_name base_dataset dataset origin zfs_path base_vols
     local -A seen=()
 
-    if ! storage_list=$(pvesm list "$VM_STORAGE" 2>/dev/null); then
+    # An unreadable config must not look like "no linked clones". Callers
+    # destroy a template only when this function succeeds and prints nothing.
+    if ! qm config "$template_id" 199>&- 200>&- 201>&- 202>&- 203>&- 204>&- >/dev/null 2>&1; then
+        log_error "Failed to read config for template $template_id"
+        return 1
+    fi
+
+    if ! storage_list=$(pvesm list "$VM_STORAGE" 199>&- 200>&- 201>&- 202>&- 203>&- 204>&- 2>/dev/null); then
         log_error "Failed to list storage volumes on $VM_STORAGE"
         return 1
     fi
     [[ -n "$storage_list" ]] || return 0
+
+    # An empty result is permission to destroy the template. < <(...) would
+    # discard a failed listing and look like no base volumes.
+    if ! base_vols=$(list_template_base_volids "$template_id"); then
+        log_error "Failed to list base volumes for template $template_id"
+        return 1
+    fi
 
     while read -r base_volid; do
         [[ -n "$base_volid" ]] || continue
@@ -301,32 +318,56 @@ list_template_linked_clone_volids() {
 
         while read -r volid _; do
             [[ "$volid" == "$prefix"* ]] || continue
-            child_name="${volid#$prefix}"
+            child_name="${volid#"$prefix"}"
+            # Directory-backed clones include the child VMID before the filename.
+            child_name="${child_name##*/}"
             [[ "$child_name" =~ ^vm-[0-9]+-disk- ]] || continue
             [[ -n "${seen[$volid]:-}" ]] && continue
             seen["$volid"]=1
             printf '%s\n' "$volid"
         done <<< "$storage_list"
-    done < <(list_template_base_volids)
+    done <<< "$base_vols"
 
     # ZFS linked clones are sibling zvols, not nested volids. They point at
-    # the template base volume snapshot via the ZFS origin property.
+    # the template base volume snapshot via the ZFS origin property. A failed
+    # path or origin lookup must fail this function: an empty result is
+    # permission to destroy the template. A path that is not a zvol is dir
+    # or LVM storage, already handled above.
     while read -r base_volid; do
         [[ -n "$base_volid" ]] || continue
-        base_dataset=$(zfs_dataset_from_volid "$base_volid") || continue
+        if ! zfs_path=$(pvesm path "$base_volid" 199>&- 200>&- 201>&- 202>&- 203>&- 204>&- 2>/dev/null); then
+            log_error "Failed to resolve path for template volume $base_volid"
+            return 1
+        fi
+        [[ "$zfs_path" == /dev/zvol/* ]] || continue
+        if ! command -v zfs >/dev/null 2>&1; then
+            log_error "Template volume $base_volid is a zvol but zfs is not available"
+            return 1
+        fi
+        base_dataset="${zfs_path#/dev/zvol/}"
+        if ! zfs list -H -o name "$base_dataset" >/dev/null 2>&1; then
+            log_error "Failed to resolve ZFS dataset for $base_volid"
+            return 1
+        fi
 
         while read -r volid _; do
             [[ "$volid" == "$VM_STORAGE:vm-"* ]] || continue
             [[ -n "${seen[$volid]:-}" ]] && continue
-
-            dataset=$(zfs_dataset_from_volid "$volid") || continue
-            origin=$(zfs get -H -o value origin "$dataset" 2>/dev/null || true)
+            if ! dataset=$(zfs_dataset_from_volid "$volid"); then
+                log_error "Failed to resolve ZFS dataset for $volid"
+                return 1
+            fi
+            if ! origin=$(zfs get -H -o value origin "$dataset" 2>/dev/null); then
+                log_error "Failed to read ZFS origin for $dataset"
+                return 1
+            fi
+            # "-" is a real origin value meaning "not a clone".
             [[ "$origin" == "$base_dataset@"* ]] || continue
 
             seen["$volid"]=1
             printf '%s\n' "$volid"
         done <<< "$storage_list"
-    done < <(list_template_base_volids)
+    done <<< "$base_vols"
 }
 
 cleanup_template_orphan_volumes() {

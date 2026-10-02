@@ -1,0 +1,14 @@
+[Unit]
+Description=Rebake the GitHub Actions runner template when it is stale
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Environment=REBAKE_FOREGROUND=1
+ExecStart=/usr/local/bin/runner rebake
+TimeoutStartSec=7200
+TimeoutStopSec=180
+KillMode=mixed
+# qm importdisk is a child of this unit. The watcher's 512M cap kills a healthy import.
+SyslogIdentifier=github-runner-rebake
