@@ -285,13 +285,13 @@ To update prebaked software in the base VM template:
    ```bash
    runner setup
    ```
-   > **Record your config first.** The wizard re-prompts all eight infrastructure
-   > questions with *hardcoded* defaults -- it does not read your existing
-   > `/etc/github-runners.conf`. Pressing Enter through it silently clears
-   > `DOCKER_MIRROR_URL` and `VLAN_TAG`, for the bake and for every future clone.
-   > Run `cat /etc/github-runners.conf` beforehand and retype every
-   > non-default value. Your PAT and org configs are not touched -- `add-org` only
-   > runs when no orgs exist yet.
+   > The wizard prefills its eight infrastructure prompts from
+   > `/etc/github-runners.conf`. Press Enter to keep a prefilled value, edit it
+   > to change the setting, or clear the line with Ctrl-U and press Enter to
+   > select the standard default shown in brackets. Empty VLAN and Docker mirror
+   > inputs disable those options. With no saved config, or with piped input,
+   > an empty line selects the standard default. Your PAT and org configs are
+   > not touched -- `add-org` only runs when no orgs exist yet.
 5. Resume the pool and refill it:
    ```bash
    runner start
