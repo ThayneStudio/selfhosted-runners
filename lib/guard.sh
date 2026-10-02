@@ -210,7 +210,7 @@ acquire_slot_lock() {
 }
 
 release_slot_lock() {
-    exec 200>&- 2>/dev/null || true
+    exec 200>&- || true
 }
 
 note_deferral() {

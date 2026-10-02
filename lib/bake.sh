@@ -916,7 +916,9 @@ bake_locked() {
     fi
 
     log_info "Starting VM to install tools (this can take a while on cold caches)..."
-    if ! qm start "$vmid"; then
+    # kvm outlives qm start; it must not hold the bake lock or any other lock fd.
+    if ! qm start "$vmid" 200>&- 201>&- 202>&- 203>&- 204>&- \
+        205>&- 206>&- 207>&- 208>&- 209>&- 210>&- 211>&- 212>&- 214>&- 215>&- 216>&- 217>&- 218>&-; then
         bake_fail "Failed to start template VM"
         return 1
     fi

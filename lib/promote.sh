@@ -51,10 +51,15 @@ promote_usage() {
 _promote_release() {
     # Drop the EXIT trap first so a later process EXIT cannot re-enter after
     # a normal release. Proven by "_promote_release clears the EXIT trap".
+    #
+    # The fd closes below carry no `2>/dev/null`: on a bare `exec` that is a
+    # permanent redirection of the shell's own stderr, not one scoped to the
+    # exec, and promote runs in-process under the canary gate and the maintain
+    # cycle. See the note on _canary_unlock in lib/canary.sh.
     trap - EXIT
-    exec 211>&- 2>/dev/null || true
+    exec 211>&- || true
     rm -f "$PROMOTION_PAUSE_FILE"
-    exec 202>&- 2>/dev/null || true
+    exec 202>&- || true
 }
 
 # Usage: promote_generation <gen_id> [--skip-canary] [--yes] [--canary-passed]
@@ -159,7 +164,7 @@ promote_generation() {
         return 1
     }
     if ! flock -n 211; then
-        exec 211>&- 2>/dev/null || true
+        exec 211>&- || true
         log_error "Another promotion already holds $PROMOTION_PAUSE_FILE"
         return 1
     fi

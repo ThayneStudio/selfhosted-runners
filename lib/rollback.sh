@@ -34,9 +34,9 @@ _rollback_release() {
     # Drop the EXIT trap first so a later process EXIT cannot re-enter after
     # a normal release. Proven by "_rollback_release clears the EXIT trap".
     trap - EXIT
-    exec 211>&- 2>/dev/null || true
+    exec 211>&- || true
     rm -f "$PROMOTION_PAUSE_FILE"
-    exec 202>&- 2>/dev/null || true
+    exec 202>&- || true
 }
 
 # Superseded former actives demoted during the retained target's most recent
@@ -245,7 +245,7 @@ rollback_generation() {
         return 1
     }
     if ! flock -n 211; then
-        exec 211>&- 2>/dev/null || true
+        exec 211>&- || true
         log_error "Another promotion already holds $PROMOTION_PAUSE_FILE"
         return 1
     fi

@@ -163,6 +163,11 @@ DETECT_FAIL_FILE="$RUNNER_STATE_DIR/detect-fail"
 # Consecutive GitHub API failures for the drift alarm (lib/drift.sh).
 # shellcheck disable=SC2034
 DRIFT_FAIL_FILE="$RUNNER_STATE_DIR/drift-fail"
+# Steady-state cycle notices already sent (lib/maintain.sh). A daily timer that
+# re-notified an unchanged condition every run would train the operator to
+# ignore the webhook, so each notice is keyed and only re-sent when it changes.
+# shellcheck disable=SC2034
+MAINTAIN_NOTICE_FILE="$RUNNER_STATE_DIR/maintain-notices"
 CLOUD_IMG="noble-server-cloudimg-amd64.img"
 # shellcheck disable=SC2034  # consumed by bake, detect, promote, maintain
 CLOUD_IMG_URL="https://cloud-images.ubuntu.com/noble/current/${CLOUD_IMG}"
@@ -656,7 +661,7 @@ reserve_vmid() {
 
 release_vmid_reservation() {
     local vmid="${1:-${RESERVED_VMID:-}}"
-    exec 203>&- 2>/dev/null || true
+    exec 203>&- || true
     [[ -n "$vmid" ]] && rm -f "$(vmid_reservation_lock_file "$vmid")" 2>/dev/null || true
 }
 
@@ -687,7 +692,7 @@ acquire_clone_slot() {
 }
 
 release_clone_slot() {
-    exec 204>&- 2>/dev/null || true
+    exec 204>&- || true
 }
 
 # Base volume ids of a template VM. Defaults to the active TEMPLATE_ID so
@@ -1602,11 +1607,11 @@ clone_runner() {
             }
             if flock -n 211; then
                 rm -f "$PROMOTION_PAUSE_FILE"
-                exec 211>&- 2>/dev/null || true
+                exec 211>&- || true
                 log_warn "clone_runner: removed stale promotion pause file"
                 break
             fi
-            exec 211>&- 2>/dev/null || true
+            exec 211>&- || true
             log_info "clone_runner: promotion in progress, will retry"
             _pool_lock_release
             return 3
@@ -1812,11 +1817,14 @@ clone_runner() {
 
     # Keep maintenance locks in this shell only. Proxmox helper children can
     # spawn long-lived kvm processes; those must not inherit runner lock fds.
+    # That includes the bake (207) and canary (218) locks: a canary VM's kvm
+    # would otherwise hold the canary lock for as long as the VM exists.
     # Capture stderr so the actual ZFS/Proxmox error surfaces under
     # `journalctl -t github-runner` instead of being buried under the service
     # unit log (which the operator does not look at first).
     local clone_err; clone_err=$(mktemp)
-    if ! qm clone "$clone_src" "$vmid" --name "$name" 200>&- 201>&- 202>&- 203>&- 204>&- 2>"$clone_err"; then
+    if ! qm clone "$clone_src" "$vmid" --name "$name" 200>&- 201>&- 202>&- 203>&- 204>&- \
+        205>&- 206>&- 207>&- 208>&- 209>&- 210>&- 211>&- 212>&- 214>&- 215>&- 216>&- 217>&- 218>&- 2>"$clone_err"; then
         while IFS= read -r line; do
             [[ -n "$line" ]] && log_error "qm clone $vmid: $line"
         done < "$clone_err"
@@ -1922,7 +1930,8 @@ clone_runner() {
     fi
 
     # Start
-    if ! qm start "$vmid" 200>&- 201>&- 202>&- 203>&- 204>&-; then
+    if ! qm start "$vmid" 200>&- 201>&- 202>&- 203>&- 204>&- \
+        205>&- 206>&- 207>&- 208>&- 209>&- 210>&- 211>&- 212>&- 214>&- 215>&- 216>&- 217>&- 218>&-; then
         _fail
         _pool_lock_release
         return 1

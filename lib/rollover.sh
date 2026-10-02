@@ -119,9 +119,9 @@ rollover_serving_count() {
 }
 
 rollover_release_locks() {
-    exec 212>&- 2>/dev/null || true
-    exec 210>&- 2>/dev/null || true
-    exec 209>&- 2>/dev/null || true
+    exec 212>&- || true
+    exec 210>&- || true
+    exec 209>&- || true
 }
 
 rollover_destroy_vm() {

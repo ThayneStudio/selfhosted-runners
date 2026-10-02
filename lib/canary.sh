@@ -109,8 +109,17 @@ canary_usage() {
 # every exit path rather than left to process exit, because canary_main is a
 # library function: maintain (#24) calls it in-process and would otherwise hold
 # the lock for the rest of its cycle.
+#
+# No `2>/dev/null` here, ever. `exec` with no command applies its redirections
+# to the *shell*, permanently — `exec 218>&- 2>/dev/null` closes the fd and
+# then points the process's stderr at /dev/null for good. Since this runs on
+# every exit path including success, and maintain calls the gate in-process,
+# that silenced every log line of the rest of the cycle. Closing an fd is
+# quiet even when it was never open, and `|| true` covers the status.
+# Proven by "no library silences the shell by closing a descriptor with
+# 2>/dev/null" and by the post-gate assertions in the real-gate cycle test.
 _canary_unlock() {
-    exec 218>&- 2>/dev/null || true
+    exec 218>&- || true
 }
 
 # ---------------------------------------------------------------------------
