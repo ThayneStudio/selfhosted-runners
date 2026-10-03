@@ -72,6 +72,32 @@ warn_template_storage() {
     log_warn "To bake one now: rm -f $BAKED_VERSION_FILE && runner rebake"
 }
 
+# EXIT trap of the bake: destroy VM $TEMPLATE_ID, which is not a template yet.
+# A signal after qm template succeeds must not destroy the template.
+# After an SSH drop every log write fails (EIO on the hung-up tty, or SIGPIPE
+# through a pipe). Neither errexit nor a second SIGHUP may stop the destroy.
+cleanup_bake() {
+    local cfg name
+    set +e
+    trap '' HUP PIPE
+    if ! cfg=$(qm_host config "$TEMPLATE_ID" 2>/dev/null); then
+        log_error "Could not read config for VM $TEMPLATE_ID; leaving it"
+        return 0
+    fi
+    name=$(printf '%s\n' "$cfg" | awk '/^name:/{print $2; exit}')
+    if [[ "$name" != "ubuntu-cloud-template" ]]; then
+        log_error "Refusing to destroy VM $TEMPLATE_ID (${name:-unnamed}); it is not the template bake VM"
+        return 0
+    fi
+    if printf '%s\n' "$cfg" | grep -q '^template: 1[[:space:]]*$'; then
+        log_warn "VM $TEMPLATE_ID is already a template; leaving it"
+        return 0
+    fi
+    log_warn "Baking failed, cleaning up template VM..."
+    qm_host stop "$TEMPLATE_ID" --timeout 30 2>/dev/null || true
+    qm_host destroy "$TEMPLATE_ID" 2>/dev/null || true
+}
+
 # Tests source this file for the functions above.
 [[ "${BASH_SOURCE[0]}" == "$0" ]] || return 0
 
@@ -296,28 +322,6 @@ else
 
     log_info "Creating VM template..."
     create_bake_vm "$TEMPLATE_ID"
-
-    # Destroy this VM on failure or interrupt. It is not a template yet.
-    # A SIGHUP after qm template succeeds must not purge the live template.
-    cleanup_bake() {
-        local cfg name
-        if ! cfg=$(qm_host config "$TEMPLATE_ID" 2>/dev/null); then
-            log_error "Could not read config for VM $TEMPLATE_ID; leaving it"
-            return 0
-        fi
-        name=$(printf '%s\n' "$cfg" | awk '/^name:/{print $2; exit}')
-        if [[ "$name" != "ubuntu-cloud-template" ]]; then
-            log_error "Refusing to destroy VM $TEMPLATE_ID (${name:-unnamed}); it is not the template bake VM"
-            return 0
-        fi
-        if printf '%s\n' "$cfg" | grep -q '^template: 1[[:space:]]*$'; then
-            log_warn "VM $TEMPLATE_ID is already a template; leaving it"
-            return 0
-        fi
-        log_warn "Baking failed, cleaning up template VM..."
-        qm_host stop "$TEMPLATE_ID" --timeout 30 2>/dev/null || true
-        qm_host destroy "$TEMPLATE_ID" --purge 2>/dev/null || true
-    }
     trap cleanup_bake EXIT
 
     bake_and_publish_vm "$TEMPLATE_ID"
