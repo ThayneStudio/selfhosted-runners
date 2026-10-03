@@ -574,11 +574,10 @@ and `runner rebake` write
 before the service starts. A one-run environment value does not change the
 drop-in. `TimeoutStopSec=180` and `KillMode=mixed` still apply when the
 service is stopped, so the script's trap can destroy a partial VM before
-leftover `qm` children are killed. It checks an environment override before it
-detaches, so a bad one fails in the terminal with exit status 1. A bad value
-in the conf fails with the same message once the rebake has read the file,
-before it creates a VM. `runner rebake --foreground` stays attached; run that
-form inside tmux.
+leftover `qm` children are killed. It checks an environment override, and
+the conf, before it detaches, so a bad value fails in the terminal with
+exit status 1 rather than only in the journal. `runner rebake --foreground`
+stays attached; run that form inside tmux.
 
 A healthy bake is 30–45 minutes. The guest writes
 `/opt/.template-setup-complete` last and does not power itself off. The host

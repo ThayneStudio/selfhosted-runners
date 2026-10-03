@@ -720,6 +720,24 @@ write_rebake_timeout_dropin() {
     fi
 }
 
+# The values a detached rebake will actually run with. systemd does not see
+# this shell's environment, so an empty override is ignored and the conf is
+# checked instead. A bad conf value then fails here, not only in the journal.
+check_conf_bake_limits() {
+    # No conf yet: setup has not been run. Nothing to validate, and the
+    # existing missing-config error still reports that after detach.
+    [[ -f "$CONFIG_FILE" ]] || return 0
+    (
+        if [[ -z "${BAKE_TIMEOUT:-}" && -z "${BAKE_MIN_FREE_GIB:-}" ]]; then
+            unset BAKE_TIMEOUT BAKE_MIN_FREE_GIB
+        fi
+        # errexit is off here: rebake_main runs this as `|| exit 1`. The &&
+        # is what makes a bad conf value the subshell's status.
+        load_infra_config
+        check_bake_timeout && check_bake_min_free_gib
+    )
+}
+
 detach_rebake_from_ssh() {
     if [[ "${REBAKE_FOREGROUND:-}" == 1 || -n "${INVOCATION_ID:-}" || "${REBAKE_DETACHED:-}" == 1 ]]; then
         return 0
@@ -784,7 +802,9 @@ rebake_main() {
     # Refuse a bad override here, where the caller sees it.
     check_bake_timeout || exit 1
     check_bake_min_free_gib || exit 1
-    # Reload the start timeout before systemd latches it for this job.
+    # Before the handoff to systemd. A bad limit in the conf must fail in
+    # this terminal, and the unit's start timeout has to be reloaded first.
+    check_conf_bake_limits || exit 1
     write_rebake_timeout_dropin || log_warn "The rebake start timeout was not updated"
     detach_rebake_from_ssh
     trap '' HUP PIPE

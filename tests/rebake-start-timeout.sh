@@ -2,6 +2,7 @@
 # The rebake oneshot's start timeout has to stay an hour above BAKE_TIMEOUT.
 # The poll limit does not cover the image download or qm importdisk, and with
 # no finite cap a hang holds the rebake lock so the daily timer never runs.
+# A bad limit in the conf must also fail before systemd is asked to start.
 set -euo pipefail
 
 if [[ "${BASH_VERSINFO[0]}" -lt 4 ]]; then
@@ -83,6 +84,23 @@ write_conf 2h 0
 write_rebake_timeout_dropin
 grep -qx 'TimeoutStartSec=9000' "$REBAKE_DROPIN_FILE" \
     || fail "a non-numeric BAKE_TIMEOUT was written into the drop-in: $(cat "$REBAKE_DROPIN_FILE")"
+
+# A manual rebake with that conf fails in this shell, before systemctl start.
+: > "$calls"
+rebake_rc=0
+(
+    unset BAKE_TIMEOUT BAKE_MIN_FREE_GIB REBAKE_FOREGROUND
+    rebake_main
+) >"$state/out" 2>"$state/log" || rebake_rc=$?
+[[ "$rebake_rc" != 0 ]] || fail "rebake detached with BAKE_TIMEOUT=2h in the conf"
+grep -q 'BAKE_TIMEOUT must be a whole number of seconds' "$state/log" \
+    || fail "the bad conf value was not reported in the terminal: $(cat "$state/log")"
+if grep -q 'systemctl start' "$calls"; then
+    fail "a bad conf BAKE_TIMEOUT was handed to systemd: $(cat "$calls")"
+fi
+if grep -q '^setsid$' "$calls"; then
+    fail "a bad conf BAKE_TIMEOUT detached with setsid: $(cat "$calls")"
+fi
 
 # A valid conf still reaches the unit, and the drop-in was reloaded first.
 write_conf 7200 0
