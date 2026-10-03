@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
-# How the watcher times and recycles dead runner VMs: a stopped VM gets one
-# grace period per clone, even when its re-clone reuses the VMID and name.
+# How the watcher times and recycles dead runner VMs: one grace period per
+# clone, even when a re-clone reuses the VMID and name; no stall when the
+# clock is stepped back; the deaths it reclaims count toward the slot's
+# backoff; leftover snippets at a foreign VM's VMID are removed once; and a
+# VM restarted minutes after its clone is caught.
 set -euo pipefail
 
 if [[ "${BASH_VERSINFO[0]}" -lt 4 ]]; then
