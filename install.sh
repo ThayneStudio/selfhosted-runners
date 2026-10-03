@@ -48,9 +48,10 @@ if [[ -f /etc/github-runners.conf ]]; then
     systemctl daemon-reload
     systemctl enable --now github-runner-rebake.timer 2>/dev/null || true
     echo "Template rebake timer enabled (daily, separate from the pool watcher)."
-    echo "Persistent=true: enabling it after today's slot can start a check immediately."
-    echo "Do not install or enable it while a template bake is still running."
+    echo "A first enable waits for the next midnight before the timer's first check."
     echo "A host with no recorded baked version bakes once on that first check."
+    echo "To run that check now: runner rebake"
+    echo "Do not install or enable it while a template bake is still running."
     # Prune obsolete per-org snippets. These embedded the org PAT; the PAT now
     # stays on the host and a single-use JIT config is rendered per-VM at clone time.
     if compgen -G "/var/lib/vz/snippets/runner-user-data-*.yaml" > /dev/null; then

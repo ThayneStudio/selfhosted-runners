@@ -27,6 +27,8 @@ ORG_CONFIG_DIR=$state/github-runners.d
 STATE_DIR=$state/lib
 RETIRED_TEMPLATES_FILE=$STATE_DIR/retired-templates
 BAKED_VERSION_FILE=$STATE_DIR/baked-runner-version
+PENDING_BAKE_FILE=$STATE_DIR/pending-bake
+PENDING_VERSION_FILE=$STATE_DIR/pending-version
 REBAKE_LOCK_FILE=$state/rebake.lock
 
 # The saved answers write_infra_config needs besides TEMPLATE_ID.
