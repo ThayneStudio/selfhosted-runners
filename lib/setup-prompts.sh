@@ -18,6 +18,11 @@ load_setup_prefills() {
     for key in NETWORK_BRIDGE VLAN_TAG VM_STORAGE TEMPLATE_ID MIN_VMID BALLOON DNS_SERVERS DOCKER_MIRROR_URL; do
         SETUP_PREFILLS["$key"]="${!key}"
     done
+    # An empty DNS_SERVERS keeps the DHCP servers. Prefill the answer that
+    # stores it, or Enter would select the default instead.
+    if [[ -z "${SETUP_PREFILLS[DNS_SERVERS]}" ]]; then
+        SETUP_PREFILLS[DNS_SERVERS]=dhcp
+    fi
 }
 
 prompt_setup_value() {
@@ -29,4 +34,13 @@ prompt_setup_value() {
         read -r -p "$label [${default:-none}]: " answer || return 1
     fi
     printf -v "$key" '%s' "${answer:-$default}"
+}
+
+# An empty answer selects the default, so "dhcp" (any case) is the answer that
+# stores an empty DNS_SERVERS: runner VMs then keep the servers DHCP offers.
+prompt_dns_servers() {
+    prompt_setup_value DNS_SERVERS "DNS nameservers, space-separated, or dhcp to use the DHCP servers" "$1" || return 1
+    if [[ "${DNS_SERVERS,,}" == dhcp ]]; then
+        DNS_SERVERS=""
+    fi
 }

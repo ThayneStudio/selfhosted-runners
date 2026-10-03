@@ -360,8 +360,9 @@ if [[ ! "$BALLOON" =~ ^[0-9]+$ ]]; then
     exit 1
 fi
 
-# DNS nameservers (space-separated, applied via cloud-init)
-prompt_setup_value DNS_SERVERS "DNS nameservers, space-separated" "1.1.1.1 8.8.8.8"
+# DNS nameservers for runner VMs (space-separated). "dhcp" stores an empty
+# value, which keeps the servers DHCP offers.
+prompt_dns_servers "1.1.1.1 8.8.8.8"
 for ns in $DNS_SERVERS; do
     if [[ ! "$ns" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && [[ ! ("$ns" =~ ^[0-9a-fA-F:]+$ && "$ns" =~ :) ]]; then
         log_error "Invalid nameserver: $ns (must be an IPv4 or IPv6 address)"
