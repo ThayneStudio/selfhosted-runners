@@ -685,15 +685,19 @@ rebake_main() {
         log_error "This command must be run on a Proxmox host"
         exit 1
     fi
-    load_infra_config
-    validate_saved_infra
-    require_live_template
 
+    # Read the config only under the lock. setup holds it while it bakes and
+    # then moves TEMPLATE_ID; a TEMPLATE_ID read before the lock can name the
+    # template setup just replaced, and publishing over that leaks setup's new
+    # template or queues it for destruction.
     exec 199>"$REBAKE_LOCK_FILE"
     if ! flock -n 199; then
         log_info "A rebake is already running"
         exit 0
     fi
+    load_infra_config
+    validate_saved_infra
+    require_live_template
 
     recover_pending_bake
     retire_retired_templates
