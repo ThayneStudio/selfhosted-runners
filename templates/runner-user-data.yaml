@@ -63,6 +63,7 @@ write_files:
       # roots. Only a mirror addressed by IP literal (IPv4, or IPv6 in
       # brackets), which usually has a self-signed or internal certificate,
       # skips that check. The bake applies the same rule.
+      MIRROR_REGISTRY=""
       if [[ -n "${DOCKER_MIRROR_URL:-}" ]]; then
         log "Configuring Docker mirror for public.ecr.aws: $DOCKER_MIRROR_URL"
         mkdir -p /etc/docker/certs.d/public.ecr.aws
@@ -110,6 +111,20 @@ write_files:
           exit 1
         fi
       fi
+      # The template keeps the hosts.toml files of the mirror it was baked
+      # with, and Docker reads them on every pull. Remove those the configured
+      # mirror does not use, or a mirror removed or replaced since the bake
+      # stays in the path of public.ecr.aws pulls until the next rebake.
+      for HOSTS_TOML in /etc/docker/certs.d/*/hosts.toml; do
+        [[ -e "$HOSTS_TOML" ]] || continue
+        HOSTS_DIR="${HOSTS_TOML%/hosts.toml}"
+        HOSTS_DIR="${HOSTS_DIR##*/}"
+        if [[ -n "$MIRROR_REGISTRY" && ( "$HOSTS_DIR" == public.ecr.aws || "$HOSTS_DIR" == "$MIRROR_REGISTRY" ) ]]; then
+          continue
+        fi
+        rm -f "$HOSTS_TOML"
+        log "Removed the template's stale Docker mirror config: $HOSTS_TOML"
+      done
 
       if ! systemctl is-active --quiet docker; then
         log_error "Docker is not running; refusing to register runner"

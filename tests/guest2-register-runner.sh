@@ -145,6 +145,26 @@ DNS_SERVERS=""
 dhcp_dns="192.168.1.1 10.0.0.53"
 resolvers=("10.0.0.53 github.com registry.example.com mirror zot.home.arpa")
 run_rc=0
+# The HTTPS mirror the template was baked with, if any.
+template_mirror=""
+
+# hosts.toml that routes registry $1 through mirror $2, skipping certificate
+# verification when $3 is 1.
+mirror_toml() {
+    printf 'server = "%s"\n\n[host."%s"]\n  capabilities = ["pull", "resolve"]' "$1" "$2"
+    [[ "$3" == 0 ]] || printf '\n  skip_verify = true'
+}
+certs=etc/docker/certs.d
+# What the bake leaves in /etc/docker for an IP-literal HTTPS mirror $1, plus
+# a CA certificate beside the mirror's hosts.toml.
+seed_template_mirror() {
+    local registry="${1#https://}"
+    mkdir -p "$guest/$certs/public.ecr.aws" "$guest/$certs/$registry"
+    mirror_toml https://public.ecr.aws "$1" 1 > "$guest/$certs/public.ecr.aws/hosts.toml"
+    mirror_toml "$1" "$1" 1 > "$guest/$certs/$registry/hosts.toml"
+    printf 'internal CA\n' > "$guest/$certs/$registry/ca.crt"
+    printf '{\n  "features": {\n    "containerd-snapshotter": true\n  }\n}\n' > "$guest/etc/docker/daemon.json"
+}
 
 # Render user-data from the settings above, write it into a fresh guest root,
 # and run register-runner.sh there. Sets user_data, guest and state.
@@ -158,6 +178,7 @@ boot() {
     cp "$state/dhcp-dns" "$state/link-dns"
     printf '%s\n' "${resolvers[@]}" > "$state/resolvers"
     printf '%s\n' "$run_rc" > "$state/run-rc"
+    [[ -z "$template_mirror" ]] || seed_template_mirror "$template_mirror"
     SNIPPETS_DIR=$work/$name
     render_user_snippet 9001 test-org "$jit" || fail "$name: render_user_snippet failed"
     user_data=$SNIPPETS_DIR/runner-9001-user-test-org.yaml
@@ -175,14 +196,6 @@ assert_ran() {
     [[ "$(grep '^shutdown ' "$state/calls" | tail -1)" == "shutdown -h now" ]] \
         || fail "$1: the EXIT trap did not power the VM off"
 }
-
-# hosts.toml that routes registry $1 through mirror $2, skipping certificate
-# verification when $3 is 1.
-mirror_toml() {
-    printf 'server = "%s"\n\n[host."%s"]\n  capabilities = ["pull", "resolve"]' "$1" "$2"
-    [[ "$3" == 0 ]] || printf '\n  skip_verify = true'
-}
-certs=etc/docker/certs.d
 
 # Docker verifies an HTTPS mirror's certificate against the system roots. Only
 # an IP-literal mirror, which usually has a self-signed or internal
@@ -210,6 +223,52 @@ https://[fd00::19] [fd00::19] 1
 http://registry.example.com:5000 registry.example.com:5000 0
 http://10.20.1.19:5000 10.20.1.19:5000 0
 EOF
+DOCKER_MIRROR_URL=""
+
+# The template keeps the hosts.toml files of the mirror it was baked with, and
+# Docker reads them on every pull. A clone removes those its mirror does not
+# use, and nothing else: the image store in daemon.json holds the template's
+# images, and a CA certificate is not mirror routing.
+template_mirror=https://10.20.1.19:5000
+boot stale-mirror-cleared
+assert_ran "mirror cleared since the bake"
+[[ ! -e "$guest/$certs/public.ecr.aws/hosts.toml" ]] \
+    || fail "a clone without a mirror still routes public.ecr.aws through the template's mirror"
+[[ ! -e "$guest/$certs/10.20.1.19:5000/hosts.toml" ]] || fail "a clone without a mirror kept the template mirror's hosts.toml"
+[[ -f "$guest/$certs/10.20.1.19:5000/ca.crt" ]] || fail "the stale mirror cleanup removed more than hosts.toml"
+jq -e '.features["containerd-snapshotter"] == true' "$guest/etc/docker/daemon.json" >/dev/null \
+    || fail "the stale mirror cleanup changed daemon.json"
+if called "systemctl restart docker"; then
+    fail "a clone without a mirror restarted Docker"
+fi
+logged "Removed the template's stale Docker mirror config" || fail "removing the template's mirror config was not logged"
+DOCKER_MIRROR_URL=https://10.20.1.20:5000
+boot stale-mirror-replaced
+assert_ran "mirror replaced since the bake"
+[[ "$(cat "$guest/$certs/public.ecr.aws/hosts.toml")" == "$(mirror_toml https://public.ecr.aws "$DOCKER_MIRROR_URL" 1)" ]] \
+    || fail "a clone did not route public.ecr.aws through the configured mirror"
+[[ "$(cat "$guest/$certs/10.20.1.20:5000/hosts.toml")" == "$(mirror_toml "$DOCKER_MIRROR_URL" "$DOCKER_MIRROR_URL" 1)" ]] \
+    || fail "a clone did not write the configured mirror's hosts.toml"
+[[ ! -e "$guest/$certs/10.20.1.19:5000/hosts.toml" ]] || fail "a clone kept the replaced mirror's hosts.toml"
+DOCKER_MIRROR_URL=https://10.20.1.19:5000
+boot stale-mirror-same
+assert_ran "the mirror the template was baked with"
+[[ "$(cat "$guest/$certs/public.ecr.aws/hosts.toml")" == "$(mirror_toml https://public.ecr.aws "$DOCKER_MIRROR_URL" 1)" ]] \
+    || fail "a clone lost public.ecr.aws routing through the template's own mirror"
+[[ "$(cat "$guest/$certs/10.20.1.19:5000/hosts.toml")" == "$(mirror_toml "$DOCKER_MIRROR_URL" "$DOCKER_MIRROR_URL" 1)" ]] \
+    || fail "a clone lost the hosts.toml of the template's own mirror"
+if logged "Removed the template's stale Docker mirror config"; then
+    fail "a clone removed config its own mirror uses"
+fi
+# IPv6 mirrors: the bracketed directory name must match literally.
+template_mirror="https://[fd00::19]:5000"
+DOCKER_MIRROR_URL="https://[fd00::20]:5000"
+boot stale-mirror-ipv6
+assert_ran "IPv6 mirror replaced since the bake"
+[[ ! -e "$guest/$certs/[fd00::19]:5000/hosts.toml" ]] || fail "a clone kept the replaced IPv6 mirror's hosts.toml"
+[[ -f "$guest/$certs/[fd00::20]:5000/hosts.toml" && -f "$guest/$certs/public.ecr.aws/hosts.toml" ]] \
+    || fail "a clone removed the configured IPv6 mirror's config"
+template_mirror=""
 DOCKER_MIRROR_URL=""
 
 printf 'guest2-register-runner: ok\n'
