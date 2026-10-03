@@ -230,7 +230,18 @@ commit_baked_version() {
     write_baked_record "$version" "$published_at" "$template_id" "${DOCKER_MIRROR_URL:-}"
 }
 
+# The REST API allows 60 unauthenticated requests an hour per address, shared
+# with every job behind it, and curl does not retry its 403. github.com's
+# releases/latest page is not the REST API, so ask it when the API fails.
 fetch_latest_runner_release() {
+    if fetch_latest_runner_release_from_api; then
+        return 0
+    fi
+    log_warn "The GitHub API did not return the latest actions/runner release; reading it from github.com instead"
+    fetch_latest_runner_release_from_redirect
+}
+
+fetch_latest_runner_release_from_api() {
     local json
     json=$(curl -sf --retry 3 --max-time 30 \
         https://api.github.com/repos/actions/runner/releases/latest) || return 1
@@ -239,12 +250,25 @@ fetch_latest_runner_release() {
     [[ -n "$LATEST_RUNNER_VERSION" && "$LATEST_RUNNER_VERSION" != "null" ]] || return 1
     LATEST_RUNNER_VERSION=$(normalize_runner_version "$LATEST_RUNNER_VERSION")
     # jq -r already turns JSON null into an empty string. This must not be a
-    # trailing `&&` command: a false test would be this function's status, and
-    # rebake_main treats that as "could not read the release".
+    # trailing `&&` command: a false test would be this function's status,
+    # which counts as "could not read the release".
     if [[ "$LATEST_RUNNER_PUBLISHED_AT" == "null" ]]; then
         LATEST_RUNNER_PUBLISHED_AT=""
     fi
     return 0
+}
+
+# github.com/actions/runner/releases/latest answers with a redirect to
+# https://github.com/actions/runner/releases/tag/v<X.Y.Z>. curl does not
+# follow it here; %{redirect_url} is that Location. The redirect carries no
+# publish date.
+fetch_latest_runner_release_from_redirect() {
+    local location
+    location=$(curl -sf -o /dev/null -w '%{redirect_url}' --retry 3 --max-time 30 \
+        https://github.com/actions/runner/releases/latest) || return 1
+    [[ "$location" =~ ^https://github\.com/actions/runner/releases/tag/v?([0-9]+\.[0-9]+\.[0-9]+)$ ]] || return 1
+    LATEST_RUNNER_VERSION=${BASH_REMATCH[1]}
+    LATEST_RUNNER_PUBLISHED_AT=""
 }
 
 # Replaces the retired list with the ids given; no ids removes it. The list is
@@ -620,16 +644,18 @@ detach_rebake_from_ssh() {
     fi
     log_info "Starting the rebake outside this shell so an SSH drop cannot kill it"
     # systemctl start cannot pass this shell's environment to the unit, which
-    # would drop a BAKE_TIMEOUT override (and its TimeoutStartSec caps the run).
-    # setsid keeps the environment, so an override goes that way.
-    if [[ -z "${BAKE_TIMEOUT:-}" && -f "$REBAKE_UNIT_FILE" ]] && command -v systemctl >/dev/null 2>&1; then
+    # would drop a BAKE_TIMEOUT or BAKE_MIN_FREE_GIB override (and its
+    # TimeoutStartSec caps the run). setsid keeps the environment, so an
+    # override goes that way.
+    if [[ -z "${BAKE_TIMEOUT:-}" && -z "${BAKE_MIN_FREE_GIB:-}" && -f "$REBAKE_UNIT_FILE" ]] \
+        && command -v systemctl >/dev/null 2>&1; then
         systemctl start --no-block github-runner-rebake.service
         log_info "Follow it with: journalctl -u github-runner-rebake.service -f"
         exit 0
     fi
     if ! command -v setsid >/dev/null 2>&1; then
-        if [[ -n "${BAKE_TIMEOUT:-}" ]]; then
-            log_error "setsid is not available, and github-runner-rebake.service cannot take BAKE_TIMEOUT"
+        if [[ -n "${BAKE_TIMEOUT:-}" || -n "${BAKE_MIN_FREE_GIB:-}" ]]; then
+            log_error "setsid is not available, and github-runner-rebake.service cannot take BAKE_TIMEOUT or BAKE_MIN_FREE_GIB"
             log_error "Run 'runner rebake --foreground' inside tmux"
         else
             log_error "setsid is not available and github-runner-rebake.service is not installed"
@@ -673,21 +699,29 @@ rebake_main() {
     done
 
     require_root rebake
+    # A detached rebake reports errors only in its log, after "Rebake started".
+    # Refuse a bad override here, where the caller sees it.
+    check_bake_timeout || exit 1
+    check_bake_min_free_gib || exit 1
     detach_rebake_from_ssh
     trap '' HUP PIPE
     if ! command -v qm >/dev/null 2>&1; then
         log_error "This command must be run on a Proxmox host"
         exit 1
     fi
-    load_infra_config
-    validate_saved_infra
-    require_live_template
 
+    # Read the config only under the lock. setup holds it while it bakes and
+    # then moves TEMPLATE_ID; a TEMPLATE_ID read before the lock can name the
+    # template setup just replaced, and publishing over that leaks setup's new
+    # template or queues it for destruction.
     exec 199>"$REBAKE_LOCK_FILE"
     if ! flock -n 199; then
         log_info "A rebake is already running"
         exit 0
     fi
+    load_infra_config
+    validate_saved_infra
+    require_live_template
 
     recover_pending_bake
     retire_retired_templates

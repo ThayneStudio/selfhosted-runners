@@ -119,30 +119,72 @@ resolve_bake_runner_version() {
     log_info "The bake installs actions/runner $LATEST_RUNNER_VERSION"
 }
 
-# A bake can write its whole BAKE_DISK_GIB disk to VM_STORAGE. A storage that
-# fills up pauses every VM on it (QEMU's default werror=enospc), not only the
-# bake VM, so refuse to start a bake without that much free. BAKE_MIN_FREE_GIB
-# overrides the floor; 0 skips the check.
-check_bake_storage_space() {
-    local min_gib="${BAKE_MIN_FREE_GIB:-$BAKE_DISK_GIB}" row storage_status avail_kib
-    if [[ ! "$min_gib" =~ ^[0-9]+$ ]]; then
-        log_error "BAKE_MIN_FREE_GIB must be a whole number of GiB, not '$min_gib'"
+# BAKE_TIMEOUT is whole seconds. bash reads "2h" or "90m" as a bad number, and
+# the poll's -ge test then fails on every pass without ending the loop, so a
+# stalled guest would hold the bake, and the rebake lock, for good.
+check_bake_timeout() {
+    if [[ -n "${BAKE_TIMEOUT:-}" && ! "$BAKE_TIMEOUT" =~ ^[1-9][0-9]*$ ]]; then
+        log_error "BAKE_TIMEOUT must be a whole number of seconds, such as 7200, not '$BAKE_TIMEOUT'"
         return 1
     fi
-    min_gib=$((10#$min_gib))
-    (( min_gib > 0 )) || return 0
+}
+
+check_bake_min_free_gib() {
+    if [[ -n "${BAKE_MIN_FREE_GIB:-}" && ! "$BAKE_MIN_FREE_GIB" =~ ^[0-9]+$ ]]; then
+        log_error "BAKE_MIN_FREE_GIB must be a whole number of GiB, not '$BAKE_MIN_FREE_GIB'"
+        return 1
+    fi
+}
+
+# 0 when storage $1's config sets `sparse`, so ZFS creates its volumes thin.
+# Without it ZFS reserves each volume's full size. A config that cannot be
+# read counts as thick.
+zfs_storage_is_sparse() {
+    local sparse
+    if ! sparse=$(pvesh get "/storage/$1" --output-format json \
+        199>&- 200>&- 201>&- 202>&- 203>&- 204>&- 2>/dev/null | jq -r '.sparse // 0' 2>/dev/null); then
+        log_warn "Could not read the config of storage $1; counting it as thick-provisioned"
+        return 1
+    fi
+    [[ "$sparse" == 1 || "$sparse" == true ]]
+}
+
+# A bake can write its whole BAKE_DISK_GIB disk to VM_STORAGE. A storage that
+# fills up pauses every VM on it (QEMU's default werror=enospc), not only the
+# bake VM, so refuse to start a bake without that much free. Thick ZFS (a
+# zfspool or ZFS over iSCSI storage without `sparse`) reserves the whole disk
+# when the bake resizes it, and the snapshot `qm template` takes then needs
+# the bake's data free outside that reservation: there a bake can take twice
+# its disk. BAKE_MIN_FREE_GIB overrides the floor; 0 skips the check.
+check_bake_storage_space() {
+    local min_gib="${BAKE_MIN_FREE_GIB:-}" row storage_type storage_status avail_kib thick=0
+    check_bake_min_free_gib || return 1
+    if [[ -n "$min_gib" ]]; then
+        min_gib=$((10#$min_gib))
+        (( min_gib > 0 )) || return 0
+    fi
     # Columns: Name Type Status Total Used Available %. Sizes are KiB.
     row=$(pvesm status --storage "$VM_STORAGE" 199>&- 200>&- 201>&- 202>&- 203>&- 204>&- 2>/dev/null \
-        | awk -v s="$VM_STORAGE" '$1 == s && !found { print $3, $6; found = 1 }') || row=""
-    read -r storage_status avail_kib _ <<< "$row"
+        | awk -v s="$VM_STORAGE" '$1 == s && !found { print $2, $3, $6; found = 1 }') || row=""
+    read -r storage_type storage_status avail_kib _ <<< "$row"
     if [[ "$storage_status" != active || ! "$avail_kib" =~ ^[0-9]+$ ]]; then
         log_error "Could not read free space on storage $VM_STORAGE (status: ${storage_status:-unknown}); not baking"
-        log_error "Set BAKE_MIN_FREE_GIB=0 to bake without this check."
+        log_error "To bake without this check: BAKE_MIN_FREE_GIB=0 runner rebake (or runner setup)"
         return 1
+    fi
+    if [[ -z "$min_gib" ]]; then
+        min_gib=$BAKE_DISK_GIB
+        if [[ "$storage_type" == zfspool || "$storage_type" == zfs ]] && ! zfs_storage_is_sparse "$VM_STORAGE"; then
+            thick=1
+            min_gib=$((2 * BAKE_DISK_GIB))
+        fi
     fi
     if (( avail_kib < min_gib * 1048576 )); then
         log_error "Not baking: storage $VM_STORAGE has $((avail_kib / 1048576)) GiB free and a bake needs $min_gib GiB"
-        log_error "A full storage pauses every VM on it. Free space on $VM_STORAGE, or set BAKE_MIN_FREE_GIB."
+        if [[ "$thick" == 1 ]]; then
+            log_error "Thick-provisioned ZFS reserves the bake's whole ${BAKE_DISK_GIB} GiB disk, and qm template needs room for the bake's data besides."
+        fi
+        log_error "A full storage pauses every VM on it. Free space on $VM_STORAGE, or lower the floor for one run: BAKE_MIN_FREE_GIB=<GiB> runner rebake (or runner setup)"
         return 1
     fi
 }
@@ -152,6 +194,7 @@ create_bake_vm() {
     local net_config="virtio,bridge=$NETWORK_BRIDGE"
 
     # Checked before the VM exists, for setup and rebake alike.
+    check_bake_timeout || return 1
     check_bake_storage_space || return 1
     resolve_bake_runner_version || return 1
 
@@ -180,6 +223,9 @@ bake_and_publish_vm() {
     local bake_elapsed=0 bake_interval=15 bake_ready=false
     local bake_timeout="${BAKE_TIMEOUT:-5400}"
     local minutes seconds_rem i
+
+    # Before any VM work: the poll below cannot time out on a bad value.
+    check_bake_timeout || return 1
 
     import_output=$(qm_host importdisk "$vmid" "$IMG_CACHE_DIR/$CLOUD_IMG" "$VM_STORAGE" 2>&1) || {
         log_error "Failed to import disk"
