@@ -73,8 +73,15 @@ fi
 
 echo ""
 if [[ $RUNNER_COUNT -gt 0 ]]; then
-    log_warn "$RUNNER_COUNT runner(s) still registered with '$ORG_NAME'."
-    log_warn "They will become unmanaged — destroy them first, or remove them from GitHub manually."
+    # The org's VMs are retired, not orphaned: reclone.sh and the watcher
+    # destroy a VM of an org that is no longer configured and clone nothing
+    # in its place (runner_slot_retired in recycle.sh). Destroying a slot
+    # before the removal only makes the watcher clone it again. GitHub
+    # removes an ephemeral runner that has been offline for a day.
+    log_warn "$RUNNER_COUNT runner VM(s) of '$ORG_NAME' remain. Once the org is removed, each one is destroyed,"
+    log_warn "not re-cloned, when it stops: after the one job it runs, or at its 6-hour idle shutdown."
+    log_warn "To remove them sooner, run 'runner destroy <name>' for each once the org is removed."
+    log_warn "GitHub removes an idle runner's registration a day after it goes offline."
     echo ""
 fi
 
