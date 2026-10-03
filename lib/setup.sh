@@ -125,10 +125,41 @@ write_infra_config() {
     mv "$conf_tmp" "$CONFIG_FILE"
 }
 
+# A bake beside the live template is a VM that neither TEMPLATE_ID nor the
+# retired list names. Record it as the rebake records its own bake, so the next
+# rebake finishes or removes it when setup dies first (SIGKILL, power loss) or
+# cleanup_bake cannot destroy it. There is one record. Replacing one whose VM
+# may still exist would leave that VM to nobody, so refuse instead.
+record_setup_bake() {
+    local id=""
+    if [[ -f "$PENDING_BAKE_FILE" ]]; then
+        id=$(tr -d '[:space:]' < "$PENDING_BAKE_FILE") || return 1
+    fi
+    if [[ "$id" =~ ^[0-9]+$ && "$id" != "$TEMPLATE_ID" ]] && ! vm_confirmed_absent "$id"; then
+        log_error "VM $id from an earlier bake is still recorded in $PENDING_BAKE_FILE"
+        log_error "Run 'runner rebake' to finish or remove it, then run setup again"
+        return 1
+    fi
+    # A version left by an earlier record does not describe this bake.
+    rm -f "$PENDING_VERSION_FILE" || return 1
+    install -d -m 700 "$STATE_DIR" || return 1
+    printf '%s\n' "$TEMPLATE_ID" > "$PENDING_BAKE_FILE" || return 1
+    chmod 600 "$PENDING_BAKE_FILE"
+}
+
+# Drop the pending-bake record once VM $TEMPLATE_ID is published or destroyed.
+# A record that names another VM belongs to a bake this setup did not make.
+forget_setup_bake() {
+    [[ -f "$PENDING_BAKE_FILE" ]] || return 0
+    [[ "$(tr -d '[:space:]' < "$PENDING_BAKE_FILE")" == "$TEMPLATE_ID" ]] || return 0
+    rm -f "$PENDING_BAKE_FILE" "$PENDING_VERSION_FILE"
+}
+
 # EXIT trap of the bake: destroy VM $TEMPLATE_ID unless it is a finished
 # template. `template: 1` alone is written before qm template converts the
 # disk, and nothing can be cloned from an unconverted one. A signal after the
-# conversion must not destroy the template.
+# conversion must not destroy the template. A VM left in place keeps its
+# pending-bake record, if it has one, for the next rebake.
 # After an SSH drop every log write fails (EIO on the hung-up tty, or SIGPIPE
 # through a pipe). Neither errexit nor a second SIGHUP may stop the destroy.
 cleanup_bake() {
@@ -150,7 +181,11 @@ cleanup_bake() {
     fi
     log_warn "Baking failed, cleaning up template VM..."
     qm_host stop "$TEMPLATE_ID" --timeout 30 2>/dev/null || true
-    qm_host destroy "$TEMPLATE_ID" 2>/dev/null || true
+    if ! qm_host destroy "$TEMPLATE_ID"; then
+        log_error "Could not destroy VM $TEMPLATE_ID. Remove it by hand: qm stop $TEMPLATE_ID; qm destroy $TEMPLATE_ID"
+        return 0
+    fi
+    forget_setup_bake
 }
 
 # Bake VM $TEMPLATE_ID. With LIVE_TEMPLATE_ID set, that template keeps serving
@@ -176,6 +211,9 @@ bake_setup_template() {
     # Simple commands, not `|| exit`: `||` disables errexit inside the callee.
     prepare_cloud_image
 
+    if [[ -n "$LIVE_TEMPLATE_ID" ]] && ! record_setup_bake; then
+        return 1
+    fi
     log_info "Creating VM template..."
     create_bake_vm "$TEMPLATE_ID"
     trap cleanup_bake EXIT
@@ -190,6 +228,7 @@ bake_setup_template() {
 
     if [[ -n "$LIVE_TEMPLATE_ID" ]]; then
         if ! set_conf_assignment "$CONFIG_FILE" TEMPLATE_ID "$TEMPLATE_ID"; then
+            # Its pending-bake record stays, so the next rebake publishes it.
             log_error "Template $TEMPLATE_ID is ready, but TEMPLATE_ID still names $LIVE_TEMPLATE_ID"
             log_error "Run setup again and enter Template VM ID $TEMPLATE_ID"
             return 1
@@ -199,6 +238,7 @@ bake_setup_template() {
         fi
         log_info "TEMPLATE_ID is now $TEMPLATE_ID. Running clones stay on $LIVE_TEMPLATE_ID until their next reclone."
     fi
+    forget_setup_bake
     if ! commit_baked_version "$BAKE_RUNNER_VERSION" "$TEMPLATE_ID"; then
         log_warn "Template was created but the baked runner version was not recorded"
     fi
