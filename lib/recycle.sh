@@ -24,9 +24,10 @@ set -euo pipefail
 # Same directory as RUN_DIR in common.sh. Callers source common.sh first.
 SLOT_STATE_DIR="${RUN_DIR:-/run/github-runners}"
 # Per-slot lock taken by watch.sh, reclone.sh, create.sh and destroy.sh.
-# slot-<name>.lock stays clear of runner-vmid.lock,
-# runner-vmid-reserve-*.lock and runner-clone-slot-*.lock in this directory.
-SLOT_LOCK_PREFIX="$SLOT_STATE_DIR/slot"
+# lock-slot-<name>.lock. clear_slot_backoff removes slot-* (the state files
+# slot-<name>). The same prefix also stays off runner-vmid.lock,
+# runner-vmid-reserve-*.lock and runner-clone-slot-*.lock.
+SLOT_LOCK_PREFIX="$SLOT_STATE_DIR/lock-slot"
 SLOT_BACKOFF_BASE=30
 SLOT_BACKOFF_MAX=1800
 RAPID_DEATH_SECS=600
@@ -86,6 +87,7 @@ slot_state_save() {
 }
 
 # Forget every slot's failures, so each slot is tried again at once.
+# slot-* is the state files only. Slot locks are lock-slot-*.lock.
 clear_slot_backoff() {
     rm -f "$SLOT_STATE_DIR"/slot-*
 }

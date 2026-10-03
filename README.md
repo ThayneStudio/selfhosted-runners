@@ -1033,7 +1033,7 @@ The runner VM might not have network connectivity. Check:
 | `/var/lib/github-runners/retired-templates` | Replaced templates, destroyed by the rebake once no linked clone depends on them |
 | `/var/lib/github-runners/pending-bake` | The VM of a bake beside the live template, from a rebake or from setup, until it is published or destroyed; the next rebake run finishes or removes a VM left there, and drops a record that names no bake VM on this node |
 | `/var/lib/github-runners/extras` | Extra runners from `runner create`, one `<name> <org>` per line, which the watcher fills like slots (see [Pool size and prefix](#pool-size-and-prefix)) — mode 600 |
-| `/run/github-runners/` | Mode 0700. Per-slot failure holds (`slot-<name>`), when the watcher first saw each stopped runner VM (`watch-stopped`), the maintenance flag (`github-runner-drain`) and the pool's lock files. A slot's lock is `slot-<name>.lock`. Gone after a reboot. A drain started by the previous version is still read from `/run/lock/github-runner-drain` when that file is root-owned |
+| `/run/github-runners/` | Mode 0700. Per-slot failure holds (`slot-<name>`), when the watcher first saw each stopped runner VM (`watch-stopped`), the maintenance flag (`github-runner-drain`) and the pool's lock files. A slot's lock is `lock-slot-<name>.lock`. Gone after a reboot. A drain started by the previous version is still read from `/run/lock/github-runner-drain` when that file is root-owned |
 | `/var/log/github-runner.log` | Output of each reclone (`github-runner-reclone-<vmid>` units) |
 | `/var/log/github-runner-rebake.log` | Rebake output when `runner rebake` detached with `setsid` |
 | `github-runner-watch.timer` | Pool filler, 30 seconds after the previous run |
