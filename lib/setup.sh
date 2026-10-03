@@ -159,7 +159,10 @@ cleanup_bake() {
 # depends on it.
 bake_setup_template() {
     # While a live template exists the daily rebake runs. Without its lock it
-    # could start a second bake and switch TEMPLATE_ID as well.
+    # could start a second bake and switch TEMPLATE_ID as well. Hold the lock
+    # until TEMPLATE_ID, the retired list and the baked-version record name the
+    # new template, as perform_bake does: a rebake in between acts on the old
+    # TEMPLATE_ID or record, and can leak or destroy the new template.
     exec 199>"$REBAKE_LOCK_FILE"
     if ! flock -n 199; then
         log_error "A template rebake is running. Run setup again after it finishes."
@@ -184,7 +187,6 @@ bake_setup_template() {
         return 1
     fi
     trap - EXIT
-    exec 199>&-
 
     if [[ -n "$LIVE_TEMPLATE_ID" ]]; then
         if ! set_conf_assignment "$CONFIG_FILE" TEMPLATE_ID "$TEMPLATE_ID"; then
@@ -200,6 +202,7 @@ bake_setup_template() {
     if ! commit_baked_version "$BAKE_RUNNER_VERSION" "$TEMPLATE_ID"; then
         log_warn "Template was created but the baked runner version was not recorded"
     fi
+    exec 199>&-
     log_info "Template created successfully (tools baked in)"
 }
 
