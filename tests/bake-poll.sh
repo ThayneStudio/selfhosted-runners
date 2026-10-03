@@ -34,12 +34,21 @@ calls=$state/calls
 sleep() { :; }
 mock_stderr=""
 mock_stopped=0
+mock_converted=0
 # Every qm call prints $mock_stderr on stderr first, like a Perl locale warning.
 qm() {
     [[ -z "$mock_stderr" ]] || printf '%s\n' "$mock_stderr" >&2
     printf '%s\n' "$*" >> "$calls"
     case "$1" in
         importdisk) printf "unused0: successfully imported disk 'local-zfs:vm-9001-disk-0'\n" ;;
+        config)
+            printf 'name: ubuntu-cloud-template\nide2: local-zfs:vm-9001-cloudinit,media=cdrom\n'
+            if [[ "$mock_converted" == 1 ]]; then
+                printf 'scsi0: local-zfs:base-9001-disk-0,size=30G\ntemplate: 1\n'
+            else
+                printf 'scsi0: local-zfs:vm-9001-disk-0,size=30G\n'
+            fi
+            ;;
         status)
             if [[ "$mock_stopped" == 1 ]]; then
                 printf 'status: stopped\n'
@@ -48,8 +57,9 @@ qm() {
             fi
             ;;
         shutdown) mock_stopped=1 ;;
+        template) mock_converted=1 ;;
         guest) guest_exec "$@" ;;
-        set|resize|start|template) return 0 ;;
+        set|resize|start) return 0 ;;
         *) return 1 ;;
     esac
 }
@@ -77,6 +87,7 @@ new_guest() {
 run_bake() {
     : > "$calls"
     mock_stopped=0
+    mock_converted=0
     bake_rc=0
     bake_and_publish_vm 9001 2>"$state/log" || bake_rc=$?
 }
