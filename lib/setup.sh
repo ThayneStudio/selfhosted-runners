@@ -7,6 +7,37 @@ source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/rebake.sh"
 # shellcheck source=setup-prompts.sh
 source "$LIB_DIR/setup-prompts.sh"
 
+# `pvesm set --content` replaces the whole list, so read the effective list and
+# append snippets. pvesh also sees the built-in local storage when storage.cfg
+# has no `dir: local` stanza. Never guess a list: that drops content types.
+enable_local_snippets() {
+    local content
+    if pvesm status --content snippets 2>/dev/null | awk '{print $1}' | grep -qx "local"; then
+        return 0
+    fi
+    if ! content=$(pvesh get /storage/local --output-format json 2>/dev/null | jq -r '.content // empty') \
+        || [[ -z "$content" ]]; then
+        log_error "Could not read the content types of local storage"
+        log_error "Add snippets to them by hand (pvesm set local --content <current>,snippets), then re-run setup"
+        return 1
+    fi
+    if [[ ",$content," == *,snippets,* ]]; then
+        log_info "Snippets already in content types for local storage"
+        return 0
+    fi
+    # "none" cannot be combined with another content type.
+    if [[ "$content" == none ]]; then
+        content=""
+    fi
+    if ! pvesm set local --content "${content:+$content,}snippets"; then
+        log_error "Failed to enable snippets on local storage"
+        return 1
+    fi
+}
+
+# Tests source this file for the functions above.
+[[ "${BASH_SOURCE[0]}" == "$0" ]] || return 0
+
 require_root "setup"
 
 echo "========================================"
@@ -52,6 +83,8 @@ BRIDGES=$(ip -br link | grep -E '^vmbr' | awk '{print $1}' || true)
 if [[ -z "$BRIDGES" ]]; then
     log_warn "No bridges found (vmbr*). Using default vmbr0."
 else
+    # Indents every line, which ${var//} cannot do.
+    # shellcheck disable=SC2001
     echo "$BRIDGES" | sed 's/^/  /'
 fi
 prompt_setup_value NETWORK_BRIDGE "Network bridge" vmbr0
@@ -175,24 +208,8 @@ log_info "Command available: runner"
 
 # Enable snippets on local storage
 log_info "[2/5] Enabling snippets storage..."
-if ! pvesm status --content snippets 2>/dev/null | awk '{print $1}' | grep -qx "local"; then
-    # Read current content types to avoid overwriting them
-    EXISTING_CONTENT=$(awk '/^dir: local$/,/^[^[:space:]]/' /etc/pve/storage.cfg 2>/dev/null | awk '/^[[:space:]]+content/ {print $2}')
-    if [[ -n "$EXISTING_CONTENT" ]]; then
-        if [[ "$EXISTING_CONTENT" == *snippets* ]]; then
-            log_info "Snippets already in content types for local storage"
-        else
-            pvesm set local --content "${EXISTING_CONTENT},snippets" || {
-                log_error "Failed to enable snippets on local storage"
-                exit 1
-            }
-        fi
-    else
-        pvesm set local --content iso,backup,vztmpl,snippets || {
-            log_error "Failed to enable snippets on local storage"
-            exit 1
-        }
-    fi
+if ! enable_local_snippets; then
+    exit 1
 fi
 mkdir -p "$SNIPPETS_DIR"
 
