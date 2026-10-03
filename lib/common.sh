@@ -809,6 +809,16 @@ clone_runner() {
         203>&- \
         204>&- \
         || { _fail; _pool_lock_release; return 1; }
+    # A guest reboot must end the VM like a shutdown. By default QEMU resets
+    # in place: no post-stop, no reclone, and cloud-init does not start the
+    # one-shot runner again, so the VM idles in its slot.
+    qm set "$vmid" --reboot 0 \
+        200>&- \
+        201>&- \
+        202>&- \
+        203>&- \
+        204>&- \
+        || { _fail; _pool_lock_release; return 1; }
 
     # Hookscript for auto-destroy on shutdown
     if [[ -f "$SNIPPETS_DIR/runner-hookscript.sh" ]]; then
