@@ -265,3 +265,25 @@ read_baked_listener_version() {
     [[ "$out" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
     printf '%s\n' "$out"
 }
+
+# 0 only when VM $1 is a finished template: `template: 1` is set and every
+# disk except cdrom media (the cloud-init drive) is a base volume of that VM.
+# Proxmox writes `template: 1` before it converts the disks, and `qm template`
+# exits 0 even when its conversion worker fails, so neither the flag nor the
+# exit status alone proves a clone can be made from it.
+template_is_converted() {
+    local vmid="$1" cfg
+    [[ "$vmid" =~ ^[0-9]+$ ]] || return 1
+    cfg=$(qm_host config "$vmid" 2>/dev/null) || return 1
+    printf '%s\n' "$cfg" | awk -v id="$vmid" '
+        /^template: 1[[:space:]]*$/ { template = 1 }
+        /^(ide|sata|scsi|virtio)[0-9]+: / {
+            if ($0 ~ /media=cdrom/) next
+            disks++
+            volume = $2
+            sub(/,.*/, "", volume)
+            if (volume !~ ("(^|[:/])base-" id "-disk-[0-9]+")) unconverted = 1
+        }
+        END { exit !(template && disks > 0 && !unconverted) }
+    '
+}
