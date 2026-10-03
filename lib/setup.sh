@@ -7,6 +7,205 @@ source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/rebake.sh"
 # shellcheck source=setup-prompts.sh
 source "$LIB_DIR/setup-prompts.sh"
 
+# Storages on this node that can hold the template and its linked clones, as
+# "name type" lines. They must allow VM disk images. Thick LVM and iSCSI LUNs
+# accept `qm template` without making a base volume, and every linked clone of
+# such a template then fails.
+template_storages() {
+    pvesm status --content images 2>/dev/null \
+        | awk 'NR > 1 && $2 !~ /^(lvm|iscsi|iscsidirect)$/ { print $1, $2 }'
+}
+
+check_vm_storage() {
+    local storage="$1" storage_type
+    if template_storages | awk -v s="$storage" '$1 == s { found = 1 } END { exit !found }'; then
+        return 0
+    fi
+    storage_type=$(pvesm status 2>/dev/null | awk -v s="$storage" 'NR > 1 && $1 == s { print $2; exit }') || storage_type=""
+    if [[ -z "$storage_type" ]]; then
+        log_error "Storage pool '$storage' does not exist"
+    else
+        log_error "Storage '$storage' ($storage_type) cannot hold the template and its linked clones"
+        log_error "Choose a listed storage: it allows VM disk images and is not thick LVM or iSCSI"
+    fi
+    return 1
+}
+
+# `pvesm set --content` replaces the whole list, so read the effective list and
+# append snippets. pvesh also sees the built-in local storage when storage.cfg
+# has no `dir: local` stanza. Never guess a list: that drops content types.
+enable_local_snippets() {
+    local content
+    if pvesm status --content snippets 2>/dev/null | awk '{print $1}' | grep -qx "local"; then
+        return 0
+    fi
+    if ! content=$(pvesh get /storage/local --output-format json 2>/dev/null | jq -r '.content // empty') \
+        || [[ -z "$content" ]]; then
+        log_error "Could not read the content types of local storage"
+        log_error "Add snippets to them by hand (pvesm set local --content <current>,snippets), then re-run setup"
+        return 1
+    fi
+    if [[ ",$content," == *,snippets,* ]]; then
+        log_info "Snippets already in content types for local storage"
+        return 0
+    fi
+    # "none" cannot be combined with another content type.
+    if [[ "$content" == none ]]; then
+        content=""
+    fi
+    if ! pvesm set local --content "${content:+$content,}snippets"; then
+        log_error "Failed to enable snippets on local storage"
+        return 1
+    fi
+}
+
+# Decide what to do with the Template VM ID answer. A finished template is used
+# as it is (TEMPLATE_READY=1). Any other VM there is refused, such as a bake
+# that stopped before `qm template` converted its disk, or a runner. A free ID
+# is baked. If the saved TEMPLATE_ID is a finished template, LIVE_TEMPLATE_ID
+# keeps it serving clones until the new one is finished.
+plan_template() {
+    local saved="${SETUP_PREFILLS[TEMPLATE_ID]:-}" cfg name
+    TEMPLATE_READY=0
+    LIVE_TEMPLATE_ID=""
+    if template_is_converted "$TEMPLATE_ID"; then
+        TEMPLATE_READY=1
+        return 0
+    fi
+    if cfg=$(qm_host config "$TEMPLATE_ID" 2>/dev/null); then
+        name=$(printf '%s\n' "$cfg" | awk '/^name:/{print $2; exit}')
+        if [[ "$name" == "ubuntu-cloud-template" ]]; then
+            log_error "VM $TEMPLATE_ID is an unfinished template bake: its disk was never converted to a template"
+            log_error "If nothing is still baking it, remove it and run setup again: qm stop $TEMPLATE_ID; qm destroy $TEMPLATE_ID"
+        else
+            log_error "VM $TEMPLATE_ID (${name:-unnamed}) is not a finished template. Choose another Template VM ID."
+        fi
+        return 1
+    fi
+    if vmid_in_use "$TEMPLATE_ID"; then
+        log_error "VM ID $TEMPLATE_ID belongs to another guest. Choose another Template VM ID."
+        return 1
+    fi
+    if [[ -n "$saved" ]] && template_is_converted "$saved"; then
+        LIVE_TEMPLATE_ID="$saved"
+    fi
+}
+
+# Linked clones stay on the template's own storage, so a VM_STORAGE that
+# differs from it applies only from the next bake. Say so and how to bake now.
+warn_template_storage() {
+    local storages
+    storages=$(qm_host config "$TEMPLATE_ID" 2>/dev/null | awk '
+        /^(ide|sata|scsi|virtio)[0-9]+: / && !/media=cdrom/ { sub(/:.*/, "", $2); print $2 }
+    ' | sort -u | paste -sd, -) || return 0
+    [[ -n "$storages" && "$storages" != "$VM_STORAGE" ]] || return 0
+    log_warn "Template $TEMPLATE_ID has its disks on $storages, not $VM_STORAGE."
+    log_warn "Runners are linked clones on $storages until a template is baked on $VM_STORAGE."
+    log_warn "To bake one now: rm -f $BAKED_VERSION_FILE && runner rebake"
+}
+
+# While a new template is baked beside the live one, the saved TEMPLATE_ID
+# keeps naming the live one. bake_setup_template moves it afterwards.
+write_infra_config() {
+    local conf_tmp
+    mkdir -p "$ORG_CONFIG_DIR"
+    chmod 700 "$ORG_CONFIG_DIR"
+    conf_tmp=$(mktemp "${CONFIG_FILE}.XXXXXX")
+    {
+        printf 'NETWORK_BRIDGE=%q\n' "$NETWORK_BRIDGE"
+        printf 'VLAN_TAG=%q\n' "${VLAN_TAG}"
+        printf 'VM_STORAGE=%q\n' "$VM_STORAGE"
+        printf 'TEMPLATE_ID=%q\n' "${LIVE_TEMPLATE_ID:-$TEMPLATE_ID}"
+        printf 'MIN_VMID=%q\n' "$MIN_VMID"
+        printf 'BALLOON=%q\n' "$BALLOON"
+        printf 'DNS_SERVERS=%q\n' "$DNS_SERVERS"
+        printf 'DOCKER_MIRROR_URL=%q\n' "${DOCKER_MIRROR_URL:-}"
+    } > "$conf_tmp"
+    chmod 600 "$conf_tmp"
+    mv "$conf_tmp" "$CONFIG_FILE"
+}
+
+# EXIT trap of the bake: destroy VM $TEMPLATE_ID unless it is a finished
+# template. `template: 1` alone is written before qm template converts the
+# disk, and nothing can be cloned from an unconverted one. A signal after the
+# conversion must not destroy the template.
+# After an SSH drop every log write fails (EIO on the hung-up tty, or SIGPIPE
+# through a pipe). Neither errexit nor a second SIGHUP may stop the destroy.
+cleanup_bake() {
+    local cfg name
+    set +e
+    trap '' HUP PIPE
+    if ! cfg=$(qm_host config "$TEMPLATE_ID" 2>/dev/null); then
+        log_error "Could not read config for VM $TEMPLATE_ID; leaving it"
+        return 0
+    fi
+    name=$(printf '%s\n' "$cfg" | awk '/^name:/{print $2; exit}')
+    if [[ "$name" != "ubuntu-cloud-template" ]]; then
+        log_error "Refusing to destroy VM $TEMPLATE_ID (${name:-unnamed}); it is not the template bake VM"
+        return 0
+    fi
+    if template_is_converted "$TEMPLATE_ID"; then
+        log_warn "VM $TEMPLATE_ID is already a template; leaving it"
+        return 0
+    fi
+    log_warn "Baking failed, cleaning up template VM..."
+    qm_host stop "$TEMPLATE_ID" --timeout 30 2>/dev/null || true
+    qm_host destroy "$TEMPLATE_ID" 2>/dev/null || true
+}
+
+# Bake VM $TEMPLATE_ID. With LIVE_TEMPLATE_ID set, that template keeps serving
+# clones until this one is a finished template. Then, as after a rebake,
+# TEMPLATE_ID moves here and the old template is retired once no linked clone
+# depends on it.
+bake_setup_template() {
+    # While a live template exists the daily rebake runs. Without its lock it
+    # could start a second bake and switch TEMPLATE_ID as well.
+    exec 199>"$REBAKE_LOCK_FILE"
+    if ! flock -n 199; then
+        log_error "A template rebake is running. Run setup again after it finishes."
+        return 1
+    fi
+    if [[ -n "$LIVE_TEMPLATE_ID" ]]; then
+        log_info "Template $LIVE_TEMPLATE_ID keeps serving clones until VM $TEMPLATE_ID is a finished template"
+    fi
+
+    # Checksum mismatch deletes the cached image and returns before qm create.
+    # Simple commands, not `|| exit`: `||` disables errexit inside the callee.
+    prepare_cloud_image
+
+    log_info "Creating VM template..."
+    create_bake_vm "$TEMPLATE_ID"
+    trap cleanup_bake EXIT
+
+    bake_and_publish_vm "$TEMPLATE_ID"
+    # qm template exits 0 even when it did not convert the disk.
+    if ! template_is_converted "$TEMPLATE_ID"; then
+        log_error "VM $TEMPLATE_ID is not a finished template after qm template"
+        return 1
+    fi
+    trap - EXIT
+    exec 199>&-
+
+    if [[ -n "$LIVE_TEMPLATE_ID" ]]; then
+        if ! set_conf_assignment "$CONFIG_FILE" TEMPLATE_ID "$TEMPLATE_ID"; then
+            log_error "Template $TEMPLATE_ID is ready, but TEMPLATE_ID still names $LIVE_TEMPLATE_ID"
+            log_error "Run setup again and enter Template VM ID $TEMPLATE_ID"
+            return 1
+        fi
+        if ! remember_retired_template "$LIVE_TEMPLATE_ID"; then
+            log_warn "Could not record template $LIVE_TEMPLATE_ID for retirement; destroy it once no runner uses it"
+        fi
+        log_info "TEMPLATE_ID is now $TEMPLATE_ID. Running clones stay on $LIVE_TEMPLATE_ID until their next reclone."
+    fi
+    if ! commit_baked_version "$BAKE_RUNNER_VERSION" "$TEMPLATE_ID"; then
+        log_warn "Template was created but the baked runner version was not recorded"
+    fi
+    log_info "Template created successfully (tools baked in)"
+}
+
+# Tests source this file for the functions above.
+[[ "${BASH_SOURCE[0]}" == "$0" ]] || return 0
+
 require_root "setup"
 
 echo "========================================"
@@ -52,6 +251,8 @@ BRIDGES=$(ip -br link | grep -E '^vmbr' | awk '{print $1}' || true)
 if [[ -z "$BRIDGES" ]]; then
     log_warn "No bridges found (vmbr*). Using default vmbr0."
 else
+    # Indents every line, which ${var//} cannot do.
+    # shellcheck disable=SC2001
     echo "$BRIDGES" | sed 's/^/  /'
 fi
 prompt_setup_value NETWORK_BRIDGE "Network bridge" vmbr0
@@ -74,12 +275,11 @@ fi
 # Detect storage
 echo ""
 echo "Available storage pools:"
-pvesm status | grep -E 'zfspool|dir|lvm' | awk '{print "  " $1 " (" $2 ")"}' || true
+template_storages | awk '{print "  " $1 " (" $2 ")"}' || true
 prompt_setup_value VM_STORAGE "Storage for VMs" local-zfs
 
-# Validate storage exists
-if ! pvesm status | awk '{print $1}' | grep -qxF "$VM_STORAGE"; then
-    log_error "Storage pool '$VM_STORAGE' does not exist"
+# Validate storage exists and can hold a template and its linked clones
+if ! check_vm_storage "$VM_STORAGE"; then
     exit 1
 fi
 
@@ -92,6 +292,9 @@ if [[ ! "$TEMPLATE_ID" =~ ^[0-9]+$ ]]; then
 fi
 if [[ "$TEMPLATE_ID" -lt 100 || "$TEMPLATE_ID" -gt 999999999 ]]; then
     log_error "Template ID must be between 100 and 999999999"
+    exit 1
+fi
+if ! plan_template; then
     exit 1
 fi
 
@@ -175,24 +378,8 @@ log_info "Command available: runner"
 
 # Enable snippets on local storage
 log_info "[2/5] Enabling snippets storage..."
-if ! pvesm status --content snippets 2>/dev/null | awk '{print $1}' | grep -qx "local"; then
-    # Read current content types to avoid overwriting them
-    EXISTING_CONTENT=$(awk '/^dir: local$/,/^[^[:space:]]/' /etc/pve/storage.cfg 2>/dev/null | awk '/^[[:space:]]+content/ {print $2}')
-    if [[ -n "$EXISTING_CONTENT" ]]; then
-        if [[ "$EXISTING_CONTENT" == *snippets* ]]; then
-            log_info "Snippets already in content types for local storage"
-        else
-            pvesm set local --content "${EXISTING_CONTENT},snippets" || {
-                log_error "Failed to enable snippets on local storage"
-                exit 1
-            }
-        fi
-    else
-        pvesm set local --content iso,backup,vztmpl,snippets || {
-            log_error "Failed to enable snippets on local storage"
-            exit 1
-        }
-    fi
+if ! enable_local_snippets; then
+    exit 1
 fi
 mkdir -p "$SNIPPETS_DIR"
 
@@ -203,21 +390,7 @@ chmod 755 "$SNIPPETS_DIR/runner-hookscript.sh"
 
 # Save infra config
 log_info "[3/5] Saving configuration..."
-mkdir -p "$ORG_CONFIG_DIR"
-chmod 700 "$ORG_CONFIG_DIR"
-CONF_TMP=$(mktemp "${CONFIG_FILE}.XXXXXX")
-{
-    printf 'NETWORK_BRIDGE=%q\n' "$NETWORK_BRIDGE"
-    printf 'VLAN_TAG=%q\n' "${VLAN_TAG}"
-    printf 'VM_STORAGE=%q\n' "$VM_STORAGE"
-    printf 'TEMPLATE_ID=%q\n' "$TEMPLATE_ID"
-    printf 'MIN_VMID=%q\n' "$MIN_VMID"
-    printf 'BALLOON=%q\n' "$BALLOON"
-    printf 'DNS_SERVERS=%q\n' "$DNS_SERVERS"
-    printf 'DOCKER_MIRROR_URL=%q\n' "${DOCKER_MIRROR_URL:-}"
-} > "$CONF_TMP"
-chmod 600 "$CONF_TMP"
-mv "$CONF_TMP" "$CONFIG_FILE"
+write_infra_config
 
 # Prune obsolete per-org snippets that embedded the org PAT. Cloud-init is now
 # rendered per-VM at clone time with a single-use JIT config; the PAT stays
@@ -227,52 +400,17 @@ if compgen -G "$SNIPPETS_DIR/runner-user-data-*.yaml" > /dev/null; then
     log_info "Removed obsolete per-org PAT snippets"
 fi
 
-# Check if template already exists
-if qm status "$TEMPLATE_ID" &> /dev/null; then
+# plan_template accepted the VM at TEMPLATE_ID only if it is a finished template.
+if [[ "$TEMPLATE_READY" == 1 ]]; then
     log_info "[4/5] Template VM $TEMPLATE_ID already exists. Skipping creation."
     log_warn "To recreate: qm destroy $TEMPLATE_ID && runner setup"
+    warn_template_storage
     if [[ ! -f "$BAKED_VERSION_FILE" ]]; then
         log_warn "No baked runner version is recorded. The daily rebake will bake once."
     fi
 else
     log_info "[4/5] Creating baked Ubuntu cloud template..."
-    # Checksum mismatch deletes the cached image and returns before qm create.
-    # Simple commands, not `|| exit`: `||` disables errexit inside the callee.
-    prepare_cloud_image
-
-    log_info "Creating VM template..."
-    create_bake_vm "$TEMPLATE_ID"
-
-    # Destroy this VM on failure or interrupt. It is not a template yet.
-    # A SIGHUP after qm template succeeds must not purge the live template.
-    cleanup_bake() {
-        local cfg name
-        if ! cfg=$(qm_host config "$TEMPLATE_ID" 2>/dev/null); then
-            log_error "Could not read config for VM $TEMPLATE_ID; leaving it"
-            return 0
-        fi
-        name=$(printf '%s\n' "$cfg" | awk '/^name:/{print $2; exit}')
-        if [[ "$name" != "ubuntu-cloud-template" ]]; then
-            log_error "Refusing to destroy VM $TEMPLATE_ID (${name:-unnamed}); it is not the template bake VM"
-            return 0
-        fi
-        if printf '%s\n' "$cfg" | grep -q '^template: 1[[:space:]]*$'; then
-            log_warn "VM $TEMPLATE_ID is already a template; leaving it"
-            return 0
-        fi
-        log_warn "Baking failed, cleaning up template VM..."
-        qm_host stop "$TEMPLATE_ID" --timeout 30 2>/dev/null || true
-        qm_host destroy "$TEMPLATE_ID" --purge 2>/dev/null || true
-    }
-    trap cleanup_bake EXIT
-
-    bake_and_publish_vm "$TEMPLATE_ID"
-    trap - EXIT
-
-    if ! commit_baked_version "$BAKE_RUNNER_VERSION" "$TEMPLATE_ID"; then
-        log_warn "Template was created but the baked runner version was not recorded"
-    fi
-    log_info "Template created successfully (tools baked in)"
+    bake_setup_template
 fi
 
 log_info "[5/5] Installing pool watcher and rebake timers..."
