@@ -69,6 +69,11 @@ slot_state_save() {
     fi
 }
 
+# Forget every slot's failures, so each slot is tried again at once.
+clear_slot_backoff() {
+    rm -f "$SLOT_STATE_DIR"/slot-*
+}
+
 # Seconds to hold a slot after its Nth failure in a row: 30, 60 ... 1800.
 slot_backoff_seconds() {
     local n="$1" secs="$SLOT_BACKOFF_BASE"
