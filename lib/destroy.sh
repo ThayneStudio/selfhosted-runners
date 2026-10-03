@@ -95,7 +95,7 @@ fi
 
 # Destroy
 log_info "Destroying $RUNNER_NAME (VMID $VMID)..."
-qm destroy "$VMID" --purge 200>&- 201>&- 202>&- || { log_error "Failed to destroy $VMID"; exit 1; }
+qm destroy "$VMID" 200>&- 201>&- 202>&- || { log_error "Failed to destroy $VMID"; exit 1; }
 
 # Clean up per-VM snippets
 rm -f "${SNIPPETS_DIR}/runner-${VMID}-meta.yaml" "${SNIPPETS_DIR}/runner-${VMID}-user-"*.yaml "${SNIPPETS_DIR}/runner-${VMID}-vendor.yaml"
