@@ -19,6 +19,7 @@ write_files:
       JIT_CONFIG="{{JIT_CONFIG}}"
       GITHUB_ORG="{{GITHUB_ORG}}"
       DOCKER_MIRROR_URL="{{DOCKER_MIRROR_URL}}"
+      DNS_SERVERS="{{DNS_SERVERS}}"
 
   - path: /opt/register-runner.sh
     permissions: '0755'
@@ -116,14 +117,27 @@ write_files:
 
       cd $RUNNER_HOME
 
-      # Remove DHCP-provided DNS (often unreachable from VMs on bridged networks)
-      # and keep only the explicitly configured nameservers from Proxmox cloud-init.
-      CONFIGURED_DNS=$(resolvectl status eth0 2>/dev/null | grep "DNS Servers:" | sed 's/.*DNS Servers: //')
-      # Filter out the DHCP gateway IP (first hop, often not a DNS server for VMs)
-      GATEWAY=$(ip route | awk '/default/{print $3}')
-      CLEAN_DNS=$(echo "$CONFIGURED_DNS" | tr ' ' '\n' | grep -vxF "$GATEWAY" | tr '\n' ' ')
-      if [[ -n "$CLEAN_DNS" ]]; then
-        resolvectl dns eth0 $CLEAN_DNS 2>/dev/null || true
+      # Proxmox's --nameserver never reaches eth0: cloud-init attaches global
+      # nameservers only to statically addressed interfaces, and eth0 is DHCP.
+      # Apply DNS_SERVERS here. Without it, drop the DHCP gateway (often not a
+      # resolver for VMs on bridged networks) unless it is the only server.
+      # Each lookup can find nothing, which must not end the script.
+      if [[ -n "${DNS_SERVERS:-}" ]]; then
+        if resolvectl dns eth0 $DNS_SERVERS; then
+          log "DNS servers: $DNS_SERVERS"
+        else
+          log_error "Failed to set DNS servers: $DNS_SERVERS"
+        fi
+      else
+        CONFIGURED_DNS=$(resolvectl status eth0 2>/dev/null | grep "DNS Servers:" | sed 's/.*DNS Servers: //' || true)
+        GATEWAY=$(ip route | awk '/default/{print $3}' || true)
+        CLEAN_DNS=$(echo "$CONFIGURED_DNS" | tr ' ' '\n' | grep -vxF "$GATEWAY" | tr '\n' ' ' || true)
+        if [[ -n "$CLEAN_DNS" ]]; then
+          resolvectl dns eth0 $CLEAN_DNS 2>/dev/null || true
+          log "DNS servers: ${CLEAN_DNS% } (DHCP, gateway removed)"
+        else
+          log "DNS servers: ${CONFIGURED_DNS:-none} (DHCP, unchanged)"
+        fi
       fi
 
       # Wait for network connectivity
