@@ -163,16 +163,34 @@ select_org() {
     done
 }
 
+# Prints N when $1 is slot <prefix $2>-N as the watcher names it (no leading
+# zeros); fails for any other name, such as a manual runner-01.
+slot_number() {
+    local name="$1" prefix="$2" n
+    [[ -n "$prefix" && "$name" == "${prefix}-"* ]] || return 1
+    n="${name#"${prefix}-"}"
+    [[ "$n" =~ ^[1-9][0-9]{0,8}$ ]] || return 1
+    printf '%s\n' "$n"
+}
+
 get_vm_org() {
-    local cicustom
-    cicustom=$(qm config "$1" 2>/dev/null | grep "^cicustom:" || true)
+    local config cicustom description
+    local marker_re='^description: selfhosted-runners org=([a-zA-Z0-9-]+)'
+    config=$(qm config "$1" 2>/dev/null) || true
+    cicustom=$(grep -m1 '^cicustom:' <<< "$config") || true
+    description=$(grep -m1 '^description:' <<< "$config") || true
     # New per-VM snippet: runner-<vmid>-user-<org>.yaml (org has no dots).
     # Legacy per-org snippet: runner-user-data-<org>.yaml (kept as a fallback so
     # VMs created before the token refactor stay identifiable/destroyable).
     # The two are mutually exclusive: legacy names have no digits after "runner-".
+    # Last, the marker clone_runner passes to qm clone: a clone cut off before
+    # --cicustom carries only that, and would otherwise hold its slot name
+    # with no runner command able to see or remove it.
     if [[ "$cicustom" =~ runner-[0-9]+-user-([a-zA-Z0-9-]+)\.yaml ]]; then
         echo "${BASH_REMATCH[1]}"
     elif [[ "$cicustom" =~ runner-user-data-([^.]+)\.yaml ]]; then
+        echo "${BASH_REMATCH[1]}"
+    elif [[ "$description" =~ $marker_re ]]; then
         echo "${BASH_REMATCH[1]}"
     else
         echo "unknown"
@@ -625,10 +643,14 @@ generate_mac() {
 
 # Clone template, configure cloud-init, set hookscript, start VM.
 # Returns VMID on stdout. Returns 1 on failure (cleans up partial clone).
+# Sets CLONE_MINT_CONFLICT to 1 when a runner of this name was still
+# registered on GitHub. An ephemeral runner is removed once it finishes a
+# job, so that means the previous runner of this name never finished one.
 clone_runner() {
     local name="$1" org="$2" vmid="${3:-}"
     local RESERVED_VMID=""
     local pool_lock_owned=0
+    CLONE_MINT_CONFLICT=0
 
     # GITHUB_PAT/GITHUB_ORG must be in scope (caller ran load_org_config).
     if [[ -z "${GITHUB_PAT:-}" || -z "${GITHUB_ORG:-}" ]]; then
@@ -720,6 +742,9 @@ clone_runner() {
     jit_config=$(fetch_jit_config "$name") && mint_rc=0 || mint_rc=$?
     if [[ $mint_rc -eq 2 ]]; then
         # Duplicate name: deregister the stale GitHub-side runner and mint once more.
+        # Read by the callers' failure backoff (recycle.sh).
+        # shellcheck disable=SC2034
+        CLONE_MINT_CONFLICT=1
         deregister_runner "$org" "$name" || true
         jit_config=$(fetch_jit_config "$name") && mint_rc=0 || mint_rc=$?
         if [[ $mint_rc -ne 0 ]]; then
@@ -792,13 +817,28 @@ clone_runner() {
         return 1
     fi
 
+    # Whether this is one of the org's RUNNER_COUNT slots, which the pool
+    # retires once the count or prefix no longer covers it, or an extra runner
+    # from `runner create`, which recycles until `runner destroy`.
+    local kind="" slot_n
+    if [[ "${RUNNER_COUNT:-}" =~ ^[0-9]{1,9}$ ]]; then
+        kind=extra
+        if slot_n=$(slot_number "$name" "${RUNNER_PREFIX:-runner}") && (( slot_n <= 10#$RUNNER_COUNT )); then
+            kind=slot
+        fi
+    fi
+
     # Keep maintenance locks in this shell only. Proxmox helper children can
     # spawn long-lived kvm processes; those must not inherit runner lock fds.
     # Capture stderr so the actual ZFS/Proxmox error surfaces under
     # `journalctl -t github-runner` instead of being buried under the service
     # unit log (which the operator does not look at first).
+    # The description is the ownership marker get_vm_org falls back to, with
+    # the kind. qm clone writes it in the same config write as the name, so a
+    # clone that is killed before --cicustom below is still recognisably ours.
     local clone_err; clone_err=$(mktemp)
-    if ! qm clone "$TEMPLATE_ID" "$vmid" --name "$name" 200>&- 201>&- 202>&- 203>&- 204>&- 2>"$clone_err"; then
+    if ! qm clone "$TEMPLATE_ID" "$vmid" --name "$name" --description "selfhosted-runners org=$org${kind:+ kind=$kind}" \
+        200>&- 201>&- 202>&- 203>&- 204>&- 2>"$clone_err"; then
         while IFS= read -r line; do
             [[ -n "$line" ]] && log_error "qm clone $vmid: $line"
         done < "$clone_err"
@@ -866,6 +906,16 @@ clone_runner() {
         204>&- \
         || { _fail; _pool_lock_release; return 1; }
     qm set "$vmid" --ciuser runner \
+        200>&- \
+        201>&- \
+        202>&- \
+        203>&- \
+        204>&- \
+        || { _fail; _pool_lock_release; return 1; }
+    # A guest reboot must end the VM like a shutdown. By default QEMU resets
+    # in place: no post-stop, no reclone, and cloud-init does not start the
+    # one-shot runner again, so the VM idles in its slot.
+    qm set "$vmid" --reboot 0 \
         200>&- \
         201>&- \
         202>&- \
