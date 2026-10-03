@@ -125,6 +125,28 @@ write_infra_config() {
     mv "$conf_tmp" "$CONFIG_FILE"
 }
 
+# Prune obsolete per-org snippets that embedded the org PAT. Cloud-init is now
+# rendered per-VM at clone time with a single-use JIT config; the PAT stays
+# on the host. VMs cloned from those snippets still hold the PAT, so
+# PAT_SNIPPETS_PRUNED records for warn_pat_snippet_vms whether this run
+# removed any.
+prune_pat_snippets() {
+    PAT_SNIPPETS_PRUNED=0
+    compgen -G "$SNIPPETS_DIR/runner-user-data-*.yaml" > /dev/null || return 0
+    rm -f "$SNIPPETS_DIR"/runner-user-data-*.yaml
+    log_info "Removed obsolete per-org PAT snippets"
+    PAT_SNIPPETS_PRUNED=1
+}
+
+# Without those snippets, the pool was cloned with JIT configs, or an earlier
+# run removed them and warned.
+warn_pat_snippet_vms() {
+    [[ "${PAT_SNIPPETS_PRUNED:-0}" == 1 ]] || return 0
+    log_warn "Runner VMs cloned from the removed snippets still have the org PAT on their cloud-init drive, where any job they run can read it."
+    log_warn "Recycle the pool to destroy them: runner stop && runner start"
+    echo ""
+}
+
 # A bake beside the live template is a VM that neither TEMPLATE_ID nor the
 # retired list names. Record it as the rebake records its own bake, so the next
 # rebake finishes or removes it when setup dies first (SIGKILL, power loss) or
@@ -138,6 +160,7 @@ record_setup_bake() {
     if [[ "$id" =~ ^[0-9]+$ && "$id" != "$TEMPLATE_ID" ]] && ! vm_confirmed_absent "$id"; then
         log_error "VM $id from an earlier bake is still recorded in $PENDING_BAKE_FILE"
         log_error "Run 'runner rebake' to finish or remove it, then run setup again"
+        log_error "If 'qm config $id' on this node shows no VM named ubuntu-cloud-template, the record is stale; remove it instead: rm $PENDING_BAKE_FILE"
         return 1
     fi
     # A version left by an earlier record does not describe this bake.
@@ -159,7 +182,9 @@ forget_setup_bake() {
 # template. `template: 1` alone is written before qm template converts the
 # disk, and nothing can be cloned from an unconverted one. A signal after the
 # conversion must not destroy the template. A VM left in place keeps its
-# pending-bake record, if it has one, for the next rebake.
+# pending-bake record, if it has one, for the next rebake. A bake that
+# create_bake_vm refused before `qm create` has no VM, and once the cluster
+# inventory confirms that, its record goes, as cleanup_rebake drops its own.
 # After an SSH drop every log write fails (EIO on the hung-up tty, or SIGPIPE
 # through a pipe). Neither errexit nor a second SIGHUP may stop the destroy.
 cleanup_bake() {
@@ -167,6 +192,10 @@ cleanup_bake() {
     set +e
     trap '' HUP PIPE
     if ! cfg=$(qm_host config "$TEMPLATE_ID" 2>/dev/null); then
+        if vm_confirmed_absent "$TEMPLATE_ID"; then
+            forget_setup_bake
+            return 0
+        fi
         log_error "Could not read config for VM $TEMPLATE_ID; leaving it"
         return 0
     fi
@@ -214,9 +243,11 @@ bake_setup_template() {
     if [[ -n "$LIVE_TEMPLATE_ID" ]] && ! record_setup_bake; then
         return 1
     fi
+    # Armed before create_bake_vm, whose checks can refuse before `qm create`,
+    # so that cleanup_bake also drops the record of a VM that never existed.
+    trap cleanup_bake EXIT
     log_info "Creating VM template..."
     create_bake_vm "$TEMPLATE_ID"
-    trap cleanup_bake EXIT
 
     bake_and_publish_vm "$TEMPLATE_ID"
     # qm template exits 0 even when it did not convert the disk.
@@ -436,13 +467,7 @@ chmod 755 "$SNIPPETS_DIR/runner-hookscript.sh"
 log_info "[3/5] Saving configuration..."
 write_infra_config
 
-# Prune obsolete per-org snippets that embedded the org PAT. Cloud-init is now
-# rendered per-VM at clone time with a single-use JIT config; the PAT stays
-# on the host.
-if compgen -G "$SNIPPETS_DIR/runner-user-data-*.yaml" > /dev/null; then
-    rm -f "$SNIPPETS_DIR"/runner-user-data-*.yaml
-    log_info "Removed obsolete per-org PAT snippets"
-fi
+prune_pat_snippets
 
 # plan_template accepted the VM at TEMPLATE_ID only if it is a finished template.
 if [[ "$TEMPLATE_READY" == 1 ]]; then
@@ -486,7 +511,5 @@ else
     echo "To add another org:  runner add-org"
     echo "To list orgs:        runner list-orgs"
     echo ""
-    log_warn "Running VMs still have the old PAT on their cloud-init drive until recycled."
-    log_warn "Recycle the pool before the next job: runner stop && runner start"
-    echo ""
+    warn_pat_snippet_vms
 fi

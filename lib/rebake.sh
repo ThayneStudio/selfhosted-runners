@@ -372,6 +372,24 @@ vmid_is_non_qemu_guest() {
         'type == "array" and any(.[]; .vmid == $id and (.type | type) == "string" and .type != "qemu")' >/dev/null 2>&1
 }
 
+# Prints the node that a readable cluster inventory lists VMID $1 on, and
+# fails when that is this node or nothing proves otherwise. Bake VMs are
+# created on this node, so a pending record for a VMID on another node is
+# stale, and `qm` here could neither finish nor remove that guest.
+vmid_node_elsewhere() {
+    local id="$1" here inventory
+    # Proxmox names this node by its host name up to the first dot.
+    here=$(uname -n) || return 1
+    here=${here%%.*}
+    [[ -n "$here" ]] || return 1
+    inventory=$(pvesh get /cluster/resources --type vm --output-format json \
+        199>&- 200>&- 201>&- 202>&- 203>&- 204>&- 2>/dev/null) || return 1
+    printf '%s\n' "$inventory" | jq -er --argjson id "$id" --arg here "$here" '
+        if type == "array" then . else error("not a list") end
+        | first(.[] | select(.vmid == $id) | .node
+            | select(type == "string" and . != "" and . != $here))' 2>/dev/null
+}
+
 retire_retired_templates() {
     local id name
     local -a kept=()
@@ -483,7 +501,7 @@ cleanup_rebake() {
 }
 
 recover_pending_bake() {
-    local id ver cfg name
+    local id ver cfg name node
     [[ -f "$PENDING_BAKE_FILE" ]] || return 0
     id=$(tr -d '[:space:]' < "$PENDING_BAKE_FILE")
     if [[ ! "$id" =~ ^[0-9]+$ ]]; then
@@ -498,6 +516,11 @@ recover_pending_bake() {
         # Kept, this record would fail every later run before the release check.
         if vmid_is_non_qemu_guest "$id"; then
             log_warn "Pending bake id $id belongs to a container, not a rebake VM; dropping the stale pending record"
+            rm -f "$PENDING_BAKE_FILE" "$PENDING_VERSION_FILE"
+            return 0
+        fi
+        if node=$(vmid_node_elsewhere "$id"); then
+            log_warn "Pending bake id $id is a guest on node $node, not a bake VM on this node; dropping the stale pending record"
             rm -f "$PENDING_BAKE_FILE" "$PENDING_VERSION_FILE"
             return 0
         fi
