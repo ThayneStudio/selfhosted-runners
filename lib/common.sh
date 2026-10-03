@@ -87,7 +87,9 @@ pool_is_draining() {
 }
 
 enable_pool_drain() {
-    install -d -m 755 "$(dirname "$POOL_DRAIN_FILE")"
+    # /run/lock is 1777 on Debian. mkdir -p leaves an existing directory's
+    # mode alone; install -d -m 755 would chmod it and lock out non-root users.
+    mkdir -p "$(dirname "$POOL_DRAIN_FILE")"
     : > "$POOL_DRAIN_FILE"
 }
 
@@ -169,9 +171,16 @@ get_vm_org() {
     fi
 }
 
+# Guest configs of every cluster node.
+PVE_NODES_DIR="/etc/pve/nodes"
+
+# VMIDs are cluster-wide and shared by VMs and containers. A container's
+# LVM-thin, LVM and RBD volumes are named vm-<ctid>-disk-N like a VM's, so a
+# VMID counts as taken when either guest type has a config for it on any node.
 vm_config_path() {
     local vmid="$1"
-    compgen -G "/etc/pve/nodes/*/qemu-server/${vmid}.conf" | head -n 1
+    compgen -G "$PVE_NODES_DIR/*/qemu-server/${vmid}.conf" | head -n 1 ||
+        compgen -G "$PVE_NODES_DIR/*/lxc/${vmid}.conf" | head -n 1
 }
 
 vmid_in_use() {
@@ -218,7 +227,10 @@ reserve_vmid() {
 
 release_vmid_reservation() {
     local vmid="${1:-${RESERVED_VMID:-}}"
-    exec 203>&- 2>/dev/null || true
+    # Closing an fd that is not open is silent and returns 0. A redirection
+    # on a bare exec applies to this shell for good: 2>/dev/null here would
+    # hide every later log line.
+    exec 203>&-
     [[ -n "$vmid" ]] && rm -f "$(vmid_reservation_lock_file "$vmid")" 2>/dev/null || true
 }
 
@@ -248,7 +260,8 @@ acquire_clone_slot() {
 }
 
 release_clone_slot() {
-    exec 204>&- 2>/dev/null || true
+    # No 2>/dev/null: see release_vmid_reservation.
+    exec 204>&-
 }
 
 list_template_base_volids() {
@@ -284,6 +297,23 @@ zfs_dataset_from_volid() {
     dataset="${path#/dev/zvol/}"
     zfs list -H -o name "$dataset" >/dev/null 2>&1 || return 1
     printf '%s\n' "$dataset"
+}
+
+# 0 only when a listing of the volume's storage succeeds and no longer shows
+# it. A failed listing is not proof that the volume is gone.
+volume_confirmed_absent() {
+    local volid="$1" listing
+    listing=$(pvesm list "${volid%%:*}" 199>&- 200>&- 201>&- 202>&- 203>&- 204>&- 2>/dev/null) || return 1
+    awk -v v="$volid" '$1 == v { found = 1 } END { exit found }' <<< "$listing"
+}
+
+# `pvesm free` exits 0 even when its deletion task fails (a busy zvol, an open
+# LV): the error only reaches stderr and the task log. A free counts only once
+# the volume is gone from its storage listing.
+free_volume() {
+    local volid="$1"
+    pvesm free "$volid" 199>&- 200>&- 201>&- 202>&- 203>&- 204>&- || return 1
+    volume_confirmed_absent "$volid"
 }
 
 list_template_linked_clone_volids() {
@@ -353,11 +383,17 @@ list_template_linked_clone_volids() {
         while read -r volid _; do
             [[ "$volid" == "$VM_STORAGE:vm-"* ]] || continue
             [[ -n "${seen[$volid]:-}" ]] && continue
+            # Runners are destroyed and recloned while this scan runs, and
+            # pvesm path does not check that a zvol exists. A volume that a
+            # fresh listing no longer shows depends on nothing; any other
+            # failed lookup still fails closed.
             if ! dataset=$(zfs_dataset_from_volid "$volid"); then
+                volume_confirmed_absent "$volid" && continue
                 log_error "Failed to resolve ZFS dataset for $volid"
                 return 1
             fi
             if ! origin=$(zfs get -H -o value origin "$dataset" 2>/dev/null); then
+                volume_confirmed_absent "$volid" && continue
                 log_error "Failed to read ZFS origin for $dataset"
                 return 1
             fi
@@ -399,7 +435,7 @@ cleanup_template_orphan_volumes() {
         fi
 
         log_info "Freeing orphaned template child volume: $volid"
-        if ! pvesm free "$volid"; then
+        if ! free_volume "$volid"; then
             log_error "Failed to free orphaned template child volume: $volid"
             return 1
         fi
@@ -419,13 +455,18 @@ cleanup_template_orphan_volumes() {
     return 0
 }
 
-# Sweep zvols on $VM_STORAGE whose VMID has no /etc/pve config — leftovers from
-# clones that failed before writing config (or whose _fail cleanup couldn't
-# fully reap). Holds the pool activity lock exclusive non-blocking so it can
-# never race a clone in progress. Scoped to vmid >= MIN_VMID and != TEMPLATE_ID
-# so non-runner VMs on the same storage are never touched.
+# Sweep VM image volumes on $VM_STORAGE whose VMID has no VM or container
+# config on any node — leftovers from clones that failed before writing config
+# (or whose _fail cleanup couldn't fully reap). Holds the pool activity lock
+# exclusive non-blocking so it can never race a clone in progress. Scoped to
+# VMIDs runners can get: vmid >= MIN_VMID and != TEMPLATE_ID. MIN_VMID=0
+# ("auto") sets no lower bound, so the floor is then TEMPLATE_ID + 1. Listing
+# only images content also leaves out every container's rootdir volumes.
 cleanup_runner_orphan_volumes() {
-    local min_vmid="${MIN_VMID:-$((TEMPLATE_ID + 1))}"
+    local min_vmid="${MIN_VMID:-}"
+    if [[ ! "$min_vmid" =~ ^[1-9][0-9]*$ ]]; then
+        min_vmid=$((TEMPLATE_ID + 1))
+    fi
 
     exec 202>"$POOL_ACTIVITY_LOCK_FILE"
     if ! flock -n -x 202; then
@@ -444,12 +485,12 @@ cleanup_runner_orphan_volumes() {
         [[ "$vmid" -ge "$min_vmid" && "$vmid" -ne "$TEMPLATE_ID" ]] || continue
         [[ -z "$(vm_config_path "$vmid")" ]] || continue
         log_info "[orphan-sweep] freeing $volid (vmid $vmid has no config)"
-        if pvesm free "$volid" 2>/dev/null; then
+        if free_volume "$volid" 2>/dev/null; then
             freed=$((freed + 1))
         else
             log_warn "[orphan-sweep] pvesm free $volid failed"
         fi
-    done < <(pvesm list "$VM_STORAGE" 2>/dev/null | awk 'NR>1 {print $1}')
+    done < <(pvesm list "$VM_STORAGE" --content images 2>/dev/null | awk 'NR>1 {print $1}')
 
     [[ "$freed" -gt 0 ]] && log_info "[orphan-sweep] reaped $freed orphan volume(s)"
     exec 202>&-
@@ -613,11 +654,16 @@ clone_runner() {
     fi
 
     # Cleanup helper: destroy VM (only if it belongs to us), remove snippet, and
-    # sweep orphan zvols at this VMID. The ownership check prevents touching
-    # another process's VM on VMID collision. Orphan sweep runs unconditionally
-    # for our-VMID and no-owner cases because qm destroy --purge can silently
-    # leave residue (busy ZFS dataset, etc.) and a clone that fails before
-    # writing config leaves zvols with no VM to attach to.
+    # sweep orphan volumes at this VMID. The ownership check prevents touching
+    # another process's VM on VMID collision. An empty owner is not a free
+    # VMID: qm config cannot read a container, a VM on another node or a VM
+    # with no name. The sweep covers our VM's residue (qm destroy can leave a
+    # busy ZFS dataset, etc.) and a clone that failed before writing config.
+    # It frees nothing while any guest config holds the VMID: a destroy that a
+    # lock refused (vzdump, for example) leaves a config still using those
+    # volumes, and once the config is gone a parallel clone can take the VMID,
+    # so the check runs again before each free. No --purge: it deletes the
+    # VMID from backup jobs, and the next clone reuses this VMID.
     _fail() {
         local owner
         owner=$(qm config "$vmid" 200>&- 201>&- 202>&- 203>&- 204>&- 2>/dev/null | awk '/^name:/{print $2}') || true
@@ -625,12 +671,16 @@ clone_runner() {
         if [[ -n "$owner" && "$owner" != "$name" ]]; then
             return 0
         fi
+        if [[ -z "$owner" ]] && vmid_in_use "$vmid"; then
+            log_warn "VMID $vmid belongs to another guest; leaving it and its volumes"
+            return 0
+        fi
 
         rm -f "${SNIPPETS_DIR}/runner-${vmid}-meta.yaml" "${SNIPPETS_DIR}/runner-${vmid}-user-"*.yaml "${SNIPPETS_DIR}/runner-${vmid}-vendor.yaml"
 
         if [[ "$owner" == "$name" ]]; then
             local destroy_err; destroy_err=$(mktemp)
-            if ! qm destroy "$vmid" --purge 200>&- 201>&- 202>&- 203>&- 204>&- 2>"$destroy_err"; then
+            if ! qm destroy "$vmid" 200>&- 201>&- 202>&- 203>&- 204>&- 2>"$destroy_err"; then
                 log_warn "qm destroy $vmid failed: $(tr '\n' ' ' < "$destroy_err")"
             fi
             rm -f "$destroy_err"
@@ -639,9 +689,13 @@ clone_runner() {
         local volid
         while read -r volid; do
             [[ -n "$volid" ]] || continue
-            pvesm free "$volid" 2>/dev/null || log_warn "Failed to free orphan volume $volid"
+            if vmid_in_use "$vmid"; then
+                log_warn "VMID $vmid still has a guest config; not freeing its volumes"
+                break
+            fi
+            free_volume "$volid" 2>/dev/null || log_warn "Failed to free orphan volume $volid"
         done < <(
-            pvesm list "$VM_STORAGE" 2>/dev/null |
+            pvesm list "$VM_STORAGE" --content images 2>/dev/null |
                 awk -v v="$vmid" 'NR>1 && $1 ~ ("(^|:|/)vm-" v "-(disk-[0-9]+|cloudinit)$") {print $1}'
         )
     }
