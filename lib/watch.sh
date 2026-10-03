@@ -24,9 +24,12 @@ WATCH_MAX_PARALLEL=6
 # then a 6-hour job). A VM up longer than this lost its shutdown: a hung
 # guest, or a job that cancelled it.
 RUNNER_MAX_UPTIME=$(( (12 * 60 + 30) * 60 ))
-# A runner VM boots once. A QEMU process this much younger than the VM's
-# clone was started again, and cloud-init never starts the runner twice.
-RUNNER_RESTART_SLACK=600
+# A runner VM boots once. clone_runner writes the meta snippet seconds before
+# it starts the VM, so a QEMU process this much younger than the snippet was
+# started again, and cloud-init never starts the runner twice. A stop-mode
+# backup reaches most VMs of a busy pool minutes after their clone, so the
+# margin covers a slow first start and no more.
+RUNNER_RESTART_SLACK=120
 # A stopped VM is reclaimed only after this long, so the hookscript's reclone
 # normally gets it first and counts its death for the backoff.
 STOPPED_GRACE=60
@@ -67,12 +70,13 @@ fill_runner_slot() {
 
 # Worker: recycle runner VM $1 named $2, which the scan found dead for reason
 # $3 (stopped, overdue or restarted). $4 is 1 when the name is a slot name of
-# a configured org. Runs in its own subshell. Everything is checked again
-# under the slot lock, so a reclone, `runner destroy` or clone that holds the
-# slot wins, and only a VM that carries this tool's snippet or clone-time
-# marker is touched.
+# a configured org. $5 is when the scan first saw a stopped VM stopped. Runs
+# in its own subshell. Everything is checked again under the slot lock, so a
+# reclone, `runner destroy` or clone that holds the slot wins, and only a VM
+# that carries this tool's snippet or clone-time marker is touched.
 reclaim_runner_vm() {
-    local vmid="$1" name="$2" reason="$3" slot_named="${4:-0}" config org status_out status uptime age
+    local vmid="$1" name="$2" reason="$3" slot_named="${4:-0}" stopped_since="${5:-}"
+    local config org status_out status uptime age lifetime=""
     exec 200>"$(slot_lock_file "$name")"
     flock -n 200 || return 0
     if pool_is_draining; then
@@ -84,12 +88,19 @@ reclaim_runner_vm() {
     if grep -qE '^(lock:|template: 1)' <<< "$config"; then
         return 0
     fi
-    org=$(get_vm_org "$vmid")
+    org=$(get_vm_org "$vmid" "$config")
     if [[ "$org" == "unknown" ]]; then
         # Worth reporting only when it holds a slot: otherwise this is a VM
         # that reused the VMID of a runner whose snippets were left behind.
         if [[ "$slot_named" == 1 ]]; then
             log_warn "[watch] $name (VMID $vmid) is $reason but carries no selfhosted-runners snippet or marker; leaving it. If it is a leftover clone, remove it with: qm destroy $vmid"
+        else
+            # A plain `qm destroy` of a runner leaves its snippets. This VM's
+            # config names none of them, and while they exist every scan
+            # queues it again. A clone at this VMID writes its own.
+            rm -f "${SNIPPETS_DIR}/runner-${vmid}-meta.yaml" "${SNIPPETS_DIR}/runner-${vmid}-user-"*.yaml \
+                "${SNIPPETS_DIR}/runner-${vmid}-vendor.yaml"
+            log_info "[watch] VMID $vmid is now $name, not a runner VM; removed the runner snippets left behind for it"
         fi
         return 0
     fi
@@ -126,7 +137,13 @@ reclaim_runner_vm() {
     fi
 
     case "$reason" in
-        stopped) log_warn "[watch] Reclaiming $name (VMID $vmid): stopped and not recycled" ;;
+        stopped)
+            log_warn "[watch] Reclaiming $name (VMID $vmid): stopped and not recycled"
+            # Read before the destroy removes the meta snippet. The VM died
+            # before the scan first saw it stopped, so its life ends at that
+            # sighting, not at this reclaim a grace period or more later.
+            lifetime=$(runner_vm_lifetime "$vmid" "$stopped_since")
+            ;;
         overdue) log_warn "[watch] Reclaiming $name (VMID $vmid): up $((uptime / 3600))h$((uptime % 3600 / 60))m, long past the guest's own shutdown" ;;
         restarted) log_warn "[watch] Reclaiming $name (VMID $vmid): started again after its first boot, so it has no runner" ;;
     esac
@@ -138,11 +155,19 @@ reclaim_runner_vm() {
         log_warn "[watch] Failed to destroy $name (VMID $vmid); retrying next tick"
         return 0
     fi
+    # A stopped VM that nothing recycled (no hookscript on it, a reclone
+    # unit that systemd refused) still died: count it as reclone.sh would,
+    # so a guest that dies fast every time gets its slot held instead of
+    # re-cloned on every tick. Counted once the VM is gone, so a destroy
+    # retried on the next tick counts it once.
+    if [[ "$reason" == "stopped" ]]; then
+        slot_note_death "$name" "$lifetime" "[watch]"
+    fi
     refill_runner_slot "$name" "$org" "[watch]" "$(runner_vm_kind "$config")" || true
 }
 
 watch_main() {
-    local vm_table now vmid name status uptime lock template age since key prefix slot entry reason n org
+    local vm_table now vmid name status uptime lock template age since mtime key prefix slot entry reason n org
     local stopped_state tmp slot_named
     local -a orgs=() prefixes=() slots=() missing=() reclaim=() stopped_now=()
     local -A vm_names=() stopped_since=()
@@ -216,6 +241,19 @@ watch_main() {
         if [[ "$status" == "stopped" ]]; then
             key="$vmid $name"
             since=${stopped_since[$key]:-$now}
+            # A sighting after now was recorded before the clock was stepped
+            # back (an RTC corrected once NTP answers after boot). Start the
+            # grace again instead of waiting for the clock to catch up.
+            (( since <= now )) || since=$now
+            # Each clone writes its meta snippet just before it starts the
+            # VM, and a re-clone usually gets the same VMID and name. A
+            # snippet written after that sighting belongs to a new VM, whose
+            # grace starts now. A snippet from the future predates a clock
+            # step, not the sighting.
+            mtime=$(file_mtime "$SNIPPETS_DIR/runner-${vmid}-meta.yaml") || mtime=""
+            if [[ "$mtime" =~ ^[0-9]+$ ]] && (( mtime > since && mtime <= now )); then
+                since=$now
+            fi
             stopped_now+=("$key $since")
             if [[ "$lock" != "-" ]]; then
                 if [[ -z "${stopped_since[$key]:-}" ]]; then
@@ -224,7 +262,7 @@ watch_main() {
                 continue
             fi
             if (( now - since >= STOPPED_GRACE )); then
-                reclaim+=("$vmid $name stopped $slot_named")
+                reclaim+=("$vmid $name stopped $slot_named $since")
             fi
         elif [[ "$status" == "running" && "$lock" == "-" ]]; then
             if (( uptime > RUNNER_MAX_UPTIME )); then
@@ -270,8 +308,8 @@ watch_main() {
     # $VMID_LOCK_FILE flock, so parallel subshells can safely pick their own.
     for entry in "${reclaim[@]}"; do
         wait_for_watch_slot
-        read -r vmid name reason slot_named <<< "$entry"
-        ( reclaim_runner_vm "$vmid" "$name" "$reason" "$slot_named" ) &
+        read -r vmid name reason slot_named since <<< "$entry"
+        ( reclaim_runner_vm "$vmid" "$name" "$reason" "$slot_named" "$since" ) &
     done
     for entry in "${missing[@]}"; do
         wait_for_watch_slot

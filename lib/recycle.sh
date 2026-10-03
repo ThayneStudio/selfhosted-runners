@@ -1,17 +1,22 @@
 #!/bin/bash
 # Runner slot recycling shared by reclone.sh (after a VM's post-stop hook)
-# and watch.sh (every 30 s). Callers source common.sh first.
+# and watch.sh (every 30 s). Callers source common.sh first, and bake.sh for
+# refill_runner_slot.
 #
 # Per-slot failure backoff, kept in /run so a reboot starts every slot fresh:
 # - A failed clone_runner holds the slot for 30 s, doubling with each failure
 #   in a row up to 30 min. A successful clone clears it.
-# - reclone.sh counts VMs that die within RAPID_DEATH_SECS of their clone.
+# - reclone.sh, and the watcher for a stopped VM that nothing recycled, count
+#   VMs that die within RAPID_DEATH_SECS of their clone.
 #   Every RAPID_DEATH_LIMIT of those in a row leave the slot empty and hold
 #   it, again doubling up to 30 min. A VM that lives longer clears the count,
 #   and so does a clone whose JIT mint finds no runner of that name still on
 #   GitHub: GitHub removes an ephemeral runner once it finishes a job, so the
 #   fast death was a short job. A runner that never ran one (GitHub rejected
 #   its version, the guest failed to start it) stays registered.
+#   That mint, not the lifetime, tells a short job from a guest that never
+#   ran one, so the window is wide: a refused or broken guest can take
+#   minutes to give up after a slow boot or a long wait for its network.
 # - Neither the watcher nor reclone.sh clones a held slot, so a slot that
 #   fails every time stops minting a JIT runner on every tick.
 set -euo pipefail
@@ -21,7 +26,7 @@ SLOT_STATE_DIR="/run/github-runners"
 SLOT_LOCK_PREFIX="/run/lock/runner"
 SLOT_BACKOFF_BASE=30
 SLOT_BACKOFF_MAX=1800
-RAPID_DEATH_SECS=120
+RAPID_DEATH_SECS=600
 RAPID_DEATH_LIMIT=3
 
 slot_lock_file() {
@@ -89,13 +94,15 @@ slot_backoff_seconds() {
 }
 
 # 0 while slot $1 is held by the backoff, with the seconds left in
-# SLOT_HOLD_LEFT.
+# SLOT_HOLD_LEFT. No hold is set for longer than SLOT_BACKOFF_MAX, so one
+# that ends later was set before the clock was stepped back: it is over,
+# instead of lasting the size of the step on top.
 slot_is_held() {
     local now
     SLOT_HOLD_LEFT=0
     slot_state_load "$1"
     now=$(date +%s)
-    (( SLOT_HOLD_UNTIL > now )) || return 1
+    (( SLOT_HOLD_UNTIL > now && SLOT_HOLD_UNTIL - now <= SLOT_BACKOFF_MAX )) || return 1
     SLOT_HOLD_LEFT=$((SLOT_HOLD_UNTIL - now))
 }
 
@@ -126,9 +133,10 @@ slot_note_clone_success() {
 }
 
 # Count the death of slot $1's VM, which lived $2 seconds. An empty or
-# non-numeric lifetime (snippet gone) counts nothing.
+# non-numeric lifetime (snippet gone) counts nothing. $3 prefixes the log
+# line (default reclone:).
 slot_note_death() {
-    local name="$1" lifetime="$2" hold
+    local name="$1" lifetime="$2" tag="${3:-reclone:}" hold
     [[ "$lifetime" =~ ^[0-9]+$ ]] || return 0
     slot_state_load "$name"
     if (( lifetime >= RAPID_DEATH_SECS )); then
@@ -142,7 +150,7 @@ slot_note_death() {
             SLOT_DEFERRALS=$((SLOT_DEFERRALS + 1))
             hold=$(slot_backoff_seconds "$SLOT_DEFERRALS")
             SLOT_HOLD_UNTIL=$(( $(date +%s) + hold ))
-            logger -t github-runner "reclone: $name died within ${RAPID_DEATH_SECS}s of its clone $RAPID_DEATH_LIMIT times in a row; holding the slot for ${hold}s"
+            logger -t github-runner "$tag $name died within ${RAPID_DEATH_SECS}s of its clone $RAPID_DEATH_LIMIT times in a row; holding the slot for ${hold}s"
         fi
     fi
     slot_state_save "$name" || log_warn "Could not record the backoff for $name in $SLOT_STATE_DIR"
@@ -152,16 +160,23 @@ file_mtime() {
     stat -c %Y "$1" 2>/dev/null
 }
 
-# Seconds since clone_runner wrote VM $1's meta snippet, which it does just
-# before starting the VM. Prints nothing when the snippet is gone.
-runner_vm_age() {
-    local mtime now
+# Seconds from when clone_runner wrote VM $1's meta snippet, which it does
+# just before starting the VM, to epoch time $2. Prints nothing when the
+# snippet is gone or is newer than $2.
+runner_vm_lifetime() {
+    local mtime end="${2:-}"
+    [[ "$end" =~ ^[0-9]+$ ]] || return 0
     mtime=$(file_mtime "$SNIPPETS_DIR/runner-$1-meta.yaml") || return 0
-    now=$(date +%s)
-    if [[ ! "$mtime" =~ ^[0-9]+$ ]] || (( mtime > now )); then
+    if [[ ! "$mtime" =~ ^[0-9]+$ ]] || (( mtime > end )); then
         return 0
     fi
-    printf '%s\n' "$((now - mtime))"
+    printf '%s\n' "$((end - mtime))"
+}
+
+# Seconds since clone_runner wrote VM $1's meta snippet. Prints nothing when
+# the snippet is gone.
+runner_vm_age() {
+    runner_vm_lifetime "$1" "$(date +%s)"
 }
 
 # Sets ORG_SLOT_PREFIX and ORG_SLOT_COUNT for org $1, read the way the
@@ -255,9 +270,10 @@ destroy_runner_vm() {
 # caller holds the slot lock (fd 200) and shared pool activity (fd 202), $3
 # prefixes the log lines and $4 is the old VM's kind (runner_vm_kind). Nothing
 # is cloned for a retired name (runner_slot_retired). The slot stays empty
-# while the backoff holds it, when the name is taken again or when the pool
-# started draining; the watcher fills it later. Returns 1 only when
-# clone_runner failed.
+# while the backoff holds it, when the name is taken again, when the pool
+# started draining or while TEMPLATE_ID is not a finished template; the
+# watcher fills it later. Returns 1 only when clone_runner failed. Needs
+# template_is_converted from bake.sh.
 refill_runner_slot() {
     local name="$1" org="$2" tag="$3" kind="${4:-}"
     if runner_slot_retired "$name" "$org" "$kind"; then
@@ -274,6 +290,15 @@ refill_runner_slot() {
     fi
     if pool_is_draining; then
         logger -t github-runner "$tag pool drain active after destroy for $name, leaving slot empty"
+        return 0
+    fi
+    # The template is being rebuilt at TEMPLATE_ID (`qm destroy` and
+    # `runner setup`), or was never converted. A clone of the unfinished VM
+    # is a full copy, with no disk at all before the bake attaches one, and
+    # holds a lock on the bake VM that can fail the bake. The watcher, which
+    # waits for the same check, fills the slot once the template is done.
+    if ! template_is_converted "$TEMPLATE_ID"; then
+        log_warn "$tag template $TEMPLATE_ID is not a finished template; leaving $name empty for the watcher"
         return 0
     fi
     load_org_config "$org"
