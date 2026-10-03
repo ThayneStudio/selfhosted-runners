@@ -246,29 +246,29 @@ destroy_runner_vm() {
 refill_runner_slot() {
     local name="$1" org="$2" tag="$3" kind="${4:-}"
     if runner_slot_retired "$name" "$org" "$kind"; then
-        log_info "$tag: not re-cloning $name: $RETIRE_REASON"
+        log_info "$tag not re-cloning $name: $RETIRE_REASON"
         return 0
     fi
     if slot_is_held "$name"; then
-        logger -t github-runner "$tag: $name is held for ${SLOT_HOLD_LEFT}s after repeated failures; the watcher refills it after that"
+        logger -t github-runner "$tag $name is held for ${SLOT_HOLD_LEFT}s after repeated failures; the watcher refills it after that"
         return 0
     fi
     if qm list 200>&- 202>&- 2>/dev/null | awk 'NR>1{print $2}' | grep -qxF "$name"; then
-        log_info "$tag: $name already exists, skipping"
+        log_info "$tag $name already exists, skipping"
         return 0
     fi
     if pool_is_draining; then
-        logger -t github-runner "$tag: pool drain active after destroy for $name, leaving slot empty"
+        logger -t github-runner "$tag pool drain active after destroy for $name, leaving slot empty"
         return 0
     fi
     load_org_config "$org"
     if clone_runner "$name" "$org" >/dev/null; then
         slot_note_clone_success "$name"
-        log_info "$tag: re-cloned $name for org $org"
+        log_info "$tag re-cloned $name for org $org"
         return 0
     fi
     # A drain refuses the clone on purpose; that is not the slot failing.
     pool_is_draining || slot_note_clone_failure "$name"
-    log_error "$tag: failed to re-clone $name for org $org"
+    log_error "$tag failed to re-clone $name for org $org"
     return 1
 }

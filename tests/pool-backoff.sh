@@ -84,6 +84,17 @@ qm() {
         *) return 1 ;;
     esac
 }
+pvesh() {
+    [[ "$*" == "get /nodes/localhost/qemu --output-format json" ]] || return 1
+    local d sep=""
+    printf '['
+    for d in "$state"/vm/*; do
+        [[ -d "$d" ]] || continue
+        printf '%s{"vmid":%s,"name":"%s","status":"%s","uptime":0}' "$sep" "${d##*/}" "$(cat "$d/name")" "$(cat "$d/status")"
+        sep=","
+    done
+    printf ']\n'
+}
 flock() { :; }
 sleep() { :; }
 logger() { printf '%s\n' "$*" >> "$state/logger"; }

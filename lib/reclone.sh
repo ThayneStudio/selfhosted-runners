@@ -77,7 +77,7 @@ reclone_main() {
         exit 1
     fi
 
-    refill_runner_slot "$name" "$org" reclone "$(runner_vm_kind "$config")" || exit 1
+    refill_runner_slot "$name" "$org" "reclone:" "$(runner_vm_kind "$config")" || exit 1
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
