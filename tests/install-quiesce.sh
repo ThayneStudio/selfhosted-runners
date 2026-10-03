@@ -46,6 +46,16 @@ operator_stop=0
 reclone_active_passes=0
 reclone_list_n=0
 systemctl_list_rc=0
+# Empty means the real owner. "0" is root. Anything else is another account.
+legacy_owner=""
+
+stat() {
+    if [[ -n "$legacy_owner" && ( "${1:-}" == -c || "${1:-}" == -f ) && "${3:-}" == "$LEGACY_POOL_DRAIN_FILE" ]]; then
+        printf '%s\n' "$legacy_owner"
+        return 0
+    fi
+    command stat "$@"
+}
 
 systemctl() {
     printf 'systemctl %s\n' "$*" >> "$log"
@@ -132,6 +142,7 @@ fresh() {
     reclone_active_passes=0
     reclone_list_n=0
     systemctl_list_rc=0
+    legacy_owner=""
     printf '0\n' > "$state/reclone-list-n"
     OLD_POOL_LOCK_WAIT=600
     rm -f "$state/token-new" "$state/token-legacy"
@@ -282,6 +293,7 @@ printf 'DOCKER_MIRROR_URL=\n' > "$CONFIG_FILE"
 mkdir -p "$SYSTEMD_DIR" "$SNIPPETS_DIR" "$(dirname "$POOL_DRAIN_FILE")"
 : > "$SYSTEMD_DIR/github-runner-watch.timer"
 printf 'operator\n' > "$LEGACY_POOL_DRAIN_FILE"
+legacy_owner=0
 ( install_main ) > "$state/out" 2>"$state/err" || fail "an upgrade with a legacy drain failed: $(cat "$state/err")"
 [[ ! -e "$POOL_DRAIN_FILE" ]] || fail "install published a new drain flag over an existing legacy drain"
 [[ "$(cat "$LEGACY_POOL_DRAIN_FILE")" == operator ]] || fail "install cleared a pre-existing legacy drain flag"
@@ -289,6 +301,26 @@ printf 'operator\n' > "$LEGACY_POOL_DRAIN_FILE"
     fail "install restarted the watcher while a legacy drain was set: $(cat "$log")"
 grep -q 'github-runner-watch.timer was left stopped' "$state/out" ||
     fail "install did not say the watcher stayed stopped for a legacy drain: $(cat "$state/out")"
+
+# /run/lock is sticky and world-writable. A file another account plants
+# there is not maintenance: install sets its own drain and starts the
+# watcher again. The new libs ignore that file because it is not root-owned.
+fresh
+printf 'DOCKER_MIRROR_URL=\n' > "$CONFIG_FILE"
+mkdir -p "$SYSTEMD_DIR" "$SNIPPETS_DIR"
+: > "$SYSTEMD_DIR/github-runner-watch.timer"
+printf 'planted\n' > "$LEGACY_POOL_DRAIN_FILE"
+legacy_owner=1000
+( install_main ) > "$state/out" 2>"$state/err" ||
+    fail "a non-root legacy drain flag aborted the install: $(cat "$state/err")"
+[[ -s "$state/token-new" && "$(cat "$state/token-new")" == "$(cat "$state/token-legacy")" ]] ||
+    fail "install did not replace a non-root legacy drain flag with its own token"
+[[ "$(line_of 'systemctl start github-runner-watch.timer')" != 0 ]] ||
+    fail "a non-root legacy drain flag left the watcher stopped: $(cat "$log")"
+if grep -q 'was left stopped' "$state/out"; then
+    fail "install treated a non-root legacy drain flag as maintenance: $(cat "$state/out")"
+fi
+drains_gone || fail "a non-root legacy drain flag was left in place"
 
 # runner stop during the install replaces both flags. stop truncates the
 # new one and renames an empty file onto the legacy one, then blocks on

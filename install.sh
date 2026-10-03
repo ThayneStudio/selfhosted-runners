@@ -103,17 +103,22 @@ wait_for_watch_service() {
     done
 }
 
-# Operator maintenance is a regular file at either drain path. A symlink
-# is replaced below: the old hookscript treats any existing path as a drain,
-# and the link would send that check somewhere else.
+# Operator maintenance is a regular file at the new drain path, or a
+# root-owned regular file at the legacy path. /run/lock is 1777, so a
+# file another account created there is not a drain. A symlink is not
+# one either: stat would report the target's owner, and the old
+# hookscript treats any existing path as a drain.
 upgrade_drain_active() {
+    local owner
     if [[ -f "$POOL_DRAIN_FILE" && ! -L "$POOL_DRAIN_FILE" ]]; then
         return 0
     fi
-    if [[ -f "$LEGACY_POOL_DRAIN_FILE" && ! -L "$LEGACY_POOL_DRAIN_FILE" ]]; then
-        return 0
+    [[ -f "$LEGACY_POOL_DRAIN_FILE" && ! -L "$LEGACY_POOL_DRAIN_FILE" ]] || return 1
+    # GNU stat, then BSD, so the owner check is the same under the tests.
+    if ! owner=$(stat -c '%u' "$LEGACY_POOL_DRAIN_FILE" 2>/dev/null); then
+        owner=$(stat -f '%u' "$LEGACY_POOL_DRAIN_FILE" 2>/dev/null) || return 1
     fi
-    return 1
+    [[ "$owner" == "0" ]]
 }
 
 # Publish both drain flags. The new directory is mode 0700. The legacy

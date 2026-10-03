@@ -763,8 +763,9 @@ stops partway, run `install.sh` again at once.
    ```
    On a host that already has `/etc/github-runners.conf`, it sets the
    maintenance drain at `/run/github-runners/github-runner-drain` and
-   `/run/lock/github-runner-drain` when neither file is already there, and
-   writes a token into each file, so a VM that stops during the install does
+   `/run/lock/github-runner-drain` when the new flag is absent and the old
+   path is not already a root-owned file, and writes a token into each file,
+   so a VM that stops during the install does
    not start a reclone on the previous version. It then stops
    `github-runner-watch.timer`, waits for `github-runner-watch.service` to
    finish, and takes `/run/lock/github-runner-pool.lock` exclusively for up to
