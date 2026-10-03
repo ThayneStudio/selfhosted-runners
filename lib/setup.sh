@@ -7,6 +7,30 @@ source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/rebake.sh"
 # shellcheck source=setup-prompts.sh
 source "$LIB_DIR/setup-prompts.sh"
 
+# Storages on this node that can hold the template and its linked clones, as
+# "name type" lines. They must allow VM disk images. Thick LVM and iSCSI LUNs
+# accept `qm template` without making a base volume, and every linked clone of
+# such a template then fails.
+template_storages() {
+    pvesm status --content images 2>/dev/null \
+        | awk 'NR > 1 && $2 !~ /^(lvm|iscsi|iscsidirect)$/ { print $1, $2 }'
+}
+
+check_vm_storage() {
+    local storage="$1" storage_type
+    if template_storages | awk -v s="$storage" '$1 == s { found = 1 } END { exit !found }'; then
+        return 0
+    fi
+    storage_type=$(pvesm status 2>/dev/null | awk -v s="$storage" 'NR > 1 && $1 == s { print $2; exit }') || storage_type=""
+    if [[ -z "$storage_type" ]]; then
+        log_error "Storage pool '$storage' does not exist"
+    else
+        log_error "Storage '$storage' ($storage_type) cannot hold the template and its linked clones"
+        log_error "Choose a listed storage: it allows VM disk images and is not thick LVM or iSCSI"
+    fi
+    return 1
+}
+
 # `pvesm set --content` replaces the whole list, so read the effective list and
 # append snippets. pvesh also sees the built-in local storage when storage.cfg
 # has no `dir: local` stanza. Never guess a list: that drops content types.
@@ -107,12 +131,11 @@ fi
 # Detect storage
 echo ""
 echo "Available storage pools:"
-pvesm status | grep -E 'zfspool|dir|lvm' | awk '{print "  " $1 " (" $2 ")"}' || true
+template_storages | awk '{print "  " $1 " (" $2 ")"}' || true
 prompt_setup_value VM_STORAGE "Storage for VMs" local-zfs
 
-# Validate storage exists
-if ! pvesm status | awk '{print $1}' | grep -qxF "$VM_STORAGE"; then
-    log_error "Storage pool '$VM_STORAGE' does not exist"
+# Validate storage exists and can hold a template and its linked clones
+if ! check_vm_storage "$VM_STORAGE"; then
     exit 1
 fi
 
