@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Checks the parts of the template bake script that shape every clone: the
-# Docker mirror configuration and the periodic apt jobs. Blocks of
-# /opt/setup-template.sh, rendered with
-# the real render_template_setup_snippet, run under a scratch root with the
-# system commands they call mocked on PATH.
+# Docker mirror configuration, the periodic apt jobs, and the DHCP client
+# identifier. Blocks of /opt/setup-template.sh, rendered with the real
+# render_template_setup_snippet, run under a scratch root with the system
+# commands they call mocked on PATH.
 set -euo pipefail
 
 if [[ "${BASH_VERSINFO[0]}" -lt 4 ]]; then
@@ -95,22 +95,28 @@ EOF
 }
 extra_path=""
 
-render_setup_script
+# Parse YAML with a real parser when one is installed: print the value of a
+# Ruby-style key path such as ["network"]["ethernets"].
+yaml_parser=""
 if command -v python3 >/dev/null 2>&1 && python3 -c 'import yaml' 2>/dev/null; then
-    python3 -c '
-import sys, yaml
-for entry in yaml.safe_load(open(sys.argv[1]))["write_files"]:
-    if entry["path"] == "/opt/setup-template.sh":
-        sys.stdout.write(entry["content"])
-' "$user_data" > "$work/parsed.sh" || fail "template-setup.yaml does not parse"
+    yaml_parser=python3
 elif command -v ruby >/dev/null 2>&1 && ruby -ryaml -e '' 2>/dev/null; then
-    ruby -ryaml -e '
-YAML.safe_load(File.read(ARGV[0]))["write_files"].each { |e| print e["content"] if e["path"] == "/opt/setup-template.sh" }
-' "$user_data" > "$work/parsed.sh" || fail "template-setup.yaml does not parse"
+    yaml_parser=ruby
 fi
-if [[ -e "$work/parsed.sh" ]]; then
-    [[ "$(cat "$work/parsed.sh")" == "$(cat "$setup_script")" ]] \
-        || fail "the YAML parser and this test read /opt/setup-template.sh differently"
+yaml_value() {
+    case "$yaml_parser" in
+        python3) python3 -c 'import sys, yaml; d = yaml.safe_load(open(sys.argv[1])); sys.stdout.write(str(eval("d" + sys.argv[2])))' "$1" "$2" ;;
+        ruby) ruby -ryaml -e 'd = YAML.safe_load(File.read(ARGV[0])); print eval("d" + ARGV[1])' "$1" "$2" ;;
+    esac
+}
+
+render_setup_script
+if [[ -n "$yaml_parser" ]]; then
+    parsed=$(yaml_value "$user_data" '["write_files"][0]["content"]') || fail "template-setup.yaml does not parse"
+    [[ "$(yaml_value "$user_data" '["write_files"][0]["path"]')" == /opt/setup-template.sh ]] \
+        || fail "/opt/setup-template.sh is no longer the first write_files entry"
+    [[ "$parsed" == "$(cat "$setup_script")" ]] \
+        || fail "$yaml_parser and this test read /opt/setup-template.sh differently"
 fi
 "$BASH" -n "$setup_script" || fail "/opt/setup-template.sh has a syntax error"
 
@@ -177,5 +183,34 @@ run_in_guest apt-periodic-no-units "$(before_first_apt_get)"
 extra_path=""
 grep -rqF 'APT::Periodic::Unattended-Upgrade "0";' "$guest/etc/apt/apt.conf.d" \
     || fail "a failed systemctl call skipped the apt settings"
+
+# DHCP client identifier. A slot keeps its MAC across recycles but each clone
+# gets a new machine-id, so the identifier must be the MAC. It must be in the
+# image: user-data write_files runs after networkd has started DHCP.
+netplan_block() {
+    script_block "$setup_script" "cat > /etc/netplan/99-dhcp-mac.yaml <<'NETPLANEOF'" \
+        'chmod 600 /etc/netplan/99-dhcp-mac.yaml'
+}
+[[ -n "$(netplan_block)" ]] || fail "the bake no longer writes /etc/netplan/99-dhcp-mac.yaml"
+run_in_guest dhcp-identifier "$(netplan_block)"
+netplan=$guest/etc/netplan/99-dhcp-mac.yaml
+[[ -n "$(find "$netplan" -perm 600 2>/dev/null)" ]] || fail "99-dhcp-mac.yaml is not mode 600"
+if [[ -n "$yaml_parser" ]]; then
+    [[ "$(yaml_value "$netplan" '["network"]["ethernets"]["eth0"]["dhcp-identifier"]')" == mac ]] \
+        || fail "99-dhcp-mac.yaml does not set dhcp-identifier: mac on eth0"
+    [[ "$(yaml_value "$netplan" '["network"]["ethernets"]["eth0"]["dhcp4"]')" == [Tt]rue ]] \
+        || fail "99-dhcp-mac.yaml turns DHCP off on eth0"
+else
+    grep -qx '      dhcp-identifier: mac' "$netplan" || fail "99-dhcp-mac.yaml does not set dhcp-identifier: mac"
+fi
+line_of() { grep -nxF -- "$1" "$setup_script" | head -1 | cut -d: -f1 || true; }
+written=$(line_of 'chmod 600 /etc/netplan/99-dhcp-mac.yaml')
+cleaned=$(line_of 'cloud-init clean --logs')
+completed=$(line_of 'touch /opt/.template-setup-complete')
+[[ -n "$cleaned" && -n "$completed" && "$written" -lt "$cleaned" && "$written" -lt "$completed" ]] \
+    || fail "99-dhcp-mac.yaml is not written before the image is sealed"
+if grep -q '^  - path: /etc/netplan/' "$root/templates/runner-user-data.yaml"; then
+    fail "runner-user-data.yaml writes netplan config that a clone never applies"
+fi
 
 printf 'guest-template-setup: ok\n'

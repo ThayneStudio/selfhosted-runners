@@ -346,6 +346,20 @@ write_files:
       log "Runner.Listener version ${LISTENER_VERSION}"
 
       log "[12/12] Cleaning up for template conversion..."
+      # A slot keeps its MAC across recycles, but each clone gets a new
+      # machine-id, so networkd's default DUID client-id would take a new DHCP
+      # lease every time. netplan merges this file into the config cloud-init
+      # generates before networkd starts, so it applies from a clone's first
+      # DHCP request. Written from user-data, it would land after DHCP started.
+      cat > /etc/netplan/99-dhcp-mac.yaml <<'NETPLANEOF'
+      network:
+        version: 2
+        ethernets:
+          eth0:
+            dhcp4: true
+            dhcp-identifier: mac
+      NETPLANEOF
+      chmod 600 /etc/netplan/99-dhcp-mac.yaml
       apt-get clean
       rm -rf /tmp/* /var/tmp/*
       truncate -s 0 /var/log/*.log 2>/dev/null || true
