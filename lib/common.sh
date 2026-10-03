@@ -818,9 +818,19 @@ clone_runner() {
         if [[ -n "$owner" && "$owner" != "$name" ]]; then
             return 0
         fi
-        if [[ -z "$owner" ]] && vmid_in_use "$vmid"; then
-            log_warn "VMID $vmid belongs to another guest; leaving it and its volumes"
-            return 0
+        # An empty owner proves the VMID free only while pmxcfs serves
+        # /etc/pve: otherwise a live runner's config, and so its owner, is
+        # just as invisible, and its snippets are the ones removed below.
+        if [[ -z "$owner" ]]; then
+            local owner_config
+            if ! owner_config=$(vm_config_path_checked "$vmid"); then
+                log_warn "pmxcfs is not serving /etc/pve; leaving VMID $vmid's snippets and volumes"
+                return 0
+            fi
+            if [[ -n "$owner_config" ]]; then
+                log_warn "VMID $vmid belongs to another guest; leaving it and its volumes"
+                return 0
+            fi
         fi
 
         rm -f "${SNIPPETS_DIR}/runner-${vmid}-meta.yaml" "${SNIPPETS_DIR}/runner-${vmid}-user-"*.yaml "${SNIPPETS_DIR}/runner-${vmid}-vendor.yaml"

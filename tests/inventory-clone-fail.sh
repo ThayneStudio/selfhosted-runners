@@ -85,6 +85,12 @@ qm() {
                     printf 'unable to create VM %s: config file already exists\n' "$3" >&2
                     return 255
                     ;;
+                cfs-down)
+                    # pmxcfs stops serving /etc/pve: qm fails, and no config shows.
+                    mv "$PVE_NODES_DIR" "$PVE_NODES_DIR.down"
+                    printf 'ipcc_send_rec[1] failed: Connection refused\n' >&2
+                    return 255
+                    ;;
                 residue)
                     # The clone died after allocating a disk and before its config.
                     printf 'vm-%s-disk-0\n' "$3" >> "$mock_storage"
@@ -237,6 +243,22 @@ run_failing_clone "unnamed VM"
 [[ -z "$(freed)" ]] || fail "unnamed VM: freed $(freed)"
 stored "vm-9001-disk-0" || fail "unnamed VM: its disk is gone"
 if grep -q '^qm destroy' "$mock_calls"; then fail "unnamed VM: qm destroy was called"; fi
+
+# While pmxcfs is not serving, a VMID with no visible config may still be a
+# live runner's: its snippets and volumes stay.
+reset
+printf 'live\n' > "$SNIPPETS_DIR/runner-9001-meta.yaml"
+printf 'live\n' > "$SNIPPETS_DIR/runner-9001-user-acme.yaml"
+printf 'vm-9001-disk-0\n' >> "$mock_storage"
+mock_clone=cfs-down
+run_failing_clone "pmxcfs down"
+mv "$PVE_NODES_DIR.down" "$PVE_NODES_DIR"
+[[ "$(cat "$SNIPPETS_DIR/runner-9001-meta.yaml" 2>/dev/null)" == live ]] ||
+    fail "pmxcfs down: removed the meta snippet at VMID 9001"
+[[ -e "$SNIPPETS_DIR/runner-9001-user-acme.yaml" ]] || fail "pmxcfs down: removed the user snippet at VMID 9001"
+[[ -z "$(freed)" ]] || fail "pmxcfs down: freed $(freed)"
+logged "pmxcfs is not serving /etc/pve" || fail "pmxcfs down: the refusal was not logged: $(cat "$errlog")"
+rm -f "$SNIPPETS_DIR"/runner-9001-*
 
 # A clone that died before writing its config leaves a volume nobody owns.
 reset
