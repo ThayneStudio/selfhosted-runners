@@ -38,6 +38,16 @@ done
     fail "drain flag is $POOL_DRAIN_FILE"
 [[ "$LEGACY_POOL_DRAIN_FILE" == "/run/lock/github-runner-drain" ]] ||
     fail "legacy drain flag is $LEGACY_POOL_DRAIN_FILE"
+[[ "$SLOT_LOCK_PREFIX" == "$RUN_DIR/slot" ]] ||
+    fail "slot lock prefix is $SLOT_LOCK_PREFIX"
+[[ "$(slot_lock_file vmid)" == "$RUN_DIR/slot-vmid.lock" ]] ||
+    fail "a runner named vmid uses $(slot_lock_file vmid)"
+[[ "$(slot_lock_file vmid)" != "$VMID_LOCK_FILE" ]] ||
+    fail "a runner named vmid shares the VMID lock"
+[[ "$(slot_lock_file clone-slot-1)" != "${CLONE_SLOT_LOCK_PREFIX}-1.lock" ]] ||
+    fail "a runner named clone-slot-1 shares a clone-slot lock"
+[[ "$(slot_lock_file vmid-reserve-100)" != "$(vmid_reservation_lock_file 100)" ]] ||
+    fail "a runner named vmid-reserve-100 shares a VMID reservation lock"
 grep -qx 'POOL_DRAIN_FILE="/run/github-runners/github-runner-drain"' \
     "$root/templates/runner-hookscript.sh" ||
     fail "hookscript drain path does not match the libs"
@@ -52,7 +62,7 @@ VMID_LOCK_FILE=$run/runner-vmid.lock
 VMID_RESERVATION_LOCK_PREFIX=$run/runner-vmid-reserve
 CLONE_SLOT_LOCK_PREFIX=$run/runner-clone-slot
 SLOT_STATE_DIR=$state/slots
-SLOT_LOCK_PREFIX=$run/runner
+SLOT_LOCK_PREFIX=$run/slot
 EXTRA_RUNNERS_FILE=$state/extras
 EXTRA_RUNNERS_LOCK_FILE=$run/github-runner-extras.lock
 REBAKE_LOCK_FILE=$run/github-runner-rebake.lock
@@ -171,7 +181,7 @@ record_extra_runner box acme || fail "extras lock was not taken"
     qm() { return 1; }
     fill_runner_slot runner-1 acme
 ) >"$state/fill.out" 2>&1 || true
-[[ -f "$run/runner-runner-1.lock" ]] || fail "slot lock is not in $run: $(cat "$state/fill.out")"
+[[ -f "$run/slot-runner-1.lock" ]] || fail "slot lock is not in $run: $(cat "$state/fill.out")"
 
 (
     GITHUB_PAT="test"
@@ -193,7 +203,7 @@ record_extra_runner box acme || fail "extras lock was not taken"
 [[ -f "$run/github-runner-rebake.lock" ]] || fail "rebake lock is not in $run"
 
 for lock in "$run/github-runner-pool.lock" "$run/runner-vmid.lock" \
-    "$run/runner-clone-slot-1.lock" "$run/runner-runner-1.lock" \
+    "$run/runner-clone-slot-1.lock" "$run/slot-runner-1.lock" \
     "$run/github-runner-extras.lock" "$run/github-runner-rebake.lock"; do
     [[ -f "$lock" && ! -L "$lock" ]] || fail "missing $lock"
     [[ "$(dirname "$lock")" == "$run" ]] || fail "$lock is outside the runtime directory"

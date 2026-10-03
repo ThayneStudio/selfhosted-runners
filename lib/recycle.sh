@@ -24,7 +24,9 @@ set -euo pipefail
 # Same directory as RUN_DIR in common.sh. Callers source common.sh first.
 SLOT_STATE_DIR="${RUN_DIR:-/run/github-runners}"
 # Per-slot lock taken by watch.sh, reclone.sh, create.sh and destroy.sh.
-SLOT_LOCK_PREFIX="$SLOT_STATE_DIR/runner"
+# slot-<name>.lock stays clear of runner-vmid.lock,
+# runner-vmid-reserve-*.lock and runner-clone-slot-*.lock in this directory.
+SLOT_LOCK_PREFIX="$SLOT_STATE_DIR/slot"
 SLOT_BACKOFF_BASE=30
 SLOT_BACKOFF_MAX=1800
 RAPID_DEATH_SECS=600
