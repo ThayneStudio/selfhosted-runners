@@ -218,7 +218,10 @@ reserve_vmid() {
 
 release_vmid_reservation() {
     local vmid="${1:-${RESERVED_VMID:-}}"
-    exec 203>&- 2>/dev/null || true
+    # Closing an fd that is not open is silent and returns 0. A redirection
+    # on a bare exec applies to this shell for good: 2>/dev/null here would
+    # hide every later log line.
+    exec 203>&-
     [[ -n "$vmid" ]] && rm -f "$(vmid_reservation_lock_file "$vmid")" 2>/dev/null || true
 }
 
@@ -248,7 +251,8 @@ acquire_clone_slot() {
 }
 
 release_clone_slot() {
-    exec 204>&- 2>/dev/null || true
+    # No 2>/dev/null: see release_vmid_reservation.
+    exec 204>&-
 }
 
 list_template_base_volids() {
