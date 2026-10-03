@@ -38,10 +38,22 @@ SNIPPETS_DIR=$state/snippets
 PVE_NODES_DIR=$state/nodes
 RUNNER_BIN=$state/bin/runner
 OLD_POOL_LOCK=$state/old/github-runner-pool.lock
+POOL_DRAIN_FILE=$state/run/github-runner-drain
+LEGACY_POOL_DRAIN_FILE=$state/legacy/github-runner-drain
 REPO_URL=http://install.test/archive.tar.gz
+stop_term=0
 
 systemctl() {
     printf 'systemctl %s\n' "$*" >> "$log"
+    if [[ "$1" == stop && "${stop_term:-0}" == 1 ]]; then
+        kill -TERM "$BASHPID"
+        sleep 2
+    fi
+    if [[ "$1" == stop || "$1" == start ]]; then
+        if [[ -f "$POOL_DRAIN_FILE" && -f "$LEGACY_POOL_DRAIN_FILE" ]]; then
+            printf 'drain-at-%s\n' "$1" >> "$log"
+        fi
+    fi
     if [[ "$1" == is-active ]]; then
         printf '%s\n' "$watch_state"
         [[ "$watch_state" == active || "$watch_state" == activating || "$watch_state" == deactivating ]]
@@ -49,6 +61,9 @@ systemctl() {
     fi
 }
 flock() {
+    if [[ -f "$POOL_DRAIN_FILE" && -f "$LEGACY_POOL_DRAIN_FILE" ]]; then
+        printf 'drain-at-flock\n' >> "$log"
+    fi
     printf 'flock %s\n' "$*" >> "$log"
     return "$flock_rc"
 }
@@ -72,12 +87,19 @@ line_of() {
 
 fresh() {
     : > "$log"
-    rm -rf "$INSTALL_DIR" "$SYSTEMD_DIR" "$SNIPPETS_DIR" "${state:?}/old" "${state:?}/bin" "$CONFIG_FILE"
-    mkdir -p "$state/bin" "$state/old" "$PVE_NODES_DIR"
+    rm -rf "$INSTALL_DIR" "$SYSTEMD_DIR" "$SNIPPETS_DIR" "${state:?}/old" "${state:?}/bin" \
+        "${state:?}/run" "${state:?}/legacy" "$CONFIG_FILE"
+    mkdir -p "$state/bin" "$state/old" "$PVE_NODES_DIR" "$state/legacy"
     watch_state=inactive
     flock_rc=0
     curl_rc=0
+    stop_term=0
     OLD_POOL_LOCK_WAIT=600
+}
+
+drains_gone() {
+    [[ ! -e "$POOL_DRAIN_FILE" && ! -L "$POOL_DRAIN_FILE" &&
+        ! -e "$LEGACY_POOL_DRAIN_FILE" && ! -L "$LEGACY_POOL_DRAIN_FILE" ]]
 }
 
 # A host with no config does not stop a timer or take a lock.
@@ -88,6 +110,7 @@ fresh
 [[ "$(line_of '^flock ')" == 0 ]] || fail "a fresh install took a pool lock: $(cat "$log")"
 grep -q 'Run the setup wizard' "$state/out" || fail "a fresh install did not say to run setup"
 [[ -L "$RUNNER_BIN" ]] || fail "a fresh install did not link runner"
+drains_gone || fail "a fresh install set a drain flag"
 
 # An existing host drains old clones before the extract, then restarts the watcher.
 fresh
@@ -111,6 +134,11 @@ started=$(line_of 'systemctl start github-runner-watch.timer')
 [[ -f "$OLD_POOL_LOCK" && ! -L "$OLD_POOL_LOCK" ]] || fail "the old pool lock was left as a symlink"
 [[ "$(cat "$state/canary")" == secret ]] || fail "taking the old pool lock followed a symlink"
 grep -q 'Done. No need to re-run setup.' "$state/out" || fail "an upgrade did not finish: $(cat "$state/out")"
+[[ "$(line_of 'drain-at-stop')" != 0 && "$(line_of 'drain-at-stop')" -lt "$held" ]] ||
+    fail "the drain was not set before the old pool lock was taken: $(cat "$log")"
+[[ "$(line_of 'drain-at-start')" -gt "$started" ]] ||
+    fail "the drain was cleared before the watcher restarted: $(cat "$log")"
+drains_gone || fail "an upgrade left the drain flag it set"
 
 # The old lock stays busy: leave the tree alone and start the watcher again.
 fresh
@@ -126,6 +154,8 @@ grep -q 'was not installed' "$state/err" || fail "a busy old pool lock was not r
 [[ "$(line_of 'systemctl start github-runner-watch.timer')" != 0 ]] ||
     fail "a timed-out upgrade left the watcher stopped"
 [[ ! -d "$INSTALL_DIR" ]] || fail "a timed-out upgrade created $INSTALL_DIR"
+[[ "$(line_of 'drain-at-stop')" != 0 ]] || fail "a timed-out upgrade did not drain before stopping the watcher"
+drains_gone || fail "a timed-out upgrade left the drain flag it set"
 
 # The watch tick never finishes: same abort, and the old lock is not taken.
 fresh
@@ -143,6 +173,7 @@ grep -q 'github-runner-watch.service was still running' "$state/err" ||
 [[ "$(line_of '^curl ')" == 0 ]] || fail "a stuck watch service still extracted the tree"
 [[ "$(line_of 'systemctl start github-runner-watch.timer')" != 0 ]] ||
     fail "a stuck watch service left the watcher stopped"
+drains_gone || fail "a stuck watch service left the drain flag set"
 
 # Config, but no watcher unit yet: still wait for old reclones, and do not start a timer.
 fresh
@@ -155,6 +186,9 @@ mkdir -p "$SYSTEMD_DIR" "$SNIPPETS_DIR"
     fail "install started a watcher timer that is not installed"
 [[ "$(line_of 'flock -w 600 -x 9')" != 0 && "$(line_of 'flock -w 600 -x 9')" -lt "$(line_of '^curl ')" ]] ||
     fail "an upgrade without a watcher did not hold the old pool lock first"
+[[ "$(line_of 'drain-at-flock')" != 0 && "$(line_of 'drain-at-flock')" -lt "$(line_of 'flock -w 600 -x 9')" ]] ||
+    fail "an upgrade without a watcher did not drain before taking the old pool lock"
+drains_gone || fail "an upgrade without a watcher left the drain flag it set"
 
 # The extract fails after the watcher was stopped: start it again.
 # install_main is the condition of if, which suspends set -e inside it,
@@ -174,6 +208,44 @@ grep -q 'The download failed' "$state/err" ||
     fail "a failed extract left the watcher stopped"
 [[ "$(grep -c 'systemctl start github-runner-watch.timer' "$log")" == 1 ]] ||
     fail "a failed extract started the watcher more than once: $(cat "$log")"
+[[ "$(line_of 'drain-at-stop')" != 0 ]] || fail "a failed extract did not drain before stopping the watcher"
+[[ "$(line_of 'drain-at-start')" != 0 ]] || fail "a failed extract cleared the drain before restarting the watcher"
+drains_gone || fail "a failed extract left the drain flag it set"
+
+# A drain the operator already set stays set, including when only one path is present.
+fresh
+printf 'DOCKER_MIRROR_URL=\n' > "$CONFIG_FILE"
+mkdir -p "$SYSTEMD_DIR" "$SNIPPETS_DIR" "$(dirname "$POOL_DRAIN_FILE")"
+: > "$SYSTEMD_DIR/github-runner-watch.timer"
+printf 'operator\n' > "$POOL_DRAIN_FILE"
+printf 'operator\n' > "$LEGACY_POOL_DRAIN_FILE"
+( install_main ) > "$state/out" 2>"$state/err" || fail "an upgrade with a drain set failed: $(cat "$state/err")"
+[[ "$(cat "$POOL_DRAIN_FILE")" == operator ]] || fail "install rewrote the operator's drain flag"
+[[ "$(cat "$LEGACY_POOL_DRAIN_FILE")" == operator ]] || fail "install rewrote the operator's legacy drain flag"
+fresh
+printf 'DOCKER_MIRROR_URL=\n' > "$CONFIG_FILE"
+mkdir -p "$SYSTEMD_DIR" "$SNIPPETS_DIR" "$(dirname "$POOL_DRAIN_FILE")"
+: > "$SYSTEMD_DIR/github-runner-watch.timer"
+printf 'operator\n' > "$LEGACY_POOL_DRAIN_FILE"
+( install_main ) > "$state/out" 2>"$state/err" || fail "an upgrade with a legacy drain failed: $(cat "$state/err")"
+[[ ! -e "$POOL_DRAIN_FILE" ]] || fail "install published a new drain flag over an existing legacy drain"
+[[ "$(cat "$LEGACY_POOL_DRAIN_FILE")" == operator ]] || fail "install cleared a pre-existing legacy drain flag"
+
+# A signal while the watcher is stopped still restarts it and clears the drain install set.
+fresh
+printf 'DOCKER_MIRROR_URL=\n' > "$CONFIG_FILE"
+mkdir -p "$SYSTEMD_DIR" "$SNIPPETS_DIR"
+: > "$SYSTEMD_DIR/github-runner-watch.timer"
+stop_term=1
+if ( install_main ) > "$state/out" 2>"$state/err"; then
+    fail "a signal during upgrade was treated as success: $(cat "$state/err")"
+fi
+[[ "$(line_of 'systemctl start github-runner-watch.timer')" != 0 ]] ||
+    fail "a signal during upgrade left the watcher stopped: $(cat "$log")"
+[[ "$(grep -c 'systemctl start github-runner-watch.timer' "$log")" == 1 ]] ||
+    fail "a signal during upgrade started the watcher more than once: $(cat "$log")"
+drains_gone || fail "a signal during upgrade left the drain flag set"
+[[ "$(line_of '^curl ')" == 0 ]] || fail "a signal during upgrade kept extracting"
 
 # curl | bash reads this file from stdin, where BASH_SOURCE is empty. The
 # guard still has to run install_main, and sourcing it must not.

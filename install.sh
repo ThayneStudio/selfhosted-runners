@@ -11,14 +11,23 @@ RUNNER_BIN="${RUNNER_BIN:-/usr/local/bin/runner}"
 # The previous version's pool lock. New code uses /run/github-runners.
 OLD_POOL_LOCK="${OLD_POOL_LOCK:-/run/lock/github-runner-pool.lock}"
 OLD_POOL_LOCK_WAIT="${OLD_POOL_LOCK_WAIT:-600}"
+# Old hookscript and old reclone.sh look at the legacy path. The new tree
+# looks at POOL_DRAIN_FILE. An upgrade sets both when neither is already set.
+POOL_DRAIN_FILE="${POOL_DRAIN_FILE:-/run/github-runners/github-runner-drain}"
+LEGACY_POOL_DRAIN_FILE="${LEGACY_POOL_DRAIN_FILE:-/run/lock/github-runner-drain}"
 
-# Set while an upgrade holds the old pool lock or has stopped the watcher.
+# Set while an upgrade holds the old pool lock, has stopped the watcher,
+# or has published a drain flag of its own.
 UPGRADE_TIMER_STOPPED=0
 UPGRADE_LOCK_HELD=0
+UPGRADE_DRAIN_SET=0
 
-# Drop the old pool lock and start the watcher again. Safe to call twice.
-# An EXIT trap that ends in a successful command would hide the failure
-# that caused the exit, so the trap exits again with the status it saved.
+# Drop the old pool lock, start the watcher, then clear a drain this
+# install published. The watcher is started while the drain is still set,
+# so its first tick does not fill a slot the old reclone skipped. Safe to
+# call twice. An EXIT trap that ends in a successful command would hide
+# the failure that caused the exit, so the trap exits again with the
+# status it saved.
 release_upgrade_quiesce() {
     if (( UPGRADE_LOCK_HELD )); then
         flock -u 9 2>/dev/null || true
@@ -29,12 +38,22 @@ release_upgrade_quiesce() {
         systemctl start github-runner-watch.timer 2>/dev/null || true
         UPGRADE_TIMER_STOPPED=0
     fi
+    if (( UPGRADE_DRAIN_SET )); then
+        rm -f -- "$POOL_DRAIN_FILE" "$LEGACY_POOL_DRAIN_FILE" || true
+        UPGRADE_DRAIN_SET=0
+    fi
 }
 
 on_upgrade_exit() {
     local status=$?
     release_upgrade_quiesce
     exit "$status"
+}
+
+on_upgrade_signal() {
+    release_upgrade_quiesce
+    trap - EXIT INT TERM HUP
+    exit 1
 }
 
 abort_upgrade() {
@@ -62,14 +81,60 @@ wait_for_watch_service() {
     done
 }
 
+# Operator maintenance is a regular file at either drain path. A symlink
+# is replaced below: the old hookscript treats any existing path as a drain,
+# and the link would send that check somewhere else.
+upgrade_drain_active() {
+    if [[ -f "$POOL_DRAIN_FILE" && ! -L "$POOL_DRAIN_FILE" ]]; then
+        return 0
+    fi
+    if [[ -f "$LEGACY_POOL_DRAIN_FILE" && ! -L "$LEGACY_POOL_DRAIN_FILE" ]]; then
+        return 0
+    fi
+    return 1
+}
+
+# Publish both drain flags. The new directory is mode 0700. The legacy
+# directory is /run/lock (1777); do not chmod it. mv replaces a symlink
+# there instead of writing through it.
+publish_upgrade_drain() {
+    local dir tmp
+    dir=$(dirname -- "$POOL_DRAIN_FILE")
+    [[ -n "$dir" && "$dir" != "/" && "$dir" != "." && ! -L "$dir" ]] || return 1
+    if [[ ! -d "$dir" ]]; then
+        install -d -m 700 "$dir" || return 1
+    fi
+    if [[ -L "$POOL_DRAIN_FILE" ]]; then
+        rm -f -- "$POOL_DRAIN_FILE" || return 1
+    fi
+    : > "$POOL_DRAIN_FILE" || return 1
+
+    dir=$(dirname -- "$LEGACY_POOL_DRAIN_FILE")
+    [[ -d "$dir" && ! -L "$dir" && -w "$dir" ]] || return 1
+    tmp=$(mktemp "$dir/.github-runner-drain.XXXXXX") || return 1
+    if ! mv -f "$tmp" "$LEGACY_POOL_DRAIN_FILE"; then
+        rm -f -- "$tmp"
+        return 1
+    fi
+}
+
 # Old processes flock /run/lock/github-runner-pool.lock. The tree we are
 # about to extract flocks /run/github-runners/github-runner-pool.lock, so
 # an in-flight reclone and a new watch tick would both fill one slot.
-# Stop the timer, let the current tick finish, then hold the old lock
-# until the new units are in place. A host with no config is new: no
-# timer and no lock.
+# A VM that stops while that lock is held would start an old reclone,
+# which passes its drain check and then blocks on the lock; when the lock
+# is released it keeps going on the old paths. Set both drain flags first,
+# unless one is already set, so that reclone exits before it takes the
+# lock. Then stop the timer, let the current tick finish, and hold the
+# old lock until the new units are in place. A host with no config is
+# new: no timer and no lock.
 quiesce_old_pool() {
     trap on_upgrade_exit EXIT
+    trap on_upgrade_signal INT TERM HUP
+    if ! upgrade_drain_active; then
+        UPGRADE_DRAIN_SET=1
+        publish_upgrade_drain || abort_upgrade "Could not set the maintenance drain, so the new tree was not installed."
+    fi
     if [[ -f "$SYSTEMD_DIR/github-runner-watch.timer" ]]; then
         UPGRADE_TIMER_STOPPED=1
         systemctl stop github-runner-watch.timer
@@ -176,7 +241,7 @@ install_main() {
     fi
 
     release_upgrade_quiesce
-    trap - EXIT
+    trap - EXIT INT TERM HUP
     echo ""
 }
 
