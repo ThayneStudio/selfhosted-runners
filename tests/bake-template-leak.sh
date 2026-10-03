@@ -53,7 +53,11 @@ half_conf() {
 }
 write_half() { half_conf "$1" > "$(conf_of "$1")"; }
 set_volumes() { cat > "$mock_storage"; }
-pending() { printf '%s\n' "$1" > "$PENDING_BAKE_FILE"; }
+pending() {
+    printf '%s\n' "$1" > "$PENDING_BAKE_FILE"
+    rm -f "${PENDING_BAKE_FILE}.created"
+}
+mark_created() { printf '%s\n' "$1" > "${PENDING_BAKE_FILE}.created"; }
 record_kept() { [[ -f "$PENDING_BAKE_FILE" ]]; }
 assert_gone() {
     if grep -qxF "$1" "$mock_storage"; then fail "$2: $1 was not freed"; fi
@@ -114,7 +118,7 @@ run_cleanup() {
     : > "$frees"
     cleanup_rc=0
     # shellcheck disable=SC2034 # cleanup_rebake reads both
-    ( set -e; BAKE_VMID=$1; REBAKE_PUBLISHED=0; cleanup_rebake 1 ) 2>"$state/log" || cleanup_rc=$?
+    ( set -e; BAKE_VMID=$1; REBAKE_PUBLISHED=0; cleanup_rebake "${2:-1}" ) 2>"$state/log" || cleanup_rc=$?
 }
 run_recover() {
     : > "$actions"
@@ -182,7 +186,8 @@ assert_bake_disks_freed "cleanup_rebake"
 if record_kept; then fail "cleanup_rebake kept the record after the volumes were freed"; fi
 grep -q 'release 9001' "$actions" || fail "cleanup_rebake did not release the VMID reservation"
 
-# A volume pvesm free does not remove stays recorded, so the next run retries.
+# A volume pvesm free does not remove is logged and the record is dropped.
+# Keeping it would fail every later rebake. The next run does not retry it.
 write_half 9001
 leak_set
 printf 'local-zfs:base-9001-disk-0\n' > "$mock_busy"
@@ -191,20 +196,32 @@ run_cleanup 9001
 [[ "$cleanup_rc" != 0 ]] || fail "a leftover volume was reported freed"
 assert_kept local-zfs:base-9001-disk-0 "busy free"
 assert_gone local-zfs:vm-9001-disk-0 "busy free"
-record_kept || fail "a remaining volume dropped the pending record"
-grep -qF "disk volume remains on $VM_STORAGE" "$state/log" \
+if record_kept; then fail "a volume pvesm free could not remove kept the pending record"; fi
+grep -qF "pvesm free 'local-zfs:base-9001-disk-0'" "$state/log" \
     || fail "the remaining volume was not named: $(cat "$state/log")"
-# The next rebake, still busy, keeps it. Once the volume can be freed, it goes.
+grep -qF 'Later rebakes will not retry it' "$state/log" \
+    || fail "the operator was not told the volume will not be retried: $(cat "$state/log")"
+grep -qxF 'vmid=9001 volid=local-zfs:base-9001-disk-0' "$STATE_DIR/bake-leftover-volumes" \
+    || fail "the remaining volume was not quarantined: $(cat "$STATE_DIR/bake-leftover-volumes" 2>/dev/null)"
+# The next rebake finds no record, so it proceeds, and the volume stays.
 run_recover
-[[ "$recover_rc" != 0 ]] || fail "recover dropped a record whose volume was still busy"
-record_kept || fail "recover dropped the record of a remaining volume"
-assert_kept local-zfs:base-9001-disk-0 "recover while busy"
+[[ "$recover_rc" == 0 ]] || fail "recover failed after a volume was left for the operator: $(cat "$state/log")"
+if record_kept; then fail "recover recreated the dropped record"; fi
+assert_kept local-zfs:base-9001-disk-0 "recover does not retry a volume pvesm free left"
+assert_decoys "recover does not retry"
 : > "$mock_busy"
-run_recover
-[[ "$recover_rc" == 0 ]] || fail "recover failed once the volume could be freed: $(cat "$state/log")"
-assert_gone local-zfs:base-9001-disk-0 "recover retry"
-if record_kept; then fail "recover kept the record after freeing the volume"; fi
-assert_decoys "recover retry"
+
+# A cleanup entered with status 0 (a signal can leave $? at 0) still fails
+# this run when a volume is left, and still drops the record.
+write_half 9001
+leak_set
+printf 'local-zfs:base-9001-disk-0\n' > "$mock_busy"
+pending 9001
+run_cleanup 9001 0
+[[ "$cleanup_rc" != 0 ]] || fail "a leftover volume let cleanup report success"
+if record_kept; then fail "status 0 kept the record of a volume pvesm free left"; fi
+assert_kept local-zfs:base-9001-disk-0 "status 0 busy free"
+: > "$mock_busy"
 
 # recover destroys a half-converted VM whose config still lists the old disk.
 write_half 9001
@@ -218,10 +235,12 @@ assert_bake_disks_freed "recover"
 if record_kept; then fail "recover kept the record of a destroyed VM"; fi
 
 # The VM is already gone (destroy succeeded, the process died before the
-# free). The record is how the next run finds the leaked base volume.
+# free). The created marker is how the next run knows the base volume is
+# this bake's.
 rm -f "$(conf_of 9001)"
 leak_set
 pending 9001
+mark_created 9001
 run_recover
 [[ "$recover_rc" == 0 ]] || fail "recover failed on an absent VM with a leaked volume: $(cat "$state/log")"
 if grep -q '^destroy ' "$actions"; then fail "recover destroyed a VM that was already gone"; fi
@@ -281,6 +300,7 @@ free_bake_leftover_volumes 9001 9000 2>"$state/log" || free_rc=$?
 assert_kept local-zfs:base-9001-disk-0 "pmxcfs down"
 grep -qF 'pmxcfs is not serving /etc/pve' "$state/log" || fail "pmxcfs being down was not reported"
 pending 9001
+mark_created 9001
 run_recover
 [[ "$recover_rc" != 0 ]] || fail "recover dropped a record while pmxcfs was down"
 record_kept || fail "recover dropped the record while pmxcfs was down"
@@ -337,8 +357,8 @@ run_setup_cleanup
 assert_gone local-zfs:base-9100-disk-0 "setup first bake"
 if record_kept; then fail "a first bake kept its record after the free"; fi
 
-# The VM is already gone. The record is what a later setup cleanup uses to
-# find the base volume; the live template's disk stays.
+# The VM is already gone and this bake never created it. A volume that was
+# already on the VMID stays, and the record goes.
 rm -f "$(conf_of 9100)"
 set_volumes <<'EOF'
 local-zfs:base-9000-disk-0
@@ -347,22 +367,37 @@ EOF
 pending 9100
 run_setup_cleanup
 if grep -q '^destroy ' "$actions"; then fail "setup destroyed a VM that was already gone"; fi
-assert_gone local-zfs:base-9100-disk-0 "setup absent"
-assert_kept local-zfs:base-9000-disk-0 "setup absent"
-assert_not_freed local-zfs:base-9000-disk-0 "setup absent"
+assert_kept local-zfs:base-9100-disk-0 "setup absent, bake never created"
+assert_kept local-zfs:base-9000-disk-0 "setup absent, bake never created"
+assert_not_freed local-zfs:base-9100-disk-0 "setup absent, bake never created"
+assert_not_freed local-zfs:base-9000-disk-0 "setup absent, bake never created"
+if record_kept; then fail "setup kept the record of a bake that never created a VM"; fi
+
+# Once this bake's qm create had succeeded, the leaked base volume is freed.
+# A volume pvesm free cannot remove is logged and the record is dropped.
+pending 9100
+mark_created 9100
+run_setup_cleanup
+assert_gone local-zfs:base-9100-disk-0 "setup absent after create"
+assert_kept local-zfs:base-9000-disk-0 "setup absent after create"
+assert_not_freed local-zfs:base-9000-disk-0 "setup absent after create"
 if record_kept; then fail "setup kept the record after freeing an absent VM's volume"; fi
+[[ ! -e "${PENDING_BAKE_FILE}.created" ]] || fail "setup left the created marker after the free"
 printf 'local-zfs:base-9100-disk-0\n' > "$mock_busy"
 set_volumes <<'EOF'
 local-zfs:base-9100-disk-0
 EOF
 pending 9100
+mark_created 9100
 run_setup_cleanup
 assert_kept local-zfs:base-9100-disk-0 "setup absent busy"
-record_kept || fail "setup dropped the record of a volume left after the VM was gone"
+if record_kept; then fail "setup kept the record of a volume pvesm free could not remove"; fi
+grep -qF "pvesm free 'local-zfs:base-9100-disk-0'" "$state/log" \
+    || fail "setup did not name the volume left behind: $(cat "$state/log")"
 : > "$mock_busy"
 
-# The same cleanup keeps the record when the volume cannot be freed, and
-# does not free when destroy fails.
+# The same cleanup drops the record when the volume cannot be freed after
+# destroy, and does not free when destroy fails.
 write_half 9100
 set_volumes <<'EOF'
 local-zfs:base-9100-disk-0
@@ -371,8 +406,8 @@ printf 'local-zfs:base-9100-disk-0\n' > "$mock_busy"
 pending 9100
 run_setup_cleanup
 assert_kept local-zfs:base-9100-disk-0 "setup busy free"
-record_kept || fail "setup dropped the record of a remaining volume"
-grep -qF "disk volume remains on $VM_STORAGE" "$state/log" \
+if record_kept; then fail "setup kept the record of a volume pvesm free could not remove after destroy"; fi
+grep -qF "pvesm free 'local-zfs:base-9100-disk-0'" "$state/log" \
     || fail "setup did not report the remaining volume: $(cat "$state/log")"
 : > "$mock_busy"
 write_half 9100

@@ -163,8 +163,9 @@ record_setup_bake() {
         log_error "If 'qm config $id' on this node shows no VM named ubuntu-cloud-template, the record is stale; remove it instead: rm $PENDING_BAKE_FILE"
         return 1
     fi
-    # A version left by an earlier record does not describe this bake.
-    rm -f "$PENDING_VERSION_FILE" || return 1
+    # A version left by an earlier record does not describe this bake, and
+    # neither does a created-marker for a VM this setup has not made yet.
+    rm -f "$PENDING_VERSION_FILE" "${PENDING_BAKE_FILE}.created" || return 1
     install -d -m 700 "$STATE_DIR" || return 1
     printf '%s\n' "$TEMPLATE_ID" > "$PENDING_BAKE_FILE" || return 1
     chmod 600 "$PENDING_BAKE_FILE"
@@ -175,7 +176,7 @@ record_setup_bake() {
 forget_setup_bake() {
     [[ -f "$PENDING_BAKE_FILE" ]] || return 0
     [[ "$(tr -d '[:space:]' < "$PENDING_BAKE_FILE")" == "$TEMPLATE_ID" ]] || return 0
-    rm -f "$PENDING_BAKE_FILE" "$PENDING_VERSION_FILE"
+    drop_pending_bake
 }
 
 # EXIT trap of the bake: destroy VM $TEMPLATE_ID unless it is a finished
@@ -187,17 +188,20 @@ forget_setup_bake() {
 # template can rename the disk to a base volume and fail before the config
 # names it, and qm destroy then does not free it. A bake that create_bake_vm
 # refused before `qm create` has no VM, and once the cluster inventory
-# confirms that, its record goes, as cleanup_rebake drops its own.
+# confirms that, its record goes, as cleanup_rebake drops its own. Volumes
+# already on that VMID are not freed: this bake did not create them.
 # After an SSH drop every log write fails (EIO on the hung-up tty, or SIGPIPE
 # through a pipe). Neither errexit nor a second SIGHUP may stop the destroy.
 cleanup_bake() {
-    local cfg name
+    local cfg name settle_rc=0
     set +e
     trap '' HUP PIPE
     if ! cfg=$(qm_host config "$TEMPLATE_ID" 2>/dev/null); then
         if vm_confirmed_absent "$TEMPLATE_ID"; then
-            if ! free_bake_leftover_volumes "$TEMPLATE_ID" "${LIVE_TEMPLATE_ID-}"; then
-                log_error "VM $TEMPLATE_ID is gone but a disk volume remains on $VM_STORAGE; not dropping its pending-bake record"
+            settle_rc=0
+            settle_bake_leftovers "$TEMPLATE_ID" "${LIVE_TEMPLATE_ID-}" absent || settle_rc=$?
+            if [[ "$settle_rc" == 1 ]]; then
+                log_error "VM $TEMPLATE_ID is gone but its volumes on $VM_STORAGE could not be checked; not dropping its pending-bake record"
                 return 0
             fi
             forget_setup_bake
@@ -223,8 +227,10 @@ cleanup_bake() {
     fi
     # LIVE_TEMPLATE_ID, when set, is the template still serving clones. This
     # VM is the bake, even though the shell's TEMPLATE_ID names it.
-    if ! free_bake_leftover_volumes "$TEMPLATE_ID" "${LIVE_TEMPLATE_ID-}"; then
-        log_error "VM $TEMPLATE_ID was destroyed but a disk volume remains on $VM_STORAGE; not dropping its pending-bake record"
+    settle_rc=0
+    settle_bake_leftovers "$TEMPLATE_ID" "${LIVE_TEMPLATE_ID-}" destroyed || settle_rc=$?
+    if [[ "$settle_rc" == 1 ]]; then
+        log_error "VM $TEMPLATE_ID was destroyed but its volumes on $VM_STORAGE could not be checked; not dropping its pending-bake record"
         return 0
     fi
     forget_setup_bake

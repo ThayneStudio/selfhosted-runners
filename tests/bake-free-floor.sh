@@ -44,6 +44,7 @@ gib=1048576
 
 mock_avail=$((100 * gib))
 mock_status_fails=0
+mock_storage_status=active
 mock_polls=$state/polls
 mock_ready_after=0
 mock_stopped=0
@@ -101,7 +102,7 @@ pvesm() {
         status)
             [[ "$mock_status_fails" == 0 ]] || return 1
             printf 'Name Type Status Total Used Available %%\n'
-            printf '%s zfspool active %s %s %s 50.00%%\n' "$VM_STORAGE" \
+            printf '%s zfspool %s %s %s %s 50.00%%\n' "$VM_STORAGE" "$mock_storage_status" \
                 $((1000 * gib)) $((1000 * gib - mock_avail)) "$mock_avail"
             ;;
         list) printf 'Volid Format Type Size VMID\n' ;;
@@ -186,6 +187,19 @@ grep -qF "Could not read free space on storage $VM_STORAGE during the bake; cont
     || fail "the unreadable reading was not warned: $(cat "$state/log")"
 grep -q '^template 9001$' "$state/qm.log" || fail "the bake did not finish after an unreadable reading"
 mock_status_fails=0
+
+# Inactive storage is not a free-space reading, even when the number is under
+# the floor. Only the status == active check distinguishes it from a full pool.
+mock_storage_status=inactive
+mock_avail=0
+mock_ready_after=5
+run_bake
+[[ "$bake_rc" == 0 ]] || fail "inactive storage aborted the bake: $(tail -n 5 "$state/log")"
+grep -qF "Could not read free space on storage $VM_STORAGE during the bake; continuing" "$state/log" \
+    || fail "inactive storage was not warned: $(cat "$state/log")"
+if grep -qF 'under the' "$state/log"; then fail "inactive storage was treated as free space: $(cat "$state/log")"; fi
+grep -q '^template 9001$' "$state/qm.log" || fail "the bake did not finish while storage was inactive"
+mock_storage_status=active
 
 # BAKE_FREE_FLOOR_GIB replaces the floor. 0 turns the check off, so a full
 # storage is not even queried.

@@ -82,9 +82,14 @@ done
 # and setup's foreground run both pass on.
 mock_row=""
 pvesm() {
-    [[ "$1" == status ]] || return 1
-    printf 'Name Type Status Total Used Available %%\n'
-    [[ -z "$mock_row" ]] || printf '%s\n' "$mock_row"
+    case "$1" in
+        list) printf 'Volid Format Type Size VMID\n' ;;
+        status)
+            printf 'Name Type Status Total Used Available %%\n'
+            [[ -z "$mock_row" ]] || printf '%s\n' "$mock_row"
+            ;;
+        *) return 1 ;;
+    esac
 }
 qm() { printf 'qm %s\n' "$*" >> "$calls"; }
 refused() {

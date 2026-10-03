@@ -37,10 +37,15 @@ mock_avail=0
 mock_cfg=""
 mock_pvesh_fails=0
 pvesm() {
-    [[ "$1" == status ]] || return 1
-    printf 'Name Type Status Total Used Available %%\n'
-    printf '%s %s active %d %d %d 50.00%%\n' "$VM_STORAGE" "$mock_type" \
-        $((1000 * gib)) $((1000 * gib - mock_avail)) "$mock_avail"
+    case "$1" in
+        list) printf 'Volid Format Type Size VMID\n' ;;
+        status)
+            printf 'Name Type Status Total Used Available %%\n'
+            printf '%s %s active %d %d %d 50.00%%\n' "$VM_STORAGE" "$mock_type" \
+                $((1000 * gib)) $((1000 * gib - mock_avail)) "$mock_avail"
+            ;;
+        *) return 1 ;;
+    esac
 }
 pvesh() {
     printf '%s\n' "$*" >> "$state/pvesh.log"

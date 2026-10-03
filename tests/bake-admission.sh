@@ -31,10 +31,15 @@ mock_rows=""
 mock_pvesm_fails=0
 pvesm() {
     printf '%s\n' "$*" >> "$state/pvesm.log"
-    [[ "$1" == status ]] || return 1
-    [[ "$mock_pvesm_fails" == 0 ]] || return 2
-    printf 'Name             Type     Status           Total            Used       Available        %%\n'
-    [[ -z "$mock_rows" ]] || printf '%s\n' "$mock_rows"
+    case "$1" in
+        list) printf 'Volid Format Type Size VMID\n' ;;
+        status)
+            [[ "$mock_pvesm_fails" == 0 ]] || return 2
+            printf 'Name             Type     Status           Total            Used       Available        %%\n'
+            [[ -z "$mock_rows" ]] || printf '%s\n' "$mock_rows"
+            ;;
+        *) return 1 ;;
+    esac
 }
 storage_row() {
     printf '%-16s %8s %10s %15d %15d %15d %7.2f%%' "$1" zfspool "$2" $((500 * gib)) $((500 * gib - $3)) "$3" 50
@@ -83,6 +88,10 @@ refused "another storage has space" 'has 10 GiB free'
 # Free space that cannot be read is not free space.
 mock_rows=$(storage_row local-zfs inactive 0)
 refused "inactive storage" 'status: inactive'
+# Enough free space that only the active-status check can refuse. A check
+# that compared the number alone would create the VM.
+mock_rows=$(storage_row local-zfs inactive $((100 * gib)))
+refused "inactive storage with 100 GiB free" 'status: inactive'
 mock_rows=""
 refused "storage missing from pvesm status" 'Could not read free space on storage local-zfs'
 mock_rows=$(storage_row local-zfs active $((100 * gib)))

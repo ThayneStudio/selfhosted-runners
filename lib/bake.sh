@@ -220,13 +220,52 @@ create_bake_vm() {
     check_bake_timeout || return 1
     check_bake_free_floor || return 1
     check_bake_storage_space || return 1
+    # A VMID that already has a volume is not usable. qm destroy later frees
+    # every base-<vmid>-disk-N and vm-<vmid>-disk-N with no guest config, and
+    # cannot tell one this bake created from one that was already there.
+    # After the space refusal, so a full storage still reports that.
+    bake_vmid_storage_clear "$vmid" || return 1
     resolve_bake_runner_version || return 1
 
     if [[ -n "${VLAN_TAG:-}" ]]; then
         net_config="${net_config},tag=$VLAN_TAG"
     fi
+
     qm_host create "$vmid" --name ubuntu-cloud-template \
         --memory 8192 --balloon "${BALLOON:-0}" --cores 2 --cpu host --net0 "$net_config"
+    # The pending record is written before this, and the failure path must
+    # not free volumes of a VM qm create never made. Recover reads the file.
+    mark_bake_vm_created "$vmid"
+}
+
+# Remember that this process created bake VM $1, for the failure path and
+# for a later recover after this process is gone. The pending file itself
+# stays a bare VMID.
+mark_bake_vm_created() {
+    local vmid="$1" marker
+    # shellcheck disable=SC2034 # bake_vm_was_created reads it
+    BAKE_VM_CREATED=$vmid
+    [[ -n "${PENDING_BAKE_FILE:-}" ]] || return 0
+    marker="${PENDING_BAKE_FILE}.created"
+    # The VM already exists. Failing here would destroy it, and this process
+    # still has BAKE_VM_CREATED for its own cleanup. A later recover needs the
+    # file; the operator is told when it could not be written.
+    if ! install -d -m 700 "$(dirname "$marker")" \
+        || ! printf '%s\n' "$vmid" > "$marker" \
+        || ! chmod 600 "$marker"; then
+        log_warn "Could not record that bake VM $vmid was created ($marker)"
+    fi
+}
+
+# 0 when this run's qm create succeeded for VMID $1, or a previous run
+# recorded that it had. A pending file with no such record is a VMID that
+# was only reserved.
+bake_vm_was_created() {
+    local vmid="$1" recorded=""
+    [[ "${BAKE_VM_CREATED:-}" == "$vmid" ]] && return 0
+    [[ -n "${PENDING_BAKE_FILE:-}" && -f "${PENDING_BAKE_FILE}.created" ]] || return 1
+    recorded=$(tr -d '[:space:]' < "${PENDING_BAKE_FILE}.created") || return 1
+    [[ "$recorded" == "$vmid" ]]
 }
 
 log_guest_setup_tail() {

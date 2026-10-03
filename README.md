@@ -485,7 +485,11 @@ setup questions. The bridge, VLAN, storage, minimum VMID, balloon, DNS, and
 Docker mirror stay as they are. It builds a second VM while the current
 template keeps serving clones, and it holds that VMID's reservation for the
 whole bake. `reserve_vmid` starts at `MIN_VMID` (at the cluster's next free
-VMID when that is 0) and walks upward, and the watcher runs every 30 seconds.
+VMID when that is 0) and walks upward. The rebake then skips a VMID that
+already has an image volume on `VM_STORAGE` and takes the next one.
+`reserve_vmid` itself, which runner clones use, still returns that VMID.
+Setup cannot skip, so it refuses that Template VM ID. The watcher runs every
+30 seconds.
 `TEMPLATE_ID` changes only after `qm template` has converted the new VM's disks
 to base volumes. `qm template` can exit 0 without converting them, so the
 rebake reads the result from `qm config`, and a VM it did not convert is
@@ -495,12 +499,16 @@ image. The previous template goes on the retirement list,
 `/var/lib/github-runners/retired-templates`. Every rebake run, including a
 daily check that does not bake, destroys a listed template once no linked clone
 depends on it, provided it is still a template named `ubuntu-cloud-template`.
-A failed bake destroys the partial VM, frees a leftover `base-<vmid>-disk-N`
-or `vm-<vmid>-disk-N` of that VMID on `VM_STORAGE`, and leaves `TEMPLATE_ID`
-and the live template as they were. `qm template` can rename the disk to a
-base volume and fail before the config names it; `qm destroy` then does not
-free that volume. A volume of the live template or a retired template is
-never freed, nor is one whose VMID still has a guest config.
+A failed bake destroys the partial VM and leaves `TEMPLATE_ID` and the live
+template as they were. When this bake created that VM, cleanup also frees a
+leftover `base-<vmid>-disk-N` or `vm-<vmid>-disk-N` of its VMID on
+`VM_STORAGE`. `qm template` can rename the disk to a base volume and fail
+before the config names it; `qm destroy` then does not free that volume. A
+volume that was already on the VMID is left alone, as is a volume of the live
+template or a retired template, and one whose VMID still has a guest config.
+A volume `pvesm free` cannot remove is logged with `pvesm free '<volid>'`,
+recorded in `/var/lib/github-runners/bake-leftover-volumes`, and not retried,
+so a later rebake is not stuck on it.
 
 Each run first checks the live template. If `TEMPLATE_ID` does not exist, is
 not a template, or has disks that are not base volumes (a template made on
@@ -509,7 +517,9 @@ Inspect it with `qm config <TEMPLATE_ID>`, destroy it, and run `runner setup`
 to bake a new one.
 
 A bake, from setup or a rebake, checks `VM_STORAGE` before it creates its VM.
-It refuses to start unless `pvesm status` shows the storage active with at
+A VMID that already has an image volume there is refused, because a failed
+bake would free it: setup stops, and a rebake chooses the next VMID. The bake
+also refuses to start unless `pvesm status` shows the storage active with at
 least 30 GiB available, the size of the bake disk, because a storage that fills
 up pauses every VM on it. On thick-provisioned ZFS the floor is 60 GiB (see
 [Resource Planning](#resource-planning)). `BAKE_MIN_FREE_GIB=<GiB>`, a whole
@@ -633,7 +643,9 @@ a second setup does not refresh the image. Any other VM at that ID is refused.
 For a bake that stopped before `qm template` finished, setup prints the
 commands that remove it (`qm stop <id>; qm destroy <id>`); run setup again
 afterwards. For a runner, another VM or a container, choose another ID. A free
-ID is baked.
+ID is baked. An ID with no guest but with a disk volume already on
+`VM_STORAGE` is refused, because a failed bake would free that volume. Remove
+it with `pvesm free <volid>`, or choose another ID.
 
 Entering a new, free Template VM ID while the saved template is finished bakes
 the new one beside it. The saved template keeps serving clones, and
@@ -658,8 +670,9 @@ hand) or could not rewrite `TEMPLATE_ID`, the next rebake run takes over. It
 destroys a VM that is not a finished template
 (`Destroying incomplete rebake VM <id>`), or publishes a finished one
 (`Finishing publish of template <id>`) and then bakes once more, because that
-publish records no runner version. It drops a record that names no VM. A
-record whose VMID now belongs to a VM with another name on this node
+publish records no runner version. It drops a record that names no VM, and
+does not free a disk that was already on that VMID. A record whose VMID now
+belongs to a VM with another name on this node
 (`Pending bake id <id> is <name>; leaving that VM and dropping the stale pending record`),
 to a container, or to a guest on another node
 (`Pending bake id <id> is a guest on node <node>, not a bake VM on this node; dropping the stale pending record`)
@@ -1035,6 +1048,7 @@ The runner VM might not have network connectivity. Check:
 | `/var/lib/github-runners/baked-runner-version` | Baked-version record: `Runner.Listener` version, template ID, bake time and Docker mirror of the last successful bake |
 | `/var/lib/github-runners/retired-templates` | Replaced templates, destroyed by the rebake once no linked clone depends on them |
 | `/var/lib/github-runners/pending-bake` | The VM of a bake beside the live template, from a rebake or from setup, until it is published or destroyed; the next rebake run finishes or removes a VM left there, and drops a record that names no bake VM on this node |
+| `/var/lib/github-runners/bake-leftover-volumes` | Disk volumes a bake created and `pvesm free` could not remove. The pending record is not kept for them; remove each volid by hand — mode 600 |
 | `/var/lib/github-runners/extras` | Extra runners from `runner create`, one `<name> <org>` per line, which the watcher fills like slots (see [Pool size and prefix](#pool-size-and-prefix)) — mode 600 |
 | `/run/github-runners/` | Per-slot failure holds (`slot-<name>`) and when the watcher first saw each stopped runner VM (`watch-stopped`); gone after a reboot |
 | `/run/lock/github-runner-drain` | Maintenance flag; the pool's lock files sit beside it in `/run/lock/` |
@@ -1192,7 +1206,9 @@ The table counts runner VMs only. Also plan for:
   during a rebake the live, the new and any retired templates each hold that
   much. If `qm template` fails after renaming the disk to a base volume, the
   failed bake's cleanup frees a leftover `base-<vmid>-disk-N` or
-  `vm-<vmid>-disk-N` of the bake VMID on `VM_STORAGE`. Turn on Thin provision
+  `vm-<vmid>-disk-N` of that VMID on `VM_STORAGE`, and only when this bake
+  created the VM. A volume `pvesm free` cannot remove is logged and left for
+  the operator. Turn on Thin provision
   (`sparse 1`) for `VM_STORAGE` so that later bakes reserve nothing. If
   `pvesh` cannot read the storage's config, the bake counts it as thick and
   logs a warning.

@@ -40,9 +40,14 @@ qm() {
     [[ "$1" == create ]]
 }
 pvesm() {
-    [[ "$1" == status ]] || return 1
-    printf 'Name Type Status Total Used Available %%\n'
-    printf '%s zfspool active 1000000000 100000000 900000000 10.00%%\n' "$VM_STORAGE"
+    case "$1" in
+        list) printf 'Volid Format Type Size VMID\n' ;;
+        status)
+            printf 'Name Type Status Total Used Available %%\n'
+            printf '%s zfspool active 1000000000 100000000 900000000 10.00%%\n' "$VM_STORAGE"
+            ;;
+        *) return 1 ;;
+    esac
 }
 
 create_vm() {
