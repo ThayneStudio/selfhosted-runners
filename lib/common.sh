@@ -312,17 +312,17 @@ linked_clone_child_vmid() {
     fi
 }
 
+# Prints the ZFS dataset behind zvol volume $1. Like pvesm path, it does not
+# check that the dataset exists.
 zfs_dataset_from_volid() {
     local volid="$1"
-    local path dataset
+    local path
 
     command -v zfs >/dev/null 2>&1 || return 1
     path=$(pvesm path "$volid" 199>&- 200>&- 201>&- 202>&- 203>&- 204>&- 2>/dev/null) || return 1
     [[ "$path" == /dev/zvol/* ]] || return 1
 
-    dataset="${path#/dev/zvol/}"
-    zfs list -H -o name "$dataset" >/dev/null 2>&1 || return 1
-    printf '%s\n' "$dataset"
+    printf '%s\n' "${path#/dev/zvol/}"
 }
 
 # 0 only when a listing of the volume's storage succeeds and no longer shows
@@ -386,9 +386,9 @@ list_template_linked_clone_volids() {
 
     # ZFS linked clones are sibling zvols, not nested volids. They point at
     # the template base volume snapshot via the ZFS origin property. A failed
-    # path or origin lookup must fail this function: an empty result is
-    # permission to destroy the template. A path that is not a zvol is dir
-    # or LVM storage, already handled above.
+    # path or origin lookup must fail this function, unless the volume is
+    # gone (below): an empty result is permission to destroy the template. A
+    # path that is not a zvol is dir or LVM storage, already handled above.
     while read -r base_volid; do
         [[ -n "$base_volid" ]] || continue
         if ! zfs_path=$(pvesm path "$base_volid" 199>&- 200>&- 201>&- 202>&- 203>&- 204>&- 2>/dev/null); then
@@ -409,18 +409,23 @@ list_template_linked_clone_volids() {
         while read -r volid _; do
             [[ "$volid" == "$VM_STORAGE:vm-"* ]] || continue
             [[ -n "${seen[$volid]:-}" ]] && continue
-            # Runners are destroyed and recloned while this scan runs, and
-            # pvesm path does not check that a zvol exists. A volume that a
-            # fresh listing no longer shows depends on nothing; any other
-            # failed lookup still fails closed.
             if ! dataset=$(zfs_dataset_from_volid "$volid"); then
-                volume_confirmed_absent "$volid" && continue
                 log_error "Failed to resolve ZFS dataset for $volid"
                 return 1
             fi
-            if ! origin=$(zfs get -H -o value origin "$dataset" 2>/dev/null); then
-                volume_confirmed_absent "$volid" && continue
+            # Runners are destroyed and recloned while this scan runs. A
+            # volume that is gone depends on nothing, so this lookup's own
+            # "dataset does not exist" (what Proxmox's ZFS plugin also takes
+            # as gone) skips it. A second lookup would not do: by then a new
+            # volume can have the same name. Any other failure fails closed.
+            if ! origin=$(LC_ALL=C zfs get -H -o value origin "$dataset" 2>&1); then
+                [[ "$origin" == *"dataset does not exist"* ]] && continue
                 log_error "Failed to read ZFS origin for $dataset"
+                return 1
+            fi
+            # stderr is captured too, so anything but one word fails closed.
+            if [[ -z "$origin" || "$origin" == *[[:space:]]* ]]; then
+                log_error "Unexpected ZFS origin for $dataset: $origin"
                 return 1
             fi
             # "-" is a real origin value meaning "not a clone".
