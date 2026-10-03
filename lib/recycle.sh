@@ -1,6 +1,7 @@
 #!/bin/bash
 # Runner slot recycling shared by reclone.sh (after a VM's post-stop hook)
-# and watch.sh (every 30 s). Callers source common.sh first.
+# and watch.sh (every 30 s). Callers source common.sh first, and bake.sh for
+# refill_runner_slot.
 #
 # Per-slot failure backoff, kept in /run so a reboot starts every slot fresh:
 # - A failed clone_runner holds the slot for 30 s, doubling with each failure
@@ -255,9 +256,10 @@ destroy_runner_vm() {
 # caller holds the slot lock (fd 200) and shared pool activity (fd 202), $3
 # prefixes the log lines and $4 is the old VM's kind (runner_vm_kind). Nothing
 # is cloned for a retired name (runner_slot_retired). The slot stays empty
-# while the backoff holds it, when the name is taken again or when the pool
-# started draining; the watcher fills it later. Returns 1 only when
-# clone_runner failed.
+# while the backoff holds it, when the name is taken again, when the pool
+# started draining or while TEMPLATE_ID is not a finished template; the
+# watcher fills it later. Returns 1 only when clone_runner failed. Needs
+# template_is_converted from bake.sh.
 refill_runner_slot() {
     local name="$1" org="$2" tag="$3" kind="${4:-}"
     if runner_slot_retired "$name" "$org" "$kind"; then
@@ -274,6 +276,15 @@ refill_runner_slot() {
     fi
     if pool_is_draining; then
         logger -t github-runner "$tag pool drain active after destroy for $name, leaving slot empty"
+        return 0
+    fi
+    # The template is being rebuilt at TEMPLATE_ID (`qm destroy` and
+    # `runner setup`), or was never converted. A clone of the unfinished VM
+    # is a full copy, with no disk at all before the bake attaches one, and
+    # holds a lock on the bake VM that can fail the bake. The watcher, which
+    # waits for the same check, fills the slot once the template is done.
+    if ! template_is_converted "$TEMPLATE_ID"; then
+        log_warn "$tag template $TEMPLATE_ID is not a finished template; leaving $name empty for the watcher"
         return 0
     fi
     load_org_config "$org"

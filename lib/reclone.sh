@@ -9,6 +9,8 @@ RECLONE_LIB_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 source "$RECLONE_LIB_DIR/common.sh"
 # shellcheck source=recycle.sh
 source "$RECLONE_LIB_DIR/recycle.sh"
+# shellcheck source=bake.sh
+source "$RECLONE_LIB_DIR/bake.sh"
 
 reclone_main() {
     local vmid="${1:-}" name org config lock status

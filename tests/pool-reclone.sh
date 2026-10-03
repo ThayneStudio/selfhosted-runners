@@ -53,6 +53,10 @@ qm() {
     local dir="$state/vm/${2:-none}"
     case "$1" in
         config)
+            if [[ "$2" == 9000 ]]; then
+                printf 'name: ubuntu-cloud-template\ntemplate: 1\nscsi0: local-zfs:base-9000-disk-0,size=30G\n'
+                return 0
+            fi
             [[ -d "$dir" ]] || return 2
             printf 'name: %s\n' "$(cat "$dir/name")"
             printf 'cicustom: user=local:snippets/runner-%s-user-acme.yaml,meta=local:snippets/runner-%s-meta.yaml\n' "$2" "$2"
