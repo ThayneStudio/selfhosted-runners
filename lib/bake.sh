@@ -136,26 +136,54 @@ check_bake_min_free_gib() {
     fi
 }
 
+# 0 when storage $1's config sets `sparse`, so ZFS creates its volumes thin.
+# Without it ZFS reserves each volume's full size. A config that cannot be
+# read counts as thick.
+zfs_storage_is_sparse() {
+    local sparse
+    if ! sparse=$(pvesh get "/storage/$1" --output-format json \
+        199>&- 200>&- 201>&- 202>&- 203>&- 204>&- 2>/dev/null | jq -r '.sparse // 0' 2>/dev/null); then
+        log_warn "Could not read the config of storage $1; counting it as thick-provisioned"
+        return 1
+    fi
+    [[ "$sparse" == 1 || "$sparse" == true ]]
+}
+
 # A bake can write its whole BAKE_DISK_GIB disk to VM_STORAGE. A storage that
 # fills up pauses every VM on it (QEMU's default werror=enospc), not only the
-# bake VM, so refuse to start a bake without that much free. BAKE_MIN_FREE_GIB
-# overrides the floor; 0 skips the check.
+# bake VM, so refuse to start a bake without that much free. Thick ZFS (a
+# zfspool or ZFS over iSCSI storage without `sparse`) reserves the whole disk
+# when the bake resizes it, and the snapshot `qm template` takes then needs
+# the bake's data free outside that reservation: there a bake can take twice
+# its disk. BAKE_MIN_FREE_GIB overrides the floor; 0 skips the check.
 check_bake_storage_space() {
-    local min_gib="${BAKE_MIN_FREE_GIB:-$BAKE_DISK_GIB}" row storage_status avail_kib
+    local min_gib="${BAKE_MIN_FREE_GIB:-}" row storage_type storage_status avail_kib thick=0
     check_bake_min_free_gib || return 1
-    min_gib=$((10#$min_gib))
-    (( min_gib > 0 )) || return 0
+    if [[ -n "$min_gib" ]]; then
+        min_gib=$((10#$min_gib))
+        (( min_gib > 0 )) || return 0
+    fi
     # Columns: Name Type Status Total Used Available %. Sizes are KiB.
     row=$(pvesm status --storage "$VM_STORAGE" 199>&- 200>&- 201>&- 202>&- 203>&- 204>&- 2>/dev/null \
-        | awk -v s="$VM_STORAGE" '$1 == s && !found { print $3, $6; found = 1 }') || row=""
-    read -r storage_status avail_kib _ <<< "$row"
+        | awk -v s="$VM_STORAGE" '$1 == s && !found { print $2, $3, $6; found = 1 }') || row=""
+    read -r storage_type storage_status avail_kib _ <<< "$row"
     if [[ "$storage_status" != active || ! "$avail_kib" =~ ^[0-9]+$ ]]; then
         log_error "Could not read free space on storage $VM_STORAGE (status: ${storage_status:-unknown}); not baking"
         log_error "To bake without this check: BAKE_MIN_FREE_GIB=0 runner rebake (or runner setup)"
         return 1
     fi
+    if [[ -z "$min_gib" ]]; then
+        min_gib=$BAKE_DISK_GIB
+        if [[ "$storage_type" == zfspool || "$storage_type" == zfs ]] && ! zfs_storage_is_sparse "$VM_STORAGE"; then
+            thick=1
+            min_gib=$((2 * BAKE_DISK_GIB))
+        fi
+    fi
     if (( avail_kib < min_gib * 1048576 )); then
         log_error "Not baking: storage $VM_STORAGE has $((avail_kib / 1048576)) GiB free and a bake needs $min_gib GiB"
+        if [[ "$thick" == 1 ]]; then
+            log_error "Thick-provisioned ZFS reserves the bake's whole ${BAKE_DISK_GIB} GiB disk, and qm template needs room for the bake's data besides."
+        fi
         log_error "A full storage pauses every VM on it. Free space on $VM_STORAGE, or lower the floor for one run: BAKE_MIN_FREE_GIB=<GiB> runner rebake (or runner setup)"
         return 1
     fi

@@ -39,6 +39,9 @@ pvesm() {
 storage_row() {
     printf '%-16s %8s %10s %15d %15d %15d %7.2f%%' "$1" zfspool "$2" $((500 * gib)) $((500 * gib - $3)) "$3" 50
 }
+# The installer's local-zfs is sparse: a bake takes at most its disk there.
+# bakerebake2-thick-zfs covers zfspool storage without `sparse`.
+pvesh() { printf '{"storage":"%s","type":"zfspool","pool":"rpool/data","sparse":1}\n' "${2#/storage/}"; }
 qm() {
     printf '%s\n' "$*" >> "$state/qm.log"
     [[ "$1" == create ]]
