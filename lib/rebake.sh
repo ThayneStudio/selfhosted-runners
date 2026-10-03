@@ -4,7 +4,8 @@
 # Reads /etc/github-runners.conf and does not prompt. Bakes a second VM while
 # the current template keeps serving clones, holds that VMID's reservation for
 # the whole bake, and points TEMPLATE_ID at the new VM only after `qm template`
-# succeeds. A failure destroys the partial VM and leaves the live template.
+# has converted its disks to base volumes. A failure destroys the partial VM
+# and leaves the live template.
 set -euo pipefail
 
 REBAKE_LIB_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
@@ -298,7 +299,12 @@ cleanup_rebake() {
                 name=$(printf '%s\n' "$cfg" | awk '/^name:/{print $2; exit}')
                 if [[ "$name" != "ubuntu-cloud-template" ]]; then
                     log_error "Refusing to destroy VM $BAKE_VMID (${name:-unnamed}); it is not the rebake VM"
-                elif printf '%s\n' "$cfg" | grep -q '^template: 1[[:space:]]*$'; then
+                elif [[ "$BAKE_VMID" == "$TEMPLATE_ID" ]]; then
+                    log_error "Refusing to destroy VM $BAKE_VMID; it is the live template"
+                    if [[ "$rc" -eq 0 ]]; then
+                        rc=1
+                    fi
+                elif template_is_converted "$BAKE_VMID"; then
                     # qm template can finish before REBAKE_PUBLISHED is set. Keep
                     # the pending files so the next run can switch TEMPLATE_ID.
                     # A signal can also leave $? at 0; the oneshot must not
@@ -308,6 +314,8 @@ cleanup_rebake() {
                         rc=1
                     fi
                 else
+                    # This includes `template: 1` over unconverted disks: qm
+                    # template writes the flag first, and no clone can use it.
                     log_warn "Rebake failed; destroying partial VM $BAKE_VMID and leaving template ${TEMPLATE_ID} unchanged"
                     qm_host stop "$BAKE_VMID" --timeout 30 2>/dev/null || true
                     if qm_host destroy "$BAKE_VMID" --purge; then
@@ -358,7 +366,9 @@ recover_pending_bake() {
         rm -f "$PENDING_BAKE_FILE" "$PENDING_VERSION_FILE"
         return 0
     fi
-    if printf '%s\n' "$cfg" | grep -q '^template: 1[[:space:]]*$'; then
+    # Never publish on `template: 1` alone: Proxmox writes it before converting
+    # the disks, and a template without base volumes cannot be cloned.
+    if template_is_converted "$id"; then
         if [[ "$id" != "$TEMPLATE_ID" ]]; then
             log_info "Finishing publish of template $id"
             switch_template_id "$id"
@@ -374,9 +384,10 @@ recover_pending_bake() {
         return 0
     fi
     if [[ "$id" == "$TEMPLATE_ID" ]]; then
-        log_error "Pending bake id $id is the live template VM and is not a template; leaving it"
+        log_error "Pending bake id $id is the live template VM and is not a converted template; leaving it"
         return 1
     fi
+    # This includes `template: 1` over disks that were never converted.
     log_warn "Destroying incomplete rebake VM $id"
     qm_host stop "$id" --timeout 30 2>/dev/null || true
     if qm_host destroy "$id" --purge; then
@@ -435,6 +446,12 @@ require_live_template() {
         log_error "VM $TEMPLATE_ID is not a template. Run 'runner setup' to create one."
         return 1
     }
+    # The flag is written before qm template converts the disks.
+    template_is_converted "$TEMPLATE_ID" || {
+        log_error "Template $TEMPLATE_ID has disks that are not base volumes, so it cannot be cloned."
+        log_error "Inspect it with 'qm config $TEMPLATE_ID'; destroy it and run 'runner setup' to bake a new one."
+        return 1
+    }
 }
 
 perform_bake() {
@@ -458,7 +475,9 @@ perform_bake() {
     create_bake_vm "$new_vmid"
     BAKE_WRITE_PENDING_VERSION=1
     bake_and_publish_vm "$new_vmid"
-    # qm template succeeded. From here the partial-VM trap must not destroy it.
+    # bake_and_publish_vm returns 0 only after template_is_converted accepts the
+    # VM, so the switch and the record below name a template clones can use.
+    # From here the partial-VM trap must not destroy it.
     REBAKE_PUBLISHED=1
     switch_template_id "$new_vmid"
     commit_baked_version "$BAKE_RUNNER_VERSION" "$new_vmid"

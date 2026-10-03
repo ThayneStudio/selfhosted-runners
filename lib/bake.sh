@@ -249,6 +249,13 @@ bake_and_publish_vm() {
     qm_host set "$vmid" --delete nameserver 2>/dev/null || true
 
     qm_host template "$vmid" || { log_error "Failed to convert to template"; return 1; }
+    # qm template exits 0 when its conversion worker fails, and Proxmox writes
+    # `template: 1` before it converts the disks. Only base volumes can be
+    # linked-cloned, so check the result instead of trusting the exit status.
+    if ! template_is_converted "$vmid"; then
+        log_error "qm template did not convert the disks of VM $vmid to base volumes; refusing to publish it"
+        return 1
+    fi
     # Set before returning so a signal in the caller cannot destroy a VM that
     # qm template already published. cleanup_rebake reads this; setup's trap does not.
     # shellcheck disable=SC2034
