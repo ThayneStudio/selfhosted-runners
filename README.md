@@ -780,8 +780,9 @@ stops partway, run `install.sh` again at once.
    `github-runner-rebake.timer`. When `/etc/github-runners.conf` exists, it
    then checks that `TEMPLATE_ID` is a finished template. If it is, it says
    there is no need to re-run setup. If it is not, it says so and tells you
-   to run `runner setup`. If `qm` is unavailable or the check cannot be made,
-   it says it could not check. On a host that still has the per-org snippets
+   to run `runner setup`. If `qm` is unavailable, pmxcfs is not serving
+   `/etc/pve`, or the check cannot be made, it says it could not check. On a
+   host that still has the per-org snippets
    of a version before single-use JIT configs
    (`/var/lib/vz/snippets/runner-user-data-<org>.yaml`, which held the org PAT),
    it also removes them. While any VM's cicustom still names one of those

@@ -22,7 +22,7 @@ echo "Installed to $INSTALL_DIR"
 # use. rebake stops in that state, so the operator runs setup. qm missing, or
 # a config we cannot read, is reported as unchecked.
 report_install_template() {
-    local id="${TEMPLATE_ID:-}" err cfg name
+    local id="${TEMPLATE_ID:-}" err cfg name nodes
     if [[ ! "$id" =~ ^[0-9]+$ ]]; then
         echo "TEMPLATE_ID (${id:-unset}) in /etc/github-runners.conf is not a finished template."
         echo "Run the setup wizard:"
@@ -42,8 +42,20 @@ report_install_template() {
         echo "Could not check whether template VM $id is a finished template."
         return 0
     fi
+    # While pmxcfs restarts, /etc/pve is empty and qm says every config
+    # "does not exist". That is not proof this template is gone.
+    nodes="${PVE_NODES_DIR:-/etc/pve/nodes}"
+    if ! compgen -G "$nodes/*" >/dev/null; then
+        echo "Could not check whether template VM $id is a finished template: pmxcfs is not serving /etc/pve."
+        return 0
+    fi
     err=$(mktemp)
     if ! cfg=$(qm config "$id" 2>"$err"); then
+        if ! compgen -G "$nodes/*" >/dev/null; then
+            rm -f "$err"
+            echo "Could not check whether template VM $id is a finished template: pmxcfs is not serving /etc/pve."
+            return 0
+        fi
         if grep -q 'does not exist' "$err"; then
             rm -f "$err"
             echo "Template VM $id does not exist, so it is not a finished template."
@@ -56,6 +68,10 @@ report_install_template() {
         return 0
     fi
     rm -f "$err"
+    if ! compgen -G "$nodes/*" >/dev/null; then
+        echo "Could not check whether template VM $id is a finished template: pmxcfs is not serving /etc/pve."
+        return 0
+    fi
     if template_is_converted "$id"; then
         echo "Done. No need to re-run setup."
         return 0

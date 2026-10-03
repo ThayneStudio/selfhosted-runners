@@ -32,6 +32,10 @@ source "$state/report.sh"
 
 INSTALL_DIR=$root
 TEMPLATE_ID=9000
+# pmxcfs is serving when a node directory is visible. qm's "does not exist"
+# is only believed while that stays true across the config read.
+PVE_NODES_DIR=$state/nodes
+mkdir -p "$PVE_NODES_DIR/pve1"
 qm_mode=converted
 
 qm() {
@@ -58,6 +62,11 @@ qm() {
                 broken)
                     printf 'connection refused\n' >&2
                     return 1
+                    ;;
+                cfs-during)
+                    rm -rf "$PVE_NODES_DIR/pve1"
+                    printf "Configuration file 'nodes/pve/qemu-server/%s.conf' does not exist\n" "$2" >&2
+                    return 2
                     ;;
                 *) fail "unknown qm mode $qm_mode" ;;
             esac
@@ -112,6 +121,27 @@ grep -qF 'runner setup' "$state/out" || fail "a missing template did not say to 
 if grep -qF 'qm destroy' "$state/out"; then
     fail "a missing VM was told to be destroyed: $(cat "$state/out")"
 fi
+
+# qm reports the same "does not exist" while pmxcfs is down. That is not
+# a missing template, and it must not send the operator to runner setup.
+rm -rf "$PVE_NODES_DIR"
+mkdir -p "$PVE_NODES_DIR"
+say missing
+refuses_done "a down pmxcfs"
+grep -qF 'Could not check whether template VM 9000 is a finished template: pmxcfs is not serving /etc/pve.' "$state/out" \
+    || fail "a down pmxcfs was treated as a missing template: $(cat "$state/out")"
+if grep -qF 'runner setup' "$state/out"; then
+    fail "a down pmxcfs told the operator to run setup: $(cat "$state/out")"
+fi
+mkdir -p "$PVE_NODES_DIR/pve1"
+say cfs-during
+refuses_done "pmxcfs dropping during qm config"
+grep -qF 'pmxcfs is not serving /etc/pve' "$state/out" \
+    || fail "pmxcfs dropping during qm config was treated as a missing template: $(cat "$state/out")"
+if grep -qF 'runner setup' "$state/out"; then
+    fail "pmxcfs dropping during qm config told the operator to run setup: $(cat "$state/out")"
+fi
+mkdir -p "$PVE_NODES_DIR/pve1"
 
 say broken
 refuses_done "an unreadable qm"
