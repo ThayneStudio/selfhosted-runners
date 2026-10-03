@@ -597,7 +597,7 @@ render_user_snippet() {
     local tmp
     tmp=$(mktemp "$SNIPPETS_DIR/.runner-${vmid}-user.XXXXXX") || return 1
     chmod 600 "$tmp"
-    JIT_CONFIG="$jit_config" GITHUB_ORG="$GITHUB_ORG" DOCKER_MIRROR_URL="${DOCKER_MIRROR_URL:-}" awk '
+    JIT_CONFIG="$jit_config" GITHUB_ORG="$GITHUB_ORG" DOCKER_MIRROR_URL="${DOCKER_MIRROR_URL:-}" DNS_SERVERS="${DNS_SERVERS:-}" awk '
     # Literal string replace (avoids gsub special chars: & and \)
     function lreplace(str, old, new,    i, result) {
         result = ""
@@ -611,6 +611,7 @@ render_user_snippet() {
         $0 = lreplace($0, "{{JIT_CONFIG}}", ENVIRON["JIT_CONFIG"])
         $0 = lreplace($0, "{{GITHUB_ORG}}", ENVIRON["GITHUB_ORG"])
         $0 = lreplace($0, "{{DOCKER_MIRROR_URL}}", ENVIRON["DOCKER_MIRROR_URL"])
+        $0 = lreplace($0, "{{DNS_SERVERS}}", ENVIRON["DNS_SERVERS"])
         print
     }' "$INSTALL_DIR/templates/runner-user-data.yaml" > "$tmp" || { rm -f "$tmp"; return 1; }
     mv "$tmp" "$SNIPPETS_DIR/runner-${vmid}-user-${org}.yaml" || { rm -f "$tmp"; return 1; }
