@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Checks the parts of the template bake script that shape every clone: the
-# Docker mirror configuration. Blocks of /opt/setup-template.sh, rendered with
+# Docker mirror configuration and the periodic apt jobs. Blocks of
+# /opt/setup-template.sh, rendered with
 # the real render_template_setup_snippet, run under a scratch root with the
 # system commands they call mocked on PATH.
 set -euo pipefail
@@ -76,7 +77,8 @@ run_in_guest() {
     local name="$1" body="$2"
     guest=$work/$name/root
     state=$work/$name/state
-    mkdir -p "$guest/etc" "$state"
+    # Directories the stock cloud image already has.
+    mkdir -p "$guest/etc/apt/apt.conf.d" "$guest/etc/netplan" "$state"
     : > "$state/calls"
     {
         cat <<'EOF'
@@ -88,9 +90,10 @@ EOF
         in_guest_root "$body" "$guest"
         printf '\n'
     } > "$state/script"
-    GUEST_STATE=$state PATH="$bin:$PATH" "$BASH" "$state/script" > "$state/out" 2>&1 \
+    GUEST_STATE=$state PATH="$extra_path$bin:$PATH" "$BASH" "$state/script" > "$state/out" 2>&1 \
         || fail "$name: the bake block failed: $(cat "$state/out")"
 }
+extra_path=""
 
 render_setup_script
 if command -v python3 >/dev/null 2>&1 && python3 -c 'import yaml' 2>/dev/null; then
@@ -141,5 +144,38 @@ jq -e '."storage-driver" == "overlay2" and ."insecure-registries" == ["10.20.1.1
     "$guest/etc/docker/daemon.json" >/dev/null || fail "an HTTP mirror lost its overlay2 and insecure-registries settings"
 [[ ! -e "$guest/etc/containerd" ]] || fail "the bake still writes /etc/containerd/certs.d, which Docker never reads"
 DOCKER_MIRROR_URL=""
+render_setup_script
+
+# Periodic apt jobs. unattended-upgrades takes the dpkg lock without waiting
+# for cloud-final, under the bake and under jobs on every clone. They must be
+# off before the bake's first apt-get, and stay off in the template.
+before_first_apt_get() {
+    awk '
+        index($0, "log \"[2/12]") == 1 { on = 1 }
+        on && !/^[[:space:]]*#/ && /apt-get/ { exit }
+        on { print }
+    ' "$setup_script"
+}
+[[ -n "$(before_first_apt_get)" ]] || fail "could not find the bake's [2/12] step"
+run_in_guest apt-periodic "$(before_first_apt_get)"
+grep -qxF 'systemctl disable --now apt-daily.timer apt-daily-upgrade.timer' "$state/calls" \
+    || fail "the apt-daily timers are not disabled before the bake's first apt-get"
+grep -qxF 'systemctl mask apt-daily.service apt-daily-upgrade.service' "$state/calls" \
+    || fail "the apt-daily services are not masked before the bake's first apt-get"
+apt_conf=$(grep -lF 'APT::Periodic::Unattended-Upgrade "0";' "$guest"/etc/apt/apt.conf.d/* 2>/dev/null | head -1 || true)
+[[ -n "$apt_conf" ]] || fail "unattended-upgrades is not turned off in apt.conf.d"
+grep -qxF 'APT::Periodic::Update-Package-Lists "0";' "$apt_conf" || fail "periodic package list updates are not turned off"
+grep -Eqx 'DPkg::Lock::Timeout "[1-9][0-9]*";' "$apt_conf" || fail "apt-get does not wait for a held dpkg lock"
+# apt reads apt.conf.d in order; the stock 20auto-upgrades turns both on.
+[[ "$(basename "$apt_conf")" > 50unattended-upgrades ]] || fail "$(basename "$apt_conf") is read before the stock apt settings"
+# An image without these units must still bake.
+mkdir -p "$work/bin-systemctl-fails"
+printf '#!/bin/bash\nexit 1\n' > "$work/bin-systemctl-fails/systemctl"
+chmod +x "$work/bin-systemctl-fails/systemctl"
+extra_path=$work/bin-systemctl-fails:
+run_in_guest apt-periodic-no-units "$(before_first_apt_get)"
+extra_path=""
+grep -rqF 'APT::Periodic::Unattended-Upgrade "0";' "$guest/etc/apt/apt.conf.d" \
+    || fail "a failed systemctl call skipped the apt settings"
 
 printf 'guest-template-setup: ok\n'

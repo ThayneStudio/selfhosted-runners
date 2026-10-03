@@ -76,6 +76,20 @@ write_files:
       done
 
       log "[2/12] Updating system packages and installing base prerequisites..."
+      # apt-daily-upgrade is not ordered after cloud-final, so unattended-upgrades
+      # can hold the dpkg lock during this bake, and during a job on any clone,
+      # and apt-get fails at once on a held lock. The template is rebaked
+      # instead, so turn the periodic jobs off for good, and let apt-get wait
+      # for a run that had already started.
+      systemctl disable --now apt-daily.timer apt-daily-upgrade.timer \
+        || log "Could not disable the apt-daily timers; continuing"
+      systemctl mask apt-daily.service apt-daily-upgrade.service \
+        || log "Could not mask the apt-daily services; continuing"
+      cat > /etc/apt/apt.conf.d/99runner-template <<'APTEOF'
+      APT::Periodic::Update-Package-Lists "0";
+      APT::Periodic::Unattended-Upgrade "0";
+      DPkg::Lock::Timeout "300";
+      APTEOF
       retry "apt-get update"
       retry "apt-get install -y ca-certificates curl gnupg jq unzip zstd build-essential git wget apt-transport-https software-properties-common qemu-guest-agent"
       systemctl enable --now qemu-guest-agent
