@@ -173,9 +173,20 @@ record_setup_bake() {
 
 # Drop the pending-bake record once VM $TEMPLATE_ID is published or destroyed.
 # A record that names another VM belongs to a bake this setup did not make.
+# A first bake writes no pending record, so the created marker has to go on
+# its own: leaving it would make the next setup of this VMID free a disk
+# that was already there.
 forget_setup_bake() {
+    local id="" marker_vmid=""
+    if [[ -f "${PENDING_BAKE_FILE}.created" ]]; then
+        read -r marker_vmid _ < "${PENDING_BAKE_FILE}.created" || true
+        if [[ "$marker_vmid" == "$TEMPLATE_ID" ]]; then
+            rm -f "${PENDING_BAKE_FILE}.created" || return 1
+        fi
+    fi
     [[ -f "$PENDING_BAKE_FILE" ]] || return 0
-    [[ "$(tr -d '[:space:]' < "$PENDING_BAKE_FILE")" == "$TEMPLATE_ID" ]] || return 0
+    id=$(tr -d '[:space:]' < "$PENDING_BAKE_FILE") || return 0
+    [[ "$id" == "$TEMPLATE_ID" ]] || return 0
     drop_pending_bake
 }
 
@@ -264,6 +275,12 @@ bake_setup_template() {
     fi
     # Armed before create_bake_vm, whose checks can refuse before `qm create`,
     # so that cleanup_bake also drops the record of a VM that never existed.
+    # The previous bake's marker, if this VMID was used before, must already
+    # be gone: a refusal frees disks only when this run created the VM.
+    # BAKE_RUN_TOKEN makes a marker the removal missed fail to match.
+    unset BAKE_VM_CREATED
+    BAKE_RUN_TOKEN=$$-$RANDOM$RANDOM
+    rm -f "${PENDING_BAKE_FILE}.created"
     trap cleanup_bake EXIT
     log_info "Creating VM template..."
     create_bake_vm "$TEMPLATE_ID"

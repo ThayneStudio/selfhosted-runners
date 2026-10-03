@@ -127,6 +127,11 @@ run_setup() {
     setup_rc=$?
     set -e
 }
+run_setup_cleanup() {
+    : > "$actions"
+    : > "$frees"
+    ( cleanup_bake ) 2>"$state/log"
+}
 run_cleanup() {
     : > "$actions"
     : > "$frees"
@@ -361,4 +366,86 @@ assert_kept local-zfs:vm-9201-disk-0 "stale created marker"
 assert_not_freed local-zfs:vm-9201-disk-0 "stale created marker"
 if record_kept; then fail "the refused rebake stayed recorded"; fi
 
+# A first setup writes no pending record. Publishing still has to remove the
+# created marker, or the next setup of this VMID treats it as its own VM.
+reset_case
+TEMPLATE_ID=9100
+unset BAKE_VM_CREATED BAKE_RUN_TOKEN
+mark_bake_vm_created 9100
+unset BAKE_VM_CREATED
+[[ -f "${PENDING_BAKE_FILE}.created" ]] || fail "mark_bake_vm_created wrote no marker"
+forget_setup_bake
+[[ ! -e "${PENDING_BAKE_FILE}.created" ]] || fail "a first setup left its created marker behind"
+[[ ! -e "$PENDING_BAKE_FILE" ]] || fail "forgetting a first setup created a pending record"
+# Another bake's marker is not this template's.
+printf '9001\n' > "${PENDING_BAKE_FILE}.created"
+forget_setup_bake
+[[ -f "${PENDING_BAKE_FILE}.created" ]] || fail "forget removed a marker for a different VMID"
+
+# The marker is cleared before create, so a refusal cannot free a disk that
+# was already on the VMID. A first setup never calls record_setup_bake.
+reset_case
+TEMPLATE_ID=9100
+LIVE_TEMPLATE_ID=
+mock_avail=$((100 * gib))
+set_volumes <<'EOF'
+local-zfs:vm-9100-disk-0
+EOF
+install -d -m 700 "$STATE_DIR"
+printf '9100\n' > "${PENDING_BAKE_FILE}.created"
+unset BAKE_VM_CREATED BAKE_RUN_TOKEN
+saved_create=$(declare -f create_bake_vm)
+eval "real_$(declare -f create_bake_vm)"
+# shellcheck disable=SC2329 # bake_setup_template calls this override
+create_bake_vm() {
+    if [[ -f "${PENDING_BAKE_FILE}.created" ]]; then
+        printf 'present\n' > "$state/marker-at-create"
+    else
+        printf 'absent\n' > "$state/marker-at-create"
+    fi
+    real_create_bake_vm "$@"
+}
+run_setup
+eval "$saved_create"
+[[ "$(cat "$state/marker-at-create" 2>/dev/null)" == absent ]] \
+    || fail "setup did not clear the created marker before qm create"
+[[ "$setup_rc" != 0 ]] || fail "a VMID that already has a volume was baked"
+if grep -q '^create ' "$actions"; then fail "qm create ran on a VMID that already has a volume"; fi
+assert_kept local-zfs:vm-9100-disk-0 "stale marker from a first setup"
+assert_not_freed local-zfs:vm-9100-disk-0 "stale marker from a first setup"
+
+# A marker that carries another run's token does not count while this process
+# is baking, even if it was not removed. Recover, which did not start a bake,
+# still honours it.
+reset_case
+TEMPLATE_ID=9100
+LIVE_TEMPLATE_ID=
+unset BAKE_VM_CREATED
+# shellcheck disable=SC2034 # bake_vm_was_created reads it
+BAKE_RUN_TOKEN=this-run
+set_volumes <<'EOF'
+local-zfs:vm-9100-disk-0
+EOF
+printf '9100 other-run\n' > "${PENDING_BAKE_FILE}.created"
+run_setup_cleanup
+assert_kept local-zfs:vm-9100-disk-0 "marker from another run"
+assert_not_freed local-zfs:vm-9100-disk-0 "marker from another run"
+printf '9100 this-run\n' > "${PENDING_BAKE_FILE}.created"
+run_setup_cleanup
+assert_gone local-zfs:vm-9100-disk-0 "marker from this run"
+# The next rebake is not this process's bake. The old marker is enough.
+set_volumes <<'EOF'
+local-zfs:base-9100-disk-0
+EOF
+pending 9100
+printf '9100 other-run\n' > "${PENDING_BAKE_FILE}.created"
+# shellcheck disable=SC2034 # recover_pending_bake clears it; the marker must still count
+BAKE_RUN_TOKEN=this-run
+TEMPLATE_ID=9000
+run_recover
+[[ "$recover_rc" == 0 ]] || fail "recover ignored a created marker because a token was set: $(cat "$state/log")"
+assert_gone local-zfs:base-9100-disk-0 "recover with a foreign token in the environment"
+unset BAKE_RUN_TOKEN
+
 printf 'bake-preexisting-volume: ok\n'
+

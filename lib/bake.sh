@@ -251,21 +251,28 @@ mark_bake_vm_created() {
     # still has BAKE_VM_CREATED for its own cleanup. A later recover needs the
     # file; the operator is told when it could not be written.
     if ! install -d -m 700 "$(dirname "$marker")" \
-        || ! printf '%s\n' "$vmid" > "$marker" \
+        || ! printf '%s %s\n' "$vmid" "${BAKE_RUN_TOKEN:-}" > "$marker" \
         || ! chmod 600 "$marker"; then
         log_warn "Could not record that bake VM $vmid was created ($marker)"
     fi
 }
 
-# 0 when this run's qm create succeeded for VMID $1, or a previous run
+# 0 when this process's qm create succeeded for VMID $1, or a previous run
 # recorded that it had. A pending file with no such record is a VMID that
-# was only reserved.
+# was only reserved. While this process has started a bake (BAKE_RUN_TOKEN),
+# a marker from an earlier process does not match: its token is different,
+# so cleanup cannot free a disk that was already on the VMID.
 bake_vm_was_created() {
-    local vmid="$1" recorded=""
+    local vmid="$1" file_vmid="" file_token=""
     [[ "${BAKE_VM_CREATED:-}" == "$vmid" ]] && return 0
     [[ -n "${PENDING_BAKE_FILE:-}" && -f "${PENDING_BAKE_FILE}.created" ]] || return 1
-    recorded=$(tr -d '[:space:]' < "${PENDING_BAKE_FILE}.created") || return 1
-    [[ "$recorded" == "$vmid" ]]
+    read -r file_vmid file_token < "${PENDING_BAKE_FILE}.created" || return 1
+    [[ "$file_vmid" == "$vmid" ]] || return 1
+    if [[ -n "${BAKE_RUN_TOKEN:-}" ]]; then
+        [[ "$file_token" == "$BAKE_RUN_TOKEN" ]]
+        return
+    fi
+    return 0
 }
 
 log_guest_setup_tail() {

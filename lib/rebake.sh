@@ -682,6 +682,9 @@ cleanup_rebake() {
 
 recover_pending_bake() {
     local id ver cfg name node settle_rc=0
+    # This process did not create the VM. A token or flag left in the
+    # environment belongs to some other bake and must not hide the marker.
+    unset BAKE_RUN_TOKEN BAKE_VM_CREATED
     [[ -f "$PENDING_BAKE_FILE" ]] || return 0
     id=$(tr -d '[:space:]' < "$PENDING_BAKE_FILE")
     if [[ ! "$id" =~ ^[0-9]+$ ]]; then
@@ -834,7 +837,10 @@ perform_bake() {
     old_template=$TEMPLATE_ID
     install -d -m 700 "$STATE_DIR"
     # The created marker is written only after qm create. A marker left by
-    # an older bake of some other id must not apply to this one.
+    # an older bake of some other id must not apply to this one, and a token
+    # on this run makes one the removal missed fail to match.
+    unset BAKE_VM_CREATED
+    BAKE_RUN_TOKEN=$$-$RANDOM$RANDOM
     rm -f "${PENDING_BAKE_FILE}.created"
     printf '%s\n' "$new_vmid" > "$PENDING_BAKE_FILE"
     chmod 600 "$PENDING_BAKE_FILE"
