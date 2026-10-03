@@ -32,6 +32,7 @@ write_files:
       # Logging with timestamps
       log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"; }
       log_error() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: $1" >&2; }
+      log_warn() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] WARNING: $1" >&2; }
 
       # Always shut down the VM when this script exits (success or failure).
       # Prevents zombie VMs that block a runner slot forever.
@@ -59,6 +60,13 @@ write_files:
       # /etc/docker/certs.d, never /etc/containerd/certs.d; that routes
       # public.ecr.aws through the mirror. HTTP mirrors use overlay2, which
       # reads no hosts.toml. A failed Docker restart refuses to register.
+      # Docker verifies an HTTPS mirror's certificate against the system
+      # roots. Only a mirror addressed by IP literal (IPv4, or IPv6 in
+      # brackets), which usually has a self-signed or internal certificate,
+      # skips that check. The bake applies the same rule. A mirror addressed
+      # by name (MIRROR_NAME) must also resolve with DNS_SERVERS (below).
+      MIRROR_REGISTRY=""
+      MIRROR_NAME=""
       if [[ -n "${DOCKER_MIRROR_URL:-}" ]]; then
         log "Configuring Docker mirror for public.ecr.aws: $DOCKER_MIRROR_URL"
         mkdir -p /etc/docker/certs.d/public.ecr.aws
@@ -66,6 +74,12 @@ write_files:
         SUPABASE_IMAGE_REGISTRY="${SUPABASE_IMAGE_REGISTRY#https://}"
         MIRROR_REGISTRY="${SUPABASE_IMAGE_REGISTRY%%/*}"
         mkdir -p "/etc/docker/certs.d/$MIRROR_REGISTRY"
+        MIRROR_TLS=""
+        if [[ "$MIRROR_REGISTRY" == \[* || "${MIRROR_REGISTRY%%:*}" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
+          [[ "$DOCKER_MIRROR_URL" != https://* ]] || MIRROR_TLS=$'\n  skip_verify = true'
+        else
+          MIRROR_NAME="${MIRROR_REGISTRY%%:*}"
+        fi
         if [[ "$DOCKER_MIRROR_URL" == http://* ]]; then
           cat > /etc/docker/daemon.json <<DOCKEREOF
       {
@@ -86,15 +100,13 @@ write_files:
       server = "https://public.ecr.aws"
 
       [host."$DOCKER_MIRROR_URL"]
-        capabilities = ["pull", "resolve"]
-        skip_verify = true
+        capabilities = ["pull", "resolve"]$MIRROR_TLS
       TOMLEOF
         cat > "/etc/docker/certs.d/$MIRROR_REGISTRY/hosts.toml" <<TOMLEOF
       server = "$DOCKER_MIRROR_URL"
 
       [host."$DOCKER_MIRROR_URL"]
-        capabilities = ["pull", "resolve"]
-        skip_verify = true
+        capabilities = ["pull", "resolve"]$MIRROR_TLS
       TOMLEOF
         if systemctl restart docker; then
           log "Docker mirror configured"
@@ -104,6 +116,20 @@ write_files:
           exit 1
         fi
       fi
+      # The template keeps the hosts.toml files of the mirror it was baked
+      # with, and Docker reads them on every pull. Remove those the configured
+      # mirror does not use, or a mirror removed or replaced since the bake
+      # stays in the path of public.ecr.aws pulls until the next rebake.
+      for HOSTS_TOML in /etc/docker/certs.d/*/hosts.toml; do
+        [[ -e "$HOSTS_TOML" ]] || continue
+        HOSTS_DIR="${HOSTS_TOML%/hosts.toml}"
+        HOSTS_DIR="${HOSTS_DIR##*/}"
+        if [[ -n "$MIRROR_REGISTRY" && ( "$HOSTS_DIR" == public.ecr.aws || "$HOSTS_DIR" == "$MIRROR_REGISTRY" ) ]]; then
+          continue
+        fi
+        rm -f "$HOSTS_TOML"
+        log "Removed the template's stale Docker mirror config: $HOSTS_TOML"
+      done
 
       if ! systemctl is-active --quiet docker; then
         log_error "Docker is not running; refusing to register runner"
@@ -124,17 +150,46 @@ write_files:
 
       # Proxmox's --nameserver never reaches eth0: cloud-init attaches global
       # nameservers only to statically addressed interfaces, and eth0 is DHCP.
-      # Apply DNS_SERVERS here. Without it, drop the DHCP gateway (often not a
-      # resolver for VMs on bridged networks) unless it is the only server.
+      # Apply DNS_SERVERS here, and keep them only if they resolve github.com
+      # and the mirror's name: a network that blocks public DNS, or a mirror
+      # with a LAN name, would otherwise break every clone. Without them, or
+      # when they fail, use the DHCP servers, read before DNS_SERVERS replace
+      # them, and drop the gateway (often not a resolver for VMs on bridged
+      # networks) unless it is the only server.
       # Each lookup can find nothing, which must not end the script.
+      CONFIGURED_DNS=$(resolvectl status eth0 2>/dev/null | grep "DNS Servers:" | sed 's/.*DNS Servers: //' || true)
+      DNS_CHECK_NAMES=(github.com)
+      [[ -z "$MIRROR_NAME" ]] || DNS_CHECK_NAMES+=("$MIRROR_NAME")
+      DNS_UNRESOLVED=""
+      # 0 when every name in $@ resolves through eth0's servers. Otherwise the
+      # first that does not is in DNS_UNRESOLVED. resolved retries a lost
+      # query for up to two minutes, so each try is cut short.
+      resolves_on_eth0() {
+        local name attempt
+        for name in "$@"; do
+          for attempt in 1 2 3; do
+            if timeout 10 resolvectl query --interface=eth0 --cache=no "$name" > /dev/null 2>&1; then
+              continue 2
+            fi
+            [[ $attempt -eq 3 ]] || sleep 2
+          done
+          DNS_UNRESOLVED=$name
+          return 1
+        done
+      }
+      DNS_KEPT=0
       if [[ -n "${DNS_SERVERS:-}" ]]; then
-        if resolvectl dns eth0 $DNS_SERVERS; then
-          log "DNS servers: $DNS_SERVERS"
-        else
+        if ! resolvectl dns eth0 $DNS_SERVERS; then
           log_error "Failed to set DNS servers: $DNS_SERVERS"
+        elif resolves_on_eth0 "${DNS_CHECK_NAMES[@]}"; then
+          log "DNS servers: $DNS_SERVERS"
+          DNS_KEPT=1
+        else
+          log_warn "DNS servers $DNS_SERVERS cannot resolve $DNS_UNRESOLVED; using the DHCP servers instead. Set DNS_SERVERS in /etc/github-runners.conf on the Proxmox host to resolvers that answer on this network, or leave it empty to use DHCP."
+          resolvectl revert eth0 || log_error "Failed to revert eth0 to the DHCP DNS servers"
         fi
-      else
-        CONFIGURED_DNS=$(resolvectl status eth0 2>/dev/null | grep "DNS Servers:" | sed 's/.*DNS Servers: //' || true)
+      fi
+      if [[ "$DNS_KEPT" == 0 ]]; then
         GATEWAY=$(ip route | awk '/default/{print $3}' || true)
         CLEAN_DNS=$(echo "$CONFIGURED_DNS" | tr ' ' '\n' | grep -vxF "$GATEWAY" | tr '\n' ' ' || true)
         if [[ -n "$CLEAN_DNS" ]]; then
@@ -206,7 +261,8 @@ write_files:
 
       # Run directly with the JIT config (no config.sh registration needed; JIT
       # runners are inherently ephemeral and auto-remove). When run.sh exits
-      # (job complete or error), the VM shuts down and the hookscript reclones.
+      # (job complete or error), the VM shuts down and the hookscript reclones;
+      # after a refused runner version it first stays up a few minutes.
       # sudo resets the environment, so run.sh's settings go through env. With
       # ACTIONS_RUNNER_RETURN_VERSION_DEPRECATED_EXIT_CODE=1 (runner 2.333.0+),
       # a runner version GitHub refuses exits 7 instead of looking like success.
@@ -215,6 +271,8 @@ write_files:
         ACTIONS_RUNNER_RETURN_VERSION_DEPRECATED_EXIT_CODE=1
         ACTIONS_RUNNER_HOOK_JOB_STARTED=/opt/runner-job-started.sh
       )
+      # How long a VM whose runner version GitHub refused stays up (below).
+      VERSION_REFUSED_HOLD_SECS=300
       RUN_STATUS=0
       if [[ -n "${SUPABASE_IMAGE_REGISTRY:-}" ]]; then
         sudo -u $RUNNER_USER env "${RUNNER_ENV[@]}" SUPABASE_INTERNAL_IMAGE_REGISTRY="$SUPABASE_IMAGE_REGISTRY" INTERNAL_IMAGE_REGISTRY="$SUPABASE_IMAGE_REGISTRY" ./run.sh --jitconfig "$JIT" --disableupdate || RUN_STATUS=$?
@@ -223,7 +281,17 @@ write_files:
       fi
       case "$RUN_STATUS" in
         0) log "run.sh exited 0" ;;
-        7) log_error "run.sh exited 7: GitHub refused this runner version. Run 'runner rebake' on the Proxmox host." ;;
+        7)
+          log_error "run.sh exited 7: GitHub refused this runner version. Run 'runner rebake' on the Proxmox host."
+          # The host sees only a stopped VM and clones the slot again from the
+          # same template, whose runner is refused a minute or so after boot.
+          # Leave the reason where `qm guest exec` can read it, and stay up a
+          # few minutes, so a refused slot cannot cycle every minute.
+          printf 'rc=7\nrunner_version=%s\n' "$(cat /opt/.baked-runner-version 2>/dev/null || echo unknown)" \
+            > /opt/.runner-version-refused || log_error "Could not write /opt/.runner-version-refused"
+          log "Holding the VM for ${VERSION_REFUSED_HOLD_SECS}s before it powers off. From the Proxmox host: qm guest exec <vmid> -- cat /opt/.runner-version-refused"
+          sleep "$VERSION_REFUSED_HOLD_SECS"
+          ;;
         *) log_error "run.sh exited $RUN_STATUS" ;;
       esac
       # EXIT trap handles shutdown

@@ -107,6 +107,17 @@ if [[ "$1" == status && -s "$GUEST_STATE/dhcp-dns" ]]; then
     printf 'Link 2 (eth0)\n       DNS Servers: %s\n' "$(cat "$GUEST_STATE/dhcp-dns")"
 fi
 EOF
+# The guest bounds each check that DNS_SERVERS resolve with timeout.
+cat > "$bin/timeout" <<'EOF'
+#!/bin/bash
+shift
+exec "$@"
+EOF
+# A refused runner version holds the VM a few minutes before it powers off.
+cat > "$bin/sleep" <<'EOF'
+#!/bin/bash
+printf 'sleep %s\n' "$*" >> "$GUEST_STATE/calls"
+EOF
 cat > "$bin/ip" <<'EOF'
 #!/bin/bash
 printf 'default via 192.168.1.1 dev eth0 proto dhcp src 192.168.1.50 metric 100\n'
