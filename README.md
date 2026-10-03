@@ -187,23 +187,46 @@ Runner VMs take the first free VMIDs from `MIN_VMID` up (setup's default is
 Each watcher run also frees leftover VM volumes, such as those of failed
 clones, unless a clone is in progress: image volumes on `VM_STORAGE` named
 `vm-<id>-disk-N` or `vm-<id>-cloudinit` whose VMID has no VM or container
-config on any node. It covers VMIDs from `MIN_VMID` up, never `TEMPLATE_ID`
-itself. With `MIN_VMID=0` it covers VMIDs above `TEMPLATE_ID`, a floor that
-moves whenever a rebake puts the template on a new VMID. Below the VMIDs it
-covers, it frees such a volume only when `pvesm list` shows it as a linked
-clone of a runner template (`base-<template>-disk-N/vm-<id>-disk-M` on ZFS or
-Ceph RBD): the current template, or one on the rebake's retirement list that
-is still a template named `ubuntu-cloud-template`. That way a runner disk left
-behind there does not keep its template from being retired. Other volumes
-there, a leftover `vm-<id>-cloudinit` included, stay. Set `MIN_VMID` above
-every VMID your other guests use, keep no volume you want without a VM in that
-range, and keep no linked clone of a runner template without a VM at any VMID.
+config on any node. A missing config counts only while pmxcfs serves
+`/etc/pve`, which the sweep checks by listing `/etc/pve/nodes` just before and
+just after each lookup. While pmxcfs is not serving it, for example while
+pve-cluster restarts during an upgrade or after pmxcfs crashed, the sweep stops
+for that run and logs
+`[orphan-sweep] pmxcfs is not serving /etc/pve, so guest configs cannot be checked; stopping the sweep`;
+the next run tries again. A failed clone then stops freeing its own volumes
+too, and leaves them to the sweep. The sweep covers VMIDs from `MIN_VMID` up,
+never `TEMPLATE_ID` itself. With `MIN_VMID=0` it covers every VMID above
+`TEMPLATE_ID`, your other guests' included, a floor that moves whenever a
+rebake puts the template on a new VMID. Below the VMIDs it covers, it frees
+such a volume only when `pvesm list` shows it as a linked clone of a runner
+template (`base-<template>-disk-N/vm-<id>-disk-M` on ZFS or Ceph RBD): the
+current template, or one on the rebake's retirement list that is still a
+template named `ubuntu-cloud-template`. That way a runner disk left behind
+there does not keep its template from being retired. Other volumes there, a
+leftover `vm-<id>-cloudinit` included, stay. Set `MIN_VMID` above every VMID
+your other guests use, keep no volume you want without a VM in that range, and
+keep no linked clone of a runner template without a VM at any VMID.
 
 The Notes field (`description`) of each runner VM reads
-`selfhosted-runners org=<org> kind=slot|extra`. Together with the per-VM
-snippets, that is how the tool recognises its VMs, so do not edit it. Runner VMs
-are set to `reboot: 0`: a reboot inside the guest ends the VM like a shutdown,
-and the runner is recycled.
+`selfhosted-runners org=<org> kind=slot|extra vmid=<vmid>`. Together with the
+per-VM snippets, that is how the tool recognises its VMs, so do not edit it. A
+VM is a managed runner of `<org>` when its `cicustom` has the whole property
+`user=local:snippets/runner-<vmid>-user-<org>.yaml`, with its own VMID as
+`<vmid>`, or `user=local:snippets/runner-user-data-<org>.yaml`, the per-org
+snippet of runners cloned before single-use JIT configs, which names no VMID.
+Failing both, the marker counts, but only on the VM whose VMID it names. A VM
+whose snippet name only resembles these, such as `runner-2-user-data.yaml` or
+`gitlab-runner-user-data-prod.yaml`, is not a managed runner, and no `runner`
+command lists, stops or destroys it. A full clone of a runner VM copies its
+Notes, `cicustom` and hookscript, but the marker and the per-VM snippet it
+copies name the VMID of the VM it was cloned from. Without a per-org snippet,
+such a clone is not a managed runner: `runner list` and `runner list-orgs`
+leave it out, `runner stop` leaves it alone, `runner destroy` refuses it as not
+managed, the watcher does not reclaim it, and when it stops, the reclone that
+its copied hookscript starts skips it (`could not identify VM`).
+
+Runner VMs are set to `reboot: 0`: a reboot inside the guest ends the VM like a
+shutdown, and the runner is recycled.
 
 ## Commands
 
@@ -216,11 +239,11 @@ After setup, the `runner` command is available globally:
 | `runner remove-org [<org>]` | Remove a configured org |
 | `runner list-orgs` | List configured orgs and runner counts |
 | `runner create [--org <org>] <name>` | Create an extra runner VM outside the pool's slots |
-| `runner destroy <name>` | Destroy a managed runner VM (the watcher refills a slot) |
+| `runner destroy <name>` | Destroy a managed runner VM (the watcher refills a slot, not an extra runner) |
 | `runner start` | Exit maintenance mode, clear failure holds and fill the pool |
 | `runner stop [options]` | Enter maintenance mode and stop managed runners |
 | `runner list` | List all runner VMs |
-| `runner watch` | Fill missing slots and reclaim dead runner VMs (run by a 30s timer) |
+| `runner watch` | Fill missing slots and recorded extra runners, and reclaim dead runner VMs (run by a 30s timer) |
 | `runner rebake [--foreground]` | Bake a replacement template when the baked runner is stale |
 | `runner help` | Show available commands |
 
@@ -422,6 +445,24 @@ needs removing there by hand. Extra runners from `runner create` are not slots:
 they keep being re-cloned until `runner destroy`, or until their org is
 removed.
 
+`runner create` records each extra runner as a `<name> <org>` line in
+`/var/lib/github-runners/extras`, unless the name is one of the org's slots.
+The watcher fills a recorded extra runner of a configured org as it fills a
+slot: failure holds, maintenance mode and an unfinished template keep it empty
+the same way, and a slot of the same name comes first. So an extra runner that
+a hold, a template rebuild or a failed re-clone left empty comes back.
+`runner destroy`, by name or `--vmid`, removes the record once the VM is gone
+and prints `Extra runner removed; the watcher will not recreate it.` If it
+cannot, it says so and exits 1; run `runner destroy <name>` again. For a
+recorded extra runner that has no VM at the moment, such as one that is held,
+`runner destroy <name>` removes just the record. A full `runner stop` removes
+every record, `runner stop --vmid-range` only those of the extra runners it
+destroys, and `runner stop --watch-only` none. `runner remove-org` removes the
+org's records, and a reclone or the watcher removes the record of a name it
+retires, such as one whose org is gone or that another org now uses as a slot.
+An extra runner that an older version created is not recorded until
+`runner create` creates it again.
+
 Runner VMs cloned by an older version have no `kind=` in their Notes. A lowered
 count still retires them, but after a prefix change they keep recycling as
 extras. After upgrading, run `runner stop && runner start` once before you
@@ -585,20 +626,35 @@ start until `TEMPLATE_ID`, the retirement list and the baked-version record
 name the new template, a window that ends with a release-date lookup on
 api.github.com of up to about 2 minutes. So setup will not bake while a rebake
 runs, and a rebake started in that time logs `A rebake is already running` and
-exits. Setup records the new VM in `/var/lib/github-runners/pending-bake`, as
-a rebake records its own bake, and removes the record once `TEMPLATE_ID` names
-the new template or its cleanup has destroyed a failed VM. If setup leaves the
-VM behind, because it was killed before its cleanup ran (`kill -9`, a power
-loss), could not destroy a failed VM (it then shows `qm`'s error and the
-commands that remove the VM by hand) or could not rewrite `TEMPLATE_ID`, the
-next rebake run takes over. It destroys a VM that is not a finished template
+exits.
+
+Setup records the new VM in `/var/lib/github-runners/pending-bake`, as a
+rebake records its own bake, and removes the record once `TEMPLATE_ID` names
+the new template or its cleanup has destroyed a failed VM. A bake that stops
+before its VM exists, such as one that the `BAKE_TIMEOUT`, free-space or
+release check refuses, loses its record as well, when the cluster inventory
+confirms that no VM has that ID. If setup leaves the VM behind, because it was
+killed before its cleanup ran (`kill -9`, a power loss), could not destroy a
+failed VM (it then shows `qm`'s error and the commands that remove the VM by
+hand) or could not rewrite `TEMPLATE_ID`, the next rebake run takes over. It
+destroys a VM that is not a finished template
 (`Destroying incomplete rebake VM <id>`), or publishes a finished one
 (`Finishing publish of template <id>`) and then bakes once more, because that
-publish records no runner version. While the record names another VM that may
-still exist, setup refuses to bake beside the live template and asks you to
-run `runner rebake` first. Choose an ID below `MIN_VMID`. Setup does not
-reserve the ID while it downloads the cloud image, so a runner clone can take
-an ID in the runner range first, and the bake then fails.
+publish records no runner version. It drops a record that names no VM. A
+record whose VMID now belongs to a VM with another name on this node
+(`Pending bake id <id> is <name>; leaving that VM and dropping the stale pending record`),
+to a container, or to a guest on another node
+(`Pending bake id <id> is a guest on node <node>, not a bake VM on this node; dropping the stale pending record`)
+is stale too: the rebake drops it and leaves that guest alone. While the record
+names another VM that may still exist, setup refuses to bake beside the live
+template and asks you to run `runner rebake` first. Its message also says that
+the record is stale when `qm config <id>` on this node shows no VM named
+`ubuntu-cloud-template`, and that you can then remove it instead with
+`rm /var/lib/github-runners/pending-bake`. Choose an ID below `MIN_VMID`. Setup
+does not reserve the ID while it downloads the cloud image, so a runner clone
+can take an ID in the runner range first. The bake then fails, and setup logs
+`Refusing to destroy VM <id> (<name>); it is not the template bake VM` after
+`qm`'s error. The next rebake drops a record that names that runner.
 
 Entering the ID of another finished template switches `TEMPLATE_ID` to it at
 once. The next daily check then finds a baked-version record for a different
@@ -631,19 +687,28 @@ setup bake.
 `runner stop` without `--vmid-range` destroys every managed runner VM for every
 configured org, extra runners from `runner create` included; `runner start`
 refills only the slots. With three orgs, that is every managed VM across all
-three. The in-progress rebake VM is named `ubuntu-cloud-template` and has no org
-snippet, so stop does not treat it as a managed runner. `runner stop` leaves
-the pool in maintenance mode until `runner start`. The maintenance flag lives
-in `/run/lock/`, which is tmpfs. It does not survive a host reboot, and the
-watcher timer stays enabled, so a reboot mid-maintenance resumes runner
-creation. Do not reboot the Proxmox host between `runner stop` and
-`runner start`. On a full stop it also frees orphaned linked-clone child
-volumes for the current template when those volumes no longer have a VM or
-container config anywhere in the cluster. Each freed volume must then be gone
-from `pvesm list`, because `pvesm free` exits 0 even when its deletion task
-fails; a volume that is still listed fails the stop. If any child volumes still
-belong to a VM, template or container config, `runner stop` fails and tells you
-to resolve those dependents before deleting the template.
+three. It also clears the record of extra runners,
+`/var/lib/github-runners/extras`, including those that have no VM at the
+moment. If it cannot, it logs
+`Could not clear the extra runners recorded in /var/lib/github-runners/extras`
+and fails before it destroys any VM. The in-progress rebake VM is named
+`ubuntu-cloud-template` and has no org snippet, so stop does not treat it as a
+managed runner. `runner stop` leaves the pool in maintenance mode until
+`runner start`. The maintenance flag lives in `/run/lock/`, which is tmpfs. It
+does not survive a host reboot, and the watcher timer stays enabled, so a
+reboot mid-maintenance resumes runner creation. Do not reboot the Proxmox host
+between `runner stop` and `runner start`. On a full stop it also frees
+orphaned linked-clone child volumes for the current template when those
+volumes no longer have a VM or container config anywhere in the cluster. Each
+freed volume must then be gone from `pvesm list`, because `pvesm free` exits 0
+even when its deletion task fails; a volume that is still listed fails the
+stop. If any child volumes still belong to a VM, template or container config,
+`runner stop` fails and tells you to resolve those dependents before deleting
+the template. While pmxcfs is not serving `/etc/pve` (pve-cluster restarting
+during an upgrade, or a crashed pmxcfs), no config can be checked: the stop
+frees no more volumes, logs
+`pmxcfs is not serving /etc/pve, so VM configs cannot be checked; not freeing <volid>`
+and fails. Check that pve-cluster is running, then run `runner stop` again.
 
 `runner start` clears the maintenance flag and every slot's failure hold,
 starts the watcher timer, and runs one pool fill inside
@@ -654,9 +719,11 @@ half. It waits for that fill, which logs to the journal:
 `runner stop --vmid-range <min:max>` is for partial maintenance windows only.
 Do not use a VMID-limited stop immediately before destroying a linked-clone
 template, because every dependent clone must be removed before `qm destroy`
-will succeed. `runner stop --watch-only` stops the watcher and leaves the VMs
-up. Its maintenance flag also keeps the hookscript from recycling a VM that
-stops, so use it before you stop or reboot a runner VM by hand.
+will succeed. It removes the records of the extra runners it destroys and
+keeps the others. `runner stop --watch-only` stops the watcher, and leaves the
+VMs up and every extra runner recorded. Its maintenance flag also keeps the
+hookscript from recycling a VM that stops, so use it before you stop or reboot
+a runner VM by hand.
 
 ### Upgrading an existing host
 
@@ -693,7 +760,12 @@ stops partway, run `install.sh` again at once.
    curl -fsSL https://raw.githubusercontent.com/ThayneStudio/selfhosted-runners/master/install.sh | bash
    ```
    It refreshes the hookscript and the systemd units and enables
-   `github-runner-rebake.timer`.
+   `github-runner-rebake.timer`. On a host that still has the per-org snippets
+   of a version before single-use JIT configs
+   (`/var/lib/vz/snippets/runner-user-data-<org>.yaml`, which held the org PAT),
+   it also removes them and warns that the runner VMs cloned from them still
+   have the PAT on their cloud-init drive. Step 4 destroys those VMs (see
+   [Security Notes](#security-notes)).
 3. Bake a template now. A template baked before the daily rebake has no
    baked-version record, so this bakes. The timer's first check would wait for
    the next midnight, and until a bake publishes, clones of the old template
@@ -780,8 +852,8 @@ reclaims no VM. `runner rebake` stops with an error for the same reason. A
 runner VM that stops in that time is still destroyed by its reclone, but its
 slot stays empty, and `/var/log/github-runner.log` shows
 `reclone: template <id> is not a finished template; leaving <name> empty for the watcher`.
-That does not count as a failed clone, and the watcher fills the slot once the
-template is finished.
+That does not count as a failed clone, and the watcher fills the slot, or the
+recorded extra runner, once the template is finished.
 
 ### VM creation fails with "storage not found"
 
@@ -829,6 +901,12 @@ the VM:
 - was started again more than about 2 minutes after its clone (a stop-mode
   backup, `qm reboot`), since cloud-init starts the runner only once.
 
+The watcher stops and destroys only a VM it can prove it cloned. Besides being
+a managed runner (see [Runner Specs](#runner-specs)), the VM must have its own
+meta snippet in `cicustom` (`meta=local:snippets/runner-<vmid>-meta.yaml`) or
+the Notes marker with its own VMID. A per-org snippet names no VMID, so it is
+not enough alone.
+
 A clone made while `/var/lib/vz/snippets/runner-hookscript.sh` is missing logs
 a warning with the command that restores it,
 `install -m 755 /opt/selfhosted-runners/templates/runner-hookscript.sh /var/lib/vz/snippets/runner-hookscript.sh`;
@@ -853,7 +931,8 @@ does the watcher for a stopped VM it reclaims because nothing recycled it (no
 hookscript on the VM, a reclone unit that systemd refused), measuring the VM's
 life up to when it first saw the VM stopped. Either logs the hold as
 `<name> died within 600s of its clone 3 times in a row`, prefixed with
-`reclone:` or `[watch]`. The watcher fills the slot when the hold ends.
+`reclone:` or `[watch]`. The watcher fills the slot when the hold ends. A
+recorded extra runner from `runner create` is held and filled the same way.
 `runner start` clears every hold, and `runner add-org` clears the holds of the
 org's slots; a hand edit of an org config clears none. A hold with more than
 30 minutes left, which only a backward clock step can leave, counts as over.
@@ -870,12 +949,22 @@ A VM that holds the slot's name also keeps it empty. The watcher logs:
   `lock: clone`, which nothing clears. Run `qm unlock <vmid>`; the watcher then
   reclaims the VM.
 - `carries no selfhosted-runners snippet or marker; leaving it`: a VM named
-  like a slot that the tool cannot prove it made, such as a clone an older
-  version left half-configured. Remove it with `qm destroy <vmid>`.
+  like a slot or a recorded extra runner that the watcher cannot prove it
+  cloned (see [Runner shows "Offline"](#runner-shows-offline-in-github)), such
+  as a full clone of a runner, or a clone that an older version left
+  half-configured, with no `vmid=` in its Notes. Remove a leftover clone with
+  `qm destroy <vmid>`, or rename a VM you keep.
 
-A plain `qm destroy` of a runner leaves its snippets behind. When a VM with any
-other name later takes that VMID, the watcher leaves the VM alone, removes the
-snippets and logs
+`runner destroy <name>` refuses a VM that is not a managed runner (see
+[Runner Specs](#runner-specs)). While such a VM holds the name of a recorded
+extra runner, `runner destroy` cannot end that extra runner either; rename or
+remove the VM first.
+
+A plain `qm destroy` of a runner leaves its snippets behind. When a VM that the
+watcher cannot prove it cloned, and that is not named like a slot or a recorded
+extra runner, later takes that VMID, the watcher leaves the VM alone and
+removes those snippets, except any that the VM's own config names. When it
+removed one, it logs
 `[watch] VMID <id> is now <name>, not a runner VM; removed the runner snippets left behind for it`.
 
 ### Docker commands fail in workflows
@@ -926,7 +1015,8 @@ The runner VM might not have network connectivity. Check:
 | `/var/lib/vz/snippets/runner-hookscript.sh` | Post-stop hookscript that starts each reclone |
 | `/var/lib/github-runners/baked-runner-version` | Baked-version record: `Runner.Listener` version, template ID, bake time and Docker mirror of the last successful bake |
 | `/var/lib/github-runners/retired-templates` | Replaced templates, destroyed by the rebake once no linked clone depends on them |
-| `/var/lib/github-runners/pending-bake` | The VM of a bake beside the live template, from a rebake or from setup, until it is published or destroyed; the next rebake run finishes or removes a VM left there |
+| `/var/lib/github-runners/pending-bake` | The VM of a bake beside the live template, from a rebake or from setup, until it is published or destroyed; the next rebake run finishes or removes a VM left there, and drops a record that names no bake VM on this node |
+| `/var/lib/github-runners/extras` | Extra runners from `runner create`, one `<name> <org>` per line, which the watcher fills like slots (see [Pool size and prefix](#pool-size-and-prefix)) — mode 600 |
 | `/run/github-runners/` | Per-slot failure holds (`slot-<name>`) and when the watcher first saw each stopped runner VM (`watch-stopped`); gone after a reboot |
 | `/run/lock/github-runner-drain` | Maintenance flag; the pool's lock files sit beside it in `/run/lock/` |
 | `/var/log/github-runner.log` | Output of each reclone (`github-runner-reclone-<vmid>` units) |
@@ -971,9 +1061,14 @@ Inside the VMs:
   runner VMs out of backups (see [Backups](#backups)). This is the recommended
   GitHub mechanism for short-lived runners and removes the reusable-token
   exposure entirely.
-- **Upgrade recycle**: after deploying this change, existing VMs still have the
-  old PAT on their cloud-init drive until they are destroyed. Recycle the pool
-  with `runner stop` then `runner start`.
+- **Upgrade recycle**: on a host upgraded from a version before single-use JIT
+  configs, runner VMs cloned from the old per-org snippets still have the org
+  PAT on their cloud-init drive, where any job they run can read it, until they
+  are destroyed. `install.sh` warns about them when it removes those snippets,
+  and so does `runner setup` on a host with orgs configured. Step 4 of
+  [Upgrading an existing host](#upgrading-an-existing-host) destroys them
+  (`runner stop && runner start`); recycling before the bake only removes the
+  PAT sooner.
 - **Runner user**: VMs run as user `runner` with NOPASSWD sudo and `docker`
   group membership (both root-equivalent inside the VM) — required for Docker.
 - **⚠️ Do not use these runners on public repositories.** Self-hosted runners
