@@ -202,14 +202,45 @@ conf_exact_assignment_key() {
     printf '%s\n' "$key"
 }
 
+# 0 when sourcing $1 in a clean shell leaves $2 set to $3.
+# The probe exits 42 after printing the value. set -e is on, and a sourced
+# exit skips the print: that must not look like an empty value. $2 is passed
+# as a parameter so the name is not interpolated into the script.
+conf_file_sets() {
+    local file="$1" key="$2" value="$3" got status
+    [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 1
+    # shellcheck disable=SC2016 # $1 and ${!2-} expand in the clean shell, not here
+    if got=$(env -i bash -c 'set -e; . "$1"; printf %s "${!2-}"; exit 42' bash "$file" "$key"); then
+        status=0
+    else
+        status=$?
+    fi
+    [[ "$status" -eq 42 ]] || return 1
+    [[ "$got" == "$value" ]]
+}
+
+# 0 when $1 sources to $2=$3. When it does not, append one exact assignment
+# and check again. 1 when the sourced value is still wrong. 2 when that
+# append could not be written. Callers leave the previous file in place.
+confirm_conf_assignment() {
+    local file="$1" key="$2" value="$3"
+    if conf_file_sets "$file" "$key" "$value"; then
+        return 0
+    fi
+    printf '%s=%q\n' "$key" "$value" >> "$file" || return 2
+    conf_file_sets "$file" "$key" "$value"
+}
+
 set_conf_assignment() {
-    local file="$1" key="$2" value="$3" tmp line found=0 syntax
+    local file="$1" key="$2" value="$3" tmp line found=0 syntax status
     # Callers invoke this under `||`, which disables errexit for the whole
     # function, so each step reports its own failure. A line is replaced only
     # when it is exactly one assignment of this key. Anything else stays,
-    # including a second command on the line, and the new assignment is
-    # appended so it wins. bash -n runs before the mv; a result that is not
-    # valid shell leaves the old file.
+    # including a second command on the line. bash -n runs before the mv.
+    # The temp file is then sourced in a clean shell. If the key is still not
+    # the new value, an exact assignment is appended and the file is sourced
+    # again. A result that is not valid shell, or that still does not set the
+    # key, leaves the old file.
     tmp=$(mktemp "${file}.XXXXXX") || {
         log_error "Failed to update $key in $file"
         return 1
@@ -235,6 +266,17 @@ set_conf_assignment() {
         log_error "Not replacing $file: the rewritten file is not valid shell, so the old one is unchanged"
         [[ -z "$syntax" ]] || log_error "$syntax"
         rm -f "$tmp"
+        return 1
+    fi
+    status=0
+    confirm_conf_assignment "$tmp" "$key" "$value" || status=$?
+    if [[ "$status" -ne 0 ]]; then
+        rm -f "$tmp"
+        if [[ "$status" -eq 2 ]]; then
+            log_error "Failed to update $key in $file"
+        else
+            log_error "Not replacing $file: sourcing it does not set $key to the new value, so the old one is unchanged"
+        fi
         return 1
     fi
     if ! chmod 600 "$tmp" || ! mv -f "$tmp" "$file"; then

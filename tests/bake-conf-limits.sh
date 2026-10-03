@@ -70,7 +70,7 @@ export VLAN_TAG=9
 VM_STORAGE=old
 BAKE_TIMEOUT=7200
 BAKE_MIN_FREE_GIB=15
-EXTRA_LIMIT=keep me
+EXTRA_LIMIT='keep me'
 TEMPLATE_ID=1
 TEMPLATE_ID=2
 MIN_VMID=2
@@ -90,7 +90,7 @@ if grep -qx 'TEMPLATE_ID=1' "$CONFIG_FILE" || grep -qx 'TEMPLATE_ID=2' "$CONFIG_
 fi
 grep -qx 'BAKE_TIMEOUT=7200' "$CONFIG_FILE" || fail "setup dropped or rewrote BAKE_TIMEOUT: $(cat "$CONFIG_FILE")"
 grep -qx 'BAKE_MIN_FREE_GIB=15' "$CONFIG_FILE" || fail "setup dropped BAKE_MIN_FREE_GIB: $(cat "$CONFIG_FILE")"
-grep -qx 'EXTRA_LIMIT=keep me' "$CONFIG_FILE" || fail "setup dropped an unknown key: $(cat "$CONFIG_FILE")"
+grep -qx "EXTRA_LIMIT='keep me'" "$CONFIG_FILE" || fail "setup dropped an unknown key: $(cat "$CONFIG_FILE")"
 grep -qx 'NETWORK_BRIDGE=vmbr0' "$CONFIG_FILE" || fail "setup did not rewrite the bridge"
 if grep -q 'VLAN_TAG=9' "$CONFIG_FILE"; then
     fail "an exported VLAN_TAG value survived the rewrite: $(cat "$CONFIG_FILE")"

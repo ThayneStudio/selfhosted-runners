@@ -110,9 +110,12 @@ warn_template_storage() {
 # wizard prompts for. Anything else stays, including BAKE_TIMEOUT,
 # BAKE_MIN_FREE_GIB, a second command on the same line, and a quoted value
 # that continues on the next line. The new assignment is then appended so
-# it wins. The old file is left in place when the result is not valid shell.
+# it wins. After bash -n, the temp file is sourced in a clean shell. A key
+# that is still wrong gets one more exact assignment. The old file is left
+# in place when the result is not valid shell, or when sourcing it still
+# does not set one of these keys to the new value.
 write_infra_config() {
-    local conf_tmp line key syntax
+    local conf_tmp line key syntax status
     local -A new_value=()
     local -A written=()
     local -A dirty=()
@@ -159,6 +162,19 @@ write_infra_config() {
         rm -f "$conf_tmp"
         return 1
     fi
+    for key in NETWORK_BRIDGE VLAN_TAG VM_STORAGE TEMPLATE_ID MIN_VMID BALLOON DNS_SERVERS DOCKER_MIRROR_URL; do
+        status=0
+        confirm_conf_assignment "$conf_tmp" "$key" "${new_value[$key]}" || status=$?
+        if [[ "$status" -ne 0 ]]; then
+            rm -f "$conf_tmp"
+            if [[ "$status" -eq 2 ]]; then
+                log_error "Failed to update $key in $CONFIG_FILE"
+            else
+                log_error "Not replacing $CONFIG_FILE: sourcing it does not set $key to the new value, so the old one is unchanged"
+            fi
+            return 1
+        fi
+    done
     chmod 600 "$conf_tmp"
     mv "$conf_tmp" "$CONFIG_FILE"
 }

@@ -2,8 +2,10 @@
 # setup replaces a conf line only when it is exactly one assignment of a key
 # it prompts for. A second command on the line, or a quote that continues
 # below, used to be swallowed, which dropped BAKE_TIMEOUT or left a file
-# bash could not source. A result that is not valid shell must not replace
-# the old file.
+# bash could not source. A later command that sets one of those keys without
+# looking like such an assignment must not stay the sourced value. A result
+# that is not valid shell, or that still does not source to the new values,
+# must not replace the old file.
 set -euo pipefail
 
 if [[ "${BASH_VERSINFO[0]}" -lt 4 ]]; then
@@ -97,5 +99,44 @@ write_infra_config 2>"$state/err" || rewrite_rc=$?
 [[ "$rewrite_rc" != 0 ]] || fail "setup published a conf bash cannot source"
 cmp -s "$CONFIG_FILE" "$state/before" || fail "setup replaced the conf with a file that is not valid shell"
 grep -q 'not valid shell' "$state/err" || fail "the refusal did not say why: $(cat "$state/err")"
+
+# The exact assignment is replaced in place, and this later command does not
+# look like one, so nothing used to be appended after it. It stayed last and
+# won. The sourced TEMPLATE_ID has to be the value setup just collected.
+TEMPLATE_ID=9001
+cat > "$CONFIG_FILE" <<'EOF'
+TEMPLATE_ID=9000
+true; TEMPLATE_ID=9000
+BAKE_MIN_FREE_GIB=50
+EOF
+write_infra_config
+grep -qx 'true; TEMPLATE_ID=9000' "$CONFIG_FILE" \
+    || fail "setup rewrote a later command that only mentions TEMPLATE_ID: $(cat "$CONFIG_FILE")"
+grep -qx 'BAKE_MIN_FREE_GIB=50' "$CONFIG_FILE" || fail "setup dropped BAKE_MIN_FREE_GIB: $(cat "$CONFIG_FILE")"
+# shellcheck disable=SC1090
+(
+    # shellcheck disable=SC1090
+    source "$CONFIG_FILE"
+    [[ "$TEMPLATE_ID" == 9001 ]] || exit 1
+    [[ "$BAKE_MIN_FREE_GIB" == 50 ]] || exit 1
+    [[ "$NETWORK_BRIDGE" == vmbr0 ]] || exit 1
+) || fail "setup left a later command as the effective TEMPLATE_ID: $(cat "$CONFIG_FILE")"
+cp "$CONFIG_FILE" "$state/stable"
+write_infra_config
+cmp -s "$CONFIG_FILE" "$state/stable" \
+    || fail "a second setup rewrite appended another TEMPLATE_ID: $(cat "$CONFIG_FILE")"
+
+# false aborts the source before any appended assignment. The old file stays.
+cat > "$CONFIG_FILE" <<'EOF'
+TEMPLATE_ID=9000
+false
+EOF
+cp "$CONFIG_FILE" "$state/before"
+rewrite_rc=0
+write_infra_config 2>"$state/err" || rewrite_rc=$?
+[[ "$rewrite_rc" != 0 ]] || fail "setup published a conf that does not source to the new values"
+cmp -s "$CONFIG_FILE" "$state/before" \
+    || fail "setup replaced a conf whose sourced keys stay wrong: $(cat "$CONFIG_FILE")"
+grep -q 'does not set' "$state/err" || fail "the refusal did not say why: $(cat "$state/err")"
 
 printf 'setup-conf-rewrite: ok\n'
