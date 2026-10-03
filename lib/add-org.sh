@@ -124,8 +124,11 @@ fi
 
 read -rp "Runner name prefix [${EXISTING_PREFIX:-runner}]: " RUNNER_PREFIX
 RUNNER_PREFIX=${RUNNER_PREFIX:-${EXISTING_PREFIX:-runner}}
-if [[ ! "$RUNNER_PREFIX" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]*$ ]]; then
-    log_error "Invalid prefix. Use only letters, numbers, dots, hyphens, underscores."
+# Slot names "${prefix}-${n}" become VM names, which qm clone checks as DNS
+# names. Checking "-1" covers every n: the digits never change the verdict.
+if ! validate_runner_name "${RUNNER_PREFIX}-1"; then
+    log_error "Invalid prefix '$RUNNER_PREFIX'. Use letters, numbers and hyphens, starting with a letter or number."
+    log_error "Runner names become Proxmox VM names, which must be DNS names (no underscores)."
     exit 1
 fi
 

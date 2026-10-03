@@ -29,8 +29,11 @@ if [[ -z "$RUNNER_NAME" ]]; then
     exit 1
 fi
 
-if [[ ! "$RUNNER_NAME" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]*$ ]]; then
+# The name becomes the VM name, which qm clone checks as a DNS name. Reject it
+# here: clone_runner mints (registers) the runner on GitHub before it clones.
+if ! validate_runner_name "$RUNNER_NAME"; then
     log_error "Invalid runner name: $RUNNER_NAME"
+    log_error "Use letters, numbers and hyphens, starting and ending with a letter or number (no underscores)."
     exit 1
 fi
 

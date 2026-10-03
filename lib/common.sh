@@ -49,6 +49,14 @@ validate_org_name() {
     [[ "$1" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?$ ]]
 }
 
+# A VM name `qm clone --name` accepts (Proxmox's dns-name format): dot-separated
+# labels of letters, digits and hyphens, each starting and ending with a letter
+# or digit. Check a runner name before minting a JIT config for it — the mint
+# registers the runner on GitHub, and a name qm rejects can never be cloned.
+validate_runner_name() {
+    [[ "$1" =~ ^([a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?\.)*[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?$ ]]
+}
+
 load_infra_config() {
     if [[ ! -f "$CONFIG_FILE" ]]; then
         log_error "Configuration not found at $CONFIG_FILE"
