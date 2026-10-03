@@ -55,13 +55,26 @@ perform_bake() { : > "$baked"; }
 
 # Runs one daily check against a config written the way setup writes it, with
 # TEMPLATE_ID=$1 and DOCKER_MIRROR_URL=$2. The record is already in place.
-daily_check() {
+write_config() {
     {
         printf 'NETWORK_BRIDGE=vmbr0\nVM_STORAGE=local-zfs\nTEMPLATE_ID=%q\n' "$1"
         printf 'MIN_VMID=9001\nDOCKER_MIRROR_URL=%q\n' "${2:-}"
     } > "$CONFIG_FILE"
     rm -f "$baked"
-    (rebake_main --foreground) || fail "rebake_main failed"
+}
+# rebake_main relies on errexit, as when `runner rebake` runs it. Bash ignores
+# errexit in anything run under `if`, `&&` or `||`, even after `set -e`, so
+# run it as a plain statement and keep its status in rebake_rc.
+run_rebake() {
+    set +e
+    (set -e; rebake_main --foreground)
+    rebake_rc=$?
+    set -e
+}
+daily_check() {
+    write_config "$@"
+    run_rebake
+    [[ "$rebake_rc" == 0 ]] || fail "rebake_main failed"
 }
 record() { cat > "$BAKED_VERSION_FILE"; }
 retired() { if [[ -e "$RETIRED_TEMPLATES_FILE" ]]; then tr '\n' ' ' < "$RETIRED_TEMPLATES_FILE"; fi; }
@@ -88,6 +101,19 @@ EOF
 daily_check 9000
 [[ -e "$baked" ]] || fail "a record for template 9005 suppressed the bake of live template 9000"
 [[ "$(retired)" == "9005 " ]] || fail "template 9005 was not queued for retirement: $(retired)"
+
+# If 9005 cannot be queued (ENOSPC), do not bake: the bake would move
+# TEMPLATE_ID on and leave 9005 recorded nowhere.
+rm -f "$RETIRED_TEMPLATES_FILE"
+write_config 9000
+mktemp() {
+    if [[ "${1:-}" == "$STATE_DIR/.retired."* ]]; then return 1; fi
+    command mktemp "$@"
+}
+run_rebake
+unset -f mktemp
+[[ "$rebake_rc" != 0 ]] || fail "rebake_main succeeded although 9005 could not be queued"
+[[ ! -e "$baked" ]] || fail "baked although template 9005 could not be queued for retirement"
 
 # Older and hand-written records have no template_id or docker_mirror_url;
 # they still count.

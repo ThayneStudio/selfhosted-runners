@@ -196,7 +196,10 @@ discard_stale_baked_record() {
         log_info "The baked-version record is for template $RECORDED_TEMPLATE_ID, not TEMPLATE_ID $TEMPLATE_ID; ignoring it"
         # Nothing listed that template for retirement when TEMPLATE_ID moved,
         # so it would leak. Retirement still checks its name and linked clones.
-        remember_retired_template "$RECORDED_TEMPLATE_ID"
+        if ! remember_retired_template "$RECORDED_TEMPLATE_ID"; then
+            log_error "Could not queue template $RECORDED_TEMPLATE_ID for retirement; not baking"
+            return 1
+        fi
     elif [[ "$RECORDED_DOCKER_MIRROR_KNOWN" == 1 && "$RECORDED_DOCKER_MIRROR_URL" != "${DOCKER_MIRROR_URL:-}" ]]; then
         log_info "The template was baked with Docker mirror ${RECORDED_DOCKER_MIRROR_URL:-none}, not ${DOCKER_MIRROR_URL:-none}; ignoring the baked-version record"
     else
