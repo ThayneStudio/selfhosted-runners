@@ -68,6 +68,12 @@ cat > "$bin/sleep" <<'EOF'
 #!/bin/bash
 printf 'sleep %s\n' "$*" >> "$GUEST_STATE/calls"
 EOF
+cat > "$bin/timeout" <<'EOF'
+#!/bin/bash
+printf 'timeout %s\n' "$*" >> "$GUEST_STATE/calls"
+shift
+exec "$@"
+EOF
 # dns-lookup NAME: 0 when one of eth0's DNS servers ($GUEST_STATE/link-dns)
 # answers for NAME. Each line of $GUEST_STATE/resolvers is a server that
 # answers on this network, then the names it resolves.
@@ -81,7 +87,8 @@ done
 exit 1
 EOF
 # eth0 starts with the servers DHCP offered: dns replaces them, revert
-# restores them, and query looks a name up through them.
+# restores them, and query looks a name up through them. The first
+# $GUEST_STATE/query-failures queries fail, as a lost packet would.
 cat > "$bin/resolvectl" <<'EOF'
 #!/bin/bash
 printf 'resolvectl %s\n' "$*" >> "$GUEST_STATE/calls"
@@ -94,7 +101,14 @@ case "$1" in
         ;;
     dns) shift 2; printf '%s' "$*" > "$GUEST_STATE/link-dns" ;;
     revert) cp "$GUEST_STATE/dhcp-dns" "$GUEST_STATE/link-dns" ;;
-    query) exec dns-lookup "${!#}" ;;
+    query)
+        failures=$(cat "$GUEST_STATE/query-failures")
+        if (( failures > 0 )); then
+            printf '%s' "$((failures - 1))" > "$GUEST_STATE/query-failures"
+            exit 1
+        fi
+        exec dns-lookup "${!#}"
+        ;;
 esac
 EOF
 cat > "$bin/ip" <<'EOF'
@@ -143,7 +157,9 @@ DNS_SERVERS=""
 # DHCP offers the gateway and the site resolver, which answers for every
 # name the checks use. Public resolvers answer only where a check says so.
 dhcp_dns="192.168.1.1 10.0.0.53"
-resolvers=("10.0.0.53 github.com registry.example.com mirror zot.home.arpa")
+site_resolver="10.0.0.53 github.com registry.example.com mirror zot.home.arpa"
+resolvers=("$site_resolver")
+query_failures=0
 run_rc=0
 # The HTTPS mirror the template was baked with, if any.
 template_mirror=""
@@ -177,6 +193,7 @@ boot() {
     printf '%s' "$dhcp_dns" > "$state/dhcp-dns"
     cp "$state/dhcp-dns" "$state/link-dns"
     printf '%s\n' "${resolvers[@]}" > "$state/resolvers"
+    printf '%s' "$query_failures" > "$state/query-failures"
     printf '%s\n' "$run_rc" > "$state/run-rc"
     [[ -z "$template_mirror" ]] || seed_template_mirror "$template_mirror"
     SNIPPETS_DIR=$work/$name
@@ -270,5 +287,75 @@ assert_ran "IPv6 mirror replaced since the bake"
     || fail "a clone removed the configured IPv6 mirror's config"
 template_mirror=""
 DOCKER_MIRROR_URL=""
+
+# DNS. DNS_SERVERS replace the DHCP servers only once they resolve github.com
+# and a mirror's host name from this network. Otherwise eth0 goes back to the
+# DHCP servers without the gateway, and the clone still registers.
+link_dns() { cat "$state/link-dns"; }
+queried() { grep -E "^resolvectl query .* $1\$" "$state/calls" || true; }
+DNS_SERVERS="1.1.1.1 8.8.8.8"
+# The network blocks public DNS: only the site resolver from DHCP answers.
+boot dns-public-blocked
+assert_ran "DNS_SERVERS blocked by the network"
+called "resolvectl dns eth0 1.1.1.1 8.8.8.8" || fail "DNS_SERVERS were not applied to eth0"
+called "resolvectl revert eth0" || fail "eth0 was not reverted to DHCP after DNS_SERVERS failed"
+[[ "$(link_dns)" == 10.0.0.53 ]] || fail "eth0 does not use the DHCP servers without the gateway: $(link_dns)"
+logged "DNS servers 1.1.1.1 8.8.8.8 cannot resolve github.com" || fail "the DNS servers that failed were not named"
+# resolved retries a lost query for up to two minutes: each try is bounded.
+[[ -n "$(queried github.com)" ]] || fail "github.com was not looked up through DNS_SERVERS"
+[[ "$(grep -c '^resolvectl query ' "$state/calls")" \
+    == "$(grep -cE '^timeout ([1-9]|[12][0-9]|30) resolvectl query ' "$state/calls")" ]] \
+    || fail "a DNS check is not bounded by timeout: $(grep -E '^(timeout|resolvectl query)' "$state/calls")"
+# DHCP offers only the gateway, which is the only server that answers.
+dhcp_dns="192.168.1.1"
+resolvers=("192.168.1.1 github.com")
+boot dns-public-blocked-gateway
+assert_ran "DNS_SERVERS blocked, DHCP offers only the gateway"
+[[ "$(link_dns)" == 192.168.1.1 ]] || fail "eth0 did not go back to the gateway, the only DHCP server: $(link_dns)"
+dhcp_dns="192.168.1.1 10.0.0.53"
+# Public DNS answers, but not for the mirror's LAN name.
+resolvers=("$site_resolver" "1.1.1.1 github.com" "8.8.8.8 github.com")
+DOCKER_MIRROR_URL=https://zot.home.arpa:5000
+boot dns-mirror-lan-name
+assert_ran "DNS_SERVERS do not resolve the mirror"
+[[ -n "$(queried zot.home.arpa)" ]] || fail "the mirror's host name was not looked up"
+called "resolvectl revert eth0" || fail "eth0 kept DNS_SERVERS that cannot resolve the mirror"
+[[ "$(link_dns)" == 10.0.0.53 ]] || fail "eth0 does not use the DHCP servers: $(link_dns)"
+logged "DNS servers 1.1.1.1 8.8.8.8 cannot resolve zot.home.arpa" || fail "the unresolved mirror was not named"
+# Working DNS_SERVERS stay.
+resolvers=("$site_resolver" "1.1.1.1 github.com zot.home.arpa")
+boot dns-servers-work
+assert_ran "working DNS_SERVERS"
+[[ "$(link_dns)" == "1.1.1.1 8.8.8.8" ]] || fail "working DNS_SERVERS were replaced: $(link_dns)"
+if called "resolvectl revert eth0"; then
+    fail "working DNS_SERVERS were reverted"
+fi
+logged "DNS servers: 1.1.1.1 8.8.8.8" || fail "the applied DNS servers were not logged"
+# One lost query is not a failure.
+query_failures=1
+boot dns-servers-flaky
+assert_ran "DNS_SERVERS with one lost query"
+[[ "$(link_dns)" == "1.1.1.1 8.8.8.8" ]] || fail "one lost query reverted working DNS_SERVERS: $(link_dns)"
+query_failures=0
+# An IP-literal mirror has no name to look up.
+n=0
+for DOCKER_MIRROR_URL in https://10.20.1.19:5000 "https://[fd00::19]:5000" http://10.20.1.19:5000; do
+    n=$((n + 1))
+    boot "dns-mirror-ip-$n"
+    assert_ran "DNS_SERVERS with mirror $DOCKER_MIRROR_URL"
+    [[ "$(grep '^resolvectl query ' "$state/calls" | grep -v ' github\.com$' || true)" == "" ]] \
+        || fail "an IP-literal mirror was looked up in DNS: $(grep '^resolvectl query ' "$state/calls")"
+    [[ "$(link_dns)" == "1.1.1.1 8.8.8.8" ]] || fail "DNS_SERVERS were not kept with mirror $DOCKER_MIRROR_URL: $(link_dns)"
+done
+DOCKER_MIRROR_URL=""
+# Without DNS_SERVERS nothing is checked: the DHCP servers stay, without the gateway.
+DNS_SERVERS=""
+resolvers=("$site_resolver")
+boot dns-dhcp
+assert_ran "DNS_SERVERS empty"
+if grep -qE '^resolvectl (query|revert) ' "$state/calls"; then
+    fail "DHCP DNS was checked or reverted although DNS_SERVERS is empty"
+fi
+[[ "$(link_dns)" == 10.0.0.53 ]] || fail "the gateway was not dropped from the DHCP DNS servers: $(link_dns)"
 
 printf 'guest2-register-runner: ok\n'

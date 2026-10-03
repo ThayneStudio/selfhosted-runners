@@ -32,6 +32,7 @@ write_files:
       # Logging with timestamps
       log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"; }
       log_error() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: $1" >&2; }
+      log_warn() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] WARNING: $1" >&2; }
 
       # Always shut down the VM when this script exits (success or failure).
       # Prevents zombie VMs that block a runner slot forever.
@@ -62,8 +63,10 @@ write_files:
       # Docker verifies an HTTPS mirror's certificate against the system
       # roots. Only a mirror addressed by IP literal (IPv4, or IPv6 in
       # brackets), which usually has a self-signed or internal certificate,
-      # skips that check. The bake applies the same rule.
+      # skips that check. The bake applies the same rule. A mirror addressed
+      # by name (MIRROR_NAME) must also resolve with DNS_SERVERS (below).
       MIRROR_REGISTRY=""
+      MIRROR_NAME=""
       if [[ -n "${DOCKER_MIRROR_URL:-}" ]]; then
         log "Configuring Docker mirror for public.ecr.aws: $DOCKER_MIRROR_URL"
         mkdir -p /etc/docker/certs.d/public.ecr.aws
@@ -74,6 +77,8 @@ write_files:
         MIRROR_TLS=""
         if [[ "$MIRROR_REGISTRY" == \[* || "${MIRROR_REGISTRY%%:*}" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
           [[ "$DOCKER_MIRROR_URL" != https://* ]] || MIRROR_TLS=$'\n  skip_verify = true'
+        else
+          MIRROR_NAME="${MIRROR_REGISTRY%%:*}"
         fi
         if [[ "$DOCKER_MIRROR_URL" == http://* ]]; then
           cat > /etc/docker/daemon.json <<DOCKEREOF
@@ -145,17 +150,46 @@ write_files:
 
       # Proxmox's --nameserver never reaches eth0: cloud-init attaches global
       # nameservers only to statically addressed interfaces, and eth0 is DHCP.
-      # Apply DNS_SERVERS here. Without it, drop the DHCP gateway (often not a
-      # resolver for VMs on bridged networks) unless it is the only server.
+      # Apply DNS_SERVERS here, and keep them only if they resolve github.com
+      # and the mirror's name: a network that blocks public DNS, or a mirror
+      # with a LAN name, would otherwise break every clone. Without them, or
+      # when they fail, use the DHCP servers, read before DNS_SERVERS replace
+      # them, and drop the gateway (often not a resolver for VMs on bridged
+      # networks) unless it is the only server.
       # Each lookup can find nothing, which must not end the script.
+      CONFIGURED_DNS=$(resolvectl status eth0 2>/dev/null | grep "DNS Servers:" | sed 's/.*DNS Servers: //' || true)
+      DNS_CHECK_NAMES=(github.com)
+      [[ -z "$MIRROR_NAME" ]] || DNS_CHECK_NAMES+=("$MIRROR_NAME")
+      DNS_UNRESOLVED=""
+      # 0 when every name in $@ resolves through eth0's servers. Otherwise the
+      # first that does not is in DNS_UNRESOLVED. resolved retries a lost
+      # query for up to two minutes, so each try is cut short.
+      resolves_on_eth0() {
+        local name attempt
+        for name in "$@"; do
+          for attempt in 1 2 3; do
+            if timeout 10 resolvectl query --interface=eth0 --cache=no "$name" > /dev/null 2>&1; then
+              continue 2
+            fi
+            [[ $attempt -eq 3 ]] || sleep 2
+          done
+          DNS_UNRESOLVED=$name
+          return 1
+        done
+      }
+      DNS_KEPT=0
       if [[ -n "${DNS_SERVERS:-}" ]]; then
-        if resolvectl dns eth0 $DNS_SERVERS; then
-          log "DNS servers: $DNS_SERVERS"
-        else
+        if ! resolvectl dns eth0 $DNS_SERVERS; then
           log_error "Failed to set DNS servers: $DNS_SERVERS"
+        elif resolves_on_eth0 "${DNS_CHECK_NAMES[@]}"; then
+          log "DNS servers: $DNS_SERVERS"
+          DNS_KEPT=1
+        else
+          log_warn "DNS servers $DNS_SERVERS cannot resolve $DNS_UNRESOLVED; using the DHCP servers instead. Set DNS_SERVERS in /etc/github-runners.conf on the Proxmox host to resolvers that answer on this network, or leave it empty to use DHCP."
+          resolvectl revert eth0 || log_error "Failed to revert eth0 to the DHCP DNS servers"
         fi
-      else
-        CONFIGURED_DNS=$(resolvectl status eth0 2>/dev/null | grep "DNS Servers:" | sed 's/.*DNS Servers: //' || true)
+      fi
+      if [[ "$DNS_KEPT" == 0 ]]; then
         GATEWAY=$(ip route | awk '/default/{print $3}' || true)
         CLEAN_DNS=$(echo "$CONFIGURED_DNS" | tr ' ' '\n' | grep -vxF "$GATEWAY" | tr '\n' ' ' || true)
         if [[ -n "$CLEAN_DNS" ]]; then
