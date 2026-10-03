@@ -2,7 +2,9 @@
 # Boots a clone's /opt/register-runner.sh the way cloud-init would: render the
 # per-VM user-data with the real render_user_snippet, write every write_files
 # entry under a scratch root, then run the script there with the system
-# commands it calls mocked on PATH. Checks the Docker mirror configuration.
+# commands it calls mocked on PATH. Checks the Docker mirror configuration,
+# the DNS_SERVERS check with its DHCP fallback, and the hold after GitHub
+# refuses the runner version.
 set -euo pipefail
 
 if [[ "${BASH_VERSINFO[0]}" -lt 4 ]]; then
@@ -64,9 +66,11 @@ cat > "$bin/systemctl" <<'EOF'
 #!/bin/bash
 printf 'systemctl %s\n' "$*" >> "$GUEST_STATE/calls"
 EOF
+# Also records what /opt holds while the guest waits.
 cat > "$bin/sleep" <<'EOF'
 #!/bin/bash
 printf 'sleep %s\n' "$*" >> "$GUEST_STATE/calls"
+ls -A "$GUEST_ROOT/opt" > "$GUEST_STATE/opt-while-sleeping"
 EOF
 cat > "$bin/timeout" <<'EOF'
 #!/bin/bash
@@ -139,6 +143,7 @@ exec env -i PATH="$PATH" GUEST_STATE="$GUEST_STATE" "$@"
 EOF
 cat > "$work/run.sh" <<'EOF'
 #!/bin/bash
+printf 'run.sh\n' >> "$GUEST_STATE/calls"
 printf '%s\n' "$@" > "$GUEST_STATE/run-args"
 exit "$(cat "$GUEST_STATE/run-rc")"
 EOF
@@ -357,5 +362,36 @@ if grep -qE '^resolvectl (query|revert) ' "$state/calls"; then
     fail "DHCP DNS was checked or reverted although DNS_SERVERS is empty"
 fi
 [[ "$(link_dns)" == 10.0.0.53 ]] || fail "the gateway was not dropped from the DHCP DNS servers: $(link_dns)"
+
+# A runner version GitHub refuses (run.sh exits 7). The host sees only a
+# stopped VM and clones the slot again at once, so the guest leaves the reason
+# where qm guest exec can read it and stays up a few minutes first.
+# The longest sleep, in seconds; empty when nothing slept a minute or more.
+held_for() { awk '$1 == "sleep" && $2 ~ /^[0-9]+$/ && $2 >= 60 && $2 > max { max = $2 } END { if (max) print max }' "$state/calls"; }
+run_rc=7
+boot version-refused
+assert_ran "run.sh exits 7"
+marker=$guest/opt/.runner-version-refused
+[[ -f "$marker" ]] || fail "a refused runner version left no marker for qm guest exec"
+grep -qxF rc=7 "$marker" || fail "the marker does not record exit 7: $(cat "$marker")"
+grep -qxF runner_version=2.337.0 "$marker" || fail "the marker does not name the refused version: $(cat "$marker")"
+hold=$(held_for)
+if [[ -z "$hold" ]] || (( hold < 180 || hold > 900 )); then
+    fail "a refused runner version did not hold the VM for a few minutes: $(grep '^sleep ' "$state/calls" || true)"
+fi
+awk -v hold="sleep $hold" '
+    $0 == "run.sh" { r = NR } $0 == hold { h = NR } $0 == "shutdown -h now" { d = NR }
+    END { exit !(r && h && d && r < h && h < d) }
+' "$state/calls" || fail "the hold does not come between run.sh and the power-off: $(cat "$state/calls")"
+grep -qxF .runner-version-refused "$state/opt-while-sleeping" || fail "the marker was not written before the hold"
+logged "Holding the VM for ${hold}s" || fail "the hold was not logged"
+# Any other exit powers off at once and leaves no marker.
+for run_rc in 0 1 2; do
+    boot "run-exit-$run_rc"
+    assert_ran "run.sh exits $run_rc"
+    [[ ! -e "$guest/opt/.runner-version-refused" ]] || fail "run.sh exit $run_rc left a refused-version marker"
+    [[ -z "$(held_for)" ]] || fail "run.sh exit $run_rc held the VM: $(grep '^sleep ' "$state/calls")"
+done
+run_rc=0
 
 printf 'guest2-register-runner: ok\n'
