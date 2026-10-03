@@ -33,7 +33,7 @@ reclone_main() {
     fi
 
     # Per-runner lock prevents races with watch.sh on the same slot
-    exec 200>"$(slot_lock_file "$name")"
+    open_lock_fd 200 "$(slot_lock_file "$name")" || exit 1
     flock -n 200 || { log_info "reclone: another process is handling $name"; exit 0; }
 
     if pool_is_draining; then
@@ -65,7 +65,7 @@ reclone_main() {
     # Hold shared pool activity for the rest of this process so `runner stop`
     # (exclusive 202) waits out destroy + mint, not just the later qm clone.
     # clone_runner sees POOL_ACTIVITY_LOCK_HELD and will not reopen fd 202.
-    exec 202>"$POOL_ACTIVITY_LOCK_FILE"
+    open_lock_fd 202 "$POOL_ACTIVITY_LOCK_FILE" || exit 1
     flock -s 202
     POOL_ACTIVITY_LOCK_HELD=1
 

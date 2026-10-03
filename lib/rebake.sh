@@ -20,7 +20,7 @@ BAKED_VERSION_FILE="$STATE_DIR/baked-runner-version"
 RETIRED_TEMPLATES_FILE="$STATE_DIR/retired-templates"
 PENDING_BAKE_FILE="$STATE_DIR/pending-bake"
 PENDING_VERSION_FILE="$STATE_DIR/pending-version"
-REBAKE_LOCK_FILE="/run/lock/github-runner-rebake.lock"
+REBAKE_LOCK_FILE="${RUN_DIR:-/run/github-runners}/github-runner-rebake.lock"
 REBAKE_UNIT_FILE="/etc/systemd/system/github-runner-rebake.service"
 REBAKE_LOG_FILE="/var/log/github-runner-rebake.log"
 
@@ -737,7 +737,7 @@ rebake_main() {
     # then moves TEMPLATE_ID; a TEMPLATE_ID read before the lock can name the
     # template setup just replaced, and publishing over that leaks setup's new
     # template or queues it for destruction.
-    exec 199>"$REBAKE_LOCK_FILE"
+    open_lock_fd 199 "$REBAKE_LOCK_FILE" || exit 1
     if ! flock -n 199; then
         log_info "A rebake is already running"
         exit 0

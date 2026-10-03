@@ -6,10 +6,14 @@
 
 VMID="$1"
 PHASE="$2"
-POOL_DRAIN_FILE="/run/lock/github-runner-drain"
+# Same path as POOL_DRAIN_FILE in lib/common.sh. This file is copied to
+# /var/lib/vz/snippets and does not source the libs. A symlink does not
+# count: /run/github-runners is mode 0700, and a link planted while it was
+# not would point the check at some other file.
+POOL_DRAIN_FILE="/run/github-runners/github-runner-drain"
 
 if [[ "$PHASE" == "post-stop" ]]; then
-    if [[ -e "$POOL_DRAIN_FILE" ]]; then
+    if [[ -f "$POOL_DRAIN_FILE" && ! -L "$POOL_DRAIN_FILE" ]]; then
         logger -t github-runner "VM $VMID stopped during pool drain, skipping reclone"
         exit 0
     fi

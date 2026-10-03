@@ -21,9 +21,10 @@
 #   fails every time stops minting a JIT runner on every tick.
 set -euo pipefail
 
-SLOT_STATE_DIR="/run/github-runners"
+# Same directory as RUN_DIR in common.sh. Callers source common.sh first.
+SLOT_STATE_DIR="${RUN_DIR:-/run/github-runners}"
 # Per-slot lock taken by watch.sh, reclone.sh, create.sh and destroy.sh.
-SLOT_LOCK_PREFIX="/run/lock/runner"
+SLOT_LOCK_PREFIX="$SLOT_STATE_DIR/runner"
 SLOT_BACKOFF_BASE=30
 SLOT_BACKOFF_MAX=1800
 RAPID_DEATH_SECS=600
@@ -32,7 +33,7 @@ RAPID_DEATH_LIMIT=3
 # watcher fills them like slots, so one that a hold, the template gate or a
 # failed clone left empty comes back. Unlike the holds, it survives a reboot.
 EXTRA_RUNNERS_FILE="/var/lib/github-runners/extras"
-EXTRA_RUNNERS_LOCK_FILE="/run/lock/github-runner-extras.lock"
+EXTRA_RUNNERS_LOCK_FILE="$SLOT_STATE_DIR/github-runner-extras.lock"
 
 slot_lock_file() {
     printf '%s-%s.lock\n' "$SLOT_LOCK_PREFIX" "$1"
@@ -72,7 +73,7 @@ slot_state_save() {
         rm -f "$file"
         return
     fi
-    install -d -m 700 "$SLOT_STATE_DIR" || return 1
+    ensure_private_dir "$SLOT_STATE_DIR" || return 1
     tmp=$(mktemp "$SLOT_STATE_DIR/.slot.XXXXXX") || return 1
     if ! printf 'hold_until=%s\nfailures=%s\nrapid=%s\ndeferrals=%s\n' \
             "$SLOT_HOLD_UNTIL" "$SLOT_FAILURES" "$SLOT_RAPID" "$SLOT_DEFERRALS" > "$tmp" \
@@ -254,6 +255,7 @@ write_extra_runners() {
 update_extra_runners() {
     local drop_name="$1" drop_org="$2" add="${3:-}" list name org changed=0
     local -a kept=()
+    prepare_lock_file "$EXTRA_RUNNERS_LOCK_FILE" || return 1
     (
         flock -w 30 205 || exit 1
         list=$(list_extra_runners) || exit 1

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# `runner stop` sets the pool drain flag in /run/lock, which is 1777 on
-# Debian. `install -d -m 755` chmodded that directory to 0755 and dropped the
-# sticky bit until the next reboot, so non-root programs could no longer
-# create their locks there.
+# `runner stop` sets the pool drain flag in the runner runtime directory.
+# That directory is created mode 0700. A looser one is tightened. Its parent
+# is left alone: an earlier `install -d -m` on the flag's directory chmodded
+# `/run/lock` itself and dropped the sticky bit until the next reboot.
 set -euo pipefail
 
 if [[ "${BASH_VERSINFO[0]}" -lt 4 ]]; then
@@ -20,21 +20,26 @@ fail() { printf 'inventory-drain-dir: %s\n' "$1" >&2; exit 1; }
 state=$(mktemp -d)
 trap 'rm -rf "$state"' EXIT
 
-mkdir "$state/lock"
-chmod 1777 "$state/lock"
-POOL_DRAIN_FILE=$state/lock/github-runner-drain
+mkdir -m 755 "$state/parent"
+mkdir -m 1777 "$state/parent/lock"
+POOL_DRAIN_FILE=$state/parent/lock/github-runner-drain
 enable_pool_drain
 pool_is_draining || fail "enable_pool_drain did not set the drain flag"
-# find -perm -1777 matches only while every bit of 1777 is still set.
-[[ -n "$(find "$state/lock" -maxdepth 0 -perm -1777)" ]] ||
-    fail "enable_pool_drain dropped the lock directory's 1777 mode"
+[[ "$(file_mode "$state/parent")" == "755" ]] ||
+    fail "enable_pool_drain changed the parent directory's mode"
+[[ "$(file_mode "$state/parent/lock")" == "700" ]] ||
+    fail "enable_pool_drain left the drain directory mode $(file_mode "$state/parent/lock")"
+[[ "$(file_owner "$state/parent/lock")" == "$EUID" ]] ||
+    fail "enable_pool_drain left the drain directory owned by $(file_owner "$state/parent/lock")"
 
 disable_pool_drain
 if pool_is_draining; then fail "disable_pool_drain left the drain flag"; fi
 
-# A lock directory that does not exist yet is still created.
+# A lock directory that does not exist yet is created mode 0700.
 POOL_DRAIN_FILE=$state/missing/github-runner-drain
 enable_pool_drain
 pool_is_draining || fail "enable_pool_drain did not create a missing lock directory"
+[[ "$(file_mode "$state/missing")" == "700" ]] ||
+    fail "a missing drain directory was created mode $(file_mode "$state/missing")"
 
 printf 'inventory-drain-dir: ok\n'
