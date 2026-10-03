@@ -142,7 +142,7 @@ reclaim_runner_vm() {
 }
 
 watch_main() {
-    local vm_table now vmid name status uptime lock template age since key prefix slot entry reason n org
+    local vm_table now vmid name status uptime lock template age since mtime key prefix slot entry reason n org
     local stopped_state tmp slot_named
     local -a orgs=() prefixes=() slots=() missing=() reclaim=() stopped_now=()
     local -A vm_names=() stopped_since=()
@@ -216,6 +216,15 @@ watch_main() {
         if [[ "$status" == "stopped" ]]; then
             key="$vmid $name"
             since=${stopped_since[$key]:-$now}
+            # Each clone writes its meta snippet just before it starts the
+            # VM, and a re-clone usually gets the same VMID and name. A
+            # snippet written after that sighting belongs to a new VM, whose
+            # grace starts now. A snippet from the future predates a clock
+            # step, not the sighting.
+            mtime=$(file_mtime "$SNIPPETS_DIR/runner-${vmid}-meta.yaml") || mtime=""
+            if [[ "$mtime" =~ ^[0-9]+$ ]] && (( mtime > since && mtime <= now )); then
+                since=$now
+            fi
             stopped_now+=("$key $since")
             if [[ "$lock" != "-" ]]; then
                 if [[ -z "${stopped_since[$key]:-}" ]]; then

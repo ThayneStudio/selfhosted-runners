@@ -48,7 +48,8 @@ date() {
 }
 
 # vm <vmid> <name> <status> [key=value ...]: uptime, lock, org (cicustom),
-# marker (clone-time description), meta=1 (meta snippet), born (its mtime).
+# marker (clone-time description), meta=1 (meta snippet), born (its mtime,
+# by default the clock when vm runs).
 vm() {
     local dir="$state/vm/$1" kv
     rm -rf "$dir"
@@ -56,6 +57,7 @@ vm() {
     printf '%s\n' "$2" > "$dir/name"
     printf '%s\n' "$3" > "$dir/status"
     printf '0\n' > "$dir/uptime"
+    printf '%s\n' "$clock" > "$dir/born"
     shift 3
     for kv in "$@"; do
         if [[ "$kv" == meta=1 ]]; then
