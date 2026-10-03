@@ -191,25 +191,73 @@ fetch_latest_runner_release() {
     return 0
 }
 
-remember_retired_template() {
-    local id="$1"
-    [[ "$id" =~ ^[0-9]+$ ]] || return 0
-    [[ "$id" == "$TEMPLATE_ID" ]] && return 0
-    install -d -m 700 "$STATE_DIR"
-    if [[ -f "$RETIRED_TEMPLATES_FILE" ]] && grep -qx "$id" "$RETIRED_TEMPLATES_FILE"; then
-        return 0
+# Replaces the retired list with the ids given; no ids removes it. The list is
+# written beside the old one and renamed over it, so a failed write (ENOSPC)
+# returns non-zero and leaves the old list as it was.
+write_retired_templates() {
+    local tmp
+    if [[ $# -eq 0 ]]; then
+        rm -f "$RETIRED_TEMPLATES_FILE"
+        return
     fi
-    printf '%s\n' "$id" >> "$RETIRED_TEMPLATES_FILE"
-    chmod 600 "$RETIRED_TEMPLATES_FILE"
+    install -d -m 700 "$STATE_DIR" || return 1
+    tmp=$(mktemp "$STATE_DIR/.retired.XXXXXX") || return 1
+    if ! printf '%s\n' "$@" > "$tmp" || ! chmod 600 "$tmp" || ! mv -f "$tmp" "$RETIRED_TEMPLATES_FILE"; then
+        rm -f "$tmp"
+        return 1
+    fi
+}
+
+# Adds template $1 to the retired list unless it is $2, the template that
+# stays live (TEMPLATE_ID by default). Non-zero means it was not recorded.
+remember_retired_template() {
+    local id="$1" live="${2:-$TEMPLATE_ID}" entry
+    local -a ids=()
+    [[ "$id" =~ ^[0-9]+$ ]] || return 0
+    [[ "$id" != "$live" ]] || return 0
+    if [[ -f "$RETIRED_TEMPLATES_FILE" ]]; then
+        while IFS= read -r entry || [[ -n "$entry" ]]; do
+            [[ "$entry" =~ ^[0-9]+$ ]] || continue
+            [[ "$entry" != "$id" ]] || return 0
+            ids+=("$entry")
+        done < "$RETIRED_TEMPLATES_FILE" || return 1
+    fi
+    write_retired_templates "${ids[@]}" "$id"
+}
+
+forget_retired_template() {
+    local id="$1" entry
+    local -a ids=()
+    [[ -f "$RETIRED_TEMPLATES_FILE" ]] || return 0
+    while IFS= read -r entry || [[ -n "$entry" ]]; do
+        if [[ "$entry" =~ ^[0-9]+$ && "$entry" != "$id" ]]; then
+            ids+=("$entry")
+        fi
+    done < "$RETIRED_TEMPLATES_FILE" || return 1
+    write_retired_templates "${ids[@]}"
 }
 
 switch_template_id() {
-    local new_id="$1" old_id="$TEMPLATE_ID"
-    set_conf_assignment "$CONFIG_FILE" TEMPLATE_ID "$new_id" || return 1
-    TEMPLATE_ID="$new_id"
+    local new_id="$1" old_id="$TEMPLATE_ID" listed=0
+    # Record the old template before TEMPLATE_ID stops naming it: once the
+    # config points elsewhere nothing else remembers it, and a failed write
+    # after the switch (ENOSPC) leaked it for good.
     if [[ -n "$old_id" && "$old_id" != "$new_id" ]]; then
-        remember_retired_template "$old_id"
+        if ! remember_retired_template "$old_id" "$new_id"; then
+            log_error "Could not record template $old_id as retired; leaving TEMPLATE_ID at $old_id"
+            return 1
+        fi
+        listed=1
     fi
+    if ! set_conf_assignment "$CONFIG_FILE" TEMPLATE_ID "$new_id"; then
+        # The old template stays live. retire_retired_templates skips the live
+        # TEMPLATE_ID, so an entry left behind by a failed undo is harmless.
+        if [[ "$listed" == 1 ]]; then
+            forget_retired_template "$old_id" || log_warn "Template $old_id stays listed in $RETIRED_TEMPLATES_FILE"
+        fi
+        return 1
+    fi
+    TEMPLATE_ID="$new_id"
 }
 
 # 0 when a linked clone still depends on the template, or when that cannot be
@@ -245,9 +293,9 @@ vmid_is_non_qemu_guest() {
 }
 
 retire_retired_templates() {
-    local id name kept_file tmp
+    local id name
+    local -a kept=()
     [[ -f "$RETIRED_TEMPLATES_FILE" ]] || return 0
-    kept_file=$(mktemp)
     while IFS= read -r id || [[ -n "$id" ]]; do
         [[ "$id" =~ ^[0-9]+$ ]] || continue
         if [[ "$id" == "$TEMPLATE_ID" ]]; then
@@ -256,24 +304,24 @@ retire_retired_templates() {
         if ! qm_host status "$id" &>/dev/null; then
             if ! vm_confirmed_absent "$id"; then
                 log_warn "Could not confirm retired VM $id is absent; retaining its record"
-                printf '%s\n' "$id" >> "$kept_file"
+                kept+=("$id")
             fi
             continue
         fi
         if ! qm_host config "$id" 2>/dev/null | grep -q '^template: 1[[:space:]]*$'; then
             log_warn "Retired id $id is not a template; leaving it"
-            printf '%s\n' "$id" >> "$kept_file"
+            kept+=("$id")
             continue
         fi
         name=$(qm_host config "$id" 2>/dev/null | awk '/^name:/{print $2; exit}')
         if [[ "$name" != "ubuntu-cloud-template" ]]; then
             log_warn "Refusing to destroy VM $id (${name:-unnamed}); it is not a runner template"
-            printf '%s\n' "$id" >> "$kept_file"
+            kept+=("$id")
             continue
         fi
         if template_has_linked_clones "$id"; then
             log_info "Template $id still has linked clones; leaving it in place"
-            printf '%s\n' "$id" >> "$kept_file"
+            kept+=("$id")
             continue
         fi
         log_info "No linked clones depend on template $id; destroying it"
@@ -281,18 +329,18 @@ retire_retired_templates() {
         # exclude lists, and that VMID is handed out again.
         if ! qm_host destroy "$id"; then
             log_warn "Failed to destroy template $id; leaving it in place"
-            printf '%s\n' "$id" >> "$kept_file"
+            kept+=("$id")
         fi
-    done < "$RETIRED_TEMPLATES_FILE"
-    if [[ -s "$kept_file" ]]; then
-        tmp=$(mktemp "$STATE_DIR/.retired.XXXXXX")
-        chmod 600 "$tmp"
-        cat "$kept_file" > "$tmp"
-        mv -f "$tmp" "$RETIRED_TEMPLATES_FILE"
-    else
-        rm -f "$RETIRED_TEMPLATES_FILE"
+    done < "$RETIRED_TEMPLATES_FILE" || {
+        log_error "Could not read $RETIRED_TEMPLATES_FILE; leaving it unchanged"
+        return 1
+    }
+    # perform_bake calls this under `||`, which disables errexit in here. A
+    # failed rewrite must keep the old list, not forget a template in use.
+    if ! write_retired_templates "${kept[@]}"; then
+        log_error "Could not rewrite $RETIRED_TEMPLATES_FILE; leaving it unchanged"
+        return 1
     fi
-    rm -f "$kept_file"
 }
 
 cleanup_rebake() {
