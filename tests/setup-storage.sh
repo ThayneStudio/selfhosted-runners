@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Setup must offer and accept only storage that can hold a template and its
 # linked clones. Thick LVM and iSCSI accept `qm template` without making a
-# base volume, so every linked clone then fails.
+# base volume, so every linked clone then fails. A VM_STORAGE that differs from
+# the template's own storage must be reported, not silently ignored.
 set -euo pipefail
 
 if [[ "${BASH_VERSINFO[0]}" -lt 4 ]]; then
@@ -50,9 +51,24 @@ if check_vm_storage missing 2> "$state/err"; then
 fi
 grep -qF "does not exist" "$state/err" || fail "a missing storage was not reported as missing"
 
+# The template's disks decide where linked clones go.
+qm() {
+    [[ "$1" == config ]] || return 1
+    printf 'name: ubuntu-cloud-template\nide2: fast-zfs:vm-9000-cloudinit,media=cdrom\nscsi0: local-zfs:base-9000-disk-0,size=30G\ntemplate: 1\n'
+}
+TEMPLATE_ID=9000
+VM_STORAGE=fast-zfs
+warn_template_storage 2> "$state/err"
+grep -qF 'disks on local-zfs, not fast-zfs' "$state/err" || fail "a VM_STORAGE change that does not apply was not reported"
+grep -qF "rm -f $BAKED_VERSION_FILE && runner rebake" "$state/err" || fail "the warning did not say how to bake on the new storage"
+VM_STORAGE=local-zfs
+warn_template_storage 2> "$state/err"
+[[ ! -s "$state/err" ]] || fail "storage that matches the template was reported"
+
 # The wizard lists and checks storage with these helpers.
 main=$(awk '/^require_root "setup"$/ { seen = 1 } seen' "$root/lib/setup.sh")
 grep -qF 'template_storages | awk' <<< "$main" || fail "setup.sh no longer lists storage with template_storages"
 grep -qF 'if ! check_vm_storage ' <<< "$main" || fail "setup.sh no longer checks VM_STORAGE"
+grep -qxF '    warn_template_storage' <<< "$main" || fail "setup.sh no longer reports a storage mismatch"
 
 printf 'setup-storage: ok\n'

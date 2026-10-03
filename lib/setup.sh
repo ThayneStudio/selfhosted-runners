@@ -59,6 +59,19 @@ enable_local_snippets() {
     fi
 }
 
+# Linked clones stay on the template's own storage, so a VM_STORAGE that
+# differs from it applies only from the next bake. Say so and how to bake now.
+warn_template_storage() {
+    local storages
+    storages=$(qm_host config "$TEMPLATE_ID" 2>/dev/null | awk '
+        /^(ide|sata|scsi|virtio)[0-9]+: / && !/media=cdrom/ { sub(/:.*/, "", $2); print $2 }
+    ' | sort -u | paste -sd, -) || return 0
+    [[ -n "$storages" && "$storages" != "$VM_STORAGE" ]] || return 0
+    log_warn "Template $TEMPLATE_ID has its disks on $storages, not $VM_STORAGE."
+    log_warn "Runners are linked clones on $storages until a template is baked on $VM_STORAGE."
+    log_warn "To bake one now: rm -f $BAKED_VERSION_FILE && runner rebake"
+}
+
 # Tests source this file for the functions above.
 [[ "${BASH_SOURCE[0]}" == "$0" ]] || return 0
 
@@ -271,6 +284,7 @@ fi
 if qm status "$TEMPLATE_ID" &> /dev/null; then
     log_info "[4/5] Template VM $TEMPLATE_ID already exists. Skipping creation."
     log_warn "To recreate: qm destroy $TEMPLATE_ID && runner setup"
+    warn_template_storage
     if [[ ! -f "$BAKED_VERSION_FILE" ]]; then
         log_warn "No baked runner version is recorded. The daily rebake will bake once."
     fi
