@@ -112,31 +112,136 @@ unquote_shell_literal() {
     printf '%s' "$value"
 }
 
+# 0 when $1 is one shell word, or empty, with only trailing whitespace.
+# printf %q output is one word (quotes or backslash escapes). A second word,
+# an unclosed quote, or ; & | and the other command separators are not.
+conf_value_is_one_word() {
+    local s="$1" i=0 n c closed
+    n=${#s}
+    while (( i < n )); do
+        c=${s:i:1}
+        if [[ "$c" =~ [[:space:]] ]]; then
+            [[ "${s:i}" =~ ^[[:space:]]*$ ]]
+            return
+        fi
+        case "$c" in
+            "'")
+                i=$((i + 1))
+                [[ "${s:i}" == *"'"* ]] || return 1
+                while (( i < n )) && [[ ${s:i:1} != "'" ]]; do
+                    i=$((i + 1))
+                done
+                (( i < n )) || return 1
+                i=$((i + 1))
+                ;;
+            '"')
+                i=$((i + 1))
+                closed=0
+                while (( i < n )); do
+                    c=${s:i:1}
+                    if [[ $c == \\ ]]; then
+                        i=$((i + 2))
+                        continue
+                    fi
+                    if [[ $c == '"' ]]; then
+                        i=$((i + 1))
+                        closed=1
+                        break
+                    fi
+                    i=$((i + 1))
+                done
+                (( closed == 1 )) || return 1
+                ;;
+            '$')
+                # $'...' is one word. $var and $(...) are left in place: the
+                # appended assignment then wins, and a half-parsed substitution
+                # cannot swallow the rest of the file.
+                [[ ${s:i:2} == "$'" ]] || return 1
+                i=$((i + 2))
+                closed=0
+                while (( i < n )); do
+                    c=${s:i:1}
+                    if [[ $c == \\ ]]; then
+                        i=$((i + 2))
+                        continue
+                    fi
+                    if [[ $c == "'" ]]; then
+                        i=$((i + 1))
+                        closed=1
+                        break
+                    fi
+                    i=$((i + 1))
+                done
+                (( closed == 1 )) || return 1
+                ;;
+            \\)
+                (( i + 1 < n )) || return 1
+                i=$((i + 2))
+                ;;
+            ';'|'&'|'|'|'<'|'>'|'('|')'|'`'|'#')
+                return 1
+                ;;
+            *)
+                i=$((i + 1))
+                ;;
+        esac
+    done
+}
+
+# Print the key when $1 is exactly one assignment of a key setup prompts for.
+conf_exact_assignment_key() {
+    local line="$1" key value
+    [[ "$line" =~ ^[[:space:]]*(export[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]] || return 1
+    key=${BASH_REMATCH[2]}
+    value=${BASH_REMATCH[3]}
+    case "$key" in
+        NETWORK_BRIDGE|VLAN_TAG|VM_STORAGE|TEMPLATE_ID|MIN_VMID|BALLOON|DNS_SERVERS|DOCKER_MIRROR_URL) ;;
+        *) return 1 ;;
+    esac
+    conf_value_is_one_word "$value" || return 1
+    printf '%s\n' "$key"
+}
+
 set_conf_assignment() {
-    local file="$1" key="$2" value="$3" tmp quoted
-    printf -v quoted '%q' "$value"
-    tmp=$(mktemp "${file}.XXXXXX")
+    local file="$1" key="$2" value="$3" tmp line found=0 syntax
     # Callers invoke this under `||`, which disables errexit for the whole
-    # function. A failed awk must not chmod and mv a truncated file into place.
-    CONF_KEY="$key" CONF_VALUE="$quoted" awk '
-        index($0, ENVIRON["CONF_KEY"] "=") == 1 {
-            print ENVIRON["CONF_KEY"] "=" ENVIRON["CONF_VALUE"]
-            found = 1
-            next
-        }
-        { print }
-        END {
-            if (!found) {
-                print ENVIRON["CONF_KEY"] "=" ENVIRON["CONF_VALUE"]
-            }
-        }
-    ' "$file" > "$tmp" || {
+    # function, so each step reports its own failure. A line is replaced only
+    # when it is exactly one assignment of this key. Anything else stays,
+    # including a second command on the line, and the new assignment is
+    # appended so it wins. bash -n runs before the mv; a result that is not
+    # valid shell leaves the old file.
+    tmp=$(mktemp "${file}.XXXXXX") || {
+        log_error "Failed to update $key in $file"
+        return 1
+    }
+    {
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            if [[ "$(conf_exact_assignment_key "$line" || true)" == "$key" ]]; then
+                printf '%s=%q\n' "$key" "$value"
+                found=1
+            else
+                printf '%s\n' "$line"
+            fi
+        done < "$file"
+        if [[ "$found" == 0 ]]; then
+            printf '%s=%q\n' "$key" "$value"
+        fi
+    } > "$tmp" || {
         rm -f "$tmp"
         log_error "Failed to update $key in $file"
         return 1
     }
-    chmod 600 "$tmp"
-    mv -f "$tmp" "$file"
+    if ! syntax=$(bash -n "$tmp" 2>&1); then
+        log_error "Not replacing $file: the rewritten file is not valid shell, so the old one is unchanged"
+        [[ -z "$syntax" ]] || log_error "$syntax"
+        rm -f "$tmp"
+        return 1
+    fi
+    if ! chmod 600 "$tmp" || ! mv -f "$tmp" "$file"; then
+        rm -f "$tmp"
+        log_error "Failed to update $key in $file"
+        return 1
+    fi
 }
 
 write_baked_record() {
