@@ -197,7 +197,9 @@ bake_and_publish_vm() {
             return 1
         fi
 
-        exec_result=$(qm_host guest exec "$vmid" -- test -f /opt/.template-setup-complete 2>&1) || {
+        # Parse stdout only. A qm warning on stderr (a Perl locale warning
+        # over SSH) ahead of the JSON would hide a finished bake.
+        exec_result=$(qm_host guest exec "$vmid" -- test -f /opt/.template-setup-complete 2>/dev/null) || {
             minutes=$((bake_elapsed / 60))
             seconds_rem=$((bake_elapsed % 60))
             printf '\r  Elapsed: %dm%02ds (waiting for guest agent...)' "$minutes" "$seconds_rem" >&2
