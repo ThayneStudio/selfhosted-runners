@@ -28,6 +28,7 @@ LATEST_RUNNER_VERSION=""
 LATEST_RUNNER_PUBLISHED_AT=""
 RECORDED_RUNNER_VERSION=""
 RECORDED_RUNNER_PUBLISHED_AT=""
+RECORDED_TEMPLATE_ID=""
 RECORDED_BAKED_AT=""
 
 normalize_runner_version() {
@@ -139,6 +140,7 @@ read_baked_record() {
     local line key value
     RECORDED_RUNNER_VERSION=""
     RECORDED_RUNNER_PUBLISHED_AT=""
+    RECORDED_TEMPLATE_ID=""
     RECORDED_BAKED_AT=""
     [[ -f "$BAKED_VERSION_FILE" ]] || return 0
     while IFS= read -r line || [[ -n "$line" ]]; do
@@ -152,9 +154,25 @@ read_baked_record() {
                 # shellcheck disable=SC2034
                 RECORDED_RUNNER_PUBLISHED_AT="$value"
                 ;;
+            template_id) RECORDED_TEMPLATE_ID="$value" ;;
             baked_at) RECORDED_BAKED_AT="$value" ;;
         esac
     done < "$BAKED_VERSION_FILE"
+}
+
+# The record describes the template it names. When TEMPLATE_ID has moved off
+# that template without a rebake (setup pointed at another VM, a hand edit,
+# setup racing a rebake), the record says nothing about the live template.
+# Ignore it so the decision bakes once. A record without template_id (older
+# or hand-written) still counts.
+discard_stale_baked_record() {
+    [[ -n "$RECORDED_TEMPLATE_ID" && "$RECORDED_TEMPLATE_ID" != "$TEMPLATE_ID" ]] || return 0
+    log_info "The baked-version record is for template $RECORDED_TEMPLATE_ID, not TEMPLATE_ID $TEMPLATE_ID; ignoring it"
+    # Nothing listed that template for retirement when TEMPLATE_ID moved, so
+    # it would leak. Retirement still checks its name and linked clones.
+    remember_retired_template "$RECORDED_TEMPLATE_ID"
+    RECORDED_RUNNER_VERSION=""
+    RECORDED_BAKED_AT=""
 }
 
 commit_baked_version() {
@@ -632,6 +650,7 @@ rebake_main() {
         exit 1
     fi
     read_baked_record
+    discard_stale_baked_record
     now_epoch=$(date -u +%s)
     rebake_apply_decision "$RECORDED_RUNNER_VERSION" "$LATEST_RUNNER_VERSION" "$RECORDED_BAKED_AT" "$now_epoch"
 }
