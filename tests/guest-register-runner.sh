@@ -303,4 +303,31 @@ GUEST_STATE=$state PATH="$work/bin-sudo-fails:$bin:$PATH" "$BASH" -e -o pipefail
 awk '/^runcmd:/ { r = 1; next } r && /^  - / && /shutdown -h \+360 / { found = 1 } END { exit !found }' "$user_data" \
     || fail "runcmd no longer schedules the boot-time shutdown"
 
+# Docker mirror. Docker's containerd image store reads hosts.toml from
+# /etc/docker/certs.d; nothing reads /etc/containerd/certs.d.
+hosts_toml() {
+    printf 'server = "%s"\n\n[host."%s"]\n  capabilities = ["pull", "resolve"]\n  skip_verify = true' "$1" "$2"
+}
+DOCKER_MIRROR_URL=https://10.20.1.19:5000
+boot mirror-https
+assert_ran "HTTPS Docker mirror"
+[[ "$(cat "$guest/etc/docker/certs.d/public.ecr.aws/hosts.toml" 2>/dev/null)" \
+    == "$(hosts_toml https://public.ecr.aws "$DOCKER_MIRROR_URL")" ]] \
+    || fail "the clone did not route public.ecr.aws through the mirror in /etc/docker/certs.d"
+[[ "$(cat "$guest/etc/docker/certs.d/10.20.1.19:5000/hosts.toml" 2>/dev/null)" \
+    == "$(hosts_toml "$DOCKER_MIRROR_URL" "$DOCKER_MIRROR_URL")" ]] \
+    || fail "the clone did not write the mirror's own hosts.toml in /etc/docker/certs.d"
+[[ ! -e "$guest/etc/containerd" ]] || fail "the clone still writes /etc/containerd/certs.d, which Docker never reads"
+jq -e '.features["containerd-snapshotter"] == true' "$guest/etc/docker/daemon.json" >/dev/null \
+    || fail "an HTTPS mirror no longer enables the containerd image store"
+called "systemctl restart docker" || fail "the clone did not restart Docker after the mirror config"
+in_run_env SUPABASE_INTERNAL_IMAGE_REGISTRY=10.20.1.19:5000 || fail "the Supabase registry override did not reach run.sh"
+DOCKER_MIRROR_URL=http://10.20.1.19:5000
+boot mirror-http
+assert_ran "HTTP Docker mirror"
+jq -e '."storage-driver" == "overlay2" and ."insecure-registries" == ["10.20.1.19:5000"]' \
+    "$guest/etc/docker/daemon.json" >/dev/null || fail "an HTTP mirror lost its overlay2 and insecure-registries settings"
+[[ ! -e "$guest/etc/containerd" ]] || fail "the clone still writes /etc/containerd/certs.d, which Docker never reads"
+DOCKER_MIRROR_URL=""
+
 printf 'guest-register-runner: ok\n'

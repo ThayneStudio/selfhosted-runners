@@ -111,13 +111,16 @@ write_files:
       usermod -aG docker runner
       log "Docker installed and running"
 
+      # Docker's containerd image store (HTTPS mirrors) reads per-registry
+      # hosts.toml from /etc/docker/certs.d, never /etc/containerd/certs.d.
+      # HTTP mirrors use overlay2 and rely on the Supabase registry override.
       if [[ -n "${DOCKER_MIRROR_URL:-}" ]]; then
         log "Configuring Docker mirror for public.ecr.aws: $DOCKER_MIRROR_URL"
-        mkdir -p /etc/docker /etc/containerd/certs.d/public.ecr.aws
+        mkdir -p /etc/docker/certs.d/public.ecr.aws
         SUPABASE_IMAGE_REGISTRY="${DOCKER_MIRROR_URL#http://}"
         SUPABASE_IMAGE_REGISTRY="${SUPABASE_IMAGE_REGISTRY#https://}"
         MIRROR_REGISTRY="${SUPABASE_IMAGE_REGISTRY%%/*}"
-        mkdir -p "/etc/containerd/certs.d/$MIRROR_REGISTRY"
+        mkdir -p "/etc/docker/certs.d/$MIRROR_REGISTRY"
         if [[ "$DOCKER_MIRROR_URL" == http://* ]]; then
           cat > /etc/docker/daemon.json <<DOCKEREOF
       {
@@ -134,14 +137,14 @@ write_files:
       }
       DOCKEREOF
         fi
-        cat > /etc/containerd/certs.d/public.ecr.aws/hosts.toml <<TOMLEOF
+        cat > /etc/docker/certs.d/public.ecr.aws/hosts.toml <<TOMLEOF
       server = "https://public.ecr.aws"
 
       [host."$DOCKER_MIRROR_URL"]
         capabilities = ["pull", "resolve"]
         skip_verify = true
       TOMLEOF
-        cat > "/etc/containerd/certs.d/$MIRROR_REGISTRY/hosts.toml" <<TOMLEOF
+        cat > "/etc/docker/certs.d/$MIRROR_REGISTRY/hosts.toml" <<TOMLEOF
       server = "$DOCKER_MIRROR_URL"
 
       [host."$DOCKER_MIRROR_URL"]
