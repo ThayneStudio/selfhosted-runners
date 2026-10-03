@@ -686,10 +686,13 @@ mirror inputs disable those options; an empty DNS input selects
 [Network Requirements](#network-requirements)), and the summary shows
 `DNS Servers: DHCP only`. A saved `DNS_SERVERS` that is empty or missing is
 prefilled as `dhcp`, so Enter keeps it. With no saved config, or with piped
-input, an empty line selects the standard default. Setup rewrites
-the eight keys it prompts for and keeps every other line, so `BAKE_TIMEOUT`,
-`BAKE_MIN_FREE_GIB` and anything else added there stay. Org configs and PATs
-are not touched; `add-org` runs only when no orgs exist yet. Run `runner setup` under tmux. It is interactive, and
+input, an empty line selects the standard default. Setup replaces a line
+only when it is exactly one assignment of one of the eight keys it prompts
+for, and keeps every other line, so `BAKE_TIMEOUT`, `BAKE_MIN_FREE_GIB`, a
+second command on the same line and a value continued on the next line stay.
+The new assignment is appended, so it wins when the file is sourced. If that
+result is not valid shell, the old file is left unchanged. Org configs and
+PATs are not touched; `add-org` runs only when no orgs exist yet. Run `runner setup` under tmux. It is interactive, and
 a dropped SSH session fires the cleanup trap and throws away an in-progress
 setup bake.
 

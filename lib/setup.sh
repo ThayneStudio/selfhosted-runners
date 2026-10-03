@@ -104,14 +104,108 @@ warn_template_storage() {
     log_warn "To bake one now: rm -f $BAKED_VERSION_FILE && runner rebake"
 }
 
+# 0 when $1 is one shell word, or empty, with only trailing whitespace.
+# printf %q output is one word (quotes or backslash escapes). A second word,
+# an unclosed quote, or ; & | and the other command separators are not.
+conf_value_is_one_word() {
+    local s="$1" i=0 n c closed
+    n=${#s}
+    while (( i < n )); do
+        c=${s:i:1}
+        if [[ "$c" =~ [[:space:]] ]]; then
+            [[ "${s:i}" =~ ^[[:space:]]*$ ]]
+            return
+        fi
+        case "$c" in
+            "'")
+                i=$((i + 1))
+                [[ "${s:i}" == *"'"* ]] || return 1
+                while (( i < n )) && [[ ${s:i:1} != "'" ]]; do
+                    i=$((i + 1))
+                done
+                (( i < n )) || return 1
+                i=$((i + 1))
+                ;;
+            '"')
+                i=$((i + 1))
+                closed=0
+                while (( i < n )); do
+                    c=${s:i:1}
+                    if [[ $c == \\ ]]; then
+                        i=$((i + 2))
+                        continue
+                    fi
+                    if [[ $c == '"' ]]; then
+                        i=$((i + 1))
+                        closed=1
+                        break
+                    fi
+                    i=$((i + 1))
+                done
+                (( closed == 1 )) || return 1
+                ;;
+            '$')
+                # $'...' is one word. $var and $(...) are left in place: the
+                # appended assignment then wins, and a half-parsed substitution
+                # cannot swallow the rest of the file.
+                [[ ${s:i:2} == "$'" ]] || return 1
+                i=$((i + 2))
+                closed=0
+                while (( i < n )); do
+                    c=${s:i:1}
+                    if [[ $c == \\ ]]; then
+                        i=$((i + 2))
+                        continue
+                    fi
+                    if [[ $c == "'" ]]; then
+                        i=$((i + 1))
+                        closed=1
+                        break
+                    fi
+                    i=$((i + 1))
+                done
+                (( closed == 1 )) || return 1
+                ;;
+            \\)
+                (( i + 1 < n )) || return 1
+                i=$((i + 2))
+                ;;
+            ';'|'&'|'|'|'<'|'>'|'('|')'|'`'|'#')
+                return 1
+                ;;
+            *)
+                i=$((i + 1))
+                ;;
+        esac
+    done
+}
+
+# Print the key when $1 is exactly one assignment of a key setup prompts for.
+conf_exact_assignment_key() {
+    local line="$1" key value
+    [[ "$line" =~ ^[[:space:]]*(export[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]] || return 1
+    key=${BASH_REMATCH[2]}
+    value=${BASH_REMATCH[3]}
+    case "$key" in
+        NETWORK_BRIDGE|VLAN_TAG|VM_STORAGE|TEMPLATE_ID|MIN_VMID|BALLOON|DNS_SERVERS|DOCKER_MIRROR_URL) ;;
+        *) return 1 ;;
+    esac
+    conf_value_is_one_word "$value" || return 1
+    printf '%s\n' "$key"
+}
+
 # While a new template is baked beside the live one, the saved TEMPLATE_ID
 # keeps naming the live one. bake_setup_template moves it afterwards.
-# Lines this wizard does not prompt for stay where they are, including
-# BAKE_TIMEOUT, BAKE_MIN_FREE_GIB and any other assignment an operator added.
+# A line is replaced only when it is exactly one assignment of a key this
+# wizard prompts for. Anything else stays, including BAKE_TIMEOUT,
+# BAKE_MIN_FREE_GIB, a second command on the same line, and a quoted value
+# that continues on the next line. The new assignment is then appended so
+# it wins. The old file is left in place when the result is not valid shell.
 write_infra_config() {
-    local conf_tmp line key
+    local conf_tmp line key syntax
     local -A new_value=()
     local -A written=()
+    local -A dirty=()
     local managed_re='^[[:space:]]*(export[[:space:]]+)?(NETWORK_BRIDGE|VLAN_TAG|VM_STORAGE|TEMPLATE_ID|MIN_VMID|BALLOON|DNS_SERVERS|DOCKER_MIRROR_URL)='
     mkdir -p "$ORG_CONFIG_DIR"
     chmod 700 "$ORG_CONFIG_DIR"
@@ -128,11 +222,19 @@ write_infra_config() {
         if [[ -f "$CONFIG_FILE" ]]; then
             # "|| [[ -n $line ]]" also reads a last line that has no newline.
             while IFS= read -r line || [[ -n "$line" ]]; do
-                if [[ "$line" =~ $managed_re ]]; then
-                    key=${BASH_REMATCH[2]}
-                    written[$key]=1
+                if key=$(conf_exact_assignment_key "$line"); then
+                    if [[ -z "${dirty[$key]:-}" ]]; then
+                        written[$key]=1
+                    fi
                     printf '%s=%q\n' "$key" "${new_value[$key]}"
                 else
+                    # A later exact assignment must not hide this line. Append
+                    # so the value setup just collected is the one that wins.
+                    if [[ "$line" =~ $managed_re ]]; then
+                        key=${BASH_REMATCH[2]}
+                        dirty[$key]=1
+                        unset "written[$key]"
+                    fi
                     printf '%s\n' "$line"
                 fi
             done < "$CONFIG_FILE"
@@ -141,6 +243,12 @@ write_infra_config() {
             [[ -n "${written[$key]:-}" ]] || printf '%s=%q\n' "$key" "${new_value[$key]}"
         done
     } > "$conf_tmp"
+    if ! syntax=$(bash -n "$conf_tmp" 2>&1); then
+        log_error "Not replacing $CONFIG_FILE: the rewritten file is not valid shell, so the old one is unchanged"
+        [[ -z "$syntax" ]] || log_error "$syntax"
+        rm -f "$conf_tmp"
+        return 1
+    fi
     chmod 600 "$conf_tmp"
     mv "$conf_tmp" "$CONFIG_FILE"
 }

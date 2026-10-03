@@ -78,6 +78,7 @@ BALLOON=1
 DNS_SERVERS=9.9.9.9
 DOCKER_MIRROR_URL=http://old.example
 EOF
+# shellcheck disable=SC2034 # write_infra_config reads it
 LIVE_TEMPLATE_ID=9000
 BAKE_TIMEOUT=99999
 write_infra_config
@@ -249,6 +250,7 @@ grep -q '^qm create 9001 ' "$calls" || fail "an environment floor that fits did 
 # setup's prefill source is the path that puts a conf limit on a setup bake.
 write_limits 2h 0
 unset BAKE_TIMEOUT BAKE_MIN_FREE_GIB
+# shellcheck disable=SC2034 # load_setup_prefills reads it
 NETWORK_BRIDGE=vmbr0
 load_setup_prefills
 [[ "${BAKE_TIMEOUT-unset}" == 2h ]] || fail "setup did not take BAKE_TIMEOUT from the conf (got ${BAKE_TIMEOUT-unset})"
