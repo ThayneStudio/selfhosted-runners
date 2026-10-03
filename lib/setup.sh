@@ -59,6 +59,33 @@ enable_local_snippets() {
     fi
 }
 
+# Decide what to do with the Template VM ID answer. A finished template is used
+# as it is (TEMPLATE_READY=1). Any other VM there is refused, such as a bake
+# that stopped before `qm template` converted its disk, or a runner. A free ID
+# is baked.
+plan_template() {
+    local cfg name
+    TEMPLATE_READY=0
+    if template_is_converted "$TEMPLATE_ID"; then
+        TEMPLATE_READY=1
+        return 0
+    fi
+    if cfg=$(qm_host config "$TEMPLATE_ID" 2>/dev/null); then
+        name=$(printf '%s\n' "$cfg" | awk '/^name:/{print $2; exit}')
+        if [[ "$name" == "ubuntu-cloud-template" ]]; then
+            log_error "VM $TEMPLATE_ID is an unfinished template bake: its disk was never converted to a template"
+            log_error "If nothing is still baking it, remove it and run setup again: qm stop $TEMPLATE_ID; qm destroy $TEMPLATE_ID"
+        else
+            log_error "VM $TEMPLATE_ID (${name:-unnamed}) is not a finished template. Choose another Template VM ID."
+        fi
+        return 1
+    fi
+    if vmid_in_use "$TEMPLATE_ID"; then
+        log_error "VM ID $TEMPLATE_ID belongs to another guest. Choose another Template VM ID."
+        return 1
+    fi
+}
+
 # Linked clones stay on the template's own storage, so a VM_STORAGE that
 # differs from it applies only from the next bake. Say so and how to bake now.
 warn_template_storage() {
@@ -72,8 +99,10 @@ warn_template_storage() {
     log_warn "To bake one now: rm -f $BAKED_VERSION_FILE && runner rebake"
 }
 
-# EXIT trap of the bake: destroy VM $TEMPLATE_ID, which is not a template yet.
-# A signal after qm template succeeds must not destroy the template.
+# EXIT trap of the bake: destroy VM $TEMPLATE_ID unless it is a finished
+# template. `template: 1` alone is written before qm template converts the
+# disk, and nothing can be cloned from an unconverted one. A signal after the
+# conversion must not destroy the template.
 # After an SSH drop every log write fails (EIO on the hung-up tty, or SIGPIPE
 # through a pipe). Neither errexit nor a second SIGHUP may stop the destroy.
 cleanup_bake() {
@@ -89,13 +118,37 @@ cleanup_bake() {
         log_error "Refusing to destroy VM $TEMPLATE_ID (${name:-unnamed}); it is not the template bake VM"
         return 0
     fi
-    if printf '%s\n' "$cfg" | grep -q '^template: 1[[:space:]]*$'; then
+    if template_is_converted "$TEMPLATE_ID"; then
         log_warn "VM $TEMPLATE_ID is already a template; leaving it"
         return 0
     fi
     log_warn "Baking failed, cleaning up template VM..."
     qm_host stop "$TEMPLATE_ID" --timeout 30 2>/dev/null || true
     qm_host destroy "$TEMPLATE_ID" 2>/dev/null || true
+}
+
+# Bake VM $TEMPLATE_ID and record its runner version.
+bake_setup_template() {
+    # Checksum mismatch deletes the cached image and returns before qm create.
+    # Simple commands, not `|| exit`: `||` disables errexit inside the callee.
+    prepare_cloud_image
+
+    log_info "Creating VM template..."
+    create_bake_vm "$TEMPLATE_ID"
+    trap cleanup_bake EXIT
+
+    bake_and_publish_vm "$TEMPLATE_ID"
+    # qm template exits 0 even when it did not convert the disk.
+    if ! template_is_converted "$TEMPLATE_ID"; then
+        log_error "VM $TEMPLATE_ID is not a finished template after qm template"
+        return 1
+    fi
+    trap - EXIT
+
+    if ! commit_baked_version "$BAKE_RUNNER_VERSION" "$TEMPLATE_ID"; then
+        log_warn "Template was created but the baked runner version was not recorded"
+    fi
+    log_info "Template created successfully (tools baked in)"
 }
 
 # Tests source this file for the functions above.
@@ -187,6 +240,9 @@ if [[ ! "$TEMPLATE_ID" =~ ^[0-9]+$ ]]; then
 fi
 if [[ "$TEMPLATE_ID" -lt 100 || "$TEMPLATE_ID" -gt 999999999 ]]; then
     log_error "Template ID must be between 100 and 999999999"
+    exit 1
+fi
+if ! plan_template; then
     exit 1
 fi
 
@@ -306,8 +362,8 @@ if compgen -G "$SNIPPETS_DIR/runner-user-data-*.yaml" > /dev/null; then
     log_info "Removed obsolete per-org PAT snippets"
 fi
 
-# Check if template already exists
-if qm status "$TEMPLATE_ID" &> /dev/null; then
+# plan_template accepted the VM at TEMPLATE_ID only if it is a finished template.
+if [[ "$TEMPLATE_READY" == 1 ]]; then
     log_info "[4/5] Template VM $TEMPLATE_ID already exists. Skipping creation."
     log_warn "To recreate: qm destroy $TEMPLATE_ID && runner setup"
     warn_template_storage
@@ -316,21 +372,7 @@ if qm status "$TEMPLATE_ID" &> /dev/null; then
     fi
 else
     log_info "[4/5] Creating baked Ubuntu cloud template..."
-    # Checksum mismatch deletes the cached image and returns before qm create.
-    # Simple commands, not `|| exit`: `||` disables errexit inside the callee.
-    prepare_cloud_image
-
-    log_info "Creating VM template..."
-    create_bake_vm "$TEMPLATE_ID"
-    trap cleanup_bake EXIT
-
-    bake_and_publish_vm "$TEMPLATE_ID"
-    trap - EXIT
-
-    if ! commit_baked_version "$BAKE_RUNNER_VERSION" "$TEMPLATE_ID"; then
-        log_warn "Template was created but the baked runner version was not recorded"
-    fi
-    log_info "Template created successfully (tools baked in)"
+    bake_setup_template
 fi
 
 log_info "[5/5] Installing pool watcher and rebake timers..."
