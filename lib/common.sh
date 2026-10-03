@@ -383,11 +383,17 @@ list_template_linked_clone_volids() {
         while read -r volid _; do
             [[ "$volid" == "$VM_STORAGE:vm-"* ]] || continue
             [[ -n "${seen[$volid]:-}" ]] && continue
+            # Runners are destroyed and recloned while this scan runs, and
+            # pvesm path does not check that a zvol exists. A volume that a
+            # fresh listing no longer shows depends on nothing; any other
+            # failed lookup still fails closed.
             if ! dataset=$(zfs_dataset_from_volid "$volid"); then
+                volume_confirmed_absent "$volid" && continue
                 log_error "Failed to resolve ZFS dataset for $volid"
                 return 1
             fi
             if ! origin=$(zfs get -H -o value origin "$dataset" 2>/dev/null); then
+                volume_confirmed_absent "$volid" && continue
                 log_error "Failed to read ZFS origin for $dataset"
                 return 1
             fi
