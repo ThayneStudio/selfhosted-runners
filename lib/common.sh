@@ -171,9 +171,16 @@ get_vm_org() {
     fi
 }
 
+# Guest configs of every cluster node.
+PVE_NODES_DIR="/etc/pve/nodes"
+
+# VMIDs are cluster-wide and shared by VMs and containers. A container's
+# LVM-thin, LVM and RBD volumes are named vm-<ctid>-disk-N like a VM's, so a
+# VMID counts as taken when either guest type has a config for it on any node.
 vm_config_path() {
     local vmid="$1"
-    compgen -G "/etc/pve/nodes/*/qemu-server/${vmid}.conf" | head -n 1
+    compgen -G "$PVE_NODES_DIR/*/qemu-server/${vmid}.conf" | head -n 1 ||
+        compgen -G "$PVE_NODES_DIR/*/lxc/${vmid}.conf" | head -n 1
 }
 
 vmid_in_use() {
@@ -425,13 +432,18 @@ cleanup_template_orphan_volumes() {
     return 0
 }
 
-# Sweep zvols on $VM_STORAGE whose VMID has no /etc/pve config — leftovers from
-# clones that failed before writing config (or whose _fail cleanup couldn't
-# fully reap). Holds the pool activity lock exclusive non-blocking so it can
-# never race a clone in progress. Scoped to vmid >= MIN_VMID and != TEMPLATE_ID
-# so non-runner VMs on the same storage are never touched.
+# Sweep VM image volumes on $VM_STORAGE whose VMID has no VM or container
+# config on any node — leftovers from clones that failed before writing config
+# (or whose _fail cleanup couldn't fully reap). Holds the pool activity lock
+# exclusive non-blocking so it can never race a clone in progress. Scoped to
+# VMIDs runners can get: vmid >= MIN_VMID and != TEMPLATE_ID. MIN_VMID=0
+# ("auto") sets no lower bound, so the floor is then TEMPLATE_ID + 1. Listing
+# only images content also leaves out every container's rootdir volumes.
 cleanup_runner_orphan_volumes() {
-    local min_vmid="${MIN_VMID:-$((TEMPLATE_ID + 1))}"
+    local min_vmid="${MIN_VMID:-}"
+    if [[ ! "$min_vmid" =~ ^[1-9][0-9]*$ ]]; then
+        min_vmid=$((TEMPLATE_ID + 1))
+    fi
 
     exec 202>"$POOL_ACTIVITY_LOCK_FILE"
     if ! flock -n -x 202; then
@@ -455,7 +467,7 @@ cleanup_runner_orphan_volumes() {
         else
             log_warn "[orphan-sweep] pvesm free $volid failed"
         fi
-    done < <(pvesm list "$VM_STORAGE" 2>/dev/null | awk 'NR>1 {print $1}')
+    done < <(pvesm list "$VM_STORAGE" --content images 2>/dev/null | awk 'NR>1 {print $1}')
 
     [[ "$freed" -gt 0 ]] && log_info "[orphan-sweep] reaped $freed orphan volume(s)"
     exec 202>&-
