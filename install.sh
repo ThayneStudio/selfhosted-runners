@@ -16,6 +16,63 @@ ln -sf "$INSTALL_DIR/runner" /usr/local/bin/runner
 
 echo "Installed to $INSTALL_DIR"
 
+# Closing line for a host that already has /etc/github-runners.conf. A conf
+# file alone is not a finished template: the first setup writes it before the
+# bake, and a failed bake leaves TEMPLATE_ID pointing at a VM clones cannot
+# use. rebake stops in that state, so the operator runs setup. qm missing, or
+# a config we cannot read, is reported as unchecked.
+report_install_template() {
+    local id="${TEMPLATE_ID:-}" err cfg name
+    if [[ ! "$id" =~ ^[0-9]+$ ]]; then
+        echo "TEMPLATE_ID (${id:-unset}) in /etc/github-runners.conf is not a finished template."
+        echo "Run the setup wizard:"
+        echo "  runner setup"
+        return 0
+    fi
+    if ! command -v qm >/dev/null 2>&1; then
+        echo "Could not check whether template VM $id is a finished template: qm is not available."
+        return 0
+    fi
+    if [[ ! -f "$INSTALL_DIR/lib/bake.sh" ]]; then
+        echo "Could not check whether template VM $id is a finished template: $INSTALL_DIR/lib/bake.sh is missing."
+        return 0
+    fi
+    # shellcheck source=lib/bake.sh
+    if ! source "$INSTALL_DIR/lib/bake.sh"; then
+        echo "Could not check whether template VM $id is a finished template."
+        return 0
+    fi
+    err=$(mktemp)
+    if ! cfg=$(qm config "$id" 2>"$err"); then
+        if grep -q 'does not exist' "$err"; then
+            rm -f "$err"
+            echo "Template VM $id does not exist, so it is not a finished template."
+            echo "Run the setup wizard:"
+            echo "  runner setup"
+            return 0
+        fi
+        rm -f "$err"
+        echo "Could not check whether template VM $id is a finished template."
+        return 0
+    fi
+    rm -f "$err"
+    if template_is_converted "$id"; then
+        echo "Done. No need to re-run setup."
+        return 0
+    fi
+    name=$(printf '%s\n' "$cfg" | awk '/^name:/{print $2; exit}')
+    if [[ "$name" == "ubuntu-cloud-template" ]]; then
+        echo "VM $id is an unfinished template bake: its disk was never converted to a template."
+        echo "If nothing is still baking it, remove it and run setup again:"
+        echo "  qm stop $id; qm destroy $id"
+        echo "  runner setup"
+        return 0
+    fi
+    echo "VM $id is not a finished template, so the pool will not clone from it."
+    echo "Run the setup wizard:"
+    echo "  runner setup"
+}
+
 # If setup was already run, sync deployed files (hookscript, systemd units)
 if [[ -f /etc/github-runners.conf ]]; then
     echo "Updating deployed files..."
@@ -58,7 +115,7 @@ if [[ -f /etc/github-runners.conf ]]; then
         rm -f /var/lib/vz/snippets/runner-user-data-*.yaml
         echo "  Removed obsolete per-org PAT snippets"
     fi
-    echo "Done. No need to re-run setup."
+    report_install_template
     # VMs cloned from those snippets keep the PAT until they are destroyed.
     # Look for the VMs, not the snippets: an earlier run may have removed the
     # snippets, and clones made with JIT configs never held the PAT.

@@ -65,8 +65,15 @@ block=${block//\/etc\/pve\/nodes/"$PVE_NODES_DIR"}
 if grep -nE '(^|[^[:alnum:]_.-])/(etc|opt|usr|var|run|srv|root|home)/' <<< "${block//"$state"/}" >&2; then
     fail "the install.sh lines under test name host paths"
 fi
+# The closing line calls report_install_template, defined above the prune.
+func=$(awk '
+    /^report_install_template\(\)/ { show = 1 }
+    show { print }
+    show && /^}$/ { exit }
+' "$root/install.sh")
+[[ -n "$func" ]] || fail "install.sh no longer defines report_install_template"
 run_install() {
-    "$BASH" -euo pipefail -c "$block" > "$state/out" 2>&1 ||
+    "$BASH" -euo pipefail -c "$func"$'\n'"$block" > "$state/out" 2>&1 ||
         fail "install.sh's closing lines failed: $(cat "$state/out")"
 }
 
@@ -87,7 +94,11 @@ grep -qF 'cloned from the old per-org snippets still have the org PAT' "$state/o
 seed jit
 run_install
 check_pruned install.sh
-grep -qF 'Done. No need to re-run setup.' "$state/out" || fail "install.sh did not finish: $(cat "$state/out")"
+if grep -qF 'Done. No need to re-run setup.' "$state/out"; then
+    fail "install.sh said setup was done with no template id: $(cat "$state/out")"
+fi
+grep -qF 'runner setup' "$state/out" ||
+    fail "install.sh did not say to run setup when TEMPLATE_ID is unset: $(cat "$state/out")"
 if grep -E 'PAT|WARNING|runner stop' "$state/out" >&2; then
     fail "install.sh warned about a PAT on a host whose clones never held one"
 fi
