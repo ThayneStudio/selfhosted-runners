@@ -42,6 +42,7 @@ POOL_DRAIN_FILE=$state/run/github-runner-drain
 LEGACY_POOL_DRAIN_FILE=$state/legacy/github-runner-drain
 REPO_URL=http://install.test/archive.tar.gz
 stop_term=0
+operator_stop=0
 
 systemctl() {
     printf 'systemctl %s\n' "$*" >> "$log"
@@ -61,8 +62,24 @@ systemctl() {
     fi
 }
 flock() {
+    local tmp
     if [[ -f "$POOL_DRAIN_FILE" && -f "$LEGACY_POOL_DRAIN_FILE" ]]; then
         printf 'drain-at-flock\n' >> "$log"
+    fi
+    # The exclusive lock is where an operator's runner stop, blocked on
+    # this lock, has already replaced both drain files.
+    if [[ "$*" == *-x* ]]; then
+        if [[ -f "$POOL_DRAIN_FILE" && ! -L "$POOL_DRAIN_FILE" ]]; then
+            cat -- "$POOL_DRAIN_FILE" > "$state/token-new"
+        fi
+        if [[ -f "$LEGACY_POOL_DRAIN_FILE" && ! -L "$LEGACY_POOL_DRAIN_FILE" ]]; then
+            cat -- "$LEGACY_POOL_DRAIN_FILE" > "$state/token-legacy"
+        fi
+        if [[ "$operator_stop" == 1 ]]; then
+            : > "$POOL_DRAIN_FILE"
+            tmp=$(mktemp "$state/legacy/.github-runner-drain.XXXXXX")
+            mv -f "$tmp" "$LEGACY_POOL_DRAIN_FILE"
+        fi
     fi
     printf 'flock %s\n' "$*" >> "$log"
     return "$flock_rc"
@@ -94,7 +111,9 @@ fresh() {
     flock_rc=0
     curl_rc=0
     stop_term=0
+    operator_stop=0
     OLD_POOL_LOCK_WAIT=600
+    rm -f "$state/token-new" "$state/token-legacy"
 }
 
 drains_gone() {
@@ -125,8 +144,8 @@ held=$(line_of 'flock -w 600 -x 9')
 extracted=$(line_of '^curl ')
 released=$(line_of 'flock -u 9')
 started=$(line_of 'systemctl start github-runner-watch.timer')
-[[ "$stop" != 0 && "$stop" -lt "$held" && "$held" -lt "$extracted" && "$extracted" -lt "$released" && "$released" -lt "$started" ]] ||
-    fail "upgrade order was stop=$stop flock=$held curl=$extracted release=$released start=$started: $(cat "$log")"
+[[ "$stop" != 0 && "$stop" -lt "$held" && "$held" -lt "$extracted" && "$extracted" -lt "$started" && "$started" -lt "$released" ]] ||
+    fail "upgrade order was stop=$stop flock=$held curl=$extracted start=$started release=$released: $(cat "$log")"
 [[ "$(grep -c 'systemctl start github-runner-watch.timer' "$log")" == 1 ]] ||
     fail "the watcher was started more than once: $(cat "$log")"
 [[ -f "$SNIPPETS_DIR/runner-hookscript.sh" ]] || fail "the hookscript was not installed"
@@ -136,9 +155,14 @@ started=$(line_of 'systemctl start github-runner-watch.timer')
 grep -q 'Done. No need to re-run setup.' "$state/out" || fail "an upgrade did not finish: $(cat "$state/out")"
 [[ "$(line_of 'drain-at-stop')" != 0 && "$(line_of 'drain-at-stop')" -lt "$held" ]] ||
     fail "the drain was not set before the old pool lock was taken: $(cat "$log")"
-[[ "$(line_of 'drain-at-start')" -gt "$started" ]] ||
-    fail "the drain was cleared before the watcher restarted: $(cat "$log")"
+[[ -s "$state/token-new" && "$(cat "$state/token-new")" == "$(cat "$state/token-legacy")" ]] ||
+    fail "install did not write the same token into both drain flags"
+[[ "$(line_of 'drain-at-start')" == 0 ]] ||
+    fail "install restarted the watcher while its own drain flag was still set: $(cat "$log")"
 drains_gone || fail "an upgrade left the drain flag it set"
+if grep -q 'was left stopped' "$state/out"; then
+    fail "install reported a maintenance drain for its own token"
+fi
 
 # The old lock stays busy: leave the tree alone and start the watcher again.
 fresh
@@ -209,7 +233,8 @@ grep -q 'The download failed' "$state/err" ||
 [[ "$(grep -c 'systemctl start github-runner-watch.timer' "$log")" == 1 ]] ||
     fail "a failed extract started the watcher more than once: $(cat "$log")"
 [[ "$(line_of 'drain-at-stop')" != 0 ]] || fail "a failed extract did not drain before stopping the watcher"
-[[ "$(line_of 'drain-at-start')" != 0 ]] || fail "a failed extract cleared the drain before restarting the watcher"
+[[ "$(line_of 'drain-at-start')" == 0 ]] ||
+    fail "a failed extract restarted the watcher while its own drain flag was still set"
 drains_gone || fail "a failed extract left the drain flag it set"
 
 # A drain the operator already set stays set, including when only one path is present.
@@ -222,6 +247,10 @@ printf 'operator\n' > "$LEGACY_POOL_DRAIN_FILE"
 ( install_main ) > "$state/out" 2>"$state/err" || fail "an upgrade with a drain set failed: $(cat "$state/err")"
 [[ "$(cat "$POOL_DRAIN_FILE")" == operator ]] || fail "install rewrote the operator's drain flag"
 [[ "$(cat "$LEGACY_POOL_DRAIN_FILE")" == operator ]] || fail "install rewrote the operator's legacy drain flag"
+[[ "$(line_of 'systemctl start github-runner-watch.timer')" == 0 ]] ||
+    fail "install restarted the watcher while the operator's drain was set: $(cat "$log")"
+grep -q 'github-runner-watch.timer was left stopped' "$state/out" ||
+    fail "install did not say the watcher stayed stopped: $(cat "$state/out")"
 fresh
 printf 'DOCKER_MIRROR_URL=\n' > "$CONFIG_FILE"
 mkdir -p "$SYSTEMD_DIR" "$SNIPPETS_DIR" "$(dirname "$POOL_DRAIN_FILE")"
@@ -230,6 +259,33 @@ printf 'operator\n' > "$LEGACY_POOL_DRAIN_FILE"
 ( install_main ) > "$state/out" 2>"$state/err" || fail "an upgrade with a legacy drain failed: $(cat "$state/err")"
 [[ ! -e "$POOL_DRAIN_FILE" ]] || fail "install published a new drain flag over an existing legacy drain"
 [[ "$(cat "$LEGACY_POOL_DRAIN_FILE")" == operator ]] || fail "install cleared a pre-existing legacy drain flag"
+[[ "$(line_of 'systemctl start github-runner-watch.timer')" == 0 ]] ||
+    fail "install restarted the watcher while a legacy drain was set: $(cat "$log")"
+grep -q 'github-runner-watch.timer was left stopped' "$state/out" ||
+    fail "install did not say the watcher stayed stopped for a legacy drain: $(cat "$state/out")"
+
+# runner stop during the install replaces both flags. stop truncates the
+# new one and renames an empty file onto the legacy one, then blocks on
+# the old pool lock. The flags stay, and the watcher stays stopped.
+fresh
+printf 'DOCKER_MIRROR_URL=\n' > "$CONFIG_FILE"
+mkdir -p "$SYSTEMD_DIR" "$SNIPPETS_DIR"
+: > "$SYSTEMD_DIR/github-runner-watch.timer"
+operator_stop=1
+( install_main ) > "$state/out" 2>"$state/err" || fail "runner stop during install failed: $(cat "$state/err")"
+[[ -s "$state/token-new" && "$(cat "$state/token-new")" == "$(cat "$state/token-legacy")" ]] ||
+    fail "install did not publish a token before runner stop replaced the drain"
+[[ -f "$POOL_DRAIN_FILE" && ! -s "$POOL_DRAIN_FILE" ]] ||
+    fail "install removed the drain flag runner stop truncated"
+[[ -e "$LEGACY_POOL_DRAIN_FILE" && ! -L "$LEGACY_POOL_DRAIN_FILE" ]] ||
+    fail "install removed the legacy drain flag runner stop replaced"
+[[ "$(cat "$LEGACY_POOL_DRAIN_FILE")" != "$(cat "$state/token-new")" ]] ||
+    fail "the replaced legacy drain still held install's token"
+[[ "$(line_of 'systemctl start github-runner-watch.timer')" == 0 ]] ||
+    fail "install restarted the watcher after runner stop set maintenance: $(cat "$log")"
+grep -q 'github-runner-watch.timer was left stopped' "$state/out" ||
+    fail "install did not say the watcher stayed stopped after runner stop: $(cat "$state/out")"
+[[ "$(line_of '^curl ')" != 0 ]] || fail "runner stop during install aborted the extract"
 
 # A signal while the watcher is stopped still restarts it and clears the drain install set.
 fresh

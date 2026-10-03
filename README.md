@@ -763,18 +763,21 @@ stops partway, run `install.sh` again at once.
    ```
    On a host that already has `/etc/github-runners.conf`, it sets the
    maintenance drain at `/run/github-runners/github-runner-drain` and
-   `/run/lock/github-runner-drain` when neither file is already there, so a
-   VM that stops during the install does not start a reclone on the previous
-   version. It then stops `github-runner-watch.timer`, waits for
-   `github-runner-watch.service` to finish, and takes
-   `/run/lock/github-runner-pool.lock` exclusively for up to 10 minutes so a
-   clone still running the previous version finishes before the new tree is
-   extracted. If that wait times out, or the download fails, the tree is left
-   unchanged and the watcher is started again. It then refreshes the
-   hookscript and the systemd units, enables `github-runner-rebake.timer`,
-   releases that lock, starts the watcher, and clears the drain it set. A
-   drain that was already set is left in place. The same cleanup runs when
-   install exits on a signal. A host with no config has no timer and no lock
+   `/run/lock/github-runner-drain` when neither file is already there, and
+   writes a token into each file, so a VM that stops during the install does
+   not start a reclone on the previous version. It then stops
+   `github-runner-watch.timer`, waits for `github-runner-watch.service` to
+   finish, and takes `/run/lock/github-runner-pool.lock` exclusively for up to
+   10 minutes so a clone still running the previous version finishes before
+   the new tree is extracted. If that wait times out, or the download fails,
+   the tree is left unchanged. It then refreshes the hookscript and the systemd
+   units and enables `github-runner-rebake.timer`. It removes a drain file only
+   when that file still contains this install's token, starts the watcher
+   again, and releases the lock. `runner stop` truncates the new flag and replaces
+   the legacy one, so those files stay. When any drain file remains, install
+   leaves the watcher stopped and says so. A drain that was already set is
+   left in place the same way. The same cleanup runs when install exits on a
+   signal. A host with no config has no timer and no lock
    file, and the install only extracts the tree. The maintenance flag and the pool's
    locks move out of `/run/lock` into `/run/github-runners` (mode 0700). A drain
    already set is a root-owned `/run/lock/github-runner-drain`, and it still counts

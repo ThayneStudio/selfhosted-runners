@@ -17,30 +17,52 @@ POOL_DRAIN_FILE="${POOL_DRAIN_FILE:-/run/github-runners/github-runner-drain}"
 LEGACY_POOL_DRAIN_FILE="${LEGACY_POOL_DRAIN_FILE:-/run/lock/github-runner-drain}"
 
 # Set while an upgrade holds the old pool lock, has stopped the watcher,
-# or has published a drain flag of its own.
+# or has published a drain flag of its own. UPGRADE_DRAIN_TOKEN is the
+# text written into those flags. runner stop truncates the new flag and
+# replaces the legacy one, so release can tell them apart.
 UPGRADE_TIMER_STOPPED=0
 UPGRADE_LOCK_HELD=0
 UPGRADE_DRAIN_SET=0
+UPGRADE_DRAIN_TOKEN=""
 
-# Drop the old pool lock, start the watcher, then clear a drain this
-# install published. The watcher is started while the drain is still set,
-# so its first tick does not fill a slot the old reclone skipped. Safe to
-# call twice. An EXIT trap that ends in a successful command would hide
-# the failure that caused the exit, so the trap exits again with the
-# status it saved.
+# True when this regular file still holds the token publish wrote. An
+# empty token would match a flag runner stop left empty, so it does not
+# count as ours.
+upgrade_drain_is_own() {
+    local content
+    [[ -n "$UPGRADE_DRAIN_TOKEN" ]] || return 1
+    [[ -f "$1" && ! -L "$1" ]] || return 1
+    content=$(cat -- "$1" 2>/dev/null || true)
+    [[ "$content" == "$UPGRADE_DRAIN_TOKEN" ]]
+}
+
+# Remove a drain this install still owns, then start the watcher only
+# when no drain flag remains. The old pool lock stays held across that
+# decision: an old runner stop is blocked on it. Safe to call twice. An
+# EXIT trap that ends in a successful command would hide the failure that
+# caused the exit, so the trap exits again with the status it saved.
 release_upgrade_quiesce() {
+    local file
+    if (( UPGRADE_DRAIN_SET )); then
+        for file in "$POOL_DRAIN_FILE" "$LEGACY_POOL_DRAIN_FILE"; do
+            if upgrade_drain_is_own "$file"; then
+                rm -f -- "$file" || true
+            fi
+        done
+        UPGRADE_DRAIN_SET=0
+    fi
+    if (( UPGRADE_TIMER_STOPPED )); then
+        if upgrade_drain_active; then
+            echo "A maintenance drain is set, so github-runner-watch.timer was left stopped."
+        else
+            systemctl start github-runner-watch.timer 2>/dev/null || true
+        fi
+        UPGRADE_TIMER_STOPPED=0
+    fi
     if (( UPGRADE_LOCK_HELD )); then
         flock -u 9 2>/dev/null || true
         exec 9>&-
         UPGRADE_LOCK_HELD=0
-    fi
-    if (( UPGRADE_TIMER_STOPPED )); then
-        systemctl start github-runner-watch.timer 2>/dev/null || true
-        UPGRADE_TIMER_STOPPED=0
-    fi
-    if (( UPGRADE_DRAIN_SET )); then
-        rm -f -- "$POOL_DRAIN_FILE" "$LEGACY_POOL_DRAIN_FILE" || true
-        UPGRADE_DRAIN_SET=0
     fi
 }
 
@@ -107,11 +129,16 @@ publish_upgrade_drain() {
     if [[ -L "$POOL_DRAIN_FILE" ]]; then
         rm -f -- "$POOL_DRAIN_FILE" || return 1
     fi
-    : > "$POOL_DRAIN_FILE" || return 1
+    [[ -n "$UPGRADE_DRAIN_TOKEN" ]] || return 1
+    printf '%s\n' "$UPGRADE_DRAIN_TOKEN" > "$POOL_DRAIN_FILE" || return 1
 
     dir=$(dirname -- "$LEGACY_POOL_DRAIN_FILE")
     [[ -d "$dir" && ! -L "$dir" && -w "$dir" ]] || return 1
     tmp=$(mktemp "$dir/.github-runner-drain.XXXXXX") || return 1
+    if ! printf '%s\n' "$UPGRADE_DRAIN_TOKEN" > "$tmp"; then
+        rm -f -- "$tmp"
+        return 1
+    fi
     if ! mv -f "$tmp" "$LEGACY_POOL_DRAIN_FILE"; then
         rm -f -- "$tmp"
         return 1
@@ -133,13 +160,21 @@ quiesce_old_pool() {
     trap on_upgrade_signal INT TERM HUP
     if ! upgrade_drain_active; then
         UPGRADE_DRAIN_SET=1
+        # /proc is Linux. bash 5 EPOCHREALTIME covers a host without it.
+        UPGRADE_DRAIN_TOKEN=""
+        if [[ -r /proc/sys/kernel/random/uuid ]]; then
+            UPGRADE_DRAIN_TOKEN=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || true)
+        fi
+        if [[ -z "$UPGRADE_DRAIN_TOKEN" ]]; then
+            UPGRADE_DRAIN_TOKEN="install $$ ${EPOCHREALTIME:-0} $RANDOM"
+        fi
         publish_upgrade_drain || abort_upgrade "Could not set the maintenance drain, so the new tree was not installed."
     fi
     if [[ -f "$SYSTEMD_DIR/github-runner-watch.timer" ]]; then
         UPGRADE_TIMER_STOPPED=1
         systemctl stop github-runner-watch.timer
         if ! wait_for_watch_service; then
-            abort_upgrade "github-runner-watch.service was still running after ${OLD_POOL_LOCK_WAIT}s, so the new tree was not installed. The watcher has been started again."
+            abort_upgrade "github-runner-watch.service was still running after ${OLD_POOL_LOCK_WAIT}s, so the new tree was not installed."
         fi
     fi
     # /run/lock is 1777. A symlink here would make flock wait on some
@@ -150,7 +185,7 @@ quiesce_old_pool() {
     exec 9>"$OLD_POOL_LOCK"
     if ! flock -w "$OLD_POOL_LOCK_WAIT" -x 9; then
         exec 9>&-
-        abort_upgrade "Timed out after ${OLD_POOL_LOCK_WAIT}s waiting for $OLD_POOL_LOCK. A clone started by the previous version is still running, so the new tree was not installed. The watcher has been started again."
+        abort_upgrade "Timed out after ${OLD_POOL_LOCK_WAIT}s waiting for $OLD_POOL_LOCK. A clone started by the previous version is still running, so the new tree was not installed."
     fi
     UPGRADE_LOCK_HELD=1
 }
@@ -167,9 +202,6 @@ install_main() {
     # so pipefail on its own does not stop the rest of the install.
     mkdir -p "$INSTALL_DIR"
     if ! curl -fsSL "$REPO_URL" | tar xz --strip-components=1 -C "$INSTALL_DIR"; then
-        if (( UPGRADE_TIMER_STOPPED )); then
-            abort_upgrade "The download failed, so the new tree was not installed. The watcher has been started again."
-        fi
         abort_upgrade "The download failed, so the new tree was not installed."
     fi
     chmod +x "$INSTALL_DIR/runner" "$INSTALL_DIR/lib/"*.sh
