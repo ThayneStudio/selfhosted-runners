@@ -329,7 +329,7 @@ bake_setup_template() {
     # until TEMPLATE_ID, the retired list and the baked-version record name the
     # new template, as perform_bake does: a rebake in between acts on the old
     # TEMPLATE_ID or record, and can leak or destroy the new template.
-    exec 199>"$REBAKE_LOCK_FILE"
+    open_lock_fd 199 "$REBAKE_LOCK_FILE" || return 1
     if ! flock -n 199; then
         log_error "A template rebake is running. Run setup again after it finishes."
         return 1

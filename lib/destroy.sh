@@ -55,7 +55,7 @@ else
     # not create it again. Under the slot lock, and only once a listing that
     # worked shows no VM of that name.
     if [[ ${#MATCHING_VMIDS[@]} -eq 0 ]] && EXTRA_ORG=$(extra_runner_org "$RUNNER_NAME"); then
-        exec 200>"$(slot_lock_file "$RUNNER_NAME")"
+        open_lock_fd 200 "$(slot_lock_file "$RUNNER_NAME")" || exit 1
         flock -n 200 || { log_error "'$RUNNER_NAME' is being managed by another process (reclone/watch); try again in a moment"; exit 1; }
         VM_LIST=$(qm list 200>&- 201>&- 202>&-) || { log_error "Could not list VMs"; exit 1; }
         if awk -v n="$RUNNER_NAME" 'NR>1 && $2==n {found=1} END {exit !found}' <<< "$VM_LIST"; then
@@ -89,7 +89,7 @@ else
 fi
 
 # Take the per-slot lock so we don't race watch/reclone on this slot.
-exec 200>"$(slot_lock_file "$RUNNER_NAME")"
+open_lock_fd 200 "$(slot_lock_file "$RUNNER_NAME")" || exit 1
 flock -n 200 || { log_error "'$RUNNER_NAME' is being managed by another process (reclone/watch); try again in a moment"; exit 1; }
 
 VM_ORG=$(get_vm_org "$VMID")

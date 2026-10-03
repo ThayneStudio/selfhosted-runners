@@ -45,7 +45,7 @@ wait_for_watch_slot() {
 fill_runner_slot() {
     local slot="$1" org="$2" kind="${3:-}"
     # Per-runner lock prevents races with reclone.sh on the same slot
-    exec 200>"$(slot_lock_file "$slot")"
+    open_lock_fd 200 "$(slot_lock_file "$slot")" || return 1
     flock -n 200 || return 0
 
     # Re-check: another process may have filled or held this slot
@@ -93,7 +93,7 @@ cloned_as_runner() {
 reclaim_runner_vm() {
     local vmid="$1" name="$2" reason="$3" slot_named="${4:-0}" stopped_since="${5:-}"
     local config org status_out status uptime age lifetime="" snippet removed=0
-    exec 200>"$(slot_lock_file "$name")"
+    open_lock_fd 200 "$(slot_lock_file "$name")" || return 1
     flock -n 200 || return 0
     if pool_is_draining; then
         return 0
@@ -156,7 +156,7 @@ reclaim_runner_vm() {
     # As in reclone.sh: hold shared pool activity so `runner stop` waits for
     # the destroy and the refill. A stop already waiting means a drain is
     # starting, so do not queue behind it.
-    exec 202>"$POOL_ACTIVITY_LOCK_FILE"
+    open_lock_fd 202 "$POOL_ACTIVITY_LOCK_FILE" || return 1
     flock -n -s 202 || return 0
     POOL_ACTIVITY_LOCK_HELD=1
     if pool_is_draining; then
@@ -319,7 +319,7 @@ watch_main() {
     done <<< "$vm_table"
 
     if (( ${#stopped_now[@]} > 0 )); then
-        if install -d -m 700 "$SLOT_STATE_DIR" && tmp=$(mktemp "$SLOT_STATE_DIR/.watch.XXXXXX"); then
+        if ensure_private_dir "$SLOT_STATE_DIR" && tmp=$(mktemp "$SLOT_STATE_DIR/.watch.XXXXXX"); then
             if ! printf '%s\n' "${stopped_now[@]}" > "$tmp" || ! mv -f "$tmp" "$stopped_state"; then
                 rm -f "$tmp"
             fi

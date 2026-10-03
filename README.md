@@ -756,10 +756,11 @@ moment. If it cannot, it logs
 and fails before it destroys any VM. The in-progress rebake VM is named
 `ubuntu-cloud-template` and has no org snippet, so stop does not treat it as a
 managed runner. `runner stop` leaves the pool in maintenance mode until
-`runner start`. The maintenance flag lives in `/run/lock/`, which is tmpfs. It
-does not survive a host reboot, and the watcher timer stays enabled, so a
-reboot mid-maintenance resumes runner creation. Do not reboot the Proxmox host
-between `runner stop` and `runner start`. On a full stop it also frees
+`runner start`. The maintenance flag lives in `/run/github-runners/`, which is
+tmpfs and mode 0700. It does not survive a host reboot, and the watcher timer
+stays enabled, so a reboot mid-maintenance resumes runner creation. Do not
+reboot the Proxmox host between `runner stop` and `runner start`. On a full stop
+it also frees
 orphaned linked-clone child volumes for the current template when those
 volumes no longer have a VM or container config anywhere in the cluster. Each
 freed volume must then be gone from `pvesm list`, because `pvesm free` exits 0
@@ -821,13 +822,40 @@ stops partway, run `install.sh` again at once.
    ```bash
    curl -fsSL https://raw.githubusercontent.com/ThayneStudio/selfhosted-runners/master/install.sh | bash
    ```
-   It refreshes the hookscript and the systemd units and enables
-   `github-runner-rebake.timer`. When `/etc/github-runners.conf` exists, it
-   then checks that `TEMPLATE_ID` is a finished template. If it is, it says
-   there is no need to re-run setup. If it is not, it says so and tells you
-   to run `runner setup`. If `qm` is unavailable, pmxcfs is not serving
-   `/etc/pve`, or the check cannot be made, it says it could not check. On a
-   host that still has the per-org snippets
+   On a host that already has `/etc/github-runners.conf`, it sets the
+   maintenance drain at `/run/github-runners/github-runner-drain` and
+   `/run/lock/github-runner-drain` when the new flag is absent and the old
+   path is not already a root-owned file, and writes a token into each file,
+   so a VM that stops during the install does not start a reclone on the
+   previous version. It then stops `github-runner-watch.timer`, waits for
+   `github-runner-watch.service` to finish, and takes
+   `/run/lock/github-runner-pool.lock` exclusively for up to 10 minutes so a
+   clone still running the previous version finishes before the new tree is
+   extracted. If a `github-runner-reclone-*` unit is still active once that
+   lock is held, install releases it, waits 2 seconds, and tries again inside
+   the same 10 minutes. When `systemctl` is unavailable, that check is
+   skipped. If that wait times out, or the download fails, the tree is left
+   unchanged. It then refreshes the hookscript and the systemd units, writes
+   the rebake start-timeout drop-in from `BAKE_TIMEOUT` in the conf, and
+   enables `github-runner-rebake.timer`. It checks that `TEMPLATE_ID` is a
+   finished template. If it is, it says there is no need to re-run setup. If
+   it is not, it says so and tells you to run `runner setup`. If `qm` is
+   unavailable, pmxcfs is not serving `/etc/pve`, or the check cannot be
+   made, it says it could not check. It removes a drain file only when that
+   file still contains this install's token, starts the watcher again, and
+   releases the lock. `runner stop` truncates the new flag and replaces the
+   legacy one, so those files stay. When any drain file remains, install
+   leaves the watcher stopped and says so. A drain that was already set is
+   left in place the same way. The same cleanup runs when install exits on a
+   signal. A host with no config has no timer and no lock file, and the
+   install only extracts the tree. The maintenance flag and the pool's locks
+   move out of `/run/lock` into `/run/github-runners` (mode 0700). A drain
+   already set is a root-owned `/run/lock/github-runner-drain`, and it still
+   counts until `runner start` clears it. `runner stop` also writes that old
+   path, so a hookscript this install has not yet copied into
+   `/var/lib/vz/snippets` still skips the reclone. If that copy does start
+   one, `reclone.sh` sees the drain and exits without cloning. On a host that
+   still has the per-org snippets
    of a version before single-use JIT configs
    (`/var/lib/vz/snippets/runner-user-data-<org>.yaml`, which held the org PAT),
    it also removes them. While any VM's cicustom still names one of those
@@ -1086,8 +1114,7 @@ The runner VM might not have network connectivity. Check:
 | `/var/lib/github-runners/pending-bake` | The VM of a bake beside the live template, from a rebake or from setup, until it is published or destroyed; the next rebake run finishes or removes a VM left there, and drops a record that names no bake VM on this node |
 | `/var/lib/github-runners/bake-leftover-volumes` | Disk volumes a bake created and `pvesm free` could not remove. The pending record is not kept for them; remove each volid by hand — mode 600 |
 | `/var/lib/github-runners/extras` | Extra runners from `runner create`, one `<name> <org>` per line, which the watcher fills like slots (see [Pool size and prefix](#pool-size-and-prefix)) — mode 600 |
-| `/run/github-runners/` | Per-slot failure holds (`slot-<name>`) and when the watcher first saw each stopped runner VM (`watch-stopped`); gone after a reboot |
-| `/run/lock/github-runner-drain` | Maintenance flag; the pool's lock files sit beside it in `/run/lock/` |
+| `/run/github-runners/` | Mode 0700. Per-slot failure holds (`slot-<name>`), when the watcher first saw each stopped runner VM (`watch-stopped`), the maintenance flag (`github-runner-drain`) and the pool's lock files. A slot's lock is `lock-slot-<name>.lock`. Gone after a reboot. A drain started by the previous version is still read from `/run/lock/github-runner-drain` when that file is root-owned |
 | `/var/log/github-runner.log` | Output of each reclone (`github-runner-reclone-<vmid>` units) |
 | `/var/log/github-runner-rebake.log` | Rebake output when `runner rebake` detached with `setsid` |
 | `github-runner-watch.timer` | Pool filler, 30 seconds after the previous run |
@@ -1196,12 +1223,6 @@ lists alone.
 - **No demand-based scaling**: each org runs a fixed pool of `RUNNER_COUNT`
   slots; `runner create` adds extras by hand
 - **Org-level only**: Repository-level runners not supported by these scripts
-- **No untrusted local accounts**: the maintenance flag and the pool's lock
-  files live in `/run/lock`, which every local account can write. Any account
-  on the host could pause refills with a fake maintenance flag, hold a lock to
-  stall recycling and `runner stop`, or hold the rebake lock so every daily
-  check logs `A rebake is already running` and skips. A Proxmox host should
-  have no untrusted local users.
 
 ## Resource Planning
 

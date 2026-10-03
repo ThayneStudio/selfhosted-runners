@@ -51,7 +51,7 @@ qm config "$TEMPLATE_ID" 2>/dev/null | grep -q "^template: 1" || {
 
 # Take the per-slot lock so watch/reclone don't race us — clone_runner requires
 # callers to hold fd 200 before entering (lock-order inversion vs VMID lock).
-exec 200>"$(slot_lock_file "$RUNNER_NAME")"
+open_lock_fd 200 "$(slot_lock_file "$RUNNER_NAME")" || exit 1
 flock -n 200 || { log_error "Another process is managing '$RUNNER_NAME'"; exit 1; }
 
 # Check name not taken

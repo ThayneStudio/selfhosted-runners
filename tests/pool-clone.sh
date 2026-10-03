@@ -24,6 +24,7 @@ INSTALL_DIR=$root
 SNIPPETS_DIR=$state/snippets
 mkdir -p "$SNIPPETS_DIR"
 POOL_DRAIN_FILE=$state/drain
+LEGACY_POOL_DRAIN_FILE=$state/legacy-drain
 POOL_ACTIVITY_LOCK_FILE=$state/pool.lock
 VMID_LOCK_FILE=$state/vmid.lock
 VMID_RESERVATION_LOCK_PREFIX=$state/reserve

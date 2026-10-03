@@ -21,20 +21,29 @@ CONFIG_FILE="/etc/github-runners.conf"
 ORG_CONFIG_DIR="/etc/github-runners.d"
 SNIPPETS_DIR="/var/lib/vz/snippets"
 INSTALL_DIR="/opt/selfhosted-runners"
-POOL_DRAIN_FILE="/run/lock/github-runner-drain"
+# Drain flag, pool locks and per-slot state (SLOT_STATE_DIR in recycle.sh).
+# /run is root-owned 0755, so another account cannot create this directory,
+# and mode 0700 keeps one from opening or unlinking the files. /run/lock is
+# 1777, which is why none of these live there.
+RUN_DIR="/run/github-runners"
+POOL_DRAIN_FILE="$RUN_DIR/github-runner-drain"
+# The hookscript copied by the previous install reads this path and does not
+# source these libs. install.sh replaces /opt before it copies the new
+# hookscript, so a VM can stop in between.
+LEGACY_POOL_DRAIN_FILE="/run/lock/github-runner-drain"
 # Shared/exclusive lock coordinating maintenance mode with in-flight clones.
 # clone_runner holds a shared lock for its full lifecycle; runner stop takes an
 # exclusive lock so it can wait until all clone activity is quiesced.
-POOL_ACTIVITY_LOCK_FILE="/run/lock/github-runner-pool.lock"
+POOL_ACTIVITY_LOCK_FILE="$RUN_DIR/github-runner-pool.lock"
 # Global lock serializing VMID allocation across reclone.sh/watch.sh/create.sh.
 # Scope is narrow: "pick free VMID -> reserve it". A per-VMID reservation
 # stays held until qm clone returns, so clone tasks can run with bounded
 # parallelism without racing on the same VMID.
 # pvesh get /cluster/nextid is not atomic and does not reserve, so without
 # this lock two parallel clones reliably pick the same VMID.
-VMID_LOCK_FILE="/run/lock/runner-vmid.lock"
-VMID_RESERVATION_LOCK_PREFIX="/run/lock/runner-vmid-reserve"
-CLONE_SLOT_LOCK_PREFIX="/run/lock/runner-clone-slot"
+VMID_LOCK_FILE="$RUN_DIR/runner-vmid.lock"
+VMID_RESERVATION_LOCK_PREFIX="$RUN_DIR/runner-vmid-reserve"
+CLONE_SLOT_LOCK_PREFIX="$RUN_DIR/runner-clone-slot"
 DEFAULT_CLONE_MAX_PARALLEL=2
 
 require_root() {
@@ -108,19 +117,163 @@ load_org_config() {
     fi
 }
 
+# uid of $1. GNU stat, then BSD, so the check is the same under the tests.
+file_owner() {
+    local owner
+    if owner=$(stat -c '%u' "$1" 2>/dev/null); then
+        printf '%s\n' "$owner"
+        return 0
+    fi
+    stat -f '%u' "$1"
+}
+
+# Permission bits of $1 as octal without the file type (700, 1777).
+file_mode() {
+    local mode
+    if ! mode=$(stat -c '%a' "$1" 2>/dev/null); then
+        mode=$(stat -f '%OLp' "$1") || return 1
+    fi
+    [[ "$mode" =~ ^[0-7]+$ ]] || return 1
+    printf '%o\n' "$((8#$mode))"
+}
+
+# Make $1 mode 0700 and owned by this process before a lock or the drain
+# flag is opened in it. Creates it if it is missing. An existing directory
+# with another owner, or with any group or other permission, is tightened;
+# if that cannot be done the caller must not open a file there. A symlink
+# is refused: chmod would follow it and change the target.
+ensure_private_dir() {
+    local dir="$1" owner mode
+    [[ -n "$dir" && "$dir" != "/" && "$dir" != "." ]] || {
+        log_error "refusing to store locks in ${dir:-<empty>}"
+        return 1
+    }
+    if [[ -L "$dir" ]]; then
+        log_error "$dir is a symlink; refusing to store locks there"
+        return 1
+    fi
+    if [[ -e "$dir" && ! -d "$dir" ]]; then
+        log_error "$dir exists and is not a directory"
+        return 1
+    fi
+    if [[ ! -d "$dir" ]]; then
+        # install -d -m applies to this directory, including one that already
+        # exists, and not to its parents. Two callers creating it both end at
+        # 0700. 0700 has no group or other bits for umask to leave set.
+        install -d -m 700 "$dir" || return 1
+    fi
+    owner=$(file_owner "$dir") || {
+        log_error "could not stat $dir"
+        return 1
+    }
+    if [[ "$owner" != "$EUID" ]]; then
+        if ! chown "$EUID:$(id -g)" "$dir" 2>/dev/null; then
+            log_error "$dir is owned by uid $owner, not $EUID; refusing to store locks there"
+            return 1
+        fi
+    fi
+    chmod 700 "$dir" || {
+        log_error "could not make $dir mode 0700; refusing to store locks there"
+        return 1
+    }
+    owner=$(file_owner "$dir") || return 1
+    mode=$(file_mode "$dir") || return 1
+    if [[ "$owner" != "$EUID" || "$mode" != "700" ]]; then
+        log_error "$dir is not private (owner $owner mode $mode); refusing to store locks there"
+        return 1
+    fi
+}
+
+# Drop a symlink or another account's file at $1 after its directory is
+# private. flock follows a symlink, and a lock file someone else created is
+# one they can already hold. Neither can be recreated once the directory is
+# mode 0700 and owned by this process.
+prepare_lock_file() {
+    local file="$1" owner dir
+    dir=$(dirname -- "$file")
+    ensure_private_dir "$dir" || return 1
+    if [[ -L "$file" ]]; then
+        rm -f -- "$file" || return 1
+    elif [[ -d "$file" ]]; then
+        log_error "$file is a directory; refusing to use it as a lock"
+        return 1
+    elif [[ -e "$file" ]]; then
+        owner=$(file_owner "$file") || return 1
+        if [[ "$owner" != "$EUID" ]]; then
+            rm -f -- "$file" || return 1
+        fi
+    fi
+}
+
+# Open $2 on file descriptor $1 for a later flock. The fd numbers are fixed:
+# workers close 200-204 around qm so a long-lived qemu does not inherit them.
+open_lock_fd() {
+    local fd="$1" file="$2"
+    prepare_lock_file "$file" || return 1
+    case "$fd" in
+        199) exec 199>"$file" ;;
+        200) exec 200>"$file" ;;
+        201) exec 201>"$file" ;;
+        202) exec 202>"$file" ;;
+        203) exec 203>"$file" ;;
+        204) exec 204>"$file" ;;
+        *)
+            log_error "internal: no lock fd $fd"
+            return 1
+            ;;
+    esac
+}
+
+# 0 when the previous install left a root-owned drain flag at the old path.
+# /run/lock is 1777, so a file another account created there does not count,
+# and neither does a symlink (stat would report the target's owner).
+legacy_drain_active() {
+    local owner
+    [[ -n "${LEGACY_POOL_DRAIN_FILE:-}" && "$LEGACY_POOL_DRAIN_FILE" != "$POOL_DRAIN_FILE" ]] || return 1
+    [[ -f "$LEGACY_POOL_DRAIN_FILE" && ! -L "$LEGACY_POOL_DRAIN_FILE" ]] || return 1
+    owner=$(file_owner "$LEGACY_POOL_DRAIN_FILE") || return 1
+    [[ "$owner" == "0" ]]
+}
+
+# The old hookscript only tests that this path exists. Replace whatever is
+# there with a file this process owns: mv uses rename, which replaces a
+# symlink instead of writing through it. /run/lock is sticky, so another
+# account cannot unlink the result. A directory we cannot write is skipped;
+# reclone.sh still checks the new flag.
+sync_legacy_drain() {
+    local dir tmp
+    [[ -n "${LEGACY_POOL_DRAIN_FILE:-}" && "$LEGACY_POOL_DRAIN_FILE" != "$POOL_DRAIN_FILE" ]] || return 0
+    dir=$(dirname -- "$LEGACY_POOL_DRAIN_FILE")
+    [[ -d "$dir" && -w "$dir" ]] || return 0
+    tmp=$(mktemp "$dir/.github-runner-drain.XXXXXX") || return 0
+    if ! mv -f "$tmp" "$LEGACY_POOL_DRAIN_FILE"; then
+        rm -f -- "$tmp"
+        return 0
+    fi
+}
+
 pool_is_draining() {
-    [[ -e "$POOL_DRAIN_FILE" ]]
+    if [[ -f "$POOL_DRAIN_FILE" && ! -L "$POOL_DRAIN_FILE" ]]; then
+        return 0
+    fi
+    legacy_drain_active || return 1
+    # Copy it forward so a new hookscript and the next check agree. The
+    # legacy flag still counts when the copy fails.
+    enable_pool_drain || true
+    return 0
 }
 
 enable_pool_drain() {
-    # /run/lock is 1777 on Debian. mkdir -p leaves an existing directory's
-    # mode alone; install -d -m 755 would chmod it and lock out non-root users.
-    mkdir -p "$(dirname "$POOL_DRAIN_FILE")"
-    : > "$POOL_DRAIN_FILE"
+    prepare_lock_file "$POOL_DRAIN_FILE" || return 1
+    : > "$POOL_DRAIN_FILE" || return 1
+    sync_legacy_drain || true
 }
 
 disable_pool_drain() {
-    rm -f "$POOL_DRAIN_FILE"
+    rm -f -- "$POOL_DRAIN_FILE"
+    if [[ -n "${LEGACY_POOL_DRAIN_FILE:-}" && "$LEGACY_POOL_DRAIN_FILE" != "$POOL_DRAIN_FILE" ]]; then
+        rm -f -- "$LEGACY_POOL_DRAIN_FILE"
+    fi
 }
 
 list_orgs() {
@@ -302,7 +455,7 @@ reserve_vmid() {
         fi
 
         lock_file=$(vmid_reservation_lock_file "$vmid")
-        exec 203>"$lock_file"
+        open_lock_fd 203 "$lock_file" || return 1
         if flock -n 203; then
             if vmid_in_use "$vmid"; then
                 exec 203>&-
@@ -341,7 +494,7 @@ acquire_clone_slot() {
     while true; do
         pool_is_draining && return 1
         for ((slot = 1; slot <= max; slot++)); do
-            exec 204>"${CLONE_SLOT_LOCK_PREFIX}-${slot}.lock"
+            open_lock_fd 204 "${CLONE_SLOT_LOCK_PREFIX}-${slot}.lock" || return 1
             if flock -n 204; then
                 return 0
             fi
@@ -611,7 +764,7 @@ cleanup_runner_orphan_volumes() {
         min_vmid=$((TEMPLATE_ID + 1))
     fi
 
-    exec 202>"$POOL_ACTIVITY_LOCK_FILE"
+    open_lock_fd 202 "$POOL_ACTIVITY_LOCK_FILE" || return 1
     if ! flock -n -x 202; then
         exec 202>&-
         return 0
@@ -798,7 +951,7 @@ clone_runner() {
         if [[ "${POOL_ACTIVITY_LOCK_HELD:-0}" == "1" ]]; then
             return 0
         fi
-        exec 202>"$POOL_ACTIVITY_LOCK_FILE"
+        open_lock_fd 202 "$POOL_ACTIVITY_LOCK_FILE" || return 1
         flock -s 202
         pool_lock_owned=1
     }
@@ -809,7 +962,7 @@ clone_runner() {
         fi
     }
 
-    _pool_lock_acquire
+    _pool_lock_acquire || return 1
 
     if pool_is_draining; then
         log_warn "clone_runner: pool drain active, refusing to create $name"
@@ -912,7 +1065,7 @@ clone_runner() {
     # workers behind the same allocation lock.
     # Callers (reclone.sh/watch.sh) must acquire their per-slot fd 200 lock
     # before entering clone_runner to avoid deadlock on lock order inversion.
-    exec 201>"$VMID_LOCK_FILE"
+    open_lock_fd 201 "$VMID_LOCK_FILE" || return 1
     if ! flock -w 300 201; then
         log_error "clone_runner: timed out acquiring VMID lock for $name"
         exec 201>&-

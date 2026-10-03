@@ -126,7 +126,7 @@ enable_pool_drain
 systemctl stop github-runner-watch.timer 2>/dev/null || true
 
 log_info "Waiting for in-flight clone activity to drain..."
-exec 202>"$POOL_ACTIVITY_LOCK_FILE"
+open_lock_fd 202 "$POOL_ACTIVITY_LOCK_FILE" || exit 1
 flock 202
 
 log_info "Stopping runner watcher service..."
