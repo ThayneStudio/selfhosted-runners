@@ -673,6 +673,9 @@ rebake_main() {
     done
 
     require_root rebake
+    # A detached rebake reports errors only in its log, after "Rebake started".
+    # Refuse a bad override here, where the caller sees it.
+    check_bake_timeout || exit 1
     detach_rebake_from_ssh
     trap '' HUP PIPE
     if ! command -v qm >/dev/null 2>&1; then

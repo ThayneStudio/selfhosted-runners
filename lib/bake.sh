@@ -119,6 +119,16 @@ resolve_bake_runner_version() {
     log_info "The bake installs actions/runner $LATEST_RUNNER_VERSION"
 }
 
+# BAKE_TIMEOUT is whole seconds. bash reads "2h" or "90m" as a bad number, and
+# the poll's -ge test then fails on every pass without ending the loop, so a
+# stalled guest would hold the bake, and the rebake lock, for good.
+check_bake_timeout() {
+    if [[ -n "${BAKE_TIMEOUT:-}" && ! "$BAKE_TIMEOUT" =~ ^[1-9][0-9]*$ ]]; then
+        log_error "BAKE_TIMEOUT must be a whole number of seconds, such as 7200, not '$BAKE_TIMEOUT'"
+        return 1
+    fi
+}
+
 # A bake can write its whole BAKE_DISK_GIB disk to VM_STORAGE. A storage that
 # fills up pauses every VM on it (QEMU's default werror=enospc), not only the
 # bake VM, so refuse to start a bake without that much free. BAKE_MIN_FREE_GIB
@@ -152,6 +162,7 @@ create_bake_vm() {
     local net_config="virtio,bridge=$NETWORK_BRIDGE"
 
     # Checked before the VM exists, for setup and rebake alike.
+    check_bake_timeout || return 1
     check_bake_storage_space || return 1
     resolve_bake_runner_version || return 1
 
@@ -180,6 +191,9 @@ bake_and_publish_vm() {
     local bake_elapsed=0 bake_interval=15 bake_ready=false
     local bake_timeout="${BAKE_TIMEOUT:-5400}"
     local minutes seconds_rem i
+
+    # Before any VM work: the poll below cannot time out on a bad value.
+    check_bake_timeout || return 1
 
     import_output=$(qm_host importdisk "$vmid" "$IMG_CACHE_DIR/$CLOUD_IMG" "$VM_STORAGE" 2>&1) || {
         log_error "Failed to import disk"
