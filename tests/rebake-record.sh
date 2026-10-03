@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
-# The baked-version record says which template it describes. A record for a
-# template other than the live TEMPLATE_ID must not suppress the next bake, and
-# the template it names, which nothing else lists, is queued for retirement.
+# The baked-version record says which template it describes and which Docker
+# mirror that template was baked with. A record for a template other than the
+# live TEMPLATE_ID, or for another mirror, must not suppress the next bake. The
+# template a stale record names, which nothing else lists, is queued for
+# retirement.
 set -euo pipefail
 
 if [[ "${BASH_VERSINFO[0]}" -lt 4 ]]; then
@@ -51,44 +53,70 @@ template_has_linked_clones() { return 0; }
 curl() { printf '{"tag_name":"v2.330.0","published_at":"2026-09-01T00:00:00Z"}\n'; }
 perform_bake() { : > "$baked"; }
 
-# Runs one daily check with TEMPLATE_ID=$1 and the record given on stdin.
+# Runs one daily check against a config written the way setup writes it, with
+# TEMPLATE_ID=$1 and DOCKER_MIRROR_URL=$2. The record is already in place.
 daily_check() {
-    printf 'NETWORK_BRIDGE=vmbr0\nVM_STORAGE=local-zfs\nTEMPLATE_ID=%s\nMIN_VMID=9001\n' "$1" > "$CONFIG_FILE"
-    cat > "$BAKED_VERSION_FILE"
+    {
+        printf 'NETWORK_BRIDGE=vmbr0\nVM_STORAGE=local-zfs\nTEMPLATE_ID=%q\n' "$1"
+        printf 'MIN_VMID=9001\nDOCKER_MIRROR_URL=%q\n' "${2:-}"
+    } > "$CONFIG_FILE"
     rm -f "$baked"
     (rebake_main --foreground) || fail "rebake_main failed"
 }
+record() { cat > "$BAKED_VERSION_FILE"; }
 retired() { if [[ -e "$RETIRED_TEMPLATES_FILE" ]]; then tr '\n' ' ' < "$RETIRED_TEMPLATES_FILE"; fi; }
 
 # A fresh record for the live template: no bake.
-daily_check 9000 <<EOF
+record <<EOF
 version=2.330.0
 published_at=2026-09-01T00:00:00Z
 template_id=9000
 baked_at=$((now - day))
 EOF
+daily_check 9000
 [[ ! -e "$baked" ]] || fail "a fresh record for the live template started a bake"
 
 # Setup pointed TEMPLATE_ID back at 9000 after a rebake had published 9005.
 # The record still describes 9005: bake once, and queue 9005 for retirement.
 printf '9000\n' > "$RETIRED_TEMPLATES_FILE"
-daily_check 9000 <<EOF
+record <<EOF
 version=2.330.0
 published_at=2026-09-01T00:00:00Z
 template_id=9005
 baked_at=$((now - day))
 EOF
+daily_check 9000
 [[ -e "$baked" ]] || fail "a record for template 9005 suppressed the bake of live template 9000"
 [[ "$(retired)" == "9005 " ]] || fail "template 9005 was not queued for retirement: $(retired)"
 
-# Older and hand-written records have no template_id; they still count.
+# Older and hand-written records have no template_id or docker_mirror_url;
+# they still count.
 rm -f "$RETIRED_TEMPLATES_FILE"
-daily_check 9000 <<EOF
+record <<EOF
 version=2.330.0
 published_at=''
 baked_at=$((now - day))
 EOF
-[[ ! -e "$baked" ]] || fail "a record without template_id started a bake"
+daily_check 9000 http://10.0.0.20:5000
+[[ ! -e "$baked" ]] || fail "a record without template_id or docker_mirror_url started a bake"
 [[ -z "$(retired)" ]] || fail "a record without template_id queued a retirement: $(retired)"
+
+# The record keeps the mirror the template was baked with. Setup changing it
+# (scheme or host, or adding or removing one) bakes once; the same mirror,
+# written and read back by the real code, does not.
+for mirror in "" http://10.0.0.20:5000 https://mirror.example:5000 'http://[fd00::20]:5000'; do
+    DOCKER_MIRROR_URL=$mirror
+    commit_baked_version 2.330.0 9000 || fail "commit_baked_version failed for mirror '${mirror}'"
+    for configured in "" http://10.0.0.20:5000 http://10.0.0.21:5000 https://mirror.example:5000 'http://[fd00::20]:5000'; do
+        daily_check 9000 "$configured"
+        if [[ "$configured" == "$mirror" && -e "$baked" ]]; then
+            fail "a template baked with mirror '${mirror}' was rebaked although the mirror is unchanged"
+        fi
+        if [[ "$configured" != "$mirror" && ! -e "$baked" ]]; then
+            fail "a template baked with mirror '${mirror}' was kept after the mirror changed to '${configured}'"
+        fi
+    done
+done
+unset DOCKER_MIRROR_URL
 
 printf 'rebake-record: ok\n'

@@ -30,6 +30,8 @@ RECORDED_RUNNER_VERSION=""
 RECORDED_RUNNER_PUBLISHED_AT=""
 RECORDED_TEMPLATE_ID=""
 RECORDED_BAKED_AT=""
+RECORDED_DOCKER_MIRROR_URL=""
+RECORDED_DOCKER_MIRROR_KNOWN=0
 
 normalize_runner_version() {
     local v="${1:-}"
@@ -83,12 +85,22 @@ rebake_apply_decision() {
 }
 
 unquote_shell_literal() {
-    local value="${1:-}"
+    local value="${1:-}" out="" i
     if [[ "$value" == \'*\' && "$value" != "''" ]]; then
         value=${value#\'}
         value=${value%\'}
     elif [[ "$value" == "''" ]]; then
         value=""
+    elif [[ "$value" == *\\* ]]; then
+        # printf %q backslash-escapes characters such as the brackets of an
+        # IPv6 mirror URL. Drop each escaping backslash.
+        for ((i = 0; i < ${#value}; i++)); do
+            if [[ "${value:i:1}" == \\ ]]; then
+                i=$((i + 1))
+            fi
+            out+="${value:i:1}"
+        done
+        value=$out
     fi
     printf '%s' "$value"
 }
@@ -121,12 +133,12 @@ set_conf_assignment() {
 }
 
 write_baked_record() {
-    local version="$1" published_at="$2" template_id="$3" tmp baked_at
+    local version="$1" published_at="$2" template_id="$3" docker_mirror_url="${4:-}" tmp baked_at
     baked_at=$(date -u +%s) || return 1
     install -d -m 700 "$STATE_DIR" || return 1
     tmp=$(mktemp "$STATE_DIR/.baked-runner.XXXXXX") || return 1
-    if ! printf 'version=%q\npublished_at=%q\ntemplate_id=%q\nbaked_at=%q\n' \
-        "$version" "$published_at" "$template_id" "$baked_at" > "$tmp"; then
+    if ! printf 'version=%q\npublished_at=%q\ntemplate_id=%q\nbaked_at=%q\ndocker_mirror_url=%q\n' \
+        "$version" "$published_at" "$template_id" "$baked_at" "$docker_mirror_url" > "$tmp"; then
         rm -f "$tmp"
         return 1
     fi
@@ -142,6 +154,8 @@ read_baked_record() {
     RECORDED_RUNNER_PUBLISHED_AT=""
     RECORDED_TEMPLATE_ID=""
     RECORDED_BAKED_AT=""
+    RECORDED_DOCKER_MIRROR_URL=""
+    RECORDED_DOCKER_MIRROR_KNOWN=0
     [[ -f "$BAKED_VERSION_FILE" ]] || return 0
     while IFS= read -r line || [[ -n "$line" ]]; do
         [[ "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]] || continue
@@ -156,21 +170,36 @@ read_baked_record() {
                 ;;
             template_id) RECORDED_TEMPLATE_ID="$value" ;;
             baked_at) RECORDED_BAKED_AT="$value" ;;
+            # Empty means baked without a mirror, so presence is tracked apart.
+            docker_mirror_url)
+                RECORDED_DOCKER_MIRROR_URL="$value"
+                RECORDED_DOCKER_MIRROR_KNOWN=1
+                ;;
         esac
     done < "$BAKED_VERSION_FILE"
 }
 
-# The record describes the template it names. When TEMPLATE_ID has moved off
-# that template without a rebake (setup pointed at another VM, a hand edit,
-# setup racing a rebake), the record says nothing about the live template.
-# Ignore it so the decision bakes once. A record without template_id (older
-# or hand-written) still counts.
+# The record describes the template it names, baked with the Docker mirror it
+# names. When the config no longer matches, the record says nothing about what
+# clones get: ignore it so the decision bakes once. Fields that an older or
+# hand-written record lacks are not compared.
+# - TEMPLATE_ID moved off that template without a rebake (setup pointed at
+#   another VM, a hand edit, setup racing a rebake).
+# - DOCKER_MIRROR_URL changed. Clones rewrite daemon.json for the configured
+#   mirror: a different scheme moves Docker to another image store, which
+#   hides the warmed image cache, and a different host renames the warmed
+#   Supabase images.
 discard_stale_baked_record() {
-    [[ -n "$RECORDED_TEMPLATE_ID" && "$RECORDED_TEMPLATE_ID" != "$TEMPLATE_ID" ]] || return 0
-    log_info "The baked-version record is for template $RECORDED_TEMPLATE_ID, not TEMPLATE_ID $TEMPLATE_ID; ignoring it"
-    # Nothing listed that template for retirement when TEMPLATE_ID moved, so
-    # it would leak. Retirement still checks its name and linked clones.
-    remember_retired_template "$RECORDED_TEMPLATE_ID"
+    if [[ -n "$RECORDED_TEMPLATE_ID" && "$RECORDED_TEMPLATE_ID" != "$TEMPLATE_ID" ]]; then
+        log_info "The baked-version record is for template $RECORDED_TEMPLATE_ID, not TEMPLATE_ID $TEMPLATE_ID; ignoring it"
+        # Nothing listed that template for retirement when TEMPLATE_ID moved,
+        # so it would leak. Retirement still checks its name and linked clones.
+        remember_retired_template "$RECORDED_TEMPLATE_ID"
+    elif [[ "$RECORDED_DOCKER_MIRROR_KNOWN" == 1 && "$RECORDED_DOCKER_MIRROR_URL" != "${DOCKER_MIRROR_URL:-}" ]]; then
+        log_info "The template was baked with Docker mirror ${RECORDED_DOCKER_MIRROR_URL:-none}, not ${DOCKER_MIRROR_URL:-none}; ignoring the baked-version record"
+    else
+        return 0
+    fi
     RECORDED_RUNNER_VERSION=""
     RECORDED_BAKED_AT=""
 }
@@ -189,7 +218,11 @@ commit_baked_version() {
     if [[ "$published_at" == "null" ]]; then
         published_at=""
     fi
-    write_baked_record "$version" "$published_at" "$template_id"
+    # Every bake renders its snippet from the loaded DOCKER_MIRROR_URL. A run
+    # that finishes publishing an earlier run's bake records the mirror set
+    # now, which is wrong only if setup changed it while that publish was
+    # pending.
+    write_baked_record "$version" "$published_at" "$template_id" "${DOCKER_MIRROR_URL:-}"
 }
 
 fetch_latest_runner_release() {
