@@ -24,9 +24,12 @@ WATCH_MAX_PARALLEL=6
 # then a 6-hour job). A VM up longer than this lost its shutdown: a hung
 # guest, or a job that cancelled it.
 RUNNER_MAX_UPTIME=$(( (12 * 60 + 30) * 60 ))
-# A runner VM boots once. A QEMU process this much younger than the VM's
-# clone was started again, and cloud-init never starts the runner twice.
-RUNNER_RESTART_SLACK=600
+# A runner VM boots once. clone_runner writes the meta snippet seconds before
+# it starts the VM, so a QEMU process this much younger than the snippet was
+# started again, and cloud-init never starts the runner twice. A stop-mode
+# backup reaches most VMs of a busy pool minutes after their clone, so the
+# margin covers a slow first start and no more.
+RUNNER_RESTART_SLACK=120
 # A stopped VM is reclaimed only after this long, so the hookscript's reclone
 # normally gets it first and counts its death for the backoff.
 STOPPED_GRACE=60

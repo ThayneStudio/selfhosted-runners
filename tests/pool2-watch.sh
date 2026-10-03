@@ -312,4 +312,17 @@ tick
 did "destroy 9005" || fail "a restarted runner whose config could be read only once was not reclaimed: $(cat "$state/out")"
 grep -q 'not a runner VM' "$state/out" && fail "a runner was taken for a foreign VM"
 
+# R2-3: a stop-mode backup restarted a VM five minutes after its clone. It
+# has no runner, since cloud-init starts it only once, and is recycled.
+reset
+vm 9001 runner-1 running org=acme marker="$marker" uptime=10 born=$((clock - 300))
+tick
+[[ "$(cat "$actions")" == $'stop 9001\ndestroy 9001\nclone runner-1 acme' ]] \
+    || fail "a VM restarted 5 minutes after its clone was not recycled: $(tr '\n' ' ' < "$actions")"
+# A first start 90 s after the meta snippet (a busy host) is not a restart.
+reset
+vm 9001 runner-1 running org=acme marker="$marker" uptime=110 born=$((clock - 200))
+tick
+did_nothing "a VM on its first boot was reclaimed as restarted"
+
 printf 'pool2-watch: ok\n'
