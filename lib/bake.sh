@@ -23,6 +23,10 @@ prepare_cloud_image() {
 
     mkdir -p "$IMG_CACHE_DIR"
     chmod 700 "$IMG_CACHE_DIR"
+    # A download killed mid-transfer (systemctl stop, shutdown, Ctrl-C) leaves
+    # its mktemp file behind. setup and rebake share no lock, and an active
+    # download keeps its mtime fresh, so remove only files idle for 3 hours.
+    find "$IMG_CACHE_DIR" -maxdepth 1 -type f -name "$CLOUD_IMG.*" -mmin +180 -delete 2>/dev/null || true
     base_url="https://cloud-images.ubuntu.com/noble/current"
     img="$IMG_CACHE_DIR/$CLOUD_IMG"
 
