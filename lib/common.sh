@@ -932,6 +932,8 @@ clone_runner() {
             203>&- \
             204>&- \
             || log_warn "Failed to set hookscript on $vmid — VM will not auto-recycle"
+    else
+        log_warn "$SNIPPETS_DIR/runner-hookscript.sh is missing, so $name (VMID $vmid) will not auto-recycle; the watcher reclaims it after it stops. Restore it with: install -m 755 $INSTALL_DIR/templates/runner-hookscript.sh $SNIPPETS_DIR/runner-hookscript.sh"
     fi
 
     if pool_is_draining; then

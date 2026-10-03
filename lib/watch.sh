@@ -67,12 +67,13 @@ fill_runner_slot() {
 
 # Worker: recycle runner VM $1 named $2, which the scan found dead for reason
 # $3 (stopped, overdue or restarted). $4 is 1 when the name is a slot name of
-# a configured org. Runs in its own subshell. Everything is checked again
-# under the slot lock, so a reclone, `runner destroy` or clone that holds the
-# slot wins, and only a VM that carries this tool's snippet or clone-time
-# marker is touched.
+# a configured org. $5 is when the scan first saw a stopped VM stopped. Runs
+# in its own subshell. Everything is checked again under the slot lock, so a
+# reclone, `runner destroy` or clone that holds the slot wins, and only a VM
+# that carries this tool's snippet or clone-time marker is touched.
 reclaim_runner_vm() {
-    local vmid="$1" name="$2" reason="$3" slot_named="${4:-0}" config org status_out status uptime age
+    local vmid="$1" name="$2" reason="$3" slot_named="${4:-0}" stopped_since="${5:-}"
+    local config org status_out status uptime age lifetime=""
     exec 200>"$(slot_lock_file "$name")"
     flock -n 200 || return 0
     if pool_is_draining; then
@@ -126,7 +127,13 @@ reclaim_runner_vm() {
     fi
 
     case "$reason" in
-        stopped) log_warn "[watch] Reclaiming $name (VMID $vmid): stopped and not recycled" ;;
+        stopped)
+            log_warn "[watch] Reclaiming $name (VMID $vmid): stopped and not recycled"
+            # Read before the destroy removes the meta snippet. The VM died
+            # before the scan first saw it stopped, so its life ends at that
+            # sighting, not at this reclaim a grace period or more later.
+            lifetime=$(runner_vm_lifetime "$vmid" "$stopped_since")
+            ;;
         overdue) log_warn "[watch] Reclaiming $name (VMID $vmid): up $((uptime / 3600))h$((uptime % 3600 / 60))m, long past the guest's own shutdown" ;;
         restarted) log_warn "[watch] Reclaiming $name (VMID $vmid): started again after its first boot, so it has no runner" ;;
     esac
@@ -137,6 +144,14 @@ reclaim_runner_vm() {
     if ! destroy_runner_vm "$vmid"; then
         log_warn "[watch] Failed to destroy $name (VMID $vmid); retrying next tick"
         return 0
+    fi
+    # A stopped VM that nothing recycled (no hookscript on it, a reclone
+    # unit that systemd refused) still died: count it as reclone.sh would,
+    # so a guest that dies fast every time gets its slot held instead of
+    # re-cloned on every tick. Counted once the VM is gone, so a destroy
+    # retried on the next tick counts it once.
+    if [[ "$reason" == "stopped" ]]; then
+        slot_note_death "$name" "$lifetime" "[watch]"
     fi
     refill_runner_slot "$name" "$org" "[watch]" "$(runner_vm_kind "$config")" || true
 }
@@ -237,7 +252,7 @@ watch_main() {
                 continue
             fi
             if (( now - since >= STOPPED_GRACE )); then
-                reclaim+=("$vmid $name stopped $slot_named")
+                reclaim+=("$vmid $name stopped $slot_named $since")
             fi
         elif [[ "$status" == "running" && "$lock" == "-" ]]; then
             if (( uptime > RUNNER_MAX_UPTIME )); then
@@ -283,8 +298,8 @@ watch_main() {
     # $VMID_LOCK_FILE flock, so parallel subshells can safely pick their own.
     for entry in "${reclaim[@]}"; do
         wait_for_watch_slot
-        read -r vmid name reason slot_named <<< "$entry"
-        ( reclaim_runner_vm "$vmid" "$name" "$reason" "$slot_named" ) &
+        read -r vmid name reason slot_named since <<< "$entry"
+        ( reclaim_runner_vm "$vmid" "$name" "$reason" "$slot_named" "$since" ) &
     done
     for entry in "${missing[@]}"; do
         wait_for_watch_slot

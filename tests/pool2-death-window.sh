@@ -75,6 +75,7 @@ qm() {
             ;;
         destroy)
             printf 'destroy %s\n' "$2" >> "$actions"
+            [[ "$destroy_rc" == 0 ]] || return "$destroy_rc"
             rm -rf "$dir"
             ;;
         list)
@@ -84,6 +85,7 @@ qm() {
         *) return 1 ;;
     esac
 }
+destroy_rc=0
 pvesh() {
     [[ "$*" == "get /nodes/localhost/qemu --output-format json" ]] || return 1
     if [[ -d "$state/vm/9001" ]]; then
@@ -162,6 +164,22 @@ die_after 900
 die_after 300
 die_after 300
 [[ "$(clones)" -eq 1 ]] || fail "the count survived a VM that outlived the window"
+
+# A reclone whose destroy fails leaves the VM to the watcher, which counts
+# the death when it destroys the VM: the reclone must not count it too.
+fresh_slot
+clock=$((born + 60))
+dead_vm
+destroy_rc=2
+set +e
+( set -e; reclone_main 9001 ) > "$state/out" 2>&1
+rc=$?
+set -e
+destroy_rc=0
+[[ $rc -ne 0 ]] || fail "a reclone whose destroy failed reported success"
+slot_state_load runner-1
+[[ "$SLOT_RAPID" == 0 ]] || fail "a reclone counted the death of a VM it could not destroy"
+rm -rf "$state/vm/9001"
 
 # One hour of a slot whose guest is refused 125 s after every clone. The
 # watcher refills a held slot on its 30 s ticks once the hold ends. Every

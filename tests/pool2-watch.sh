@@ -47,7 +47,7 @@ date() {
 
 # vm <vmid> <name> <status> [key=value ...]: uptime, org (cicustom), marker
 # (clone-time description), born (when it was cloned: its meta snippet's
-# mtime). Every VM but a foreign one has its meta snippet.
+# mtime), undeletable (qm destroy fails). Every VM gets a meta snippet.
 vm() {
     local dir="$state/vm/$1" kv
     rm -rf "$dir"
@@ -103,6 +103,7 @@ qm() {
             ;;
         destroy)
             printf 'destroy %s\n' "$id" >> "$actions"
+            [[ -z "$(field "$id" undeletable)" ]] || return 2
             rm -rf "$state/vm/$id"
             ;;
         list)
@@ -216,5 +217,59 @@ for _ in $(seq 0 "$((SLOT_BACKOFF_MAX / 30))"); do
     clock=$((clock + 30))
 done
 (( retried )) || fail "a hold set before the clock was stepped back kept the slot empty for 30 minutes"
+
+# N12: nothing recycles the slot's VMs when they stop (the hookscript was
+# missing at clone time, or systemd refused the reclone unit), and each one
+# dies 30 s after its clone. The watcher's reclaims count those deaths as
+# reclone.sh does, and the third in a row holds the slot.
+reset
+for n in 1 2 3; do
+    runner_vm 9001 runner-1 30
+    tick
+    clock=$((clock + 61))
+    tick
+    did "destroy 9001" || fail "death $n: the stopped VM was not reclaimed"
+    if (( n < 3 )) && ! did "clone runner-1 acme"; then
+        fail "death $n: the slot was not refilled"
+    fi
+done
+did "clone runner-1 acme" && fail "the slot was refilled after three fast deaths in a row"
+grep -qF '[watch] runner-1 died within 600s of its clone 3 times in a row; holding the slot for 30s' "$state/logger" \
+    || fail "the watcher's hold was not logged"
+clock=$((clock + 25))
+tick
+did_nothing "a slot held by the watcher was refilled"
+clock=$((clock + 6))
+tick
+did "clone runner-1 acme" || fail "the slot was not refilled after its hold"
+
+# The VM died before the tick that first saw it stopped. Measured at the
+# reclaim a grace period later, a VM that died 570 s after its clone would
+# read as one that outlived the 600 s window.
+reset
+runner_vm 9001 runner-1 570
+tick
+clock=$((clock + 61))
+tick
+did "destroy 9001" || fail "a stopped VM was not reclaimed"
+slot_state_load runner-1
+[[ "$SLOT_RAPID" == 1 ]] || fail "a VM that died 570 s after its clone was not counted (rapid=$SLOT_RAPID)"
+
+# A destroy that fails is retried on the next tick, and the death is
+# counted once, when the VM is gone.
+reset
+runner_vm 9001 runner-1 30
+printf '1\n' > "$state/vm/9001/undeletable"
+tick
+clock=$((clock + 61))
+tick
+did "destroy 9001" || fail "the stopped VM was not reclaimed"
+grep -q 'Failed to destroy runner-1' "$state/out" || fail "the failed destroy was not reported"
+rm -f "$state/vm/9001/undeletable"
+clock=$((clock + 30))
+tick
+did "clone runner-1 acme" || fail "the slot was not refilled once the destroy succeeded"
+slot_state_load runner-1
+[[ "$SLOT_RAPID" == 1 ]] || fail "a death whose destroy was retried was counted $SLOT_RAPID times"
 
 printf 'pool2-watch: ok\n'

@@ -13,7 +13,7 @@ source "$RECLONE_LIB_DIR/recycle.sh"
 source "$RECLONE_LIB_DIR/bake.sh"
 
 reclone_main() {
-    local vmid="${1:-}" name org config lock status
+    local vmid="${1:-}" name org config lock status age
     [[ -n "$vmid" ]] || { log_error "reclone: missing VMID argument"; exit 1; }
 
     load_infra_config
@@ -72,12 +72,16 @@ reclone_main() {
     # A single fast death is normal: a short job on a runner that picked it up
     # straight away. A run of them means the guest never got to run a job, and
     # holds the slot (recycle.sh) so the refill below waits for the watcher.
-    slot_note_death "$name" "$(runner_vm_age "$vmid")"
+    # The age is read before the destroy removes the meta snippet, and the
+    # death is counted once the VM is gone: a VM this destroy leaves behind
+    # is the watcher's, which counts it when it reclaims it.
+    age=$(runner_vm_age "$vmid")
 
     if ! destroy_runner_vm "$vmid"; then
         log_error "reclone: failed to destroy VM $vmid after 3 attempts, deferring to watcher"
         exit 1
     fi
+    slot_note_death "$name" "$age"
 
     refill_runner_slot "$name" "$org" "reclone:" "$(runner_vm_kind "$config")" || exit 1
 }
