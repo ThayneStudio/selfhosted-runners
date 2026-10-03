@@ -230,7 +230,18 @@ commit_baked_version() {
     write_baked_record "$version" "$published_at" "$template_id" "${DOCKER_MIRROR_URL:-}"
 }
 
+# The REST API allows 60 unauthenticated requests an hour per address, shared
+# with every job behind it, and curl does not retry its 403. github.com's
+# releases/latest page is not the REST API, so ask it when the API fails.
 fetch_latest_runner_release() {
+    if fetch_latest_runner_release_from_api; then
+        return 0
+    fi
+    log_warn "The GitHub API did not return the latest actions/runner release; reading it from github.com instead"
+    fetch_latest_runner_release_from_redirect
+}
+
+fetch_latest_runner_release_from_api() {
     local json
     json=$(curl -sf --retry 3 --max-time 30 \
         https://api.github.com/repos/actions/runner/releases/latest) || return 1
@@ -239,12 +250,25 @@ fetch_latest_runner_release() {
     [[ -n "$LATEST_RUNNER_VERSION" && "$LATEST_RUNNER_VERSION" != "null" ]] || return 1
     LATEST_RUNNER_VERSION=$(normalize_runner_version "$LATEST_RUNNER_VERSION")
     # jq -r already turns JSON null into an empty string. This must not be a
-    # trailing `&&` command: a false test would be this function's status, and
-    # rebake_main treats that as "could not read the release".
+    # trailing `&&` command: a false test would be this function's status,
+    # which counts as "could not read the release".
     if [[ "$LATEST_RUNNER_PUBLISHED_AT" == "null" ]]; then
         LATEST_RUNNER_PUBLISHED_AT=""
     fi
     return 0
+}
+
+# github.com/actions/runner/releases/latest answers with a redirect to
+# https://github.com/actions/runner/releases/tag/v<X.Y.Z>. curl does not
+# follow it here; %{redirect_url} is that Location. The redirect carries no
+# publish date.
+fetch_latest_runner_release_from_redirect() {
+    local location
+    location=$(curl -sf -o /dev/null -w '%{redirect_url}' --retry 3 --max-time 30 \
+        https://github.com/actions/runner/releases/latest) || return 1
+    [[ "$location" =~ ^https://github\.com/actions/runner/releases/tag/v?([0-9]+\.[0-9]+\.[0-9]+)$ ]] || return 1
+    LATEST_RUNNER_VERSION=${BASH_REMATCH[1]}
+    LATEST_RUNNER_PUBLISHED_AT=""
 }
 
 # Replaces the retired list with the ids given; no ids removes it. The list is
