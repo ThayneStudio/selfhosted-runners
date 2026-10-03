@@ -447,5 +447,38 @@ run_recover
 assert_gone local-zfs:base-9100-disk-0 "recover with a foreign token in the environment"
 unset BAKE_RUN_TOKEN
 
+# qm template renamed the disk and failed; qm destroy left the base volume.
+# A listing that cannot be read is not an empty storage: the record and the
+# marker stay, and the next recover frees the volume once the list works.
+reset_case
+TEMPLATE_ID=9000
+unset BAKE_VM_CREATED BAKE_RUN_TOKEN
+printf 'name: ubuntu-cloud-template\nscsi0: local-zfs:vm-9201-disk-0,size=30G\n' > "$(conf_of 9201)"
+set_volumes <<'EOF'
+local-zfs:base-9201-disk-0
+EOF
+pending 9201
+mark_created 9201
+mock_list_fails=1
+run_cleanup 9201
+[[ "$cleanup_rc" != 0 ]] || fail "cleanup reported success when the volume list failed"
+assert_kept local-zfs:base-9201-disk-0 "unlistable after destroy"
+assert_not_freed local-zfs:base-9201-disk-0 "unlistable after destroy"
+if ! record_kept; then fail "an unreadable volume list dropped the pending record"; fi
+grep -qF 'could not be checked' "$state/log" \
+    || fail "an unreadable volume list was not reported: $(cat "$state/log")"
+[[ -f "${PENDING_BAKE_FILE}.created" ]] || fail "an unreadable volume list dropped the created marker"
+if [[ -f "$STATE_DIR/bake-leftover-volumes" ]] \
+    && grep -q 'base-9201-disk-0' "$STATE_DIR/bake-leftover-volumes"; then
+    fail "an unreadable volume list was quarantined: $(cat "$STATE_DIR/bake-leftover-volumes")"
+fi
+[[ ! -e "$(conf_of 9201)" ]] || fail "the bake VM was not destroyed before the list failed"
+mock_list_fails=0
+run_recover
+[[ "$recover_rc" == 0 ]] || fail "the next recover did not free the volume once the list worked: $(cat "$state/log")"
+assert_gone local-zfs:base-9201-disk-0 "retry after an unreadable list"
+if record_kept; then fail "the record stayed after the leftover volume was freed"; fi
+[[ ! -e "${PENDING_BAKE_FILE}.created" ]] || fail "the created marker stayed after the leftover volume was freed"
+
 printf 'bake-preexisting-volume: ok\n'
 

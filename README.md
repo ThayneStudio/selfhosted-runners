@@ -506,9 +506,11 @@ leftover `base-<vmid>-disk-N` or `vm-<vmid>-disk-N` of its VMID on
 before the config names it; `qm destroy` then does not free that volume. A
 volume that was already on the VMID is left alone, as is a volume of the live
 template or a retired template, and one whose VMID still has a guest config.
-A volume `pvesm free` cannot remove is logged with `pvesm free '<volid>'`,
-recorded in `/var/lib/github-runners/bake-leftover-volumes`, and not retried,
-so a later rebake is not stuck on it.
+If the listing of `VM_STORAGE` cannot be read, the pending record stays and
+the next rebake tries the free again. A volume `pvesm free` cannot remove is
+logged with `pvesm free '<volid>'`, recorded in
+`/var/lib/github-runners/bake-leftover-volumes`, and not retried, so a later
+rebake is not stuck on it.
 
 Each run first checks the live template. If `TEMPLATE_ID` does not exist, is
 not a template, or has disks that are not base volumes (a template made on
@@ -1207,8 +1209,9 @@ The table counts runner VMs only. Also plan for:
   much. If `qm template` fails after renaming the disk to a base volume, the
   failed bake's cleanup frees a leftover `base-<vmid>-disk-N` or
   `vm-<vmid>-disk-N` of that VMID on `VM_STORAGE`, and only when this bake
-  created the VM. A volume `pvesm free` cannot remove is logged and left for
-  the operator. Turn on Thin provision
+  created the VM. If that storage's listing cannot be read, the pending
+  record stays and the next rebake tries the free again. A volume `pvesm free`
+  cannot remove is logged and left for the operator. Turn on Thin provision
   (`sparse 1`) for `VM_STORAGE` so that later bakes reserve nothing. If
   `pvesh` cannot read the storage's config, the bake counts it as thick and
   logs a warning.

@@ -538,9 +538,10 @@ settle_bake_leftovers() {
 # base snapshot) leaves the new name off the config, so qm destroy does
 # not free it. $2, when set, is the live template: its volumes are never
 # freed, nor is a VMID on the retired-template list, nor one that still
-# has a guest config. An unreadable storage listing is not proof a volume
-# remains. Returns 1 when the volumes could not be checked, and 2 when a
-# volume is still listed after pvesm free.
+# has a guest config. An unreadable storage listing returns 1: a volume may
+# still be there, and the caller keeps the pending record so the next run
+# tries again. Returns 2 when a volume is still listed after pvesm free;
+# that drops the record, so a stuck volume does not stop every later rebake.
 free_bake_leftover_volumes() {
     local vmid="$1" live_id="${2-}" listing matches volid config_path failed=0
     [[ "$vmid" =~ ^[0-9]+$ ]] || return 0
@@ -554,7 +555,7 @@ free_bake_leftover_volumes() {
     if ! listing=$(pvesm list "$VM_STORAGE" --content images \
         199>&- 200>&- 201>&- 202>&- 203>&- 204>&- 2>/dev/null); then
         log_warn "Could not list volumes on $VM_STORAGE after bake VM $vmid was destroyed; not freeing leftover disks"
-        return 0
+        return 1
     fi
     # The volume's own name only. A linked clone is base-<other>-disk-N/vm-<vmid>-disk-N
     # and belongs to the template it was cloned from. Directory storage appends
