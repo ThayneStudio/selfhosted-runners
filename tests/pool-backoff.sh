@@ -162,7 +162,7 @@ die_fast
 [[ "$(clones)" -eq 1 ]] || fail "second fast death was not recloned"
 die_fast
 [[ "$(cat "$actions")" == "destroy 9001" ]] || fail "third fast death in a row was recloned: $(cat "$actions")"
-grep -q 'runner-1 died within 120s of its clone 3 times in a row; holding the slot for 30s' "$state/logger" \
+grep -q 'runner-1 died within 600s of its clone 3 times in a row; holding the slot for 30s' "$state/logger" \
     || fail "the hold was not logged"
 clock=$((clock + 25))
 run watch_main
@@ -199,7 +199,7 @@ rm -f "$SNIPPETS_DIR/runner-9001-meta.yaml"
 run reclone_main 9001
 [[ "$(clones)" -eq 1 ]] || fail "a VM with an unknown lifetime was held"
 
-# A short job also ends its VM within 120 s of the clone. That runner
+# A short job also ends its VM within 600 s of the clone. That runner
 # finished a job, so GitHub no longer lists it and the next mint has no
 # conflict: a stream of short jobs must never hold the slot.
 rm -rf "$SLOT_STATE_DIR"

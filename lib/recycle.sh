@@ -13,6 +13,9 @@
 #   GitHub: GitHub removes an ephemeral runner once it finishes a job, so the
 #   fast death was a short job. A runner that never ran one (GitHub rejected
 #   its version, the guest failed to start it) stays registered.
+#   That mint, not the lifetime, tells a short job from a guest that never
+#   ran one, so the window is wide: a refused or broken guest can take
+#   minutes to give up after a slow boot or a long wait for its network.
 # - Neither the watcher nor reclone.sh clones a held slot, so a slot that
 #   fails every time stops minting a JIT runner on every tick.
 set -euo pipefail
@@ -22,7 +25,7 @@ SLOT_STATE_DIR="/run/github-runners"
 SLOT_LOCK_PREFIX="/run/lock/runner"
 SLOT_BACKOFF_BASE=30
 SLOT_BACKOFF_MAX=1800
-RAPID_DEATH_SECS=120
+RAPID_DEATH_SECS=600
 RAPID_DEATH_LIMIT=3
 
 slot_lock_file() {
