@@ -620,16 +620,18 @@ detach_rebake_from_ssh() {
     fi
     log_info "Starting the rebake outside this shell so an SSH drop cannot kill it"
     # systemctl start cannot pass this shell's environment to the unit, which
-    # would drop a BAKE_TIMEOUT override (and its TimeoutStartSec caps the run).
-    # setsid keeps the environment, so an override goes that way.
-    if [[ -z "${BAKE_TIMEOUT:-}" && -f "$REBAKE_UNIT_FILE" ]] && command -v systemctl >/dev/null 2>&1; then
+    # would drop a BAKE_TIMEOUT or BAKE_MIN_FREE_GIB override (and its
+    # TimeoutStartSec caps the run). setsid keeps the environment, so an
+    # override goes that way.
+    if [[ -z "${BAKE_TIMEOUT:-}" && -z "${BAKE_MIN_FREE_GIB:-}" && -f "$REBAKE_UNIT_FILE" ]] \
+        && command -v systemctl >/dev/null 2>&1; then
         systemctl start --no-block github-runner-rebake.service
         log_info "Follow it with: journalctl -u github-runner-rebake.service -f"
         exit 0
     fi
     if ! command -v setsid >/dev/null 2>&1; then
-        if [[ -n "${BAKE_TIMEOUT:-}" ]]; then
-            log_error "setsid is not available, and github-runner-rebake.service cannot take BAKE_TIMEOUT"
+        if [[ -n "${BAKE_TIMEOUT:-}" || -n "${BAKE_MIN_FREE_GIB:-}" ]]; then
+            log_error "setsid is not available, and github-runner-rebake.service cannot take BAKE_TIMEOUT or BAKE_MIN_FREE_GIB"
             log_error "Run 'runner rebake --foreground' inside tmux"
         else
             log_error "setsid is not available and github-runner-rebake.service is not installed"
@@ -676,6 +678,7 @@ rebake_main() {
     # A detached rebake reports errors only in its log, after "Rebake started".
     # Refuse a bad override here, where the caller sees it.
     check_bake_timeout || exit 1
+    check_bake_min_free_gib || exit 1
     detach_rebake_from_ssh
     trap '' HUP PIPE
     if ! command -v qm >/dev/null 2>&1; then

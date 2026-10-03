@@ -129,16 +129,20 @@ check_bake_timeout() {
     fi
 }
 
+check_bake_min_free_gib() {
+    if [[ -n "${BAKE_MIN_FREE_GIB:-}" && ! "$BAKE_MIN_FREE_GIB" =~ ^[0-9]+$ ]]; then
+        log_error "BAKE_MIN_FREE_GIB must be a whole number of GiB, not '$BAKE_MIN_FREE_GIB'"
+        return 1
+    fi
+}
+
 # A bake can write its whole BAKE_DISK_GIB disk to VM_STORAGE. A storage that
 # fills up pauses every VM on it (QEMU's default werror=enospc), not only the
 # bake VM, so refuse to start a bake without that much free. BAKE_MIN_FREE_GIB
 # overrides the floor; 0 skips the check.
 check_bake_storage_space() {
     local min_gib="${BAKE_MIN_FREE_GIB:-$BAKE_DISK_GIB}" row storage_status avail_kib
-    if [[ ! "$min_gib" =~ ^[0-9]+$ ]]; then
-        log_error "BAKE_MIN_FREE_GIB must be a whole number of GiB, not '$min_gib'"
-        return 1
-    fi
+    check_bake_min_free_gib || return 1
     min_gib=$((10#$min_gib))
     (( min_gib > 0 )) || return 0
     # Columns: Name Type Status Total Used Available %. Sizes are KiB.
@@ -147,12 +151,12 @@ check_bake_storage_space() {
     read -r storage_status avail_kib _ <<< "$row"
     if [[ "$storage_status" != active || ! "$avail_kib" =~ ^[0-9]+$ ]]; then
         log_error "Could not read free space on storage $VM_STORAGE (status: ${storage_status:-unknown}); not baking"
-        log_error "Set BAKE_MIN_FREE_GIB=0 to bake without this check."
+        log_error "To bake without this check: BAKE_MIN_FREE_GIB=0 runner rebake (or runner setup)"
         return 1
     fi
     if (( avail_kib < min_gib * 1048576 )); then
         log_error "Not baking: storage $VM_STORAGE has $((avail_kib / 1048576)) GiB free and a bake needs $min_gib GiB"
-        log_error "A full storage pauses every VM on it. Free space on $VM_STORAGE, or set BAKE_MIN_FREE_GIB."
+        log_error "A full storage pauses every VM on it. Free space on $VM_STORAGE, or lower the floor for one run: BAKE_MIN_FREE_GIB=<GiB> runner rebake (or runner setup)"
         return 1
     fi
 }
