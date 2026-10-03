@@ -1,79 +1,188 @@
 #!/bin/bash
 set -euo pipefail
 
-INSTALL_DIR="/opt/selfhosted-runners"
-REPO_URL="https://github.com/ThayneStudio/selfhosted-runners/archive/refs/heads/master.tar.gz"
+INSTALL_DIR="${INSTALL_DIR:-/opt/selfhosted-runners}"
+REPO_URL="${REPO_URL:-https://github.com/ThayneStudio/selfhosted-runners/archive/refs/heads/master.tar.gz}"
+CONFIG_FILE="${CONFIG_FILE:-/etc/github-runners.conf}"
+SYSTEMD_DIR="${SYSTEMD_DIR:-/etc/systemd/system}"
+SNIPPETS_DIR="${SNIPPETS_DIR:-/var/lib/vz/snippets}"
+PVE_NODES_DIR="${PVE_NODES_DIR:-/etc/pve/nodes}"
+RUNNER_BIN="${RUNNER_BIN:-/usr/local/bin/runner}"
+# The previous version's pool lock. New code uses /run/github-runners.
+OLD_POOL_LOCK="${OLD_POOL_LOCK:-/run/lock/github-runner-pool.lock}"
+OLD_POOL_LOCK_WAIT="${OLD_POOL_LOCK_WAIT:-600}"
 
-echo "Installing selfhosted-runners..."
+# Set while an upgrade holds the old pool lock or has stopped the watcher.
+UPGRADE_TIMER_STOPPED=0
+UPGRADE_LOCK_HELD=0
 
-# Download and extract
-mkdir -p "$INSTALL_DIR"
-curl -fsSL "$REPO_URL" | tar xz --strip-components=1 -C "$INSTALL_DIR"
-chmod +x "$INSTALL_DIR/runner" "$INSTALL_DIR/lib/"*.sh
+# Drop the old pool lock and start the watcher again. Safe to call twice.
+# An EXIT trap that ends in a successful command would hide the failure
+# that caused the exit, so the trap exits again with the status it saved.
+release_upgrade_quiesce() {
+    if (( UPGRADE_LOCK_HELD )); then
+        flock -u 9 2>/dev/null || true
+        exec 9>&-
+        UPGRADE_LOCK_HELD=0
+    fi
+    if (( UPGRADE_TIMER_STOPPED )); then
+        systemctl start github-runner-watch.timer 2>/dev/null || true
+        UPGRADE_TIMER_STOPPED=0
+    fi
+}
 
-# Symlink to /usr/local/bin
-ln -sf "$INSTALL_DIR/runner" /usr/local/bin/runner
+on_upgrade_exit() {
+    local status=$?
+    release_upgrade_quiesce
+    exit "$status"
+}
 
-echo "Installed to $INSTALL_DIR"
+abort_upgrade() {
+    printf '%s\n' "$1" >&2
+    release_upgrade_quiesce
+    exit 1
+}
 
-# If setup was already run, sync deployed files (hookscript, systemd units)
-if [[ -f /etc/github-runners.conf ]]; then
-    echo "Updating deployed files..."
-    # shellcheck source=/dev/null
-    source /etc/github-runners.conf
-    if [[ -d /var/lib/vz/snippets ]]; then
-        cp "$INSTALL_DIR/templates/runner-hookscript.sh" /var/lib/vz/snippets/runner-hookscript.sh
-        chmod 755 /var/lib/vz/snippets/runner-hookscript.sh
-        DOCKER_MIRROR_URL="${DOCKER_MIRROR_URL:-}" awk '
-        function lreplace(str, old, new,    i, result) {
-            result = ""
-            while ((i = index(str, old)) > 0) {
-                result = result substr(str, 1, i - 1) new
-                str = substr(str, i + length(old))
+# A oneshot stays "activating" until ExecStart returns. is-active --quiet
+# is false for that, so match the state text. Do not stop the service:
+# that would kill a clone the pool lock is what we wait for.
+wait_for_watch_service() {
+    local state deadline
+    deadline=$((SECONDS + OLD_POOL_LOCK_WAIT))
+    while true; do
+        state=$(systemctl is-active github-runner-watch.service 2>/dev/null || true)
+        case "$state" in
+            active|activating|deactivating) ;;
+            *) return 0 ;;
+        esac
+        if (( SECONDS >= deadline )); then
+            return 1
+        fi
+        sleep 1
+    done
+}
+
+# Old processes flock /run/lock/github-runner-pool.lock. The tree we are
+# about to extract flocks /run/github-runners/github-runner-pool.lock, so
+# an in-flight reclone and a new watch tick would both fill one slot.
+# Stop the timer, let the current tick finish, then hold the old lock
+# until the new units are in place. A host with no config is new: no
+# timer and no lock.
+quiesce_old_pool() {
+    trap on_upgrade_exit EXIT
+    if [[ -f "$SYSTEMD_DIR/github-runner-watch.timer" ]]; then
+        UPGRADE_TIMER_STOPPED=1
+        systemctl stop github-runner-watch.timer
+        if ! wait_for_watch_service; then
+            abort_upgrade "github-runner-watch.service was still running after ${OLD_POOL_LOCK_WAIT}s, so the new tree was not installed. The watcher has been started again."
+        fi
+    fi
+    # /run/lock is 1777. A symlink here would make flock wait on some
+    # other file while the real lock stayed free.
+    if [[ -L "$OLD_POOL_LOCK" ]]; then
+        rm -f -- "$OLD_POOL_LOCK"
+    fi
+    exec 9>"$OLD_POOL_LOCK"
+    if ! flock -w "$OLD_POOL_LOCK_WAIT" -x 9; then
+        exec 9>&-
+        abort_upgrade "Timed out after ${OLD_POOL_LOCK_WAIT}s waiting for $OLD_POOL_LOCK. A clone started by the previous version is still running, so the new tree was not installed. The watcher has been started again."
+    fi
+    UPGRADE_LOCK_HELD=1
+}
+
+install_main() {
+    echo "Installing selfhosted-runners..."
+
+    if [[ -f "$CONFIG_FILE" ]]; then
+        quiesce_old_pool
+    fi
+
+    # Download and extract. The status is checked here because a caller that
+    # runs install_main from if or || suspends set -e for the whole function,
+    # so pipefail on its own does not stop the rest of the install.
+    mkdir -p "$INSTALL_DIR"
+    if ! curl -fsSL "$REPO_URL" | tar xz --strip-components=1 -C "$INSTALL_DIR"; then
+        if (( UPGRADE_TIMER_STOPPED )); then
+            abort_upgrade "The download failed, so the new tree was not installed. The watcher has been started again."
+        fi
+        abort_upgrade "The download failed, so the new tree was not installed."
+    fi
+    chmod +x "$INSTALL_DIR/runner" "$INSTALL_DIR/lib/"*.sh
+
+    # Symlink to /usr/local/bin
+    ln -sf "$INSTALL_DIR/runner" "$RUNNER_BIN"
+
+    echo "Installed to $INSTALL_DIR"
+
+    # If setup was already run, sync deployed files (hookscript, systemd units)
+    if [[ -f "$CONFIG_FILE" ]]; then
+        echo "Updating deployed files..."
+        # shellcheck source=/dev/null
+        source "$CONFIG_FILE"
+        if [[ -d "$SNIPPETS_DIR" ]]; then
+            cp "$INSTALL_DIR/templates/runner-hookscript.sh" "$SNIPPETS_DIR/runner-hookscript.sh"
+            chmod 755 "$SNIPPETS_DIR/runner-hookscript.sh"
+            DOCKER_MIRROR_URL="${DOCKER_MIRROR_URL:-}" awk '
+            function lreplace(str, old, new,    i, result) {
+                result = ""
+                while ((i = index(str, old)) > 0) {
+                    result = result substr(str, 1, i - 1) new
+                    str = substr(str, i + length(old))
+                }
+                return result str
             }
-            return result str
-        }
-        {
-            $0 = lreplace($0, "{{DOCKER_MIRROR_URL}}", ENVIRON["DOCKER_MIRROR_URL"])
-            print
-        }' "$INSTALL_DIR/templates/template-setup.yaml" > /var/lib/vz/snippets/template-setup.yaml
-        chmod 600 /var/lib/vz/snippets/template-setup.yaml
-    fi
-    if [[ -f /etc/systemd/system/github-runner-watch.timer ]]; then
-        cp "$INSTALL_DIR/templates/github-runner-watch.service" /etc/systemd/system/
-        cp "$INSTALL_DIR/templates/github-runner-watch.timer" /etc/systemd/system/
-    fi
-    cp "$INSTALL_DIR/templates/github-runner-rebake.service" /etc/systemd/system/
-    cp "$INSTALL_DIR/templates/github-runner-rebake.timer" /etc/systemd/system/
-    systemctl daemon-reload
-    systemctl enable --now github-runner-rebake.timer 2>/dev/null || true
-    echo "Template rebake timer enabled (daily, separate from the pool watcher)."
-    echo "A first enable waits for the next midnight before the timer's first check."
-    echo "A host with no recorded baked version bakes once on that first check."
-    echo "To run that check now: runner rebake"
-    echo "Do not install or enable it while a template bake is still running."
-    # Prune obsolete per-org snippets. These embedded the org PAT; the PAT now
-    # stays on the host and a single-use JIT config is rendered per-VM at clone time.
-    if compgen -G "/var/lib/vz/snippets/runner-user-data-*.yaml" > /dev/null; then
-        rm -f /var/lib/vz/snippets/runner-user-data-*.yaml
-        echo "  Removed obsolete per-org PAT snippets"
-    fi
-    echo "Done. No need to re-run setup."
-    # VMs cloned from those snippets keep the PAT until they are destroyed.
-    # Look for the VMs, not the snippets: an earlier run may have removed the
-    # snippets, and clones made with JIT configs never held the PAT.
-    pat_vms=$(grep -ls '^cicustom:.*user=local:snippets/runner-user-data-' /etc/pve/nodes/*/qemu-server/*.conf | wc -l) || pat_vms=0
-    if (( pat_vms > 0 )); then
+            {
+                $0 = lreplace($0, "{{DOCKER_MIRROR_URL}}", ENVIRON["DOCKER_MIRROR_URL"])
+                print
+            }' "$INSTALL_DIR/templates/template-setup.yaml" > "$SNIPPETS_DIR/template-setup.yaml"
+            chmod 600 "$SNIPPETS_DIR/template-setup.yaml"
+        fi
+        if [[ -f "$SYSTEMD_DIR/github-runner-watch.timer" ]]; then
+            cp "$INSTALL_DIR/templates/github-runner-watch.service" "$SYSTEMD_DIR/"
+            cp "$INSTALL_DIR/templates/github-runner-watch.timer" "$SYSTEMD_DIR/"
+        fi
+        cp "$INSTALL_DIR/templates/github-runner-rebake.service" "$SYSTEMD_DIR/"
+        cp "$INSTALL_DIR/templates/github-runner-rebake.timer" "$SYSTEMD_DIR/"
+        systemctl daemon-reload
+        systemctl enable --now github-runner-rebake.timer 2>/dev/null || true
+        echo "Template rebake timer enabled (daily, separate from the pool watcher)."
+        echo "A first enable waits for the next midnight before the timer's first check."
+        echo "A host with no recorded baked version bakes once on that first check."
+        echo "To run that check now: runner rebake"
+        echo "Do not install or enable it while a template bake is still running."
+        # Prune obsolete per-org snippets. These embedded the org PAT; the PAT now
+        # stays on the host and a single-use JIT config is rendered per-VM at clone time.
+        if compgen -G "$SNIPPETS_DIR/runner-user-data-*.yaml" > /dev/null; then
+            rm -f "$SNIPPETS_DIR"/runner-user-data-*.yaml
+            echo "  Removed obsolete per-org PAT snippets"
+        fi
+        echo "Done. No need to re-run setup."
+        # VMs cloned from those snippets keep the PAT until they are destroyed.
+        # Look for the VMs, not the snippets: an earlier run may have removed the
+        # snippets, and clones made with JIT configs never held the PAT.
+        pat_vms=$(grep -ls '^cicustom:.*user=local:snippets/runner-user-data-' "$PVE_NODES_DIR"/*/qemu-server/*.conf | wc -l) || pat_vms=0
+        if (( pat_vms > 0 )); then
+            echo ""
+            echo "WARNING: $((pat_vms)) runner VM(s) cloned from the old per-org snippets still have the org PAT"
+            echo "on their cloud-init drive, where any job they run can read it, until they are"
+            echo "destroyed. Recycle the pool to destroy them, now or once the first rebake has"
+            echo "published a new template:"
+            echo "  runner stop && runner start"
+        fi
+    else
         echo ""
-        echo "WARNING: $((pat_vms)) runner VM(s) cloned from the old per-org snippets still have the org PAT"
-        echo "on their cloud-init drive, where any job they run can read it, until they are"
-        echo "destroyed. Recycle the pool to destroy them, now or once the first rebake has"
-        echo "published a new template:"
-        echo "  runner stop && runner start"
+        echo "Run the setup wizard:"
+        echo "  runner setup"
     fi
-else
+
+    release_upgrade_quiesce
+    trap - EXIT
     echo ""
-    echo "Run the setup wizard:"
-    echo "  runner setup"
+}
+
+# A file execution has BASH_SOURCE equal to $0. curl | bash leaves it
+# unset, and set -u would trip on a bare ${BASH_SOURCE[0]}. Sourcing (the
+# tests) sets BASH_SOURCE to this file and $0 to the caller.
+if [[ -z "${BASH_SOURCE[0]:-}" || "${BASH_SOURCE[0]:-}" == "$0" ]]; then
+    install_main "$@"
 fi
-echo ""

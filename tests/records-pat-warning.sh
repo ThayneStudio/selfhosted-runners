@@ -55,18 +55,18 @@ check_pruned() {
 # --- install.sh: its lines from the prune to the end of the upgrade branch ---
 block=$(awk '
     /# Prune obsolete per-org snippets/ { seen = 1 }
-    seen && /^else$/ { exit }
+    seen && /^[[:space:]]*else$/ { exit }
     seen { print }
 ' "$root/install.sh")
 grep -qF 'runner-user-data-' <<< "$block" || fail "install.sh no longer prunes the per-org PAT snippets"
-block=${block//\/var\/lib\/vz\/snippets/"$SNIPPETS_DIR"}
-block=${block//\/etc\/pve\/nodes/"$PVE_NODES_DIR"}
-# These lines run on this machine, so they may name no other host path.
+# These lines run on this machine, so they may name no host path. The
+# directories come in as variables, the same ones install.sh defaults.
 if grep -nE '(^|[^[:alnum:]_.-])/(etc|opt|usr|var|run|srv|root|home)/' <<< "${block//"$state"/}" >&2; then
     fail "the install.sh lines under test name host paths"
 fi
 run_install() {
-    "$BASH" -euo pipefail -c "$block" > "$state/out" 2>&1 ||
+    SNIPPETS_DIR="$SNIPPETS_DIR" PVE_NODES_DIR="$PVE_NODES_DIR" \
+        "$BASH" -euo pipefail -c "$block" > "$state/out" 2>&1 ||
         fail "install.sh's closing lines failed: $(cat "$state/out")"
 }
 

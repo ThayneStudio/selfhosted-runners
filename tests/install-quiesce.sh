@@ -1,0 +1,213 @@
+#!/usr/bin/env bash
+# install.sh replaces the tree while the watcher and reclone units are still
+# running. Those processes hold /run/lock/github-runner-pool.lock; the new
+# tree locks a different file. An upgrade has to stop the watcher, wait out
+# the current tick, and hold the old lock across the extract. A new host has
+# neither the timer nor the lock.
+set -euo pipefail
+
+if [[ "${BASH_VERSINFO[0]}" -lt 4 ]]; then
+    for candidate in /opt/homebrew/bin/bash /usr/local/bin/bash; do
+        [[ ! -x "$candidate" ]] || exec "$candidate" "$0" "$@"
+    done
+    printf 'install-quiesce: bash 4+ is required\n' >&2
+    exit 1
+fi
+
+root=$(cd "$(dirname "$0")/.." && pwd)
+# shellcheck source=../install.sh
+source "$root/install.sh"
+fail() { printf 'install-quiesce: %s\n' "$1" >&2; exit 1; }
+state=$(mktemp -d)
+trap 'rm -rf "$state"' EXIT
+
+grep -q 'OLD_POOL_LOCK:-/run/lock/github-runner-pool.lock' "$root/install.sh" ||
+    fail "install.sh does not take the previous version's pool lock"
+grep -q 'OLD_POOL_LOCK_WAIT:-600' "$root/install.sh" ||
+    fail "install.sh does not bound the wait for the old pool lock"
+
+log=$state/log
+watch_state=inactive
+flock_rc=0
+curl_rc=0
+
+INSTALL_DIR=$state/opt
+CONFIG_FILE=$state/github-runners.conf
+SYSTEMD_DIR=$state/systemd
+SNIPPETS_DIR=$state/snippets
+PVE_NODES_DIR=$state/nodes
+RUNNER_BIN=$state/bin/runner
+OLD_POOL_LOCK=$state/old/github-runner-pool.lock
+REPO_URL=http://install.test/archive.tar.gz
+
+systemctl() {
+    printf 'systemctl %s\n' "$*" >> "$log"
+    if [[ "$1" == is-active ]]; then
+        printf '%s\n' "$watch_state"
+        [[ "$watch_state" == active || "$watch_state" == activating || "$watch_state" == deactivating ]]
+        return
+    fi
+}
+flock() {
+    printf 'flock %s\n' "$*" >> "$log"
+    return "$flock_rc"
+}
+curl() {
+    printf 'curl %s\n' "$*" >> "$log"
+    return "$curl_rc"
+}
+tar() {
+    printf 'tar %s\n' "$*" >> "$log"
+    mkdir -p "$INSTALL_DIR/templates" "$INSTALL_DIR/lib"
+    cp "$root"/templates/* "$INSTALL_DIR/templates/"
+    printf '#!/bin/sh\n' > "$INSTALL_DIR/runner"
+    printf '#!/bin/sh\n' > "$INSTALL_DIR/lib/common.sh"
+}
+
+line_of() {
+    local n
+    n=$(grep -n "$1" "$log" | head -1 | cut -d: -f1)
+    printf '%s\n' "${n:-0}"
+}
+
+fresh() {
+    : > "$log"
+    rm -rf "$INSTALL_DIR" "$SYSTEMD_DIR" "$SNIPPETS_DIR" "${state:?}/old" "${state:?}/bin" "$CONFIG_FILE"
+    mkdir -p "$state/bin" "$state/old" "$PVE_NODES_DIR"
+    watch_state=inactive
+    flock_rc=0
+    curl_rc=0
+    OLD_POOL_LOCK_WAIT=600
+}
+
+# A host with no config does not stop a timer or take a lock.
+fresh
+( install_main ) > "$state/out" 2>"$state/err" || fail "a fresh install failed: $(cat "$state/err")"
+[[ "$(line_of '^curl ')" != 0 ]] || fail "a fresh install did not extract the tree"
+[[ "$(line_of '^systemctl ')" == 0 ]] || fail "a fresh install called systemctl: $(cat "$log")"
+[[ "$(line_of '^flock ')" == 0 ]] || fail "a fresh install took a pool lock: $(cat "$log")"
+grep -q 'Run the setup wizard' "$state/out" || fail "a fresh install did not say to run setup"
+[[ -L "$RUNNER_BIN" ]] || fail "a fresh install did not link runner"
+
+# An existing host drains old clones before the extract, then restarts the watcher.
+fresh
+printf 'DOCKER_MIRROR_URL=http://mirror.example\n' > "$CONFIG_FILE"
+mkdir -p "$SYSTEMD_DIR" "$SNIPPETS_DIR"
+: > "$SYSTEMD_DIR/github-runner-watch.timer"
+printf 'secret\n' > "$state/canary"
+ln -s "$state/canary" "$OLD_POOL_LOCK"
+( install_main ) > "$state/out" 2>"$state/err" || fail "an upgrade failed: $(cat "$state/err")"
+stop=$(line_of 'systemctl stop github-runner-watch.timer')
+held=$(line_of 'flock -w 600 -x 9')
+extracted=$(line_of '^curl ')
+released=$(line_of 'flock -u 9')
+started=$(line_of 'systemctl start github-runner-watch.timer')
+[[ "$stop" != 0 && "$stop" -lt "$held" && "$held" -lt "$extracted" && "$extracted" -lt "$released" && "$released" -lt "$started" ]] ||
+    fail "upgrade order was stop=$stop flock=$held curl=$extracted release=$released start=$started: $(cat "$log")"
+[[ "$(grep -c 'systemctl start github-runner-watch.timer' "$log")" == 1 ]] ||
+    fail "the watcher was started more than once: $(cat "$log")"
+[[ -f "$SNIPPETS_DIR/runner-hookscript.sh" ]] || fail "the hookscript was not installed"
+[[ -f "$SYSTEMD_DIR/github-runner-rebake.timer" ]] || fail "the rebake timer was not installed"
+[[ -f "$OLD_POOL_LOCK" && ! -L "$OLD_POOL_LOCK" ]] || fail "the old pool lock was left as a symlink"
+[[ "$(cat "$state/canary")" == secret ]] || fail "taking the old pool lock followed a symlink"
+grep -q 'Done. No need to re-run setup.' "$state/out" || fail "an upgrade did not finish: $(cat "$state/out")"
+
+# The old lock stays busy: leave the tree alone and start the watcher again.
+fresh
+printf 'DOCKER_MIRROR_URL=\n' > "$CONFIG_FILE"
+mkdir -p "$SYSTEMD_DIR" "$SNIPPETS_DIR"
+: > "$SYSTEMD_DIR/github-runner-watch.timer"
+flock_rc=1
+if ( install_main ) > "$state/out" 2>"$state/err"; then
+    fail "install extracted the tree while the old pool lock was busy"
+fi
+grep -q 'was not installed' "$state/err" || fail "a busy old pool lock was not reported: $(cat "$state/err")"
+[[ "$(line_of '^curl ')" == 0 ]] || fail "a busy old pool lock still extracted the tree"
+[[ "$(line_of 'systemctl start github-runner-watch.timer')" != 0 ]] ||
+    fail "a timed-out upgrade left the watcher stopped"
+[[ ! -d "$INSTALL_DIR" ]] || fail "a timed-out upgrade created $INSTALL_DIR"
+
+# The watch tick never finishes: same abort, and the old lock is not taken.
+fresh
+printf 'DOCKER_MIRROR_URL=\n' > "$CONFIG_FILE"
+mkdir -p "$SYSTEMD_DIR" "$SNIPPETS_DIR"
+: > "$SYSTEMD_DIR/github-runner-watch.timer"
+watch_state=activating
+OLD_POOL_LOCK_WAIT=0
+if ( install_main ) > "$state/out" 2>"$state/err"; then
+    fail "install waited forever for github-runner-watch.service"
+fi
+grep -q 'github-runner-watch.service was still running' "$state/err" ||
+    fail "a stuck watch service was not reported: $(cat "$state/err")"
+[[ "$(line_of '^flock ')" == 0 ]] || fail "a stuck watch service still took the pool lock"
+[[ "$(line_of '^curl ')" == 0 ]] || fail "a stuck watch service still extracted the tree"
+[[ "$(line_of 'systemctl start github-runner-watch.timer')" != 0 ]] ||
+    fail "a stuck watch service left the watcher stopped"
+
+# Config, but no watcher unit yet: still wait for old reclones, and do not start a timer.
+fresh
+printf 'DOCKER_MIRROR_URL=\n' > "$CONFIG_FILE"
+mkdir -p "$SYSTEMD_DIR" "$SNIPPETS_DIR"
+( install_main ) > "$state/out" 2>"$state/err" || fail "an upgrade without a watcher failed: $(cat "$state/err")"
+[[ "$(line_of 'systemctl stop github-runner-watch.timer')" == 0 ]] ||
+    fail "install stopped a watcher timer that is not installed"
+[[ "$(line_of 'systemctl start github-runner-watch.timer')" == 0 ]] ||
+    fail "install started a watcher timer that is not installed"
+[[ "$(line_of 'flock -w 600 -x 9')" != 0 && "$(line_of 'flock -w 600 -x 9')" -lt "$(line_of '^curl ')" ]] ||
+    fail "an upgrade without a watcher did not hold the old pool lock first"
+
+# The extract fails after the watcher was stopped: start it again.
+# install_main is the condition of if, which suspends set -e inside it,
+# so the download itself has to abort.
+fresh
+printf 'DOCKER_MIRROR_URL=\n' > "$CONFIG_FILE"
+mkdir -p "$SYSTEMD_DIR" "$SNIPPETS_DIR"
+: > "$SYSTEMD_DIR/github-runner-watch.timer"
+curl_rc=1
+if ( install_main ) > "$state/out" 2>"$state/err"; then
+    fail "a failed extract was treated as success"
+fi
+grep -q 'The download failed' "$state/err" ||
+    fail "a failed extract was not reported: $(cat "$state/err")"
+[[ "$(line_of 'systemctl stop github-runner-watch.timer')" != 0 ]] || fail "the watcher was not stopped"
+[[ "$(line_of 'systemctl start github-runner-watch.timer')" != 0 ]] ||
+    fail "a failed extract left the watcher stopped"
+[[ "$(grep -c 'systemctl start github-runner-watch.timer' "$log")" == 1 ]] ||
+    fail "a failed extract started the watcher more than once: $(cat "$log")"
+
+# curl | bash reads this file from stdin, where BASH_SOURCE is empty. The
+# guard still has to run install_main, and sourcing it must not.
+mkdir -p "$state/fakebin"
+cat > "$state/fakebin/curl" <<EOF
+#!/bin/sh
+printf 'curl %s\n' "\$*" >> "$log"
+exit 1
+EOF
+chmod +x "$state/fakebin/curl"
+run_stdin() {
+    env PATH="$state/fakebin:$PATH" \
+        INSTALL_DIR="$state/stdin-opt" \
+        CONFIG_FILE="$state/missing.conf" \
+        SYSTEMD_DIR="$state/stdin-systemd" \
+        SNIPPETS_DIR="$state/stdin-snippets" \
+        PVE_NODES_DIR="$state/stdin-nodes" \
+        RUNNER_BIN="$state/stdin-bin/runner" \
+        OLD_POOL_LOCK="$state/stdin-old.lock" \
+        "$@"
+}
+: > "$log"
+stdin_rc=0
+run_stdin "$BASH" < "$root/install.sh" > "$state/stdin-out" 2>"$state/stdin-err" || stdin_rc=$?
+[[ "$stdin_rc" -ne 0 ]] || fail "a stdin install treated a failed download as success"
+grep -q 'Installing selfhosted-runners' "$state/stdin-out" ||
+    fail "a stdin install did not run: $(cat "$state/stdin-out") $(cat "$state/stdin-err")"
+grep -q 'The download failed' "$state/stdin-err" ||
+    fail "a stdin install did not report the failed download: $(cat "$state/stdin-err")"
+[[ "$(grep -c '^curl ' "$log")" == 1 ]] || fail "a stdin install did not download once: $(cat "$log")"
+file_rc=0
+run_stdin "$BASH" "$root/install.sh" > "$state/file-out" 2>"$state/file-err" || file_rc=$?
+[[ "$file_rc" -ne 0 ]] || fail "a file install treated a failed download as success"
+grep -q 'Installing selfhosted-runners' "$state/file-out" ||
+    fail "a file install did not run: $(cat "$state/file-out") $(cat "$state/file-err")"
+
+printf 'install-quiesce: ok\n'

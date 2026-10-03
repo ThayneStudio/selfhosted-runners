@@ -761,10 +761,17 @@ stops partway, run `install.sh` again at once.
    ```bash
    curl -fsSL https://raw.githubusercontent.com/ThayneStudio/selfhosted-runners/master/install.sh | bash
    ```
-   It refreshes the hookscript and the systemd units and enables
-   `github-runner-rebake.timer`. The maintenance flag and the pool's locks move
-   out of `/run/lock` into `/run/github-runners` (mode 0700). A drain already
-   set is a root-owned `/run/lock/github-runner-drain`, and it still counts
+   On a host that already has `/etc/github-runners.conf`, it stops
+   `github-runner-watch.timer`, waits for `github-runner-watch.service` to
+   finish, and takes `/run/lock/github-runner-pool.lock` exclusively for up to
+   10 minutes so a clone still running the previous version drains before the
+   new tree is extracted. If that wait times out, the tree is left unchanged
+   and the watcher is started again. It then refreshes the hookscript and the
+   systemd units, enables `github-runner-rebake.timer`, releases that lock and
+   starts the watcher. A host with no config has no timer and no lock file,
+   and the install only extracts the tree. The maintenance flag and the pool's
+   locks move out of `/run/lock` into `/run/github-runners` (mode 0700). A drain
+   already set is a root-owned `/run/lock/github-runner-drain`, and it still counts
    until `runner start` clears it. `runner stop` also writes that old path, so
    a hookscript this install has not yet copied into `/var/lib/vz/snippets`
    still skips the reclone. If that copy does start one, `reclone.sh` sees the
