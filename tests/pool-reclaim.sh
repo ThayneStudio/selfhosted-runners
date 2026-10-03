@@ -244,6 +244,19 @@ did_nothing "a VM without this tool's marks was touched"
 grep -q 'runner-1 (VMID 9001) is stopped but carries no selfhosted-runners snippet or marker' "$state/out" \
     || fail "an unmarked VM holding a slot name was not reported"
 
+# A VM that reused the VMID of a runner removed with plain `qm destroy`
+# (snippets left behind) is not ours, and holds no slot: not even reported.
+reset_vms
+healthy 9001 runner-1
+healthy 9002 runner-2
+vm 9003 builder running meta=1 uptime=300 born=$((clock - 7200))
+vm 9004 scratch stopped meta=1
+tick
+clock=$((clock + 61))
+tick
+did_nothing "a foreign VM with a leftover runner snippet was touched"
+grep -q 'carries no selfhosted-runners' "$state/out" && fail "a foreign VM outside the slot names was reported"
+
 # Surplus slots that died are destroyed and not refilled.
 reset_vms
 vm 9003 runner-3 stopped org=acme marker='selfhosted-runners org=acme kind=slot' meta=1
