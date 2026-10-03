@@ -193,8 +193,9 @@ just after each lookup. While pmxcfs is not serving it, for example while
 pve-cluster restarts during an upgrade or after pmxcfs crashed, the sweep stops
 for that run and logs
 `[orphan-sweep] pmxcfs is not serving /etc/pve, so guest configs cannot be checked; stopping the sweep`;
-the next run tries again. A failed clone then stops freeing its own volumes
-too, and leaves them to the sweep. The sweep covers VMIDs from `MIN_VMID` up,
+the next run tries again. A failed clone then leaves its VMID's snippets and
+volumes alone too, since a live runner's config at that VMID would be just as
+invisible, and leaves the volumes to the sweep. The sweep covers VMIDs from `MIN_VMID` up,
 never `TEMPLATE_ID` itself. With `MIN_VMID=0` it covers every VMID above
 `TEMPLATE_ID`, your other guests' included, a floor that moves whenever a
 rebake puts the template on a new VMID. Below the VMIDs it covers, it frees
@@ -763,9 +764,10 @@ stops partway, run `install.sh` again at once.
    `github-runner-rebake.timer`. On a host that still has the per-org snippets
    of a version before single-use JIT configs
    (`/var/lib/vz/snippets/runner-user-data-<org>.yaml`, which held the org PAT),
-   it also removes them and warns that the runner VMs cloned from them still
-   have the PAT on their cloud-init drive. Step 4 destroys those VMs (see
-   [Security Notes](#security-notes)).
+   it also removes them. While any VM's cicustom still names one of those
+   snippets, it warns with the count of runner VMs that still have the PAT on
+   their cloud-init drive, on every run until they are gone. Step 4 destroys
+   those VMs (see [Security Notes](#security-notes)).
 3. Bake a template now. A template baked before the daily rebake has no
    baked-version record, so this bakes. The timer's first check would wait for
    the next midnight, and until a bake publishes, clones of the old template
@@ -1064,8 +1066,9 @@ Inside the VMs:
 - **Upgrade recycle**: on a host upgraded from a version before single-use JIT
   configs, runner VMs cloned from the old per-org snippets still have the org
   PAT on their cloud-init drive, where any job they run can read it, until they
-  are destroyed. `install.sh` warns about them when it removes those snippets,
-  and so does `runner setup` on a host with orgs configured. Step 4 of
+  are destroyed. `install.sh`, and `runner setup` on a host with orgs
+  configured, warn with their count on every run while any VM's cicustom still
+  names a per-org snippet, even after an earlier run removed the snippets. Step 4 of
   [Upgrading an existing host](#upgrading-an-existing-host) destroys them
   (`runner stop && runner start`); recycling before the bake only removes the
   PAT sooner.
