@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # The host's bake poll must see the guest's completion marker even when qm
-# prints warnings on stderr.
+# prints warnings on stderr, and must fail at once, without converting, when
+# the guest reports a failed setup or stops.
 set -euo pipefail
 
 if [[ "${BASH_VERSINFO[0]}" -lt 4 ]]; then
@@ -94,5 +95,31 @@ run_bake
 grep -q '^template 9001$' "$calls" || fail "a finished bake with qm warnings was not converted"
 [[ "$BAKE_RUNNER_VERSION" == 2.329.0 ]] || fail "baked version was not read: $BAKE_RUNNER_VERSION"
 mock_stderr=""
+
+# A guest whose setup failed writes its failure marker and keeps running. The
+# first poll must fail the bake and show the guest log, not wait BAKE_TIMEOUT.
+new_guest
+printf 'rc=1\n' > "$guest/opt/.template-setup-failed"
+printf '[2026-10-02 00:10:00] ERROR: All 3 attempts failed for: apt-get update\n' \
+    > "$guest/var/log/template-setup.log"
+run_bake
+[[ "$bake_rc" != 0 ]] || fail "a failed guest setup was converted"
+grep -q 'Template setup failed inside the guest' "$state/log" || fail "the guest failure was not reported"
+grep -q 'All 3 attempts failed for: apt-get update' "$state/log" || fail "the guest log tail was not shown"
+if grep -q 'timed out' "$state/log"; then fail "a failed guest setup waited for BAKE_TIMEOUT"; fi
+polls=$(grep -c 'template-setup-complete' "$calls" || true)
+[[ "$polls" -eq 1 ]] || fail "the host polled $polls times after the guest failed"
+if grep -q '^template ' "$calls"; then fail "qm template ran on a failed bake"; fi
+
+# A guest that fails before its agent runs powers off; that fails the bake too.
+new_guest
+mock_stopped=1
+: > "$calls"
+bake_rc=0
+bake_and_publish_vm 9001 2>"$state/log" || bake_rc=$?
+[[ "$bake_rc" != 0 ]] || fail "a stopped bake VM was converted"
+grep -q 'stopped before setup completion was confirmed (status: stopped)' "$state/log" \
+    || fail "a stopped bake VM was not reported"
+if grep -q '^template ' "$calls"; then fail "qm template ran on a stopped bake VM"; fi
 
 printf 'bake-poll: ok\n'

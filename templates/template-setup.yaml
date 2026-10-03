@@ -17,6 +17,24 @@ write_files:
       log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"; }
       log_error() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: $1" >&2; }
 
+      # Any failure writes /opt/.template-setup-failed. The host polls for it
+      # beside the completion marker and fails the bake at once instead of
+      # waiting for BAKE_TIMEOUT. It reads both through qemu-guest-agent, which
+      # step 2 installs, so a failure before the agent runs powers the VM off:
+      # the host also fails a bake whose VM stops before completion.
+      on_setup_exit() {
+        local rc=$?
+        set +e
+        [[ $rc -eq 0 ]] && return 0
+        log_error "Template setup failed with exit code $rc (last command: $BASH_COMMAND)"
+        printf 'rc=%s\n' "$rc" > /opt/.template-setup-failed
+        if ! systemctl is-active --quiet qemu-guest-agent; then
+          log_error "qemu-guest-agent is not running; powering off so the host sees the failure"
+          systemctl --no-block poweroff
+        fi
+      }
+      trap on_setup_exit EXIT
+
       export DEBIAN_FRONTEND=noninteractive
       export NEEDRESTART_MODE=a
 

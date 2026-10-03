@@ -2,6 +2,8 @@
 # Shared template bake. Callers source common.sh first and run as root on Proxmox.
 # The guest writes /opt/.template-setup-complete last and does not power itself off.
 # This side confirms that marker, shuts the VM down, and only then runs `qm template`.
+# A failed guest setup writes /opt/.template-setup-failed instead, or powers the
+# VM off when it fails before its guest agent runs. Either fails the bake at once.
 set -euo pipefail
 
 IMG_CACHE_DIR="/var/cache/github-runners"
@@ -100,6 +102,12 @@ create_bake_vm() {
         --memory 8192 --balloon "${BALLOON:-0}" --cores 2 --cpu host --net0 "$net_config"
 }
 
+log_guest_setup_tail() {
+    log_error "Last 40 lines from the guest:"
+    qm_host guest exec "$1" -- tail -n 40 /var/log/template-setup.log 2>/dev/null \
+        | jq -r '."out-data" // empty' >&2 || true
+}
+
 # Import, boot, wait for the guest marker, read Runner.Listener --version,
 # shut down, and convert. Does not change TEMPLATE_ID. On failure the caller's
 # EXIT trap destroys the VM; this function never publishes a VM whose marker
@@ -181,25 +189,29 @@ bake_and_publish_vm() {
         if [[ $bake_elapsed -ge $bake_timeout ]]; then
             echo "" >&2
             log_error "Bake timed out after $((bake_timeout / 60)) minutes (override with BAKE_TIMEOUT=<seconds>)"
-            log_error "Last 40 lines from the guest:"
-            qm_host guest exec "$vmid" -- tail -n 40 /var/log/template-setup.log 2>/dev/null \
-                | jq -r '."out-data" // empty' >&2 || true
+            log_guest_setup_tail "$vmid"
             return 1
         fi
 
-        # The guest never powers itself off. A stopped VM is a crash or an
-        # external `qm stop`, never success.
+        # A successful guest never powers itself off. A stopped VM is a crash,
+        # an external `qm stop`, or a setup that failed before its guest agent
+        # ran; never success.
         vm_status=$(qm_host status "$vmid" 2>/dev/null | awk '{print $2}') || true
         if [[ "$vm_status" != "running" ]]; then
             echo "" >&2
-            log_error "Template VM stopped before setup completion was confirmed"
+            log_error "Template VM stopped before setup completion was confirmed (status: ${vm_status:-unknown})"
+            log_error "Guest setup powers the VM off when it fails before its guest agent runs (network, DNS, apt)."
             log_error "Refusing to publish a possibly half-baked template."
             return 1
         fi
 
+        # One call tells the states apart: exit 2 is the guest's failure
+        # marker, 0 its completion marker, anything else still installing.
         # Parse stdout only. A qm warning on stderr (a Perl locale warning
         # over SSH) ahead of the JSON would hide a finished bake.
-        exec_result=$(qm_host guest exec "$vmid" -- test -f /opt/.template-setup-complete 2>/dev/null) || {
+        exec_result=$(qm_host guest exec "$vmid" -- sh -c \
+            'test -f /opt/.template-setup-failed && exit 2; test -f /opt/.template-setup-complete' \
+            2>/dev/null) || {
             minutes=$((bake_elapsed / 60))
             seconds_rem=$((bake_elapsed % 60))
             printf '\r  Elapsed: %dm%02ds (waiting for guest agent...)' "$minutes" "$seconds_rem" >&2
@@ -212,6 +224,12 @@ bake_and_publish_vm() {
             echo "" >&2
             log_info "Template setup complete!"
             break
+        fi
+        if [[ "$exec_exit" == "2" ]]; then
+            echo "" >&2
+            log_error "Template setup failed inside the guest after $((bake_elapsed / 60)) minutes"
+            log_guest_setup_tail "$vmid"
+            return 1
         fi
 
         minutes=$((bake_elapsed / 60))
