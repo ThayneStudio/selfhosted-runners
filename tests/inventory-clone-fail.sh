@@ -49,6 +49,7 @@ mock_list_args=$state/list-args
 mock_clone=ok
 mock_set=ok
 mock_destroy=ok
+mock_free=ok
 mock_list_hook=""
 vm_conf() { printf '%s/pve1/qemu-server/%s.conf' "$PVE_NODES_DIR" "$1"; }
 ct_conf() { printf '%s/pve1/lxc/%s.conf' "$PVE_NODES_DIR" "$1"; }
@@ -147,6 +148,11 @@ pvesm() {
             ;;
         free)
             printf '%s\n' "$2" >> "$mock_freed"
+            if [[ "$mock_free" == busy ]]; then
+                # The real CLI exits 0 when its deletion task fails.
+                printf "cannot destroy '%s': dataset is busy\n" "${2#*:}" >&2
+                return 0
+            fi
             grep -vxF "${2#*:}" "$mock_storage" > "$mock_storage.new" || true
             mv "$mock_storage.new" "$mock_storage"
             ;;
@@ -164,6 +170,7 @@ reset() {
     mock_clone=ok
     mock_set=ok
     mock_destroy=ok
+    mock_free=ok
     mock_list_hook=""
 }
 run_failing_clone() {
@@ -196,6 +203,15 @@ run_failing_clone "destroy residue"
 [[ "$(freed)" == "local-lvm:vm-9001-cloudinit " ]] || fail "destroy residue: freed '$(freed)'"
 grep -qx 'qm destroy 9001' "$mock_calls" || fail "destroy residue: qm destroy was not called as 'qm destroy 9001'"
 grep -q -- '--content images' "$mock_list_args" || fail "_fail listed $VM_STORAGE without --content images"
+
+# A residue volume that survives its free has to be reported.
+reset
+mock_set=locked
+mock_destroy=residue
+mock_free=busy
+run_failing_clone "busy residue"
+logged "Failed to free orphan volume local-lvm:vm-9001-cloudinit" ||
+    fail "busy residue: a volume that was not freed was not reported: $(cat "$errlog")"
 
 # A parallel clone that takes the VMID after the listing keeps its volumes.
 reset

@@ -299,6 +299,23 @@ zfs_dataset_from_volid() {
     printf '%s\n' "$dataset"
 }
 
+# 0 only when a listing of the volume's storage succeeds and no longer shows
+# it. A failed listing is not proof that the volume is gone.
+volume_confirmed_absent() {
+    local volid="$1" listing
+    listing=$(pvesm list "${volid%%:*}" 199>&- 200>&- 201>&- 202>&- 203>&- 204>&- 2>/dev/null) || return 1
+    awk -v v="$volid" '$1 == v { found = 1 } END { exit found }' <<< "$listing"
+}
+
+# `pvesm free` exits 0 even when its deletion task fails (a busy zvol, an open
+# LV): the error only reaches stderr and the task log. A free counts only once
+# the volume is gone from its storage listing.
+free_volume() {
+    local volid="$1"
+    pvesm free "$volid" 199>&- 200>&- 201>&- 202>&- 203>&- 204>&- || return 1
+    volume_confirmed_absent "$volid"
+}
+
 list_template_linked_clone_volids() {
     local template_id="${1:-$TEMPLATE_ID}"
     local storage_list base_volid base_path prefix volid child_name base_dataset dataset origin zfs_path base_vols
@@ -412,7 +429,7 @@ cleanup_template_orphan_volumes() {
         fi
 
         log_info "Freeing orphaned template child volume: $volid"
-        if ! pvesm free "$volid"; then
+        if ! free_volume "$volid"; then
             log_error "Failed to free orphaned template child volume: $volid"
             return 1
         fi
@@ -462,7 +479,7 @@ cleanup_runner_orphan_volumes() {
         [[ "$vmid" -ge "$min_vmid" && "$vmid" -ne "$TEMPLATE_ID" ]] || continue
         [[ -z "$(vm_config_path "$vmid")" ]] || continue
         log_info "[orphan-sweep] freeing $volid (vmid $vmid has no config)"
-        if pvesm free "$volid" 2>/dev/null; then
+        if free_volume "$volid" 2>/dev/null; then
             freed=$((freed + 1))
         else
             log_warn "[orphan-sweep] pvesm free $volid failed"
@@ -670,7 +687,7 @@ clone_runner() {
                 log_warn "VMID $vmid still has a guest config; not freeing its volumes"
                 break
             fi
-            pvesm free "$volid" 2>/dev/null || log_warn "Failed to free orphan volume $volid"
+            free_volume "$volid" 2>/dev/null || log_warn "Failed to free orphan volume $volid"
         done < <(
             pvesm list "$VM_STORAGE" --content images 2>/dev/null |
                 awk -v v="$vmid" 'NR>1 && $1 ~ ("(^|:|/)vm-" v "-(disk-[0-9]+|cloudinit)$") {print $1}'
