@@ -107,6 +107,8 @@ create_bake_vm() {
 bake_and_publish_vm() {
     local vmid="$1"
     local import_output imported_disk exec_result exec_exit vm_status
+    local new_import_re="unused0: successfully imported disk '([^'[:space:]]+)'"
+    local old_import_re="unused0:([^'\"[:space:]]+)"
     local bake_elapsed=0 bake_interval=15 bake_ready=false
     local bake_timeout="${BAKE_TIMEOUT:-5400}"
     local minutes seconds_rem i
@@ -117,13 +119,23 @@ bake_and_publish_vm() {
         return 1
     }
 
-    if [[ "$import_output" =~ unused0:([^\'\"[:space:]]+) ]]; then
+    # qemu-server before 8.2.7 prints "Successfully imported disk as
+    # 'unused0:<volid>'"; 8.2.7 and later print "unused0: successfully
+    # imported disk '<volid>'". Never guess the volid: dir storage names it
+    # <storage>:<vmid>/vm-<vmid>-disk-0.<fmt>, and a leftover vm-<vmid>-disk-0
+    # pushes the import to disk-1. Otherwise read the unused0 entry that
+    # importdisk added to this new VM's config.
+    if [[ "$import_output" =~ $new_import_re || "$import_output" =~ $old_import_re ]]; then
         imported_disk="${BASH_REMATCH[1]}"
     else
-        imported_disk="${VM_STORAGE}:vm-${vmid}-disk-0"
-        log_warn "Could not parse imported disk name from importdisk output:"
-        log_warn "$import_output"
-        log_warn "Assuming: $imported_disk"
+        log_warn "importdisk output did not name the imported disk; reading unused0 from VM $vmid's config"
+        imported_disk=$(qm_host config "$vmid" 2>/dev/null \
+            | awk -F': ' '$1 == "unused0" && !found { print $2; found = 1 }') || imported_disk=""
+    fi
+    if [[ "$imported_disk" != "$VM_STORAGE:"?* ]]; then
+        log_error "Could not find the imported disk on $VM_STORAGE in the importdisk output or VM $vmid's config:"
+        printf '%s\n' "$import_output" >&2
+        return 1
     fi
 
     qm_host set "$vmid" --scsihw virtio-scsi-pci --scsi0 "$imported_disk" \
