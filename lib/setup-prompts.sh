@@ -20,6 +20,10 @@ load_setup_prefills() {
         # shellcheck disable=SC2034
         local BAKE_MIN_FREE_GIB="$BAKE_MIN_FREE_GIB"
     fi
+    if [[ -v BAKE_FREE_FLOOR_GIB ]]; then
+        # shellcheck disable=SC2034
+        local BAKE_FREE_FLOOR_GIB="$BAKE_FREE_FLOOR_GIB"
+    fi
     SETUP_PREFILLS=()
     [[ -f "$CONFIG_FILE" ]] || return 0
     # This is the same trusted, root-owned shell config used by load_infra_config.

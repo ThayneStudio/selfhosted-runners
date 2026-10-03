@@ -77,6 +77,14 @@ pvesh() {
     printf ']\n'
 }
 flock() { :; }
+# An empty successful listing: a destroyed bake with no leftover disk drops
+# its record. A listing that fails keeps the record.
+pvesm() {
+    case "$1" in
+        list) printf 'Volid Format Type Size VMID\n' ;;
+        *) return 1 ;;
+    esac
+}
 prepare_cloud_image() { :; }
 create_bake_vm() {
     printf 'create %s\n' "$1" >> "$actions"

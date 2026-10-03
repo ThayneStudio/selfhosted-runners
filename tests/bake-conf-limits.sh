@@ -205,9 +205,14 @@ grep -qx 'apply timeout=7200 min=0' "$calls" || fail "the valid environment limi
 # --- create_bake_vm refuses a conf value before qm create; the poll uses it ---
 pvesm() {
     printf 'pvesm %s\n' "$*" >> "$calls"
-    [[ "$1" == status ]] || return 1
-    printf 'Name Type Status Total Used Available %%\n'
-    printf 'local-zfs lvmthin active 1000000000 100000000 10485760 10.00%%\n'
+    case "$1" in
+        list) printf 'Volid Format Type Size VMID\n' ;;
+        status)
+            printf 'Name Type Status Total Used Available %%\n'
+            printf 'local-zfs lvmthin active 1000000000 100000000 10485760 10.00%%\n'
+            ;;
+        *) return 1 ;;
+    esac
 }
 load_limits() {
     local timeout_mode="${1-unset}" min_mode="${2-unset}"

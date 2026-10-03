@@ -108,9 +108,9 @@ warn_template_storage() {
 # keeps naming the live one. bake_setup_template moves it afterwards.
 # A line is replaced only when it is exactly one assignment of a key this
 # wizard prompts for. Anything else stays, including BAKE_TIMEOUT,
-# BAKE_MIN_FREE_GIB, a second command on the same line, and a quoted value
-# that continues on the next line. The new assignment is then appended so
-# it wins. After bash -n, the temp file is sourced in a clean shell. A key
+# BAKE_MIN_FREE_GIB, BAKE_FREE_FLOOR_GIB, a second command on the same line,
+# and a quoted value that continues on the next line. The new assignment
+# is appended so it wins. After bash -n, the temp file is sourced in a clean shell. A key
 # that is still wrong gets one more exact assignment. The old file is left
 # in place when the result is not valid shell, or when sourcing it still
 # does not set one of these keys to the new value.
@@ -205,9 +205,12 @@ warn_pat_snippet_vms() {
 # retired list names. Record it as the rebake records its own bake, so the next
 # rebake finishes or removes it when setup dies first (SIGKILL, power loss) or
 # cleanup_bake cannot destroy it. There is one record. Replacing one whose VM
-# may still exist would leave that VM to nobody, so refuse instead.
+# may still exist would leave that VM to nobody, so refuse instead. Replacing
+# one whose VM is already gone has to settle that VMID's leftover disks first:
+# the marker is what says the bake created them, and removing it first would
+# leave a base volume nobody retries.
 record_setup_bake() {
-    local id=""
+    local id="" settle_rc=0
     if [[ -f "$PENDING_BAKE_FILE" ]]; then
         id=$(tr -d '[:space:]' < "$PENDING_BAKE_FILE") || return 1
     fi
@@ -217,8 +220,24 @@ record_setup_bake() {
         log_error "If 'qm config $id' on this node shows no VM named ubuntu-cloud-template, the record is stale; remove it instead: rm $PENDING_BAKE_FILE"
         return 1
     fi
-    # A version left by an earlier record does not describe this bake.
-    rm -f "$PENDING_VERSION_FILE" || return 1
+    if [[ "$id" =~ ^[0-9]+$ && "$id" != "$TEMPLATE_ID" ]]; then
+        # This process did not create that VM. A token or flag left in the
+        # environment belongs to some other bake and must not hide the marker.
+        unset BAKE_RUN_TOKEN BAKE_VM_CREATED
+        settle_bake_leftovers "$id" "$TEMPLATE_ID" absent || settle_rc=$?
+        if [[ "$settle_rc" -eq 1 ]]; then
+            log_error "VM $id from an earlier bake is gone, but its volumes on $VM_STORAGE could not be checked"
+            log_error "Its record stays in $PENDING_BAKE_FILE. Run 'runner rebake' once storage can be listed, then run setup again"
+            return 1
+        fi
+        # 0: nothing of this bake remains. 2: a volume is still listed.
+        # free_bake_leftover_volumes has logged it and appended it to
+        # bake-leftover-volumes. Keeping the record would stop every later
+        # rebake, so this setup takes the pending file either way.
+    fi
+    # A version left by an earlier record does not describe this bake, and
+    # neither does a created-marker for a VM this setup has not made yet.
+    rm -f "$PENDING_VERSION_FILE" "${PENDING_BAKE_FILE}.created" || return 1
     install -d -m 700 "$STATE_DIR" || return 1
     printf '%s\n' "$TEMPLATE_ID" > "$PENDING_BAKE_FILE" || return 1
     chmod 600 "$PENDING_BAKE_FILE"
@@ -226,27 +245,48 @@ record_setup_bake() {
 
 # Drop the pending-bake record once VM $TEMPLATE_ID is published or destroyed.
 # A record that names another VM belongs to a bake this setup did not make.
+# A first bake writes no pending record, so the created marker has to go on
+# its own: leaving it would make the next setup of this VMID free a disk
+# that was already there.
 forget_setup_bake() {
+    local id="" marker_vmid=""
+    if [[ -f "${PENDING_BAKE_FILE}.created" ]]; then
+        read -r marker_vmid _ < "${PENDING_BAKE_FILE}.created" || true
+        if [[ "$marker_vmid" == "$TEMPLATE_ID" ]]; then
+            rm -f "${PENDING_BAKE_FILE}.created" || return 1
+        fi
+    fi
     [[ -f "$PENDING_BAKE_FILE" ]] || return 0
-    [[ "$(tr -d '[:space:]' < "$PENDING_BAKE_FILE")" == "$TEMPLATE_ID" ]] || return 0
-    rm -f "$PENDING_BAKE_FILE" "$PENDING_VERSION_FILE"
+    id=$(tr -d '[:space:]' < "$PENDING_BAKE_FILE") || return 0
+    [[ "$id" == "$TEMPLATE_ID" ]] || return 0
+    drop_pending_bake
 }
 
 # EXIT trap of the bake: destroy VM $TEMPLATE_ID unless it is a finished
 # template. `template: 1` alone is written before qm template converts the
 # disk, and nothing can be cloned from an unconverted one. A signal after the
 # conversion must not destroy the template. A VM left in place keeps its
-# pending-bake record, if it has one, for the next rebake. A bake that
-# create_bake_vm refused before `qm create` has no VM, and once the cluster
-# inventory confirms that, its record goes, as cleanup_rebake drops its own.
+# pending-bake record, if it has one, for the next rebake. So does a VM that
+# was destroyed while a disk volume of its VMID is still on VM_STORAGE: qm
+# template can rename the disk to a base volume and fail before the config
+# names it, and qm destroy then does not free it. A bake that create_bake_vm
+# refused before `qm create` has no VM, and once the cluster inventory
+# confirms that, its record goes, as cleanup_rebake drops its own. Volumes
+# already on that VMID are not freed: this bake did not create them.
 # After an SSH drop every log write fails (EIO on the hung-up tty, or SIGPIPE
 # through a pipe). Neither errexit nor a second SIGHUP may stop the destroy.
 cleanup_bake() {
-    local cfg name
+    local cfg name settle_rc=0
     set +e
     trap '' HUP PIPE
     if ! cfg=$(qm_host config "$TEMPLATE_ID" 2>/dev/null); then
         if vm_confirmed_absent "$TEMPLATE_ID"; then
+            settle_rc=0
+            settle_bake_leftovers "$TEMPLATE_ID" "${LIVE_TEMPLATE_ID-}" absent || settle_rc=$?
+            if [[ "$settle_rc" == 1 ]]; then
+                log_error "VM $TEMPLATE_ID is gone but its volumes on $VM_STORAGE could not be checked; not dropping its pending-bake record"
+                return 0
+            fi
             forget_setup_bake
             return 0
         fi
@@ -266,6 +306,14 @@ cleanup_bake() {
     qm_host stop "$TEMPLATE_ID" --timeout 30 2>/dev/null || true
     if ! qm_host destroy "$TEMPLATE_ID"; then
         log_error "Could not destroy VM $TEMPLATE_ID. Remove it by hand: qm stop $TEMPLATE_ID; qm destroy $TEMPLATE_ID"
+        return 0
+    fi
+    # LIVE_TEMPLATE_ID, when set, is the template still serving clones. This
+    # VM is the bake, even though the shell's TEMPLATE_ID names it.
+    settle_rc=0
+    settle_bake_leftovers "$TEMPLATE_ID" "${LIVE_TEMPLATE_ID-}" destroyed || settle_rc=$?
+    if [[ "$settle_rc" == 1 ]]; then
+        log_error "VM $TEMPLATE_ID was destroyed but its volumes on $VM_STORAGE could not be checked; not dropping its pending-bake record"
         return 0
     fi
     forget_setup_bake
@@ -299,6 +347,12 @@ bake_setup_template() {
     fi
     # Armed before create_bake_vm, whose checks can refuse before `qm create`,
     # so that cleanup_bake also drops the record of a VM that never existed.
+    # The previous bake's marker, if this VMID was used before, must already
+    # be gone: a refusal frees disks only when this run created the VM.
+    # BAKE_RUN_TOKEN makes a marker the removal missed fail to match.
+    unset BAKE_VM_CREATED
+    BAKE_RUN_TOKEN=$$-$RANDOM$RANDOM
+    rm -f "${PENDING_BAKE_FILE}.created"
     trap cleanup_bake EXIT
     log_info "Creating VM template..."
     create_bake_vm "$TEMPLATE_ID"

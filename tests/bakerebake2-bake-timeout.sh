@@ -42,9 +42,14 @@ qm() {
 }
 pvesm() {
     printf 'pvesm %s\n' "$*" >> "$calls"
-    [[ "$1" == status ]] || return 1
-    printf 'Name Type Status Total Used Available %%\n'
-    printf 'local-zfs lvmthin active 1000000000 100000000 900000000 10.00%%\n'
+    case "$1" in
+        list) printf 'Volid Format Type Size VMID\n' ;;
+        status)
+            printf 'Name Type Status Total Used Available %%\n'
+            printf 'local-zfs lvmthin active 1000000000 100000000 900000000 10.00%%\n'
+            ;;
+        *) return 1 ;;
+    esac
 }
 pvesh() { printf '{"type":"lvmthin"}\n'; }
 systemctl() { printf 'systemctl %s\n' "$*" >> "$calls"; }

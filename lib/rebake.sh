@@ -5,7 +5,9 @@
 # the current template keeps serving clones, holds that VMID's reservation for
 # the whole bake, and points TEMPLATE_ID at the new VM only after `qm template`
 # has converted its disks to base volumes. A failure destroys the partial VM
-# and leaves the live template.
+# and frees a disk volume that this bake created and left behind on
+# VM_STORAGE. A volume that was already on the VMID is left alone, and the
+# live template is left as it was.
 set -euo pipefail
 
 REBAKE_LIB_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
@@ -593,9 +595,170 @@ retire_retired_templates() {
     fi
 }
 
+# Image volids on VM_STORAGE that belong to VMID $1: its own vm-/base-
+# disk, a cloud-init drive, or a linked clone named vm-<vmid>- under
+# another base. Prints nothing when there are none. Returns 1 when the
+# storage listing cannot be read.
+vmid_image_volids() {
+    local vmid="$1" listing
+    [[ "$vmid" =~ ^[0-9]+$ ]] || return 1
+    if ! listing=$(pvesm list "$VM_STORAGE" --content images \
+        199>&- 200>&- 201>&- 202>&- 203>&- 204>&- 2>/dev/null); then
+        return 1
+    fi
+    awk -v v="$vmid" '
+        {
+            id = $1
+            sub(/^[^:]+:/, "", id)
+            if (id ~ ("(^|/)((vm|base)-" v "-|" v "/)"))
+                print $1
+        }
+    ' <<< "$listing"
+}
+
+# 0 when VMID $1 has no image volume on VM_STORAGE. 1 when it has one.
+# 2 when the listing cannot be read. Either failure refuses a bake: qm
+# destroy cannot tell that volume from one this bake is about to create.
+bake_vmid_storage_clear() {
+    local vmid="$1" vols
+    if ! vols=$(vmid_image_volids "$vmid"); then
+        log_error "Could not list volumes on $VM_STORAGE; not baking on VMID $vmid"
+        return 2
+    fi
+    [[ -n "$vols" ]] || return 0
+    log_error "VMID $vmid already has disk volumes on $VM_STORAGE:"
+    printf '%s\n' "$vols" >&2
+    log_error "A bake there would free them if it failed. Choose another VMID, or remove them by hand with pvesm free."
+    return 1
+}
+
+# reserve_vmid walks past guests. A rebake also walks past a VMID that
+# already has a volume, which runner clones do not: those VMIDs are at or
+# above MIN_VMID, where the orphan sweep reaps a config-less vm- disk.
+# Setup cannot walk; it refuses the chosen Template VM ID instead.
+reserve_bake_vmid() {
+    local vmid="" next="" clear_rc=0 skips=0
+    while true; do
+        if [[ -n "$next" ]]; then
+            reserve_vmid "$next" || return 1
+        else
+            reserve_vmid || return 1
+        fi
+        vmid=$RESERVED_VMID
+        clear_rc=0
+        bake_vmid_storage_clear "$vmid" || clear_rc=$?
+        if [[ "$clear_rc" == 0 ]]; then
+            return 0
+        fi
+        release_vmid_reservation "$vmid"
+        # A listing that cannot be read would skip every VMID.
+        [[ "$clear_rc" == 1 ]] || return 1
+        skips=$((skips + 1))
+        if (( skips >= 1000 )); then
+            log_error "No VMID without disk volumes on $VM_STORAGE in 1000 tries"
+            return 1
+        fi
+        log_warn "VMID $vmid already has disk volumes on $VM_STORAGE; choosing another"
+        next=$((vmid + 1))
+    done
+}
+
+drop_pending_bake() {
+    rm -f "$PENDING_BAKE_FILE" "$PENDING_VERSION_FILE" "${PENDING_BAKE_FILE}.created"
+}
+
+# $3 is "absent" (no guest was there) or "destroyed" (this run removed a
+# bake VM it had confirmed by name). An absent VMID is freed only when this
+# bake's qm create succeeded: the pending file is written before that, and
+# a pre-existing volume of the VMID is not this bake's disk. Returns 0 when
+# the pending record can be dropped, 1 when it must stay (the volumes could
+# not be checked), and 2 when a volume is still listed after pvesm free.
+# 2 still drops the record: keeping it would fail every later rebake. The
+# caller fails this run and leaves the volume for the operator.
+settle_bake_leftovers() {
+    local vmid="$1" live_id="${2-}" why="$3" free_rc=0
+    if [[ "$why" == absent ]] && ! bake_vm_was_created "$vmid"; then
+        return 0
+    fi
+    free_bake_leftover_volumes "$vmid" "$live_id" || free_rc=$?
+    return "$free_rc"
+}
+
+# After bake VM $1 is destroyed, free its disk volumes still listed on
+# VM_STORAGE. qm template renames vm-<vmid>-disk-N to base-<vmid>-disk-N
+# before it rewrites the config, and a failure there (no space for the
+# base snapshot) leaves the new name off the config, so qm destroy does
+# not free it. $2, when set, is the live template: its volumes are never
+# freed, nor is a VMID on the retired-template list, nor one that still
+# has a guest config. An unreadable storage listing returns 1: a volume may
+# still be there, and the caller keeps the pending record so the next run
+# tries again. Returns 2 when a volume is still listed after pvesm free;
+# that drops the record, so a stuck volume does not stop every later rebake.
+free_bake_leftover_volumes() {
+    local vmid="$1" live_id="${2-}" listing matches volid config_path failed=0
+    [[ "$vmid" =~ ^[0-9]+$ ]] || return 0
+    if [[ -n "$live_id" && "$vmid" == "$live_id" ]]; then
+        return 0
+    fi
+    if [[ -n "${RETIRED_TEMPLATES_FILE:-}" && -f "$RETIRED_TEMPLATES_FILE" ]] \
+        && grep -qxF "$vmid" "$RETIRED_TEMPLATES_FILE"; then
+        return 0
+    fi
+    if ! listing=$(pvesm list "$VM_STORAGE" --content images \
+        199>&- 200>&- 201>&- 202>&- 203>&- 204>&- 2>/dev/null); then
+        log_warn "Could not list volumes on $VM_STORAGE after bake VM $vmid was destroyed; not freeing leftover disks"
+        return 1
+    fi
+    # The volume's own name only. A linked clone is base-<other>-disk-N/vm-<vmid>-disk-N
+    # and belongs to the template it was cloned from. Directory storage appends
+    # the format (base-<vmid>-disk-N.raw).
+    matches=$(awk -v v="$vmid" '
+        {
+            id = $1
+            sub(/^[^:]+:/, "", id)
+            if (id ~ ("^(" v "/)?(vm|base)-" v "-disk-[0-9]+(\\.[A-Za-z0-9]+)?$"))
+                print $1
+        }
+    ' <<< "$listing") || true
+    [[ -n "$matches" ]] || return 0
+    if ! config_path=$(vm_config_path_checked "$vmid"); then
+        log_warn "pmxcfs is not serving /etc/pve; not freeing the volumes of VMID $vmid"
+        return 1
+    fi
+    if [[ -n "$config_path" ]]; then
+        log_warn "VMID $vmid still has a guest config; not freeing its volumes"
+        return 1
+    fi
+    while IFS= read -r volid; do
+        [[ -n "$volid" ]] || continue
+        if ! config_path=$(vm_config_path_checked "$vmid"); then
+            log_warn "pmxcfs is not serving /etc/pve; not freeing the volumes of VMID $vmid"
+            return 1
+        fi
+        if [[ -n "$config_path" ]]; then
+            log_warn "VMID $vmid still has a guest config; not freeing its volumes"
+            return 1
+        fi
+        log_info "Freeing disk volume left after bake VM $vmid was destroyed: $volid"
+        if ! free_volume "$volid" 2>/dev/null; then
+            # Keeping the pending record would fail every later rebake. The
+            # volume stays; the operator removes it. The record does not.
+            log_error "Disk volume $volid is still on $VM_STORAGE after bake VM $vmid was destroyed"
+            log_error "Later rebakes will not retry it. Remove it by hand: pvesm free '$volid'"
+            if [[ -n "${STATE_DIR:-}" ]]; then
+                install -d -m 700 "$STATE_DIR" 2>/dev/null || true
+                printf 'vmid=%s volid=%s\n' "$vmid" "$volid" >> "$STATE_DIR/bake-leftover-volumes" || true
+                chmod 600 "$STATE_DIR/bake-leftover-volumes" 2>/dev/null || true
+            fi
+            failed=1
+        fi
+    done <<< "$matches"
+    [[ "$failed" == 0 ]] || return 2
+}
+
 cleanup_rebake() {
     # Signal traps pass their status: $? there is the last command's, often 0.
-    local rc=${1:-$?} name cfg
+    local rc=${1:-$?} name cfg settle_rc=0
     trap - EXIT INT TERM
     if [[ "${REBAKE_PUBLISHED:-0}" != 1 && -n "${BAKE_VMID:-}" ]]; then
         if qm_host status "$BAKE_VMID" &>/dev/null; then
@@ -630,7 +793,17 @@ cleanup_rebake() {
                     log_warn "Rebake failed; destroying partial VM $BAKE_VMID and leaving template ${TEMPLATE_ID} unchanged"
                     qm_host stop "$BAKE_VMID" --timeout 30 2>/dev/null || true
                     if qm_host destroy "$BAKE_VMID"; then
-                        rm -f "$PENDING_BAKE_FILE" "$PENDING_VERSION_FILE"
+                        settle_rc=0
+                        settle_bake_leftovers "$BAKE_VMID" "$TEMPLATE_ID" destroyed || settle_rc=$?
+                        if [[ "$settle_rc" == 1 ]]; then
+                            log_error "VM $BAKE_VMID was destroyed but its volumes on $VM_STORAGE could not be checked; it stays recorded in $PENDING_BAKE_FILE"
+                            [[ "$rc" -ne 0 ]] || rc=1
+                        else
+                            drop_pending_bake
+                            # pvesm free left a volume. This run failed; the
+                            # next rebake is not stopped by the record.
+                            [[ "$settle_rc" != 2 || "$rc" -ne 0 ]] || rc=1
+                        fi
                     else
                         log_error "Could not destroy partial VM $BAKE_VMID; it stays recorded in $PENDING_BAKE_FILE"
                     fi
@@ -638,10 +811,18 @@ cleanup_rebake() {
             fi
         else
             if vm_confirmed_absent "$BAKE_VMID"; then
-                rm -f "$PENDING_BAKE_FILE" "$PENDING_VERSION_FILE"
+                settle_rc=0
+                settle_bake_leftovers "$BAKE_VMID" "$TEMPLATE_ID" absent || settle_rc=$?
+                if [[ "$settle_rc" == 1 ]]; then
+                    log_error "Rebake VM $BAKE_VMID is gone but its volumes on $VM_STORAGE could not be checked; it stays recorded in $PENDING_BAKE_FILE"
+                    [[ "$rc" -ne 0 ]] || rc=1
+                else
+                    drop_pending_bake
+                    [[ "$settle_rc" != 2 || "$rc" -ne 0 ]] || rc=1
+                fi
             elif vmid_is_non_qemu_guest "$BAKE_VMID"; then
                 log_warn "VMID $BAKE_VMID belongs to a container, not the rebake VM; dropping the pending record"
-                rm -f "$PENDING_BAKE_FILE" "$PENDING_VERSION_FILE"
+                drop_pending_bake
             else
                 log_error "Could not confirm rebake VM $BAKE_VMID is absent; retaining the pending record"
                 [[ "$rc" -ne 0 ]] || rc=1
@@ -653,27 +834,36 @@ cleanup_rebake() {
 }
 
 recover_pending_bake() {
-    local id ver cfg name node
+    local id ver cfg name node settle_rc=0
+    # This process did not create the VM. A token or flag left in the
+    # environment belongs to some other bake and must not hide the marker.
+    unset BAKE_RUN_TOKEN BAKE_VM_CREATED
     [[ -f "$PENDING_BAKE_FILE" ]] || return 0
     id=$(tr -d '[:space:]' < "$PENDING_BAKE_FILE")
     if [[ ! "$id" =~ ^[0-9]+$ ]]; then
-        rm -f "$PENDING_BAKE_FILE" "$PENDING_VERSION_FILE"
+        drop_pending_bake
         return 0
     fi
     if ! qm_host status "$id" &>/dev/null; then
         if vm_confirmed_absent "$id"; then
-            rm -f "$PENDING_BAKE_FILE" "$PENDING_VERSION_FILE"
+            settle_rc=0
+            settle_bake_leftovers "$id" "$TEMPLATE_ID" absent || settle_rc=$?
+            if [[ "$settle_rc" == 1 ]]; then
+                log_error "Pending bake VM $id is gone but its volumes on $VM_STORAGE could not be checked; retaining its record"
+                return 1
+            fi
+            drop_pending_bake
             return 0
         fi
         # Kept, this record would fail every later run before the release check.
         if vmid_is_non_qemu_guest "$id"; then
             log_warn "Pending bake id $id belongs to a container, not a rebake VM; dropping the stale pending record"
-            rm -f "$PENDING_BAKE_FILE" "$PENDING_VERSION_FILE"
+            drop_pending_bake
             return 0
         fi
         if node=$(vmid_node_elsewhere "$id"); then
             log_warn "Pending bake id $id is a guest on node $node, not a bake VM on this node; dropping the stale pending record"
-            rm -f "$PENDING_BAKE_FILE" "$PENDING_VERSION_FILE"
+            drop_pending_bake
             return 0
         fi
         log_error "Could not confirm pending bake VM $id is absent; retaining its record"
@@ -688,7 +878,7 @@ recover_pending_bake() {
     name=$(printf '%s\n' "$cfg" | awk '/^name:/{print $2; exit}')
     if [[ "$name" != "ubuntu-cloud-template" ]]; then
         log_error "Pending bake id $id is ${name:-unnamed}; leaving that VM and dropping the stale pending record"
-        rm -f "$PENDING_BAKE_FILE" "$PENDING_VERSION_FILE"
+        drop_pending_bake
         return 0
     fi
     # Never publish on `template: 1` alone: Proxmox writes it before converting
@@ -705,7 +895,7 @@ recover_pending_bake() {
                 log_warn "Template $id is published but its runner version was not recorded"
             fi
         fi
-        rm -f "$PENDING_BAKE_FILE" "$PENDING_VERSION_FILE"
+        drop_pending_bake
         return 0
     fi
     if [[ "$id" == "$TEMPLATE_ID" ]]; then
@@ -716,7 +906,13 @@ recover_pending_bake() {
     log_warn "Destroying incomplete rebake VM $id"
     qm_host stop "$id" --timeout 30 2>/dev/null || true
     if qm_host destroy "$id"; then
-        rm -f "$PENDING_BAKE_FILE" "$PENDING_VERSION_FILE"
+        settle_rc=0
+        settle_bake_leftovers "$id" "$TEMPLATE_ID" destroyed || settle_rc=$?
+        if [[ "$settle_rc" == 1 ]]; then
+            log_error "VM $id was destroyed but its volumes on $VM_STORAGE could not be checked; retaining its record"
+            return 1
+        fi
+        drop_pending_bake
         return 0
     fi
     log_error "Could not destroy incomplete rebake VM $id"
@@ -785,12 +981,20 @@ perform_bake() {
     # Simple commands, not `|| exit`: `||` disables errexit inside the callee.
     prepare_cloud_image
     # reserve_vmid starts at MIN_VMID and walks upward. Hold fd 203 until the
-    # bake ends so the 30-second watcher cannot take this VMID.
-    reserve_vmid
+    # bake ends so the 30-second watcher cannot take this VMID. A VMID that
+    # already has a volume is skipped; reserve_vmid itself still hands that
+    # VMID to a runner clone.
+    reserve_bake_vmid
     new_vmid=$RESERVED_VMID
     BAKE_VMID=$new_vmid
     old_template=$TEMPLATE_ID
     install -d -m 700 "$STATE_DIR"
+    # The created marker is written only after qm create. A marker left by
+    # an older bake of some other id must not apply to this one, and a token
+    # on this run makes one the removal missed fail to match.
+    unset BAKE_VM_CREATED
+    BAKE_RUN_TOKEN=$$-$RANDOM$RANDOM
+    rm -f "${PENDING_BAKE_FILE}.created"
     printf '%s\n' "$new_vmid" > "$PENDING_BAKE_FILE"
     chmod 600 "$PENDING_BAKE_FILE"
     trap cleanup_rebake EXIT
@@ -806,7 +1010,7 @@ perform_bake() {
     REBAKE_PUBLISHED=1
     switch_template_id "$new_vmid"
     commit_baked_version "$BAKE_RUNNER_VERSION" "$new_vmid"
-    rm -f "$PENDING_BAKE_FILE" "$PENDING_VERSION_FILE"
+    drop_pending_bake
     release_vmid_reservation "$new_vmid"
     trap - EXIT INT TERM
     retire_retired_templates || true
@@ -883,13 +1087,13 @@ check_conf_bake_limits() {
     # existing missing-config error still reports that after detach.
     [[ -f "$CONFIG_FILE" ]] || return 0
     (
-        if [[ -z "${BAKE_TIMEOUT:-}" && -z "${BAKE_MIN_FREE_GIB:-}" ]]; then
-            unset BAKE_TIMEOUT BAKE_MIN_FREE_GIB
+        if [[ -z "${BAKE_TIMEOUT:-}" && -z "${BAKE_MIN_FREE_GIB:-}" && -z "${BAKE_FREE_FLOOR_GIB:-}" ]]; then
+            unset BAKE_TIMEOUT BAKE_MIN_FREE_GIB BAKE_FREE_FLOOR_GIB
         fi
         # errexit is off here: rebake_main runs this as `|| exit 1`. The &&
         # is what makes a bad conf value the subshell's status.
         load_infra_config
-        check_bake_timeout && check_bake_min_free_gib
+        check_bake_timeout && check_bake_min_free_gib && check_bake_free_floor
     )
 }
 
@@ -899,17 +1103,18 @@ detach_rebake_from_ssh() {
     fi
     log_info "Starting the rebake outside this shell so an SSH drop cannot kill it"
     # systemctl start cannot pass this shell's environment to the unit, so a
-    # one-run BAKE_TIMEOUT or BAKE_MIN_FREE_GIB would be dropped and the conf
-    # value (or the default) would be used instead. setsid keeps the environment.
-    if [[ -z "${BAKE_TIMEOUT:-}" && -z "${BAKE_MIN_FREE_GIB:-}" && -f "$REBAKE_UNIT_FILE" ]] \
+    # one-run BAKE_TIMEOUT, BAKE_MIN_FREE_GIB or BAKE_FREE_FLOOR_GIB would be
+    # dropped and the conf value (or the default) would be used instead.
+    # setsid keeps the environment.
+    if [[ -z "${BAKE_TIMEOUT:-}" && -z "${BAKE_MIN_FREE_GIB:-}" && -z "${BAKE_FREE_FLOOR_GIB:-}" && -f "$REBAKE_UNIT_FILE" ]] \
         && command -v systemctl >/dev/null 2>&1; then
         systemctl start --no-block github-runner-rebake.service
         log_info "Follow it with: journalctl -u github-runner-rebake.service -f"
         exit 0
     fi
     if ! command -v setsid >/dev/null 2>&1; then
-        if [[ -n "${BAKE_TIMEOUT:-}" || -n "${BAKE_MIN_FREE_GIB:-}" ]]; then
-            log_error "setsid is not available, and github-runner-rebake.service cannot take BAKE_TIMEOUT or BAKE_MIN_FREE_GIB"
+        if [[ -n "${BAKE_TIMEOUT:-}" || -n "${BAKE_MIN_FREE_GIB:-}" || -n "${BAKE_FREE_FLOOR_GIB:-}" ]]; then
+            log_error "setsid is not available, and github-runner-rebake.service cannot take BAKE_TIMEOUT, BAKE_MIN_FREE_GIB or BAKE_FREE_FLOOR_GIB"
             log_error "Run 'runner rebake --foreground' inside tmux"
         else
             log_error "setsid is not available and github-runner-rebake.service is not installed"
@@ -957,6 +1162,7 @@ rebake_main() {
     # Refuse a bad override here, where the caller sees it.
     check_bake_timeout || exit 1
     check_bake_min_free_gib || exit 1
+    check_bake_free_floor || exit 1
     # Before the handoff to systemd. A bad limit in the conf must fail in
     # this terminal, and the unit's start timeout has to be reloaded first.
     check_conf_bake_limits || exit 1
@@ -982,6 +1188,7 @@ rebake_main() {
     # conf arrives with the source above and must fail before any VM exists.
     check_bake_timeout || exit 1
     check_bake_min_free_gib || exit 1
+    check_bake_free_floor || exit 1
     validate_saved_infra
     require_live_template
 
