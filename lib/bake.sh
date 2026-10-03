@@ -75,7 +75,12 @@ prepare_cloud_image() {
 }
 
 render_template_setup_snippet() {
-    DOCKER_MIRROR_URL="${DOCKER_MIRROR_URL:-}" awk '
+    # The guest installs exactly this release and makes no GitHub API call.
+    if [[ ! "${LATEST_RUNNER_VERSION:-}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        log_error "No actions/runner version was resolved for the bake"
+        return 1
+    fi
+    DOCKER_MIRROR_URL="${DOCKER_MIRROR_URL:-}" RUNNER_VERSION="$LATEST_RUNNER_VERSION" awk '
     function lreplace(str, old, new,    i, result) {
         result = ""
         while ((i = index(str, old)) > 0) {
@@ -86,14 +91,35 @@ render_template_setup_snippet() {
     }
     {
         $0 = lreplace($0, "{{DOCKER_MIRROR_URL}}", ENVIRON["DOCKER_MIRROR_URL"])
+        $0 = lreplace($0, "{{RUNNER_VERSION}}", ENVIRON["RUNNER_VERSION"])
         print
-    }' "$INSTALL_DIR/templates/template-setup.yaml" > "$SNIPPETS_DIR/template-setup.yaml"
+    }' "$INSTALL_DIR/templates/template-setup.yaml" > "$SNIPPETS_DIR/template-setup.yaml" || return 1
     chmod 600 "$SNIPPETS_DIR/template-setup.yaml"
+}
+
+# The host picks the runner release for the bake, so the guest makes no
+# unauthenticated GitHub API call (60 an hour per address, shared with every
+# job behind it). rebake_main has already read the latest release; setup has
+# not, so read it once here. rebake.sh, which both callers source, defines
+# fetch_latest_runner_release.
+resolve_bake_runner_version() {
+    if [[ -z "${LATEST_RUNNER_VERSION:-}" ]] && ! fetch_latest_runner_release; then
+        log_error "Could not read the latest actions/runner release; not baking"
+        return 1
+    fi
+    if [[ ! "${LATEST_RUNNER_VERSION:-}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        log_error "actions/runner release '${LATEST_RUNNER_VERSION:-}' is not an X.Y.Z version; not baking"
+        return 1
+    fi
+    log_info "The bake installs actions/runner $LATEST_RUNNER_VERSION"
 }
 
 create_bake_vm() {
     local vmid="$1"
     local net_config="virtio,bridge=$NETWORK_BRIDGE"
+
+    # Checked before the VM exists, for setup and rebake alike.
+    resolve_bake_runner_version || return 1
 
     if [[ -n "${VLAN_TAG:-}" ]]; then
         net_config="${net_config},tag=$VLAN_TAG"
@@ -160,7 +186,8 @@ bake_and_publish_vm() {
         || { log_error "Failed to resize disk"; return 1; }
 
     log_info "Configuring template cloud-init..."
-    render_template_setup_snippet
+    render_template_setup_snippet \
+        || { log_error "Failed to write the template cloud-init snippet"; return 1; }
 
     qm_host set "$vmid" --cicustom "user=local:snippets/template-setup.yaml" \
         || { log_error "Failed to set cloud-init config"; return 1; }

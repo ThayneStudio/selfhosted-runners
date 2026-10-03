@@ -304,10 +304,12 @@ write_files:
       chown $RUNNER_USER:$RUNNER_USER $RUNNER_HOME
       cd $RUNNER_HOME
 
-      # Get latest runner version with validation
-      RUNNER_VERSION=$(curl -sf --retry 3 https://api.github.com/repos/actions/runner/releases/latest | jq -r .tag_name | sed 's/v//')
-      if [[ -z "$RUNNER_VERSION" || "$RUNNER_VERSION" == "null" ]]; then
-        log_error "Failed to get runner version from GitHub API"
+      # The host picks the release and renders it here. The guest makes no
+      # GitHub API call: unauthenticated calls share a limit of 60 an hour
+      # with every job behind this address, and a 403 would fail the bake.
+      RUNNER_VERSION="{{RUNNER_VERSION}}"
+      if [[ ! "$RUNNER_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        log_error "Runner version from the host is not X.Y.Z: ${RUNNER_VERSION:-empty}"
         exit 1
       fi
       log "Latest runner version: $RUNNER_VERSION"
