@@ -2,6 +2,8 @@
 set -euo pipefail
 
 source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/common.sh"
+# shellcheck source=recycle.sh
+source "$LIB_DIR/recycle.sh"
 
 require_root "add-org"
 
@@ -124,8 +126,11 @@ fi
 
 read -rp "Runner name prefix [${EXISTING_PREFIX:-runner}]: " RUNNER_PREFIX
 RUNNER_PREFIX=${RUNNER_PREFIX:-${EXISTING_PREFIX:-runner}}
-if [[ ! "$RUNNER_PREFIX" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]*$ ]]; then
-    log_error "Invalid prefix. Use only letters, numbers, dots, hyphens, underscores."
+# Slot names "${prefix}-${n}" become VM names, which qm clone checks as DNS
+# names. Checking "-1" covers every n: the digits never change the verdict.
+if ! validate_runner_name "${RUNNER_PREFIX}-1"; then
+    log_error "Invalid prefix '$RUNNER_PREFIX'. Use letters, numbers and hyphens, starting with a letter or number."
+    log_error "Runner names become Proxmox VM names, which must be DNS names (no underscores)."
     exit 1
 fi
 
@@ -176,10 +181,48 @@ fi
 mkdir -p "$ORG_CONFIG_DIR"
 chmod 700 "$ORG_CONFIG_DIR"
 CONF_TMP=$(mktemp "$ORG_CONFIG_DIR/.${GITHUB_ORG}.XXXXXX")
-printf 'GITHUB_ORG="%s"\nGITHUB_PAT="%s"\nRUNNER_PREFIX="%s"\nRUNNER_COUNT="%s"\nRUNNER_GROUP_ID="%s"\n' "$GITHUB_ORG" "$GITHUB_PAT" "$RUNNER_PREFIX" "$RUNNER_COUNT" "$RUNNER_GROUP_ID" > "$CONF_TMP"
+# Updating an org keeps every line (a hand-set RUNNER_LABELS, comments) where
+# it is, and rewrites each line that sets a prompted key, indented or with
+# export too, to KEY="new value". So a kept line that expands a key, such as
+# RUNNER_LABELS="...,${RUNNER_PREFIX}", still follows it when the file is
+# sourced under set -u, no line is left to set an old value, and the grep
+# readers see the new one. No line is dropped, so a block around a rewritten
+# line stays valid. A key the file lacked goes at the end.
+declare -A new_value=([GITHUB_ORG]="$GITHUB_ORG" [GITHUB_PAT]="$GITHUB_PAT"
+    [RUNNER_PREFIX]="$RUNNER_PREFIX" [RUNNER_COUNT]="$RUNNER_COUNT" [RUNNER_GROUP_ID]="$RUNNER_GROUP_ID")
+declare -A written=()
+managed_re='^[[:space:]]*(export[[:space:]]+)?(GITHUB_ORG|GITHUB_PAT|RUNNER_PREFIX|RUNNER_COUNT|RUNNER_GROUP_ID)='
+{
+    if [[ -f "$ORG_CONFIG_DIR/${GITHUB_ORG}.conf" ]]; then
+        # "|| [[ -n $line ]]" also reads a last line that has no newline.
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            if [[ "$line" =~ $managed_re ]]; then
+                key=${BASH_REMATCH[2]}
+                written[$key]=1
+                printf '%s="%s"\n' "$key" "${new_value[$key]}"
+            else
+                printf '%s\n' "$line"
+            fi
+        done < "$ORG_CONFIG_DIR/${GITHUB_ORG}.conf"
+    fi
+    for key in GITHUB_ORG GITHUB_PAT RUNNER_PREFIX RUNNER_COUNT RUNNER_GROUP_ID; do
+        [[ -n "${written[$key]:-}" ]] || printf '%s="%s"\n' "$key" "${new_value[$key]}"
+    done
+} > "$CONF_TMP"
 chmod 600 "$CONF_TMP"
 mv "$CONF_TMP" "$ORG_CONFIG_DIR/${GITHUB_ORG}.conf"
 CONF_TMP=""
+
+# A slot whose clones kept failing is held for up to 30 minutes (recycle.sh).
+# The new config is the fix for what failed them, such as an expired PAT, so
+# the watcher retries the org's slots on its next tick. Only this org's exact
+# slot names, as the watcher reads them: a glob on the prefix would also clear
+# another org's ${prefix}-x-N holds.
+read_org_slots "$GITHUB_ORG"
+for ((n = 1; n <= ${ORG_SLOT_COUNT:-0}; n++)); do
+    rm -f "$(slot_state_file "${ORG_SLOT_PREFIX}-${n}")" ||
+        log_warn "Could not clear the failure hold of ${ORG_SLOT_PREFIX}-${n}; the watcher retries it when the hold ends"
+done
 
 echo ""
 log_info "Organization '$GITHUB_ORG' configured successfully"
