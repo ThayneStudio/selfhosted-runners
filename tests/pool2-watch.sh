@@ -47,7 +47,8 @@ date() {
 
 # vm <vmid> <name> <status> [key=value ...]: uptime, org (cicustom), marker
 # (clone-time description), born (when it was cloned: its meta snippet's
-# mtime), undeletable (qm destroy fails). Every VM gets a meta snippet.
+# mtime), undeletable (qm destroy fails), reads (how many `qm config` calls
+# succeed). Every VM gets a meta snippet.
 vm() {
     local dir="$state/vm/$1" kv
     rm -rf "$dir"
@@ -88,6 +89,10 @@ qm() {
                 return 0
             fi
             gone "$id" && return 2
+            if [[ -n "$(field "$id" reads)" ]]; then
+                (( $(field "$id" reads) > 0 )) || return 2
+                printf '%s\n' "$(( $(field "$id" reads) - 1 ))" > "$state/vm/$id/reads"
+            fi
             printf 'name: %s\n' "$(field "$id" name)"
             [[ -z "$(field "$id" marker)" ]] || printf 'description: %s\n' "$(field "$id" marker)"
             [[ -z "$(field "$id" org)" ]] \
@@ -271,5 +276,40 @@ tick
 did "clone runner-1 acme" || fail "the slot was not refilled once the destroy succeeded"
 slot_state_load runner-1
 [[ "$SLOT_RAPID" == 1 ]] || fail "a death whose destroy was retried was counted $SLOT_RAPID times"
+
+# N15: runners removed with plain `qm destroy` left their snippets, and VMs
+# created later at those VMIDs are not ours. The watcher removes the
+# leftovers once instead of queueing those VMs on every tick.
+reset
+vm 9001 runner-1 running org=acme marker="$marker" uptime=100 born=$((clock - 100))
+: > "$SNIPPETS_DIR/runner-9001-user-acme.yaml"
+vm 9003 builder running uptime=300 born=$((clock - 7200))
+: > "$SNIPPETS_DIR/runner-9003-user-acme.yaml"
+vm 9004 scratch stopped born=$((clock - 7200))
+tick
+grep -q 'Reclaiming 1 dead runner VM' "$state/out" || fail "the running foreign VM was not checked"
+grep -q 'VMID 9003 is now builder, not a runner VM; removed the runner snippets left behind for it' "$state/out" \
+    || fail "the leftover snippets of a running foreign VM were not removed"
+compgen -G "$SNIPPETS_DIR/runner-9003-*" > /dev/null && fail "snippets were left for VMID 9003"
+clock=$((clock + 61))
+tick
+compgen -G "$SNIPPETS_DIR/runner-9004-*" > /dev/null && fail "snippets were left for stopped VMID 9004"
+clock=$((clock + 30))
+tick
+grep -q 'Reclaiming' "$state/out" && fail "a foreign VM was still queued: $(cat "$state/out")"
+did_nothing "a foreign VM was touched"
+[[ -e "$SNIPPETS_DIR/runner-9001-meta.yaml" && -e "$SNIPPETS_DIR/runner-9001-user-acme.yaml" ]] \
+    || fail "a healthy runner's snippets were removed"
+
+# The decision rests on the config read under the slot lock. A second read
+# that fails must not make a runner (an extra one, outside the slot names)
+# look foreign and lose its snippets.
+reset
+vm 9001 runner-1 running org=acme marker="$marker" uptime=100 born=$((clock - 100))
+vm 9005 build-box running org=acme marker='selfhosted-runners org=acme kind=extra' uptime=300 \
+    born=$((clock - 7200)) reads=1
+tick
+did "destroy 9005" || fail "a restarted runner whose config could be read only once was not reclaimed: $(cat "$state/out")"
+grep -q 'not a runner VM' "$state/out" && fail "a runner was taken for a foreign VM"
 
 printf 'pool2-watch: ok\n'

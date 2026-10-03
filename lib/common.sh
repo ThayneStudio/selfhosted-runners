@@ -173,10 +173,16 @@ slot_number() {
     printf '%s\n' "$n"
 }
 
+# Prints the org of runner VM $1, or "unknown". $2, when given, is the VM's
+# config as the caller already read it.
 get_vm_org() {
     local config cicustom description
     local marker_re='^description: selfhosted-runners org=([a-zA-Z0-9-]+)'
-    config=$(qm config "$1" 2>/dev/null) || true
+    if (( $# > 1 )); then
+        config="$2"
+    else
+        config=$(qm config "$1" 2>/dev/null) || true
+    fi
     cicustom=$(grep -m1 '^cicustom:' <<< "$config") || true
     description=$(grep -m1 '^description:' <<< "$config") || true
     # New per-VM snippet: runner-<vmid>-user-<org>.yaml (org has no dots).

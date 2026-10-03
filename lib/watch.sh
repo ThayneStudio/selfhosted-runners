@@ -85,12 +85,19 @@ reclaim_runner_vm() {
     if grep -qE '^(lock:|template: 1)' <<< "$config"; then
         return 0
     fi
-    org=$(get_vm_org "$vmid")
+    org=$(get_vm_org "$vmid" "$config")
     if [[ "$org" == "unknown" ]]; then
         # Worth reporting only when it holds a slot: otherwise this is a VM
         # that reused the VMID of a runner whose snippets were left behind.
         if [[ "$slot_named" == 1 ]]; then
             log_warn "[watch] $name (VMID $vmid) is $reason but carries no selfhosted-runners snippet or marker; leaving it. If it is a leftover clone, remove it with: qm destroy $vmid"
+        else
+            # A plain `qm destroy` of a runner leaves its snippets. This VM's
+            # config names none of them, and while they exist every scan
+            # queues it again. A clone at this VMID writes its own.
+            rm -f "${SNIPPETS_DIR}/runner-${vmid}-meta.yaml" "${SNIPPETS_DIR}/runner-${vmid}-user-"*.yaml \
+                "${SNIPPETS_DIR}/runner-${vmid}-vendor.yaml"
+            log_info "[watch] VMID $vmid is now $name, not a runner VM; removed the runner snippets left behind for it"
         fi
         return 0
     fi
