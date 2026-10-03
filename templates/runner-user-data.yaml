@@ -179,9 +179,17 @@ write_files:
           )' <<<"$decoded") || return 1
         printf '%s' "$patched" | base64 -w0
       }
-      if ! JIT=$(patch_jit_disableupdate "$JIT"); then
-        log_error "Failed to set disableUpdate on the JIT runner config"
-        exit 1
+      # Templates baked since the daily rebake record /opt/.baked-runner-version,
+      # and the rebake keeps them current. An older template has no record and
+      # may hold a runner GitHub refuses unless it updates, so its clones keep
+      # updating themselves until a rebake replaces it.
+      if [[ -f /opt/.baked-runner-version ]]; then
+        if ! JIT=$(patch_jit_disableupdate "$JIT"); then
+          log_error "Failed to set disableUpdate on the JIT runner config"
+          exit 1
+        fi
+      else
+        log "No /opt/.baked-runner-version: template predates the rebake, leaving runner self-update on"
       fi
 
       # Signal that the runner is ready

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Fails if a clone can start run.sh without --disableupdate, or if the JIT
-# .runner document is no longer patched with disableUpdate=true.
+# .runner document is no longer patched with disableUpdate=true on clones of a
+# template that records its runner version (older templates keep updating).
 set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -28,6 +29,10 @@ done
 grep -q 'endswith(".runner")' "$guest" || fail "JIT patch no longer selects .runner keys"
 grep -q '.disableUpdate = true' "$guest" || fail "JIT patch no longer sets disableUpdate"
 grep -q 'Failed to set disableUpdate on the JIT runner config' "$guest" || fail "patch failure no longer exits"
+# The patch is skipped only on templates without the record the bake writes.
+grep -q 'if \[\[ -f /opt/.baked-runner-version \]\]; then' "$guest" \
+    || fail "JIT patch is no longer gated on /opt/.baked-runner-version"
+grep -q '> /opt/.baked-runner-version' "$bake" || fail "template bake no longer writes /opt/.baked-runner-version"
 # The failure path must be an exit, not a warning that still starts run.sh.
 awk '
     /Failed to set disableUpdate on the JIT runner config/ { seen = 1 }

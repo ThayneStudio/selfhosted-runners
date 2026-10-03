@@ -218,4 +218,30 @@ logged "DNS servers: 1.1.1.1 8.8.8.8" || fail "the applied DNS servers were not 
 DNS_SERVERS=""
 dhcp_dns=""
 
+# disableUpdate. A template baked since the daily rebake records its runner
+# version and the rebake keeps it current, so its clones must not self-update.
+started_runner_doc() {
+    [[ "$(sed -n 1p "$state/run-args")" == --jitconfig ]] || fail "run.sh was not started with --jitconfig"
+    sed -n 2p "$state/run-args" | base64 -d | jq -r '.[".runner"]' | base64 -d
+}
+baked=1
+boot baked-template
+assert_ran "template with a runner version record"
+started_runner_doc | jq -e '.disableUpdate == true and .agentName == "runner-01"' >/dev/null \
+    || fail "a clone of a recorded template started without disableUpdate: $(started_runner_doc)"
+# An older template has no record and may hold a runner GitHub refuses unless
+# it updates, so its clones keep self-updating until a rebake replaces it.
+baked=0
+boot legacy-template
+assert_ran "template without a runner version record"
+[[ "$(sed -n 2p "$state/run-args")" == "$jit" ]] || fail "the JIT config of a legacy template clone was modified"
+logged "leaving runner self-update on" || fail "skipping the disableUpdate patch was not logged"
+baked=1
+good_jit=$jit
+jit=$(b64 '{"other":"x"}')
+boot jit-without-runner
+[[ ! -e "$state/run-args" ]] || fail "run.sh started although the JIT config could not be patched"
+logged "Failed to set disableUpdate on the JIT runner config" || fail "the JIT patch failure was not logged"
+jit=$good_jit
+
 printf 'guest-register-runner: ok\n'
