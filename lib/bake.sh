@@ -8,6 +8,7 @@ set -euo pipefail
 
 IMG_CACHE_DIR="/var/cache/github-runners"
 CLOUD_IMG="noble-server-cloudimg-amd64.img"
+BAKE_DISK_GIB=30
 BAKE_RUNNER_VERSION=""
 
 # Proxmox helpers can fork long-lived kvm processes. Those must not inherit
@@ -114,11 +115,40 @@ resolve_bake_runner_version() {
     log_info "The bake installs actions/runner $LATEST_RUNNER_VERSION"
 }
 
+# A bake can write its whole BAKE_DISK_GIB disk to VM_STORAGE. A storage that
+# fills up pauses every VM on it (QEMU's default werror=enospc), not only the
+# bake VM, so refuse to start a bake without that much free. BAKE_MIN_FREE_GIB
+# overrides the floor; 0 skips the check.
+check_bake_storage_space() {
+    local min_gib="${BAKE_MIN_FREE_GIB:-$BAKE_DISK_GIB}" row storage_status avail_kib
+    if [[ ! "$min_gib" =~ ^[0-9]+$ ]]; then
+        log_error "BAKE_MIN_FREE_GIB must be a whole number of GiB, not '$min_gib'"
+        return 1
+    fi
+    min_gib=$((10#$min_gib))
+    (( min_gib > 0 )) || return 0
+    # Columns: Name Type Status Total Used Available %. Sizes are KiB.
+    row=$(pvesm status --storage "$VM_STORAGE" 199>&- 200>&- 201>&- 202>&- 203>&- 204>&- 2>/dev/null \
+        | awk -v s="$VM_STORAGE" '$1 == s && !found { print $3, $6; found = 1 }') || row=""
+    read -r storage_status avail_kib _ <<< "$row"
+    if [[ "$storage_status" != active || ! "$avail_kib" =~ ^[0-9]+$ ]]; then
+        log_error "Could not read free space on storage $VM_STORAGE (status: ${storage_status:-unknown}); not baking"
+        log_error "Set BAKE_MIN_FREE_GIB=0 to bake without this check."
+        return 1
+    fi
+    if (( avail_kib < min_gib * 1048576 )); then
+        log_error "Not baking: storage $VM_STORAGE has $((avail_kib / 1048576)) GiB free and a bake needs $min_gib GiB"
+        log_error "A full storage pauses every VM on it. Free space on $VM_STORAGE, or set BAKE_MIN_FREE_GIB."
+        return 1
+    fi
+}
+
 create_bake_vm() {
     local vmid="$1"
     local net_config="virtio,bridge=$NETWORK_BRIDGE"
 
     # Checked before the VM exists, for setup and rebake alike.
+    check_bake_storage_space || return 1
     resolve_bake_runner_version || return 1
 
     if [[ -n "${VLAN_TAG:-}" ]]; then
@@ -182,7 +212,7 @@ bake_and_publish_vm() {
         || { log_error "Failed to set serial"; return 1; }
     qm_host set "$vmid" --agent enabled=1 \
         || { log_error "Failed to enable agent"; return 1; }
-    qm_host resize "$vmid" scsi0 30G \
+    qm_host resize "$vmid" scsi0 "${BAKE_DISK_GIB}G" \
         || { log_error "Failed to resize disk"; return 1; }
 
     log_info "Configuring template cloud-init..."
