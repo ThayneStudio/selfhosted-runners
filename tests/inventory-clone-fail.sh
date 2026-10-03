@@ -26,6 +26,7 @@ PVE_NODES_DIR=$state/nodes
 SNIPPETS_DIR=$state/snippets
 INSTALL_DIR=$root
 POOL_DRAIN_FILE=$state/drain
+LEGACY_POOL_DRAIN_FILE=$state/legacy-drain
 POOL_ACTIVITY_LOCK_FILE=$state/pool.lock
 VMID_LOCK_FILE=$state/vmid.lock
 VMID_RESERVATION_LOCK_PREFIX=$state/reserve

@@ -27,6 +27,7 @@ trap 'rm -rf "$state"' EXIT
 
 CONFIG_FILE=$state/github-runners.conf
 POOL_DRAIN_FILE=$state/drain
+LEGACY_POOL_DRAIN_FILE=$state/legacy-drain
 SLOT_STATE_DIR=$state/slots
 WATCH_SERVICE_FILE=$state/github-runner-watch.service
 LIB_DIR=$state/lib
@@ -46,10 +47,16 @@ prepare() {
     printf '9001 runner-1 1000\n' > "$SLOT_STATE_DIR/watch-stopped"
 }
 
+# start_main deletes the legacy drain flag. That has to be the scratch
+# copy: the default path is the operator's real maintenance flag.
+[[ "$LEGACY_POOL_DRAIN_FILE" == "$state/"* ]] ||
+    fail "legacy drain flag is $LEGACY_POOL_DRAIN_FILE"
 prepare
+printf 'on\n' > "$LEGACY_POOL_DRAIN_FILE"
 : > "$WATCH_SERVICE_FILE"
 ( start_main ) > "$state/out" 2>&1 || fail "start failed: $(tail -n 3 "$state/out")"
 [[ ! -e "$POOL_DRAIN_FILE" ]] || fail "the pool drain was not cleared"
+[[ ! -e "$LEGACY_POOL_DRAIN_FILE" ]] || fail "runner start left the legacy drain flag"
 [[ ! -e "$SLOT_STATE_DIR/slot-runner-1" ]] || fail "the failure backoff survived runner start"
 [[ -e "$SLOT_STATE_DIR/watch-stopped" ]] || fail "runner start dropped the watcher's stopped-VM record"
 grep -qx 'systemctl start github-runner-watch.timer' "$actions" || fail "the watcher timer was not started"

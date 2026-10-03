@@ -23,8 +23,15 @@ trap 'rm -rf "$state"' EXIT
 mkdir -m 755 "$state/parent"
 mkdir -m 1777 "$state/parent/lock"
 POOL_DRAIN_FILE=$state/parent/lock/github-runner-drain
+LEGACY_POOL_DRAIN_FILE=$state/legacy-drain
+# The default legacy path is the host's /run/lock flag. enable_pool_drain
+# publishes it and the last case below used to leave that file behind.
+[[ "$LEGACY_POOL_DRAIN_FILE" == "$state/"* ]] ||
+    fail "legacy drain flag is $LEGACY_POOL_DRAIN_FILE"
 enable_pool_drain
 pool_is_draining || fail "enable_pool_drain did not set the drain flag"
+[[ -f "$LEGACY_POOL_DRAIN_FILE" && ! -L "$LEGACY_POOL_DRAIN_FILE" ]] ||
+    fail "enable_pool_drain did not publish the legacy drain flag in the scratch dir"
 [[ "$(file_mode "$state/parent")" == "755" ]] ||
     fail "enable_pool_drain changed the parent directory's mode"
 [[ "$(file_mode "$state/parent/lock")" == "700" ]] ||
@@ -41,5 +48,8 @@ enable_pool_drain
 pool_is_draining || fail "enable_pool_drain did not create a missing lock directory"
 [[ "$(file_mode "$state/missing")" == "700" ]] ||
     fail "a missing drain directory was created mode $(file_mode "$state/missing")"
+disable_pool_drain
+[[ ! -e "$POOL_DRAIN_FILE" && ! -e "$LEGACY_POOL_DRAIN_FILE" ]] ||
+    fail "the scratch drain flags were left behind"
 
 printf 'inventory-drain-dir: ok\n'

@@ -52,6 +52,7 @@ CONFIG_FILE="$state/github-runners.conf"
 ORG_CONFIG_DIR="$state/orgs"
 INSTALL_DIR="$state/install"
 POOL_DRAIN_FILE="$state/drain"
+LEGACY_POOL_DRAIN_FILE="$state/legacy-drain"
 require_root() { :; }
 curl() { printf 'curl %s\n' "\${*: -1}" >> "$state/calls"; printf 200; }
 qm() { printf 'qm %s\n' "\$*" >> "$state/calls"; return 1; }

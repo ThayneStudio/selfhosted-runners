@@ -30,6 +30,7 @@ CONFIG_FILE=$state/github-runners.conf
 ORG_CONFIG_DIR=$state/orgs
 SNIPPETS_DIR=$state/snippets
 POOL_DRAIN_FILE=$state/drain
+LEGACY_POOL_DRAIN_FILE=$state/legacy-drain
 POOL_ACTIVITY_LOCK_FILE=$state/pool.lock
 SLOT_STATE_DIR=$state/slots
 SLOT_LOCK_PREFIX=$state/slot

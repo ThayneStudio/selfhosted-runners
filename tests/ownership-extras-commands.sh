@@ -32,6 +32,7 @@ ORG_CONFIG_DIR="$state/orgs"
 SNIPPETS_DIR="$state/snippets"
 INSTALL_DIR="$root"
 POOL_DRAIN_FILE="$state/drain"
+LEGACY_POOL_DRAIN_FILE="$state/legacy-drain"
 POOL_ACTIVITY_LOCK_FILE="$state/pool.lock"
 MOCK_STATE="$state"
 EOF
