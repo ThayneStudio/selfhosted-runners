@@ -59,7 +59,7 @@ qm() {
     case "$1" in
         config)
             if [[ "$2" == 9000 ]]; then
-                printf 'name: ubuntu-cloud-template\ntemplate: 1\nscsi0: local-zfs:base-9000-disk-0,size=30G\n'
+                printf 'name: ubuntu-cloud-template\ntemplate: 1\nscsi0: local-zfs:%s,size=30G\n' "$template_disk"
                 return 0
             fi
             [[ -d "$dir" ]] || return 2
@@ -95,6 +95,7 @@ pvesh() {
     done
     printf ']\n'
 }
+template_disk=base-9000-disk-0
 flock() { :; }
 sleep() { :; }
 logger() { printf '%s\n' "$*" >> "$state/logger"; }
@@ -193,5 +194,15 @@ make_vm 9001 runner-1
 rm -f "$SNIPPETS_DIR/runner-9001-meta.yaml"
 run reclone_main 9001
 [[ "$(clones)" -eq 1 ]] || fail "a VM with an unknown lifetime was held"
+
+# A template whose disks were never converted (an interrupted `qm template`)
+# fails every clone after the JIT mint. The watcher must not even try.
+rm -rf "$state/vm"/* "$SLOT_STATE_DIR"
+template_disk=vm-9000-disk-0
+run watch_main
+[[ "$(clones)" -eq 0 ]] || fail "the watcher cloned from an unconverted template"
+template_disk=base-9000-disk-0
+run watch_main
+[[ "$(clones)" -eq 1 ]] || fail "the watcher did not clone from a converted template"
 
 printf 'pool-backoff: ok\n'

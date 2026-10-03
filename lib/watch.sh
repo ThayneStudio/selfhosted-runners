@@ -15,6 +15,8 @@ WATCH_LIB_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 source "$WATCH_LIB_DIR/common.sh"
 # shellcheck source=recycle.sh
 source "$WATCH_LIB_DIR/recycle.sh"
+# shellcheck source=bake.sh
+source "$WATCH_LIB_DIR/bake.sh"
 
 WATCH_MAX_PARALLEL=6
 # The guest powers itself off 360 minutes after boot. The margin also covers
@@ -150,8 +152,9 @@ watch_main() {
         exit 0
     fi
 
-    # Template must be ready
-    qm config "$TEMPLATE_ID" 2>/dev/null | grep -q "^template: 1" || exit 0
+    # Template must be ready: `template: 1` alone is written before its disks
+    # are converted, and every clone of an unconverted one fails after minting.
+    template_is_converted "$TEMPLATE_ID" || exit 0
 
     # Reap zvols left behind by failed clones before computing missing slots, so
     # VMIDs whose only residue was an orphan zvol become available for refill.

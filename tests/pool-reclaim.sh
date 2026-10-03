@@ -88,7 +88,7 @@ qm() {
     case "$1" in
         config)
             if [[ "$id" == 9000 ]]; then
-                printf 'name: ubuntu-cloud-template\ntemplate: 1\n'
+                printf 'name: ubuntu-cloud-template\ntemplate: 1\nscsi0: local-zfs:base-9000-disk-0,size=30G\n'
                 return 0
             fi
             gone "$id" && return 2
