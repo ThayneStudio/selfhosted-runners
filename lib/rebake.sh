@@ -771,25 +771,32 @@ perform_bake() {
     log_info "TEMPLATE_ID is now $new_vmid. Running clones stay on $old_template until their next reclone."
 }
 
-# Poll limit this run will use, from the conf rather than a one-run
-# environment value. The service does not see that environment. Empty or
-# invalid means the script default.
+# Seconds the start timeout has to clear. The conf value, or the script
+# default. While this process is the systemd unit, also the unit's own
+# BAKE_TIMEOUT: that environment is a limit the run will use, and the cap
+# has to sit above it. A one-run value in an ordinary shell is not, because
+# the unit does not receive it. Empty or invalid means the script default.
 conf_bake_timeout_seconds() {
-    local seconds=5400
+    local from_conf=5400
     if [[ -f "$CONFIG_FILE" ]]; then
-        seconds=$(
+        from_conf=$(
             unset BAKE_TIMEOUT
             # shellcheck disable=SC1090
             source "$CONFIG_FILE"
             printf '%s\n' "${BAKE_TIMEOUT:-5400}"
-        ) || seconds=5400
+        ) || from_conf=5400
     fi
-    [[ "$seconds" =~ ^[1-9][0-9]*$ ]] || seconds=5400
-    printf '%s\n' "$seconds"
+    [[ "$from_conf" =~ ^[1-9][0-9]*$ ]] || from_conf=5400
+    if [[ -n "${INVOCATION_ID:-}" && "${BAKE_TIMEOUT:-}" =~ ^[1-9][0-9]*$ ]] \
+        && (( BAKE_TIMEOUT > from_conf )); then
+        printf '%s\n' "$BAKE_TIMEOUT"
+        return 0
+    fi
+    printf '%s\n' "$from_conf"
 }
 
-# TimeoutStartSec for the rebake oneshot: the conf's BAKE_TIMEOUT plus an
-# hour. The unit file carries the default (5400+3600) for a host whose
+# TimeoutStartSec for the rebake oneshot: an hour past the limit that run
+# can use. The unit file carries the default (5400+3600) for a host whose
 # drop-in has not been written yet.
 write_rebake_timeout_dropin() {
     local seconds dropin dir tmp
@@ -811,8 +818,9 @@ write_rebake_timeout_dropin() {
     tmp=$(mktemp "$dir/timeout.conf.XXXXXX") || return 1
     {
         printf '%s\n' '[Service]'
-        printf '%s\n' '# An hour past BAKE_TIMEOUT. The poll does not cover the image download,'
-        printf '%s\n' '# qm importdisk or qm template. This ends a hang so the rebake lock drops.'
+        printf '%s\n' '# An hour past the bake limit this unit can run with. The poll does not'
+        printf '%s\n' '# cover the image download, qm importdisk or qm template. This ends a hang'
+        printf '%s\n' '# so the rebake lock drops.'
         printf 'TimeoutStartSec=%s\n' "$seconds"
     } > "$tmp" || { rm -f "$tmp"; return 1; }
     chmod 644 "$tmp" || { rm -f "$tmp"; return 1; }

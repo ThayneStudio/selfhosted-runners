@@ -9,9 +9,10 @@ Environment=REBAKE_FOREGROUND=1
 ExecStart=/usr/local/bin/runner rebake
 # Default cap: BAKE_TIMEOUT's default of 5400s plus an hour for the image
 # download, qm importdisk and qm template, which the poll limit does not
-# cover. setup, install and rebake write timeout.conf beside this unit when
-# the conf sets another BAKE_TIMEOUT, an hour above that value. A stop still
-# SIGTERMs the main process so its trap can destroy a partial VM.
+# cover. setup, install and rebake write timeout.conf beside this unit an
+# hour above the conf value, or above the unit's own BAKE_TIMEOUT when that
+# is larger. A stop still SIGTERMs the main process so its trap can destroy
+# a partial VM.
 TimeoutStartSec=9000
 TimeoutStopSec=180
 KillMode=mixed

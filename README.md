@@ -508,14 +508,16 @@ It refuses to start unless `pvesm status` shows the storage active with at
 least 30 GiB available, the size of the bake disk, because a storage that fills
 up pauses every VM on it. On thick-provisioned ZFS the floor is 60 GiB (see
 [Resource Planning](#resource-planning)). `BAKE_MIN_FREE_GIB=<GiB>`, a whole
-number, replaces that floor, and `0` turns the check off. Set it in
-`/etc/github-runners.conf`; the daily rebake and `runner setup` both use it,
-and `runner setup` keeps the line when it rewrites that file. For one run,
-put it on the command line of `runner setup` or `runner rebake`, as the
-refusal suggests. That value wins over the conf, and `runner rebake` then
-detaches with `setsid` (below). An `Environment=` line from `systemctl edit
-github-runner-rebake.service` is the same kind of override: it wins over the
-conf for runs of that unit.
+number, replaces that floor, and `0` turns the check off. Set it, and
+`BAKE_TIMEOUT`, in `/etc/github-runners.conf`. The daily rebake and `runner
+setup` both use them, and `runner setup` keeps the lines when it rewrites that
+file. For one run, put either value on the command line of `runner setup` or
+`runner rebake`, as the refusal suggests. That value wins over the conf, and
+`runner rebake` then detaches with `setsid` (below). Leave both out of a
+systemd drop-in. `timeout.conf` is applied after `override.conf`, so a
+`TimeoutStartSec` in the operator's drop-in cannot raise the cap, and an
+`Environment=BAKE_TIMEOUT=` there would let the guest poll run for longer than
+that cap allows.
 
 The host picks the `actions/runner` release for each bake: the rebake uses the
 release it just compared, and setup looks up the latest release once when its
@@ -572,7 +574,11 @@ and `runner rebake` write
 `/etc/systemd/system/github-runner-rebake.service.d/timeout.conf` with
 `TimeoutStartSec` set to that many seconds plus 3600, and reload systemd,
 before the service starts. A one-run environment value does not change the
-drop-in. `TimeoutStopSec=180` and `KillMode=mixed` still apply when the
+drop-in, because the service does not see it. When this process is the
+service, the drop-in uses the greater of the conf value and the service's
+`BAKE_TIMEOUT`, plus 3600, so a limit the unit already carries is covered.
+systemd keeps the cap it latched when the job started, so that write applies
+to the next start. `TimeoutStopSec=180` and `KillMode=mixed` still apply when the
 service is stopped, so the script's trap can destroy a partial VM before
 leftover `qm` children are killed. It checks an environment override, and
 the conf, before it detaches, so a bad value fails in the terminal with

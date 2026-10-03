@@ -68,6 +68,12 @@ grep -qx 'TimeoutStartSec=10800' "$REBAKE_DROPIN_FILE" \
     || fail "the drop-in was not an hour above the conf BAKE_TIMEOUT: $(cat "$REBAKE_DROPIN_FILE")"
 grep -q 'systemctl daemon-reload' "$calls" \
     || fail "writing the drop-in did not reload systemd: $(cat "$calls")"
+# Larger than the conf, and still not a value the unit will see.
+BAKE_TIMEOUT=14400
+write_rebake_timeout_dropin
+unset BAKE_TIMEOUT
+grep -qx 'TimeoutStartSec=10800' "$REBAKE_DROPIN_FILE" \
+    || fail "a one-run BAKE_TIMEOUT raised the unit cap: $(cat "$REBAKE_DROPIN_FILE")"
 
 # No BAKE_TIMEOUT in the conf: the same default the unit file carries.
 cat > "$CONFIG_FILE" <<'EOF'
@@ -78,6 +84,14 @@ EOF
 write_rebake_timeout_dropin
 grep -qx 'TimeoutStartSec=9000' "$REBAKE_DROPIN_FILE" \
     || fail "an unset BAKE_TIMEOUT did not keep the 9000 default: $(cat "$REBAKE_DROPIN_FILE")"
+# The unit's own Environment=BAKE_TIMEOUT is a limit that run will use.
+# The cap has to clear it, or systemd kills a bake the poll allows.
+INVOCATION_ID=unit
+BAKE_TIMEOUT=14400
+write_rebake_timeout_dropin
+unset INVOCATION_ID BAKE_TIMEOUT
+grep -qx 'TimeoutStartSec=18000' "$REBAKE_DROPIN_FILE" \
+    || fail "the unit's BAKE_TIMEOUT was left under the default cap: $(cat "$REBAKE_DROPIN_FILE")"
 
 # An invalid conf value cannot become TimeoutStartSec. The default stands.
 write_conf 2h 0
@@ -114,5 +128,26 @@ rebake_rc=0
 grep -q 'systemctl daemon-reload' "$calls" || fail "detach did not reload the new start timeout"
 grep -q 'systemctl start --no-block github-runner-rebake.service' "$calls" \
     || fail "a valid conf did not start the unit: $(cat "$calls")"
+
+# Under the unit, the cap clears whichever limit is longer.
+write_conf 7200 0
+INVOCATION_ID=unit
+BAKE_TIMEOUT=14400
+write_rebake_timeout_dropin
+grep -qx 'TimeoutStartSec=18000' "$REBAKE_DROPIN_FILE" \
+    || fail "the unit environment did not raise the cap above the conf: $(cat "$REBAKE_DROPIN_FILE")"
+BAKE_TIMEOUT=100
+write_rebake_timeout_dropin
+unset INVOCATION_ID BAKE_TIMEOUT
+grep -qx 'TimeoutStartSec=10800' "$REBAKE_DROPIN_FILE" \
+    || fail "a shorter unit BAKE_TIMEOUT lowered the cap under the conf: $(cat "$REBAKE_DROPIN_FILE")"
+
+if grep -q 'systemctl edit' "$root/README.md"; then
+    fail "the README still tells operators to set a bake limit with systemctl edit"
+fi
+grep -F 'applied after' "$root/README.md" >/dev/null \
+    || fail "the README does not say why an operator drop-in cannot raise the cap"
+grep -q 'greater of the conf value and the service' "$root/README.md" \
+    || fail "the README does not document the unit environment in the start cap"
 
 printf 'rebake-start-timeout: ok\n'
