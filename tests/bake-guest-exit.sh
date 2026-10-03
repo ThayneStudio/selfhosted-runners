@@ -88,9 +88,11 @@ expect_failure_marker "apt-get upgrade" 1
 grep -q 'All 3 attempts failed for: apt-get upgrade' "$state/out" || fail "the run did not reach apt-get upgrade"
 if grep -q poweroff "$state/systemctl.log"; then fail "a failure with the agent running powered off"; fi
 
-# The same handler on the success path and on a plain failing command.
-awk '{ print } /^trap on_setup_exit EXIT$/ { exit }' "$state/setup-template.sh" > "$state/head.sh"
-grep -q '^trap on_setup_exit EXIT$' "$state/head.sh" || fail "setup-template.sh sets no top-level EXIT trap"
+# The same handler on the success path and on a plain failing command: run the
+# script's helpers and exit handling, everything before its first step.
+awk '/^log "=== Template Setup: Installing Tools ===\"$/ { exit } { print }' \
+    "$state/setup-template.sh" > "$state/head.sh"
+grep -q '^trap [[:alnum:]_]* EXIT$' "$state/head.sh" || fail "setup-template.sh sets no top-level EXIT trap"
 { cat "$state/head.sh"; printf 'log "setup finished"\n'; } > "$state/ok.sh"
 run_setup "$state/ok.sh"
 [[ "$setup_rc" == 0 ]] || fail "a successful run exited $setup_rc"

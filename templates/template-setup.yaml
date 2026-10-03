@@ -13,10 +13,6 @@ write_files:
       #!/bin/bash
       set -euo pipefail
 
-      # Logging with timestamps
-      log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"; }
-      log_error() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: $1" >&2; }
-
       # Any failure writes /opt/.template-setup-failed. The host polls for it
       # beside the completion marker and fails the bake at once instead of
       # waiting for BAKE_TIMEOUT. It reads both through qemu-guest-agent, which
@@ -34,6 +30,10 @@ write_files:
         fi
       }
       trap on_setup_exit EXIT
+
+      # Logging with timestamps
+      log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"; }
+      log_error() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: $1" >&2; }
 
       export DEBIAN_FRONTEND=noninteractive
       export NEEDRESTART_MODE=a
