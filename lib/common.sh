@@ -631,11 +631,16 @@ clone_runner() {
     fi
 
     # Cleanup helper: destroy VM (only if it belongs to us), remove snippet, and
-    # sweep orphan zvols at this VMID. The ownership check prevents touching
-    # another process's VM on VMID collision. Orphan sweep runs unconditionally
-    # for our-VMID and no-owner cases because qm destroy --purge can silently
-    # leave residue (busy ZFS dataset, etc.) and a clone that fails before
-    # writing config leaves zvols with no VM to attach to.
+    # sweep orphan volumes at this VMID. The ownership check prevents touching
+    # another process's VM on VMID collision. An empty owner is not a free
+    # VMID: qm config cannot read a container, a VM on another node or a VM
+    # with no name. The sweep covers our VM's residue (qm destroy can leave a
+    # busy ZFS dataset, etc.) and a clone that failed before writing config.
+    # It frees nothing while any guest config holds the VMID: a destroy that a
+    # lock refused (vzdump, for example) leaves a config still using those
+    # volumes, and once the config is gone a parallel clone can take the VMID,
+    # so the check runs again before each free. No --purge: it deletes the
+    # VMID from backup jobs, and the next clone reuses this VMID.
     _fail() {
         local owner
         owner=$(qm config "$vmid" 200>&- 201>&- 202>&- 203>&- 204>&- 2>/dev/null | awk '/^name:/{print $2}') || true
@@ -643,12 +648,16 @@ clone_runner() {
         if [[ -n "$owner" && "$owner" != "$name" ]]; then
             return 0
         fi
+        if [[ -z "$owner" ]] && vmid_in_use "$vmid"; then
+            log_warn "VMID $vmid belongs to another guest; leaving it and its volumes"
+            return 0
+        fi
 
         rm -f "${SNIPPETS_DIR}/runner-${vmid}-meta.yaml" "${SNIPPETS_DIR}/runner-${vmid}-user-"*.yaml "${SNIPPETS_DIR}/runner-${vmid}-vendor.yaml"
 
         if [[ "$owner" == "$name" ]]; then
             local destroy_err; destroy_err=$(mktemp)
-            if ! qm destroy "$vmid" --purge 200>&- 201>&- 202>&- 203>&- 204>&- 2>"$destroy_err"; then
+            if ! qm destroy "$vmid" 200>&- 201>&- 202>&- 203>&- 204>&- 2>"$destroy_err"; then
                 log_warn "qm destroy $vmid failed: $(tr '\n' ' ' < "$destroy_err")"
             fi
             rm -f "$destroy_err"
@@ -657,9 +666,13 @@ clone_runner() {
         local volid
         while read -r volid; do
             [[ -n "$volid" ]] || continue
+            if vmid_in_use "$vmid"; then
+                log_warn "VMID $vmid still has a guest config; not freeing its volumes"
+                break
+            fi
             pvesm free "$volid" 2>/dev/null || log_warn "Failed to free orphan volume $volid"
         done < <(
-            pvesm list "$VM_STORAGE" 2>/dev/null |
+            pvesm list "$VM_STORAGE" --content images 2>/dev/null |
                 awk -v v="$vmid" 'NR>1 && $1 ~ ("(^|:|/)vm-" v "-(disk-[0-9]+|cloudinit)$") {print $1}'
         )
     }
