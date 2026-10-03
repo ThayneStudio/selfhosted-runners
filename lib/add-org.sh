@@ -179,7 +179,14 @@ fi
 mkdir -p "$ORG_CONFIG_DIR"
 chmod 700 "$ORG_CONFIG_DIR"
 CONF_TMP=$(mktemp "$ORG_CONFIG_DIR/.${GITHUB_ORG}.XXXXXX")
-printf 'GITHUB_ORG="%s"\nGITHUB_PAT="%s"\nRUNNER_PREFIX="%s"\nRUNNER_COUNT="%s"\nRUNNER_GROUP_ID="%s"\n' "$GITHUB_ORG" "$GITHUB_PAT" "$RUNNER_PREFIX" "$RUNNER_COUNT" "$RUNNER_GROUP_ID" > "$CONF_TMP"
+# Updating an org keeps every line that doesn't set a prompted key (a hand-set
+# RUNNER_LABELS, comments). The prompted keys go last so their new values win
+# when the file is sourced, and each is set exactly once for the grep readers.
+if [[ -f "$ORG_CONFIG_DIR/${GITHUB_ORG}.conf" ]]; then
+    awk '!/^(GITHUB_ORG|GITHUB_PAT|RUNNER_PREFIX|RUNNER_COUNT|RUNNER_GROUP_ID)=/' \
+        "$ORG_CONFIG_DIR/${GITHUB_ORG}.conf" > "$CONF_TMP"
+fi
+printf 'GITHUB_ORG="%s"\nGITHUB_PAT="%s"\nRUNNER_PREFIX="%s"\nRUNNER_COUNT="%s"\nRUNNER_GROUP_ID="%s"\n' "$GITHUB_ORG" "$GITHUB_PAT" "$RUNNER_PREFIX" "$RUNNER_COUNT" "$RUNNER_GROUP_ID" >> "$CONF_TMP"
 chmod 600 "$CONF_TMP"
 mv "$CONF_TMP" "$ORG_CONFIG_DIR/${GITHUB_ORG}.conf"
 CONF_TMP=""
