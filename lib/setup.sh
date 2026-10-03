@@ -62,10 +62,12 @@ enable_local_snippets() {
 # Decide what to do with the Template VM ID answer. A finished template is used
 # as it is (TEMPLATE_READY=1). Any other VM there is refused, such as a bake
 # that stopped before `qm template` converted its disk, or a runner. A free ID
-# is baked.
+# is baked. If the saved TEMPLATE_ID is a finished template, LIVE_TEMPLATE_ID
+# keeps it serving clones until the new one is finished.
 plan_template() {
-    local cfg name
+    local saved="${SETUP_PREFILLS[TEMPLATE_ID]:-}" cfg name
     TEMPLATE_READY=0
+    LIVE_TEMPLATE_ID=""
     if template_is_converted "$TEMPLATE_ID"; then
         TEMPLATE_READY=1
         return 0
@@ -84,6 +86,9 @@ plan_template() {
         log_error "VM ID $TEMPLATE_ID belongs to another guest. Choose another Template VM ID."
         return 1
     fi
+    if [[ -n "$saved" ]] && template_is_converted "$saved"; then
+        LIVE_TEMPLATE_ID="$saved"
+    fi
 }
 
 # Linked clones stay on the template's own storage, so a VM_STORAGE that
@@ -97,6 +102,27 @@ warn_template_storage() {
     log_warn "Template $TEMPLATE_ID has its disks on $storages, not $VM_STORAGE."
     log_warn "Runners are linked clones on $storages until a template is baked on $VM_STORAGE."
     log_warn "To bake one now: rm -f $BAKED_VERSION_FILE && runner rebake"
+}
+
+# While a new template is baked beside the live one, the saved TEMPLATE_ID
+# keeps naming the live one. bake_setup_template moves it afterwards.
+write_infra_config() {
+    local conf_tmp
+    mkdir -p "$ORG_CONFIG_DIR"
+    chmod 700 "$ORG_CONFIG_DIR"
+    conf_tmp=$(mktemp "${CONFIG_FILE}.XXXXXX")
+    {
+        printf 'NETWORK_BRIDGE=%q\n' "$NETWORK_BRIDGE"
+        printf 'VLAN_TAG=%q\n' "${VLAN_TAG}"
+        printf 'VM_STORAGE=%q\n' "$VM_STORAGE"
+        printf 'TEMPLATE_ID=%q\n' "${LIVE_TEMPLATE_ID:-$TEMPLATE_ID}"
+        printf 'MIN_VMID=%q\n' "$MIN_VMID"
+        printf 'BALLOON=%q\n' "$BALLOON"
+        printf 'DNS_SERVERS=%q\n' "$DNS_SERVERS"
+        printf 'DOCKER_MIRROR_URL=%q\n' "${DOCKER_MIRROR_URL:-}"
+    } > "$conf_tmp"
+    chmod 600 "$conf_tmp"
+    mv "$conf_tmp" "$CONFIG_FILE"
 }
 
 # EXIT trap of the bake: destroy VM $TEMPLATE_ID unless it is a finished
@@ -127,8 +153,22 @@ cleanup_bake() {
     qm_host destroy "$TEMPLATE_ID" 2>/dev/null || true
 }
 
-# Bake VM $TEMPLATE_ID and record its runner version.
+# Bake VM $TEMPLATE_ID. With LIVE_TEMPLATE_ID set, that template keeps serving
+# clones until this one is a finished template. Then, as after a rebake,
+# TEMPLATE_ID moves here and the old template is retired once no linked clone
+# depends on it.
 bake_setup_template() {
+    # While a live template exists the daily rebake runs. Without its lock it
+    # could start a second bake and switch TEMPLATE_ID as well.
+    exec 199>"$REBAKE_LOCK_FILE"
+    if ! flock -n 199; then
+        log_error "A template rebake is running. Run setup again after it finishes."
+        return 1
+    fi
+    if [[ -n "$LIVE_TEMPLATE_ID" ]]; then
+        log_info "Template $LIVE_TEMPLATE_ID keeps serving clones until VM $TEMPLATE_ID is a finished template"
+    fi
+
     # Checksum mismatch deletes the cached image and returns before qm create.
     # Simple commands, not `|| exit`: `||` disables errexit inside the callee.
     prepare_cloud_image
@@ -144,7 +184,19 @@ bake_setup_template() {
         return 1
     fi
     trap - EXIT
+    exec 199>&-
 
+    if [[ -n "$LIVE_TEMPLATE_ID" ]]; then
+        if ! set_conf_assignment "$CONFIG_FILE" TEMPLATE_ID "$TEMPLATE_ID"; then
+            log_error "Template $TEMPLATE_ID is ready, but TEMPLATE_ID still names $LIVE_TEMPLATE_ID"
+            log_error "Run setup again and enter Template VM ID $TEMPLATE_ID"
+            return 1
+        fi
+        if ! remember_retired_template "$LIVE_TEMPLATE_ID"; then
+            log_warn "Could not record template $LIVE_TEMPLATE_ID for retirement; destroy it once no runner uses it"
+        fi
+        log_info "TEMPLATE_ID is now $TEMPLATE_ID. Running clones stay on $LIVE_TEMPLATE_ID until their next reclone."
+    fi
     if ! commit_baked_version "$BAKE_RUNNER_VERSION" "$TEMPLATE_ID"; then
         log_warn "Template was created but the baked runner version was not recorded"
     fi
@@ -338,21 +390,7 @@ chmod 755 "$SNIPPETS_DIR/runner-hookscript.sh"
 
 # Save infra config
 log_info "[3/5] Saving configuration..."
-mkdir -p "$ORG_CONFIG_DIR"
-chmod 700 "$ORG_CONFIG_DIR"
-CONF_TMP=$(mktemp "${CONFIG_FILE}.XXXXXX")
-{
-    printf 'NETWORK_BRIDGE=%q\n' "$NETWORK_BRIDGE"
-    printf 'VLAN_TAG=%q\n' "${VLAN_TAG}"
-    printf 'VM_STORAGE=%q\n' "$VM_STORAGE"
-    printf 'TEMPLATE_ID=%q\n' "$TEMPLATE_ID"
-    printf 'MIN_VMID=%q\n' "$MIN_VMID"
-    printf 'BALLOON=%q\n' "$BALLOON"
-    printf 'DNS_SERVERS=%q\n' "$DNS_SERVERS"
-    printf 'DOCKER_MIRROR_URL=%q\n' "${DOCKER_MIRROR_URL:-}"
-} > "$CONF_TMP"
-chmod 600 "$CONF_TMP"
-mv "$CONF_TMP" "$CONFIG_FILE"
+write_infra_config
 
 # Prune obsolete per-org snippets that embedded the org PAT. Cloud-init is now
 # rendered per-VM at clone time with a single-use JIT config; the PAT stays
