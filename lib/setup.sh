@@ -182,9 +182,12 @@ forget_setup_bake() {
 # template. `template: 1` alone is written before qm template converts the
 # disk, and nothing can be cloned from an unconverted one. A signal after the
 # conversion must not destroy the template. A VM left in place keeps its
-# pending-bake record, if it has one, for the next rebake. A bake that
-# create_bake_vm refused before `qm create` has no VM, and once the cluster
-# inventory confirms that, its record goes, as cleanup_rebake drops its own.
+# pending-bake record, if it has one, for the next rebake. So does a VM that
+# was destroyed while a disk volume of its VMID is still on VM_STORAGE: qm
+# template can rename the disk to a base volume and fail before the config
+# names it, and qm destroy then does not free it. A bake that create_bake_vm
+# refused before `qm create` has no VM, and once the cluster inventory
+# confirms that, its record goes, as cleanup_rebake drops its own.
 # After an SSH drop every log write fails (EIO on the hung-up tty, or SIGPIPE
 # through a pipe). Neither errexit nor a second SIGHUP may stop the destroy.
 cleanup_bake() {
@@ -193,6 +196,10 @@ cleanup_bake() {
     trap '' HUP PIPE
     if ! cfg=$(qm_host config "$TEMPLATE_ID" 2>/dev/null); then
         if vm_confirmed_absent "$TEMPLATE_ID"; then
+            if ! free_bake_leftover_volumes "$TEMPLATE_ID" "${LIVE_TEMPLATE_ID-}"; then
+                log_error "VM $TEMPLATE_ID is gone but a disk volume remains on $VM_STORAGE; not dropping its pending-bake record"
+                return 0
+            fi
             forget_setup_bake
             return 0
         fi
@@ -212,6 +219,12 @@ cleanup_bake() {
     qm_host stop "$TEMPLATE_ID" --timeout 30 2>/dev/null || true
     if ! qm_host destroy "$TEMPLATE_ID"; then
         log_error "Could not destroy VM $TEMPLATE_ID. Remove it by hand: qm stop $TEMPLATE_ID; qm destroy $TEMPLATE_ID"
+        return 0
+    fi
+    # LIVE_TEMPLATE_ID, when set, is the template still serving clones. This
+    # VM is the bake, even though the shell's TEMPLATE_ID names it.
+    if ! free_bake_leftover_volumes "$TEMPLATE_ID" "${LIVE_TEMPLATE_ID-}"; then
+        log_error "VM $TEMPLATE_ID was destroyed but a disk volume remains on $VM_STORAGE; not dropping its pending-bake record"
         return 0
     fi
     forget_setup_bake

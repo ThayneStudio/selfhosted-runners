@@ -9,6 +9,10 @@ set -euo pipefail
 IMG_CACHE_DIR="/var/cache/github-runners"
 CLOUD_IMG="noble-server-cloudimg-amd64.img"
 BAKE_DISK_GIB=30
+# While the guest installs, abort if VM_STORAGE drops below this. The
+# admission floor is the whole disk (twice that on thick ZFS); this only
+# catches the pool filling up afterwards. BAKE_FREE_FLOOR_GIB overrides it.
+BAKE_FREE_FLOOR_DEFAULT_GIB=5
 BAKE_RUNNER_VERSION=""
 
 # Proxmox helpers can fork long-lived kvm processes. Those must not inherit
@@ -136,6 +140,27 @@ check_bake_min_free_gib() {
     fi
 }
 
+check_bake_free_floor() {
+    if [[ -n "${BAKE_FREE_FLOOR_GIB:-}" && ! "$BAKE_FREE_FLOOR_GIB" =~ ^[0-9]+$ ]]; then
+        log_error "BAKE_FREE_FLOOR_GIB must be a whole number of GiB, not '$BAKE_FREE_FLOOR_GIB'"
+        return 1
+    fi
+}
+
+# Prints "type status avail_kib" for $VM_STORAGE from `pvesm status`.
+# Returns 0 only when the storage is active and avail_kib is a whole number
+# of KiB. The admission check refuses to bake otherwise; the running bake
+# only warns, because a transient failure must not abort a healthy guest.
+read_vm_storage_status() {
+    local row storage_type="" storage_status="" avail_kib=""
+    # Columns: Name Type Status Total Used Available %. Sizes are KiB.
+    row=$(pvesm status --storage "$VM_STORAGE" 199>&- 200>&- 201>&- 202>&- 203>&- 204>&- 2>/dev/null \
+        | awk -v s="$VM_STORAGE" '$1 == s && !found { print $2, $3, $6; found = 1 }') || row=""
+    read -r storage_type storage_status avail_kib _ <<< "$row"
+    printf '%s %s %s\n' "$storage_type" "$storage_status" "$avail_kib"
+    [[ "$storage_status" == active && "$avail_kib" =~ ^[0-9]+$ ]]
+}
+
 # 0 when storage $1's config sets `sparse`, so ZFS creates its volumes thin.
 # Without it ZFS reserves each volume's full size. A config that cannot be
 # read counts as thick.
@@ -163,15 +188,13 @@ check_bake_storage_space() {
         min_gib=$((10#$min_gib))
         (( min_gib > 0 )) || return 0
     fi
-    # Columns: Name Type Status Total Used Available %. Sizes are KiB.
-    row=$(pvesm status --storage "$VM_STORAGE" 199>&- 200>&- 201>&- 202>&- 203>&- 204>&- 2>/dev/null \
-        | awk -v s="$VM_STORAGE" '$1 == s && !found { print $2, $3, $6; found = 1 }') || row=""
-    read -r storage_type storage_status avail_kib _ <<< "$row"
-    if [[ "$storage_status" != active || ! "$avail_kib" =~ ^[0-9]+$ ]]; then
+    if ! row=$(read_vm_storage_status); then
+        read -r storage_type storage_status avail_kib <<< "$row"
         log_error "Could not read free space on storage $VM_STORAGE (status: ${storage_status:-unknown}); not baking"
         log_error "To bake without this check: BAKE_MIN_FREE_GIB=0 runner rebake (or runner setup)"
         return 1
     fi
+    read -r storage_type storage_status avail_kib <<< "$row"
     if [[ -z "$min_gib" ]]; then
         min_gib=$BAKE_DISK_GIB
         if [[ "$storage_type" == zfspool || "$storage_type" == zfs ]] && ! zfs_storage_is_sparse "$VM_STORAGE"; then
@@ -195,6 +218,7 @@ create_bake_vm() {
 
     # Checked before the VM exists, for setup and rebake alike.
     check_bake_timeout || return 1
+    check_bake_free_floor || return 1
     check_bake_storage_space || return 1
     resolve_bake_runner_version || return 1
 
@@ -222,10 +246,16 @@ bake_and_publish_vm() {
     local old_import_re="unused0:([^'\"[:space:]]+)"
     local bake_elapsed=0 bake_interval=15 bake_ready=false
     local bake_timeout="${BAKE_TIMEOUT:-5400}"
-    local minutes seconds_rem i
+    local free_floor_gib=$BAKE_FREE_FLOOR_DEFAULT_GIB free_check_every=60 since_free_check=0
+    local minutes seconds_rem i storage_row avail_kib
 
-    # Before any VM work: the poll below cannot time out on a bad value.
+    # Before any VM work: the poll below cannot time out on a bad value,
+    # and a bad floor would otherwise abort a healthy bake on the first check.
     check_bake_timeout || return 1
+    check_bake_free_floor || return 1
+    if [[ -n "${BAKE_FREE_FLOOR_GIB:-}" ]]; then
+        free_floor_gib=$((10#$BAKE_FREE_FLOOR_GIB))
+    fi
 
     import_output=$(qm_host importdisk "$vmid" "$IMG_CACHE_DIR/$CLOUD_IMG" "$VM_STORAGE" 2>&1) || {
         log_error "Failed to import disk"
@@ -298,6 +328,29 @@ bake_and_publish_vm() {
             log_error "Bake timed out after $((bake_timeout / 60)) minutes (override with BAKE_TIMEOUT=<seconds>)"
             log_guest_setup_tail "$vmid"
             return 1
+        fi
+
+        # Once a minute, not every poll: pvesm status walks the storage.
+        # qm resize has already reserved the disk on thick ZFS, and linked
+        # clones writing job data can fill what is left. Below the floor,
+        # abort through the caller's cleanup so it destroys this VM and
+        # releases that reservation. A reading that cannot be taken must
+        # not abort a guest that is still installing.
+        since_free_check=$((since_free_check + bake_interval))
+        if (( free_floor_gib > 0 && since_free_check >= free_check_every )); then
+            since_free_check=0
+            if ! storage_row=$(read_vm_storage_status); then
+                echo "" >&2
+                log_warn "Could not read free space on storage $VM_STORAGE during the bake; continuing"
+            else
+                read -r _ _ avail_kib <<< "$storage_row"
+                if (( avail_kib < free_floor_gib * 1048576 )); then
+                    echo "" >&2
+                    log_error "Aborting the bake: storage $VM_STORAGE has $((avail_kib / 1048576)) GiB free, under the ${free_floor_gib} GiB floor"
+                    log_error "A full storage pauses every VM on it. Override with BAKE_FREE_FLOOR_GIB=<GiB>, or 0 to keep baking."
+                    return 1
+                fi
+            fi
         fi
 
         # A successful guest never powers itself off. A stopped VM is a crash,
