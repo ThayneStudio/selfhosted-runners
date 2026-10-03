@@ -29,17 +29,18 @@ else
 fi
 
 # The script cloud-init writes to /opt/setup-template.sh, with its markers
-# moved under $state/opt.
+# moved under $state/opt and its apt settings under $state/apt.conf.d.
 awk '
     /^  - path: \/opt\/setup-template\.sh$/ { file = 1; next }
     file && /^    content: \|$/ { block = 1; next }
     block && /^      / { print substr($0, 7); next }
     block && /^[[:space:]]*$/ { print ""; next }
     block { exit }
-' "$yaml" | sed "s#/opt/\.template-setup-#$state/opt/.template-setup-#g" > "$state/setup-template.sh"
+' "$yaml" | sed -e "s#/opt/\.template-setup-#$state/opt/.template-setup-#g" \
+    -e "s#/etc/apt/apt\.conf\.d/#$state/apt.conf.d/#g" > "$state/setup-template.sh"
 grep -q '^set -euo pipefail$' "$state/setup-template.sh" || fail "could not extract setup-template.sh"
 "$BASH" -n "$state/setup-template.sh" || fail "setup-template.sh has a syntax error"
-mkdir -p "$state/opt" "$state/bin"
+mkdir -p "$state/opt" "$state/bin" "$state/apt.conf.d"
 
 mock() {
     printf '#!/bin/sh\n%s\n' "$2" > "$state/bin/$1"

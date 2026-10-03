@@ -31,6 +31,8 @@ trap 'rm -rf "$state"' EXIT
     INSTALL_DIR=$root
     SNIPPETS_DIR=$state/snippets
     VM_STORAGE=local-zfs
+    # rebake_main resolves the release before baking.
+    LATEST_RUNNER_VERSION=2.330.0
 }
 mkdir -p "$STATE_DIR" "$SNIPPETS_DIR"
 actions=$state/actions

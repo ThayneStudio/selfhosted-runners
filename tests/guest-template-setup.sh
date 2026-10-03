@@ -62,6 +62,8 @@ chmod +x "$bin"/*
 INSTALL_DIR=$root
 SNIPPETS_DIR=$work
 DOCKER_MIRROR_URL=""
+# The host resolves the runner release before rendering the bake snippet.
+LATEST_RUNNER_VERSION=2.330.0
 
 # Render the bake user-data for the current DOCKER_MIRROR_URL and extract
 # /opt/setup-template.sh from it.
