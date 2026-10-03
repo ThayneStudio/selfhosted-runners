@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # clone_runner must configure a clone so the pool can always recycle it:
 # a guest reboot has to exit QEMU (post-stop, then reclone) instead of
-# resetting in place with no runner.
+# resetting in place with no runner, and the clone must name its org from
+# the very first config write, before --cicustom exists.
 set -euo pipefail
 
 if [[ "${BASH_VERSINFO[0]}" -lt 4 ]]; then
@@ -53,5 +54,28 @@ vmid=$(clone_runner runner-1 acme) || fail "clone_runner failed"
 reboot_line=$(grep -n '^set 9001 --reboot 0$' "$calls" | cut -d: -f1) || fail "reboot was not disabled on the clone"
 start_line=$(grep -n '^start 9001$' "$calls" | cut -d: -f1) || fail "the clone was not started"
 (( reboot_line < start_line )) || fail "reboot was disabled only after the clone started"
+grep -qx 'clone 9000 9001 --name runner-1 --description selfhosted-runners org=acme' "$calls" \
+    || fail "qm clone did not write the ownership marker with the name: $(grep '^clone' "$calls")"
+
+# get_vm_org: snippets first, then the clone-time marker. A clone killed
+# between qm clone and --cicustom has only the marker.
+vm_config=""
+qm() { [[ "$1" == config ]] && printf '%s\n' "$vm_config"; }
+org_of() {
+    vm_config="$1"
+    get_vm_org 9001
+}
+[[ "$(org_of $'name: runner-1\ndescription: selfhosted-runners org=acme\nscsi0: local-zfs:base-9000-disk-0/vm-9001-disk-0')" == acme ]] \
+    || fail "a clone with only the marker is not managed"
+[[ "$(org_of $'name: runner-1\ndescription: selfhosted-runners org=acme%0Aoperator note')" == acme ]] \
+    || fail "an edited description lost the marker"
+[[ "$(org_of $'cicustom: user=local:snippets/runner-9001-user-beta.yaml,meta=local:snippets/runner-9001-meta.yaml\ndescription: selfhosted-runners org=acme')" == beta ]] \
+    || fail "the marker overrode the cicustom snippet"
+[[ "$(org_of $'cicustom: user=local:snippets/runner-user-data-legacy.yaml')" == legacy ]] \
+    || fail "legacy per-org snippets are no longer recognised"
+[[ "$(org_of $'name: runner-1\ndescription: my own runner-1 VM')" == unknown ]] \
+    || fail "a foreign VM with a description was treated as managed"
+[[ "$(org_of $'name: runner-1')" == unknown ]] || fail "an unmarked VM was treated as managed"
+[[ "$(org_of '')" == unknown ]] || fail "an unreadable config was treated as managed"
 
 printf 'pool-clone: ok\n'

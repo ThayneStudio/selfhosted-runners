@@ -154,15 +154,23 @@ select_org() {
 }
 
 get_vm_org() {
-    local cicustom
-    cicustom=$(qm config "$1" 2>/dev/null | grep "^cicustom:" || true)
+    local config cicustom description
+    local marker_re='^description: selfhosted-runners org=([a-zA-Z0-9-]+)'
+    config=$(qm config "$1" 2>/dev/null) || true
+    cicustom=$(grep -m1 '^cicustom:' <<< "$config") || true
+    description=$(grep -m1 '^description:' <<< "$config") || true
     # New per-VM snippet: runner-<vmid>-user-<org>.yaml (org has no dots).
     # Legacy per-org snippet: runner-user-data-<org>.yaml (kept as a fallback so
     # VMs created before the token refactor stay identifiable/destroyable).
     # The two are mutually exclusive: legacy names have no digits after "runner-".
+    # Last, the marker clone_runner passes to qm clone: a clone cut off before
+    # --cicustom carries only that, and would otherwise hold its slot name
+    # with no runner command able to see or remove it.
     if [[ "$cicustom" =~ runner-[0-9]+-user-([a-zA-Z0-9-]+)\.yaml ]]; then
         echo "${BASH_REMATCH[1]}"
     elif [[ "$cicustom" =~ runner-user-data-([^.]+)\.yaml ]]; then
+        echo "${BASH_REMATCH[1]}"
+    elif [[ "$description" =~ $marker_re ]]; then
         echo "${BASH_REMATCH[1]}"
     else
         echo "unknown"
@@ -734,8 +742,12 @@ clone_runner() {
     # Capture stderr so the actual ZFS/Proxmox error surfaces under
     # `journalctl -t github-runner` instead of being buried under the service
     # unit log (which the operator does not look at first).
+    # The description is the ownership marker get_vm_org falls back to. qm
+    # clone writes it in the same config write as the name, so a clone that is
+    # killed before --cicustom below is still recognisably ours.
     local clone_err; clone_err=$(mktemp)
-    if ! qm clone "$TEMPLATE_ID" "$vmid" --name "$name" 200>&- 201>&- 202>&- 203>&- 204>&- 2>"$clone_err"; then
+    if ! qm clone "$TEMPLATE_ID" "$vmid" --name "$name" --description "selfhosted-runners org=$org" \
+        200>&- 201>&- 202>&- 203>&- 204>&- 2>"$clone_err"; then
         while IFS= read -r line; do
             [[ -n "$line" ]] && log_error "qm clone $vmid: $line"
         done < "$clone_err"
