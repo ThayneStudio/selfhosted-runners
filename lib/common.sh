@@ -63,6 +63,19 @@ load_infra_config() {
         log_error "Run 'runner setup' first."
         exit 1
     fi
+    # A BAKE_TIMEOUT or BAKE_MIN_FREE_GIB set for this run wins over the conf.
+    # local hides that value from the source, then drops on return. A name the
+    # environment left unset keeps the value the file assigned, which is how
+    # the daily rebake honours a limit written in the conf.
+    if [[ -v BAKE_TIMEOUT ]]; then
+        # shellcheck disable=SC2034 # shadows the caller's value across source
+        local BAKE_TIMEOUT="$BAKE_TIMEOUT"
+    fi
+    if [[ -v BAKE_MIN_FREE_GIB ]]; then
+        # shellcheck disable=SC2034
+        local BAKE_MIN_FREE_GIB="$BAKE_MIN_FREE_GIB"
+    fi
+    # shellcheck disable=SC1090
     source "$CONFIG_FILE"
     for var in NETWORK_BRIDGE VM_STORAGE TEMPLATE_ID; do
         if [[ -z "${!var:-}" ]]; then

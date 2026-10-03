@@ -9,6 +9,17 @@ load_setup_prefills() {
     local NETWORK_BRIDGE="" VLAN_TAG="" VM_STORAGE="" TEMPLATE_ID=""
     # shellcheck disable=SC2034
     local MIN_VMID="" BALLOON="" DNS_SERVERS="" DOCKER_MIRROR_URL=""
+    # Same precedence as load_infra_config: an explicit bake limit on this run
+    # stays, and one the environment left unset takes the conf's value so the
+    # setup bake uses it.
+    if [[ -v BAKE_TIMEOUT ]]; then
+        # shellcheck disable=SC2034 # shadows the caller's value across source
+        local BAKE_TIMEOUT="$BAKE_TIMEOUT"
+    fi
+    if [[ -v BAKE_MIN_FREE_GIB ]]; then
+        # shellcheck disable=SC2034
+        local BAKE_MIN_FREE_GIB="$BAKE_MIN_FREE_GIB"
+    fi
     SETUP_PREFILLS=()
     [[ -f "$CONFIG_FILE" ]] || return 0
     # This is the same trusted, root-owned shell config used by load_infra_config.

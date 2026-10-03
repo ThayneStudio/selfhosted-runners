@@ -666,10 +666,9 @@ detach_rebake_from_ssh() {
         return 0
     fi
     log_info "Starting the rebake outside this shell so an SSH drop cannot kill it"
-    # systemctl start cannot pass this shell's environment to the unit, which
-    # would drop a BAKE_TIMEOUT or BAKE_MIN_FREE_GIB override (and its
-    # TimeoutStartSec caps the run). setsid keeps the environment, so an
-    # override goes that way.
+    # systemctl start cannot pass this shell's environment to the unit, so a
+    # one-run BAKE_TIMEOUT or BAKE_MIN_FREE_GIB would be dropped and the conf
+    # value (or the default) would be used instead. setsid keeps the environment.
     if [[ -z "${BAKE_TIMEOUT:-}" && -z "${BAKE_MIN_FREE_GIB:-}" && -f "$REBAKE_UNIT_FILE" ]] \
         && command -v systemctl >/dev/null 2>&1; then
         systemctl start --no-block github-runner-rebake.service
@@ -743,6 +742,10 @@ rebake_main() {
         exit 0
     fi
     load_infra_config
+    # The check before detach saw only the environment. A bad value in the
+    # conf arrives with the source above and must fail before any VM exists.
+    check_bake_timeout || exit 1
+    check_bake_min_free_gib || exit 1
     validate_saved_infra
     require_live_template
 

@@ -7,7 +7,10 @@ Wants=network-online.target
 Type=oneshot
 Environment=REBAKE_FOREGROUND=1
 ExecStart=/usr/local/bin/runner rebake
-TimeoutStartSec=7200
+# BAKE_TIMEOUT bounds the bake (the default, or the conf or environment
+# value). A fixed start timeout would kill one still inside a larger limit.
+# TimeoutStopSec and KillMode still let a stop destroy a partial VM.
+TimeoutStartSec=infinity
 TimeoutStopSec=180
 KillMode=mixed
 # qm importdisk is a child of this unit. The watcher's 512M cap kills a healthy import.
