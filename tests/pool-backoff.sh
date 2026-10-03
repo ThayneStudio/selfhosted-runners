@@ -95,7 +95,7 @@ pvesh() {
     done
     printf ']\n'
 }
-template_disk=base-9000-disk-0
+template_disk='base-9000-disk-0'
 flock() { :; }
 sleep() { :; }
 logger() { printf '%s\n' "$*" >> "$state/logger"; }
@@ -216,7 +216,7 @@ rm -rf "$state/vm"/* "$SLOT_STATE_DIR"
 template_disk=vm-9000-disk-0
 run watch_main
 [[ "$(clones)" -eq 0 ]] || fail "the watcher cloned from an unconverted template"
-template_disk=base-9000-disk-0
+template_disk='base-9000-disk-0'
 run watch_main
 [[ "$(clones)" -eq 1 ]] || fail "the watcher did not clone from a converted template"
 
