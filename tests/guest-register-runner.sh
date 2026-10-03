@@ -244,4 +244,38 @@ boot jit-without-runner
 logged "Failed to set disableUpdate on the JIT runner config" || fail "the JIT patch failure was not logged"
 jit=$good_jit
 
+# run.sh's exit status. A refused runner version exits 7 only when run.sh sees
+# ACTIONS_RUNNER_RETURN_VERSION_DEPRECATED_EXIT_CODE=1. The guest logs the
+# status before the EXIT trap powers the VM off.
+in_run_env() { grep -qxF -- "$1" "$state/run-env"; }
+logged_before_shutdown() {
+    local at shutdown_at
+    at=$(grep -nF -- "$1" "$state/out" | head -1 | cut -d: -f1 || true)
+    shutdown_at=$(grep -nF 'Shutting down VM' "$state/out" | tail -1 | cut -d: -f1 || true)
+    [[ -n "$at" && -n "$shutdown_at" && "$at" -lt "$shutdown_at" ]]
+}
+boot run-finished
+assert_ran "run.sh exits 0"
+logged_before_shutdown "run.sh exited 0" || fail "a finished run.sh was not logged before shutdown"
+run_rc=7
+boot version-refused
+assert_ran "run.sh exits 7"
+in_run_env ACTIONS_RUNNER_RETURN_VERSION_DEPRECATED_EXIT_CODE=1 \
+    || fail "run.sh did not see ACTIONS_RUNNER_RETURN_VERSION_DEPRECATED_EXIT_CODE=1"
+logged_before_shutdown "run.sh exited 7: GitHub refused this runner version" \
+    || fail "a refused runner version was not logged before shutdown"
+run_rc=1
+boot run-failed
+assert_ran "run.sh exits 1"
+logged_before_shutdown "run.sh exited 1" || fail "a failed run.sh was not logged before shutdown"
+run_rc=0
+# The Docker mirror branch starts run.sh with the same settings.
+DOCKER_MIRROR_URL=http://10.20.1.19:5000
+boot mirror-run-env
+assert_ran "Docker mirror is set"
+in_run_env ACTIONS_RUNNER_RETURN_VERSION_DEPRECATED_EXIT_CODE=1 \
+    || fail "the Docker mirror branch did not pass ACTIONS_RUNNER_RETURN_VERSION_DEPRECATED_EXIT_CODE=1"
+in_run_env SUPABASE_INTERNAL_IMAGE_REGISTRY=10.20.1.19:5000 || fail "the Supabase registry override did not reach run.sh"
+DOCKER_MIRROR_URL=""
+
 printf 'guest-register-runner: ok\n'

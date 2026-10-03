@@ -202,11 +202,21 @@ write_files:
       # Run directly with the JIT config (no config.sh registration needed; JIT
       # runners are inherently ephemeral and auto-remove). When run.sh exits
       # (job complete or error), the VM shuts down and the hookscript reclones.
+      # sudo resets the environment, so run.sh's settings go through env. With
+      # ACTIONS_RUNNER_RETURN_VERSION_DEPRECATED_EXIT_CODE=1 (runner 2.333.0+),
+      # a runner version GitHub refuses exits 7 instead of looking like success.
+      RUNNER_ENV=(ACTIONS_RUNNER_RETURN_VERSION_DEPRECATED_EXIT_CODE=1)
+      RUN_STATUS=0
       if [[ -n "${SUPABASE_IMAGE_REGISTRY:-}" ]]; then
-        sudo -u $RUNNER_USER env SUPABASE_INTERNAL_IMAGE_REGISTRY="$SUPABASE_IMAGE_REGISTRY" INTERNAL_IMAGE_REGISTRY="$SUPABASE_IMAGE_REGISTRY" ./run.sh --jitconfig "$JIT" --disableupdate || true
+        sudo -u $RUNNER_USER env "${RUNNER_ENV[@]}" SUPABASE_INTERNAL_IMAGE_REGISTRY="$SUPABASE_IMAGE_REGISTRY" INTERNAL_IMAGE_REGISTRY="$SUPABASE_IMAGE_REGISTRY" ./run.sh --jitconfig "$JIT" --disableupdate || RUN_STATUS=$?
       else
-        sudo -u $RUNNER_USER ./run.sh --jitconfig "$JIT" --disableupdate || true
+        sudo -u $RUNNER_USER env "${RUNNER_ENV[@]}" ./run.sh --jitconfig "$JIT" --disableupdate || RUN_STATUS=$?
       fi
+      case "$RUN_STATUS" in
+        0) log "run.sh exited 0" ;;
+        7) log_error "run.sh exited 7: GitHub refused this runner version. Run 'runner rebake' on the Proxmox host." ;;
+        *) log_error "run.sh exited $RUN_STATUS" ;;
+      esac
       # EXIT trap handles shutdown
 
 runcmd:
