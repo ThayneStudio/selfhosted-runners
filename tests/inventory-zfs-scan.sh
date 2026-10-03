@@ -33,13 +33,11 @@ qm() {
 # would not survive. Mocks read only mock_* variables.
 mock_storage=$state/storage
 mock_race=$state/race
-mock_list_fails=$state/list-fails
 mock_origin_fails=$state/origin-fails
 pvesm() {
     local volume
     case "$1" in
         list)
-            [[ ! -e "$mock_list_fails" ]] || return 1
             printf 'Volid Format Type Size VMID\n'
             while read -r volume; do
                 printf 'local-zfs:%s raw images 1 0\n' "$volume"
@@ -52,14 +50,23 @@ pvesm() {
                 # A reclone destroys VM 9002 while 9001 is being looked up.
                 grep -v 'vm-9002-' "$mock_storage" > "$mock_storage.new" || true
                 mv "$mock_storage.new" "$mock_storage"
-                [[ "$(cat "$mock_race")" != list-fails ]] || : > "$mock_list_fails"
             fi
             printf '/dev/zvol/rpool/data/%s\n' "${2##*[:/]}"
             ;;
         *) return 1 ;;
     esac
 }
-zfs_exists() { grep -qE "(^|/)${1##*/}\$" "$mock_storage"; }
+# Like zfs, a lookup of a missing dataset says it does not exist, unless the
+# race injects another error.
+zfs_exists() {
+    grep -qE "(^|/)${1##*/}\$" "$mock_storage" && return 0
+    if [[ "$(cat "$mock_race" 2>/dev/null)" == zfs-error ]]; then
+        printf "cannot open '%s': pool I/O is currently suspended\n" "$1" >&2
+    else
+        printf "cannot open '%s': dataset does not exist\n" "$1" >&2
+    fi
+    return 1
+}
 zfs() {
     local dataset="${*: -1}"
     case "$1" in
@@ -83,7 +90,7 @@ reset() {
         base-9000-disk-0/vm-9001-disk-0 vm-9001-cloudinit \
         base-9000-disk-0/vm-9002-disk-0 vm-9002-cloudinit \
         vm-9003-disk-0 vm-9004-disk-0 > "$mock_storage"
-    rm -f "$mock_race" "$mock_list_fails" "$mock_origin_fails"
+    rm -f "$mock_race" "$mock_origin_fails"
 }
 
 reset
@@ -99,11 +106,12 @@ out=$(list_template_linked_clone_volids 9000 2>"$state/stderr") ||
     fail "a runner destroyed mid-scan failed the scan: $(cat "$state/stderr")"
 [[ "$out" == "$expected" ]] || fail "after a runner was destroyed mid-scan the scan listed: $out"
 
-# If the fresh listing fails, nothing proves the volume is gone.
+# Only the lookup's own "dataset does not exist" shows that a volume is gone.
+# Any other error fails closed, even for a volume destroyed mid-scan.
 reset
-printf 'list-fails\n' > "$mock_race"
+printf 'zfs-error\n' > "$mock_race"
 if list_template_linked_clone_volids 9000 >/dev/null 2>&1; then
-    fail "a failed lookup passed although the storage could not be listed again"
+    fail "a lookup that failed for another reason passed"
 fi
 
 # A volume that still exists but cannot be read fails closed.

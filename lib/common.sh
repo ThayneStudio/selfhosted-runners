@@ -298,7 +298,12 @@ release_clone_slot() {
 
 list_template_base_volids() {
     local template_id="${1:-$TEMPLATE_ID}"
-    qm config "$template_id" 199>&- 200>&- 201>&- 202>&- 203>&- 204>&- 2>/dev/null | awk -F': ' -v storage="$VM_STORAGE:" '
+    qm config "$template_id" 199>&- 200>&- 201>&- 202>&- 203>&- 204>&- 2>/dev/null | base_volids_in_config
+}
+
+# Base volumes on $VM_STORAGE among the disks of the VM config on stdin.
+base_volids_in_config() {
+    awk -F': ' -v storage="$VM_STORAGE:" '
         $1 ~ /^(ide|sata|scsi|virtio)[0-9]+$/ {
             split($2, parts, ",")
             volume = substr(parts[1], length(storage) + 1)
@@ -307,6 +312,37 @@ list_template_base_volids() {
             }
         }
     '
+}
+
+# Base volumes of the runner templates: TEMPLATE_ID, and each template the
+# rebake retired but has not destroyed yet (lib/rebake.sh). The rebake also
+# keeps ids that are no longer runner templates on that list, so a retired id
+# counts only while it is a template named ubuntu-cloud-template, the check
+# retire_retired_templates makes before it destroys one.
+runner_template_base_volids() {
+    local retired_file="${RETIRED_TEMPLATES_FILE:-/var/lib/github-runners/retired-templates}"
+    local id config
+    list_template_base_volids "$TEMPLATE_ID" || true
+    [[ -f "$retired_file" ]] || return 0
+    while IFS= read -r id || [[ -n "$id" ]]; do
+        [[ "$id" =~ ^[0-9]+$ && "$id" != "$TEMPLATE_ID" ]] || continue
+        config=$(qm config "$id" 199>&- 200>&- 201>&- 202>&- 203>&- 204>&- 2>/dev/null) || continue
+        grep -q '^template: 1[[:space:]]*$' <<< "$config" || continue
+        grep -q '^name: ubuntu-cloud-template[[:space:]]*$' <<< "$config" || continue
+        base_volids_in_config <<< "$config"
+    done < "$retired_file" || true
+}
+
+# 0 when the storage listing shows volume $1 as a linked clone of one of the
+# base volumes that follow. Proxmox lists a ZFS, RBD or directory linked clone
+# under its base; LVM-thin lists it on its own, so it never matches.
+volume_is_linked_clone_of() {
+    local volid="$1" base
+    shift
+    for base in "$@"; do
+        [[ "$volid" == "$base/"* ]] && return 0
+    done
+    return 1
 }
 
 linked_clone_child_vmid() {
@@ -318,17 +354,17 @@ linked_clone_child_vmid() {
     fi
 }
 
+# Prints the ZFS dataset behind zvol volume $1. Like pvesm path, it does not
+# check that the dataset exists.
 zfs_dataset_from_volid() {
     local volid="$1"
-    local path dataset
+    local path
 
     command -v zfs >/dev/null 2>&1 || return 1
     path=$(pvesm path "$volid" 199>&- 200>&- 201>&- 202>&- 203>&- 204>&- 2>/dev/null) || return 1
     [[ "$path" == /dev/zvol/* ]] || return 1
 
-    dataset="${path#/dev/zvol/}"
-    zfs list -H -o name "$dataset" >/dev/null 2>&1 || return 1
-    printf '%s\n' "$dataset"
+    printf '%s\n' "${path#/dev/zvol/}"
 }
 
 # 0 only when a listing of the volume's storage succeeds and no longer shows
@@ -392,9 +428,9 @@ list_template_linked_clone_volids() {
 
     # ZFS linked clones are sibling zvols, not nested volids. They point at
     # the template base volume snapshot via the ZFS origin property. A failed
-    # path or origin lookup must fail this function: an empty result is
-    # permission to destroy the template. A path that is not a zvol is dir
-    # or LVM storage, already handled above.
+    # path or origin lookup must fail this function, unless the volume is
+    # gone (below): an empty result is permission to destroy the template. A
+    # path that is not a zvol is dir or LVM storage, already handled above.
     while read -r base_volid; do
         [[ -n "$base_volid" ]] || continue
         if ! zfs_path=$(pvesm path "$base_volid" 199>&- 200>&- 201>&- 202>&- 203>&- 204>&- 2>/dev/null); then
@@ -415,18 +451,23 @@ list_template_linked_clone_volids() {
         while read -r volid _; do
             [[ "$volid" == "$VM_STORAGE:vm-"* ]] || continue
             [[ -n "${seen[$volid]:-}" ]] && continue
-            # Runners are destroyed and recloned while this scan runs, and
-            # pvesm path does not check that a zvol exists. A volume that a
-            # fresh listing no longer shows depends on nothing; any other
-            # failed lookup still fails closed.
             if ! dataset=$(zfs_dataset_from_volid "$volid"); then
-                volume_confirmed_absent "$volid" && continue
                 log_error "Failed to resolve ZFS dataset for $volid"
                 return 1
             fi
-            if ! origin=$(zfs get -H -o value origin "$dataset" 2>/dev/null); then
-                volume_confirmed_absent "$volid" && continue
+            # Runners are destroyed and recloned while this scan runs. A
+            # volume that is gone depends on nothing, so this lookup's own
+            # "dataset does not exist" (what Proxmox's ZFS plugin also takes
+            # as gone) skips it. A second lookup would not do: by then a new
+            # volume can have the same name. Any other failure fails closed.
+            if ! origin=$(LC_ALL=C zfs get -H -o value origin "$dataset" 2>&1); then
+                [[ "$origin" == *"dataset does not exist"* ]] && continue
                 log_error "Failed to read ZFS origin for $dataset"
+                return 1
+            fi
+            # stderr is captured too, so anything but one word fails closed.
+            if [[ -z "$origin" || "$origin" == *[[:space:]]* ]]; then
+                log_error "Unexpected ZFS origin for $dataset: $origin"
                 return 1
             fi
             # "-" is a real origin value meaning "not a clone".
@@ -494,6 +535,11 @@ cleanup_template_orphan_volumes() {
 # VMIDs runners can get: vmid >= MIN_VMID and != TEMPLATE_ID. MIN_VMID=0
 # ("auto") sets no lower bound, so the floor is then TEMPLATE_ID + 1. Listing
 # only images content also leaves out every container's rootdir volumes.
+# Runners get VMIDs below that floor too (MIN_VMID=0 hands out the cluster's
+# next free ones). There it frees only linked clones of the live or a retired
+# runner template; a runner disk left there would otherwise stay for good and
+# keep its template from being retired. qm clone writes the new VM's config
+# before it creates a disk, so a clone in progress is never config-less.
 cleanup_runner_orphan_volumes() {
     local min_vmid="${MIN_VMID:-}"
     if [[ ! "$min_vmid" =~ ^[1-9][0-9]*$ ]]; then
@@ -506,7 +552,8 @@ cleanup_runner_orphan_volumes() {
         return 0
     fi
 
-    local volid vmid freed=0
+    local volid vmid freed=0 template_bases_read=0
+    local -a template_bases=()
     while IFS= read -r volid; do
         [[ -n "$volid" ]] || continue
         if [[ "$volid" =~ (:|/)vm-([0-9]+)-(disk-[0-9]+|cloudinit)$ ]]; then
@@ -514,8 +561,19 @@ cleanup_runner_orphan_volumes() {
         else
             continue
         fi
-        [[ "$vmid" -ge "$min_vmid" && "$vmid" -ne "$TEMPLATE_ID" ]] || continue
+        [[ "$vmid" -ne "$TEMPLATE_ID" ]] || continue
+        # Below the floor only a volume listed under a base volume can be a
+        # runner's. Template configs are read once, and only when needed.
+        [[ "$vmid" -ge "$min_vmid" || "$volid" == */* ]] || continue
         [[ -z "$(vm_config_path "$vmid")" ]] || continue
+        if [[ "$vmid" -lt "$min_vmid" ]]; then
+            if [[ "$template_bases_read" == 0 ]]; then
+                # </dev/null: its qm calls must not read this loop's listing.
+                mapfile -t template_bases < <(runner_template_base_volids </dev/null)
+                template_bases_read=1
+            fi
+            volume_is_linked_clone_of "$volid" "${template_bases[@]}" || continue
+        fi
         log_info "[orphan-sweep] freeing $volid (vmid $vmid has no config)"
         if free_volume "$volid" 2>/dev/null; then
             freed=$((freed + 1))
