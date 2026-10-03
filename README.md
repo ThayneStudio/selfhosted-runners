@@ -769,7 +769,10 @@ stops partway, run `install.sh` again at once.
    `github-runner-watch.timer`, waits for `github-runner-watch.service` to
    finish, and takes `/run/lock/github-runner-pool.lock` exclusively for up to
    10 minutes so a clone still running the previous version finishes before
-   the new tree is extracted. If that wait times out, or the download fails,
+   the new tree is extracted. If a `github-runner-reclone-*` unit is still
+   active once that lock is held, install releases it, waits 2 seconds, and
+   tries again inside the same 10 minutes. When `systemctl` is unavailable,
+   that check is skipped. If that wait times out, or the download fails,
    the tree is left unchanged. It then refreshes the hookscript and the systemd
    units and enables `github-runner-rebake.timer`. It removes a drain file only
    when that file still contains this install's token, starts the watcher

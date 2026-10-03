@@ -43,9 +43,26 @@ LEGACY_POOL_DRAIN_FILE=$state/legacy/github-runner-drain
 REPO_URL=http://install.test/archive.tar.gz
 stop_term=0
 operator_stop=0
+reclone_active_passes=0
+reclone_list_n=0
+systemctl_list_rc=0
 
 systemctl() {
     printf 'systemctl %s\n' "$*" >> "$log"
+    # list-units runs in a command substitution, so a shell variable
+    # set here is discarded. The count lives in a file.
+    if [[ "$1" == list-units ]]; then
+        reclone_list_n=$(cat "$state/reclone-list-n" 2>/dev/null || printf '0\n')
+        reclone_list_n=$((reclone_list_n + 1))
+        printf '%s\n' "$reclone_list_n" > "$state/reclone-list-n"
+        if [[ "$systemctl_list_rc" != 0 ]]; then
+            return "$systemctl_list_rc"
+        fi
+        if (( reclone_list_n <= reclone_active_passes )); then
+            printf '%s\n' 'github-runner-reclone-101.service loaded active running GitHub runner reclone'
+        fi
+        return 0
+    fi
     if [[ "$1" == stop && "${stop_term:-0}" == 1 ]]; then
         kill -TERM "$BASHPID"
         sleep 2
@@ -112,8 +129,17 @@ fresh() {
     curl_rc=0
     stop_term=0
     operator_stop=0
+    reclone_active_passes=0
+    reclone_list_n=0
+    systemctl_list_rc=0
+    printf '0\n' > "$state/reclone-list-n"
     OLD_POOL_LOCK_WAIT=600
     rm -f "$state/token-new" "$state/token-legacy"
+}
+
+sleep() {
+    printf 'sleep %s\n' "$*" >> "$log"
+    command sleep "$@"
 }
 
 drains_gone() {
@@ -286,6 +312,70 @@ operator_stop=1
 grep -q 'github-runner-watch.timer was left stopped' "$state/out" ||
     fail "install did not say the watcher stayed stopped after runner stop: $(cat "$state/out")"
 [[ "$(line_of '^curl ')" != 0 ]] || fail "runner stop during install aborted the extract"
+
+# An active reclone unit has passed its drain check and not taken the
+# shared lock. Install drops the exclusive lock, waits, and takes it again.
+fresh
+printf 'DOCKER_MIRROR_URL=\n' > "$CONFIG_FILE"
+mkdir -p "$SYSTEMD_DIR" "$SNIPPETS_DIR"
+: > "$SYSTEMD_DIR/github-runner-watch.timer"
+reclone_active_passes=1
+# Short enough that a unit which stays active fails this case quickly,
+# and long enough for the one 2 second retry.
+OLD_POOL_LOCK_WAIT=5
+( install_main ) > "$state/out" 2>"$state/err" || fail "an active reclone unit aborted the install: $(cat "$state/err")"
+[[ "$(grep -c 'flock -w [0-9][0-9]* -x 9' "$log")" == 2 ]] ||
+    fail "an active reclone unit did not make install retry the old pool lock: $(cat "$log")"
+[[ "$(grep -c 'systemctl list-units --state=active github-runner-reclone-' "$log")" == 2 ]] ||
+    fail "install did not check for an active reclone unit twice: $(cat "$log")"
+first_x=$(grep -n 'flock -w [0-9][0-9]* -x 9' "$log" | head -1 | cut -d: -f1)
+second_x=$(grep -n 'flock -w [0-9][0-9]* -x 9' "$log" | tail -1 | cut -d: -f1)
+listed=$(line_of 'systemctl list-units')
+unlocked=$(line_of 'flock -u 9')
+slept=$(line_of 'sleep 2')
+[[ "$first_x" -lt "$listed" && "$listed" -lt "$unlocked" && "$unlocked" -lt "$slept" && "$slept" -lt "$second_x" ]] ||
+    fail "reclone retry order was flock=$first_x list=$listed unlock=$unlocked sleep=$slept flock2=$second_x"
+[[ "$second_x" -lt "$(line_of '^curl ')" ]] || fail "install extracted the tree before the reclone retry"
+[[ "$(grep -c 'systemctl start github-runner-watch.timer' "$log")" == 1 ]] ||
+    fail "a reclone retry started the watcher more than once: $(cat "$log")"
+drains_gone || fail "a reclone retry left the drain flag install set"
+
+# The same 10 minute budget covers the retry. A unit that stays active
+# aborts, restarts the watcher, and clears the drain this install wrote.
+fresh
+printf 'DOCKER_MIRROR_URL=\n' > "$CONFIG_FILE"
+mkdir -p "$SYSTEMD_DIR" "$SNIPPETS_DIR"
+: > "$SYSTEMD_DIR/github-runner-watch.timer"
+reclone_active_passes=100
+OLD_POOL_LOCK_WAIT=1
+if ( install_main ) > "$state/out" 2>"$state/err"; then
+    fail "install kept going while a reclone unit stayed active"
+fi
+grep -q 'was not installed' "$state/err" ||
+    fail "a reclone unit that stayed active was not reported: $(cat "$state/err")"
+[[ "$(line_of '^curl ')" == 0 ]] || fail "a reclone unit that stayed active still extracted the tree"
+[[ "$(grep -c 'flock -w [0-9][0-9]* -x 9' "$log")" == 1 ]] ||
+    fail "a reclone deadline took the old pool lock more than once: $(cat "$log")"
+[[ "$(line_of 'sleep 2')" == 0 ]] || fail "a reclone deadline slept past its budget: $(cat "$log")"
+[[ "$(line_of 'systemctl start github-runner-watch.timer')" != 0 ]] ||
+    fail "a reclone deadline left the watcher stopped"
+drains_gone || fail "a reclone deadline left the drain flag install set"
+
+# systemctl failing the unit list is the same as systemctl being absent:
+# skip the check and keep the lock.
+fresh
+printf 'DOCKER_MIRROR_URL=\n' > "$CONFIG_FILE"
+mkdir -p "$SYSTEMD_DIR" "$SNIPPETS_DIR"
+: > "$SYSTEMD_DIR/github-runner-watch.timer"
+systemctl_list_rc=127
+OLD_POOL_LOCK_WAIT=3
+( install_main ) > "$state/out" 2>"$state/err" ||
+    fail "a failing systemctl aborted the install: $(cat "$state/err")"
+[[ "$(grep -c 'flock -w [0-9][0-9]* -x 9' "$log")" == 1 ]] ||
+    fail "a failing systemctl made install retry the old pool lock: $(cat "$log")"
+[[ "$(grep -c 'systemctl list-units --state=active github-runner-reclone-' "$log")" == 1 ]] ||
+    fail "install did not ask systemctl which reclone units are active: $(cat "$log")"
+drains_gone || fail "a failing systemctl left the drain flag install set"
 
 # A signal while the watcher is stopped still restarts it and clears the drain install set.
 fresh

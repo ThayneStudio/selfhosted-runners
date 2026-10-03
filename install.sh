@@ -145,6 +145,59 @@ publish_upgrade_drain() {
     fi
 }
 
+# An old reclone can pass its drain check and still be starting when the
+# exclusive lock is granted, if it has not reached its shared flock yet.
+# systemctl missing or failing means that check cannot be done.
+reclone_unit_active() {
+    local listed
+    command -v systemctl >/dev/null 2>&1 || return 1
+    listed=$(systemctl list-units --state=active 'github-runner-reclone-*' --no-legend 2>/dev/null) || return 1
+    [[ -n "${listed//[[:space:]]/}" ]]
+}
+
+# Take the old pool lock. The first wait is the full budget. If a reclone
+# unit is active once the lock is held, drop it, wait 2 seconds, and try
+# again with whatever time is left. The deadline abort restarts the watcher
+# and clears this install's own drain, same as a flock timeout.
+hold_old_pool_lock() {
+    local deadline remaining attempt msg
+    deadline=$((SECONDS + OLD_POOL_LOCK_WAIT))
+    attempt=0
+    msg="Timed out after ${OLD_POOL_LOCK_WAIT}s waiting for $OLD_POOL_LOCK. A clone started by the previous version is still running, so the new tree was not installed."
+    while true; do
+        remaining=$((deadline - SECONDS))
+        if (( attempt > 0 && remaining <= 0 )); then
+            abort_upgrade "$msg"
+        fi
+        # The first wait is the whole budget. A retry waits only what is left.
+        if (( attempt == 0 )); then
+            remaining=$OLD_POOL_LOCK_WAIT
+        fi
+        attempt=$((attempt + 1))
+        # /run/lock is 1777. A symlink here would make flock wait on some
+        # other file while the real lock stayed free.
+        if [[ -L "$OLD_POOL_LOCK" ]]; then
+            rm -f -- "$OLD_POOL_LOCK"
+        fi
+        exec 9>"$OLD_POOL_LOCK"
+        if ! flock -w "$remaining" -x 9; then
+            exec 9>&-
+            abort_upgrade "$msg"
+        fi
+        UPGRADE_LOCK_HELD=1
+        if ! reclone_unit_active; then
+            return 0
+        fi
+        flock -u 9 2>/dev/null || true
+        exec 9>&-
+        UPGRADE_LOCK_HELD=0
+        if (( deadline - SECONDS < 2 )); then
+            abort_upgrade "$msg"
+        fi
+        sleep 2
+    done
+}
+
 # Old processes flock /run/lock/github-runner-pool.lock. The tree we are
 # about to extract flocks /run/github-runners/github-runner-pool.lock, so
 # an in-flight reclone and a new watch tick would both fill one slot.
@@ -177,17 +230,7 @@ quiesce_old_pool() {
             abort_upgrade "github-runner-watch.service was still running after ${OLD_POOL_LOCK_WAIT}s, so the new tree was not installed."
         fi
     fi
-    # /run/lock is 1777. A symlink here would make flock wait on some
-    # other file while the real lock stayed free.
-    if [[ -L "$OLD_POOL_LOCK" ]]; then
-        rm -f -- "$OLD_POOL_LOCK"
-    fi
-    exec 9>"$OLD_POOL_LOCK"
-    if ! flock -w "$OLD_POOL_LOCK_WAIT" -x 9; then
-        exec 9>&-
-        abort_upgrade "Timed out after ${OLD_POOL_LOCK_WAIT}s waiting for $OLD_POOL_LOCK. A clone started by the previous version is still running, so the new tree was not installed."
-    fi
-    UPGRADE_LOCK_HELD=1
+    hold_old_pool_lock
 }
 
 install_main() {
