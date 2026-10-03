@@ -21,6 +21,8 @@ RETIRED_TEMPLATES_FILE="$STATE_DIR/retired-templates"
 PENDING_BAKE_FILE="$STATE_DIR/pending-bake"
 PENDING_VERSION_FILE="$STATE_DIR/pending-version"
 REBAKE_LOCK_FILE="/run/lock/github-runner-rebake.lock"
+REBAKE_UNIT_FILE="/etc/systemd/system/github-runner-rebake.service"
+REBAKE_LOG_FILE="/var/log/github-runner-rebake.log"
 
 REBAKE_PUBLISHED=0
 BAKE_VMID=""
@@ -614,27 +616,35 @@ detach_rebake_from_ssh() {
         return 0
     fi
     log_info "Starting the rebake outside this shell so an SSH drop cannot kill it"
-    if [[ -f /etc/systemd/system/github-runner-rebake.service ]] && command -v systemctl >/dev/null 2>&1; then
+    # systemctl start cannot pass this shell's environment to the unit, which
+    # would drop a BAKE_TIMEOUT override (and its TimeoutStartSec caps the run).
+    # setsid keeps the environment, so an override goes that way.
+    if [[ -z "${BAKE_TIMEOUT:-}" && -f "$REBAKE_UNIT_FILE" ]] && command -v systemctl >/dev/null 2>&1; then
         systemctl start --no-block github-runner-rebake.service
         log_info "Follow it with: journalctl -u github-runner-rebake.service -f"
         exit 0
     fi
     if ! command -v setsid >/dev/null 2>&1; then
-        log_error "setsid is not available and github-runner-rebake.service is not installed"
-        log_error "Install the unit, or run 'runner rebake --foreground' inside tmux"
+        if [[ -n "${BAKE_TIMEOUT:-}" ]]; then
+            log_error "setsid is not available, and github-runner-rebake.service cannot take BAKE_TIMEOUT"
+            log_error "Run 'runner rebake --foreground' inside tmux"
+        else
+            log_error "setsid is not available and github-runner-rebake.service is not installed"
+            log_error "Install the unit, or run 'runner rebake --foreground' inside tmux"
+        fi
         exit 1
     fi
-    touch /var/log/github-runner-rebake.log
-    chmod 600 /var/log/github-runner-rebake.log
+    touch "$REBAKE_LOG_FILE"
+    chmod 600 "$REBAKE_LOG_FILE"
     # setsid -f returns after forking, so this shell can exit without a job
     # left in the SSH session. A dead tty plus set -e would otherwise fire the
     # destroy trap on the next log write.
-    if ! REBAKE_DETACHED=1 setsid -f "$REPO_DIR/runner" rebake >>/var/log/github-runner-rebake.log 2>&1 </dev/null; then
+    if ! REBAKE_DETACHED=1 setsid -f "$REPO_DIR/runner" rebake >>"$REBAKE_LOG_FILE" 2>&1 </dev/null; then
         log_error "Could not detach the rebake (setsid -f failed)"
         log_error "Run 'runner rebake --foreground' inside tmux"
         exit 1
     fi
-    log_info "Rebake started. Log: /var/log/github-runner-rebake.log"
+    log_info "Rebake started. Log: $REBAKE_LOG_FILE"
     exit 0
 }
 
