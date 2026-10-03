@@ -62,9 +62,10 @@ EOF
 add_org $'acme\ny\nghp_new\n\n\n\n'
 [[ "$(sourced)" == ghp_new/gpu/3/7/self-hosted,linux,x64,gpu ]] || fail "rotation lost a setting: $(sourced)"
 grep -qxF '# GPU pool: labels set by hand' "$conf" || fail "rotation dropped a comment"
-# The prompted keys come last, once each, so they win over any kept line when
-# sourced and the grep readers (watch, list-orgs) see the same values.
-[[ "$(tail -n 5 "$conf")" == "$managed" ]] || fail "the prompted keys are not written last"
+# The prompted keys are rewritten on the lines that set them, so kept lines
+# keep their place around them and the grep readers (watch, list-orgs) see
+# the values the sourcing scripts see.
+[[ "$(sed -n 2,6p "$conf")" == "$managed" ]] || fail "the prompted keys were not rewritten in place"
 for key in GITHUB_ORG GITHUB_PAT RUNNER_PREFIX RUNNER_COUNT RUNNER_GROUP_ID RUNNER_LABELS; do
     [[ "$(grep -c "^$key=" "$conf")" == 1 ]] || fail "$key is not set exactly once"
 done
