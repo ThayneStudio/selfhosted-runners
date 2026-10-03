@@ -2,6 +2,7 @@
 set -euo pipefail
 
 source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/common.sh"
+source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/recycle.sh"
 
 require_root "remove-org"
 
@@ -100,6 +101,10 @@ fi
 
 rm -f "$ORG_CONFIG_DIR/${ORG_NAME}.conf"
 rm -f "$SNIPPETS_DIR/runner-user-data-${ORG_NAME}.yaml"  # legacy per-org snippet (no-op on new installs)
+# The org's extra runners from `runner create` end with it. The watcher fills
+# none of an org that is not configured, so a leftover entry waits harmlessly.
+forget_extra_runners "" "$ORG_NAME" \
+    || log_warn "Could not remove the extra runners of '$ORG_NAME' from $EXTRA_RUNNERS_FILE"
 
 echo ""
 log_info "Organization '$ORG_NAME' removed."

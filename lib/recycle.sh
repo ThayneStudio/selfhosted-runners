@@ -28,6 +28,11 @@ SLOT_BACKOFF_BASE=30
 SLOT_BACKOFF_MAX=1800
 RAPID_DEATH_SECS=600
 RAPID_DEATH_LIMIT=3
+# Extra runners from `runner create`, one "<name> <org>" line each. The
+# watcher fills them like slots, so one that a hold, the template gate or a
+# failed clone left empty comes back. Unlike the holds, it survives a reboot.
+EXTRA_RUNNERS_FILE="/var/lib/github-runners/extras"
+EXTRA_RUNNERS_LOCK_FILE="/run/lock/github-runner-extras.lock"
 
 slot_lock_file() {
     printf '%s-%s.lock\n' "$SLOT_LOCK_PREFIX" "$1"
@@ -193,6 +198,101 @@ read_org_slots() {
     fi
 }
 
+# Prints the recorded extra runners, "<name> <org>" per line. A line without
+# a valid runner name and org name is skipped.
+list_extra_runners() {
+    local name org rest
+    [[ -e "$EXTRA_RUNNERS_FILE" ]] || return 0
+    while read -r name org rest || [[ -n "$name" ]]; do
+        if [[ -z "$rest" ]] && validate_runner_name "$name" && validate_org_name "$org"; then
+            printf '%s %s\n' "$name" "$org"
+        fi
+    done < "$EXTRA_RUNNERS_FILE"
+}
+
+# Prints the org that extra runner $1 is recorded for. Fails when it is not
+# recorded, or the list cannot be read.
+extra_runner_org() {
+    local list name org
+    list=$(list_extra_runners) || return 1
+    while read -r name org; do
+        if [[ -n "$name" && "$name" == "$1" ]]; then
+            printf '%s\n' "$org"
+            return 0
+        fi
+    done <<< "$list"
+    return 1
+}
+
+# 0 when extra runner $1 is recorded for org $2.
+extra_runner_recorded() {
+    local org
+    org=$(extra_runner_org "$1") && [[ "$org" == "$2" ]]
+}
+
+# Replaces the extras list with the lines given; none removes it. The list is
+# written beside the old one and renamed over it, so a failed write (ENOSPC)
+# returns non-zero and leaves the old list. Callers hold the extras lock.
+write_extra_runners() {
+    local dir tmp
+    if [[ $# -eq 0 ]]; then
+        rm -f "$EXTRA_RUNNERS_FILE"
+        return
+    fi
+    dir=$(dirname "$EXTRA_RUNNERS_FILE")
+    install -d -m 700 "$dir" || return 1
+    tmp=$(mktemp "$dir/.extras.XXXXXX") || return 1
+    if ! printf '%s\n' "$@" > "$tmp" || ! chmod 600 "$tmp" || ! mv -f "$tmp" "$EXTRA_RUNNERS_FILE"; then
+        rm -f "$tmp"
+        return 1
+    fi
+}
+
+# Under the extras lock, drops the entries of name $1 and org $2 (an empty
+# one matches any), then adds the line $3 when given. `runner create`,
+# `runner destroy` and reclones can change the list at the same time.
+update_extra_runners() {
+    local drop_name="$1" drop_org="$2" add="${3:-}" list name org changed=0
+    local -a kept=()
+    (
+        flock -w 30 205 || exit 1
+        list=$(list_extra_runners) || exit 1
+        while read -r name org; do
+            [[ -n "$name" ]] || continue
+            if [[ ( -z "$drop_name" || "$name" == "$drop_name" ) && ( -z "$drop_org" || "$org" == "$drop_org" ) ]]; then
+                changed=1
+                continue
+            fi
+            kept+=("$name $org")
+        done <<< "$list"
+        if [[ -n "$add" ]]; then
+            kept+=("$add")
+            changed=1
+        fi
+        [[ "$changed" == 1 ]] || exit 0
+        write_extra_runners "${kept[@]}"
+    ) 205> "$EXTRA_RUNNERS_LOCK_FILE"
+}
+
+# Records extra runner $1 of org $2, in place of any entry of that name.
+record_extra_runner() {
+    update_extra_runners "$1" "" "$1 $2"
+}
+
+# Forgets the extra runners of name $1 and org $2; an empty one matches any,
+# but not both.
+forget_extra_runners() {
+    [[ -n "$1$2" ]] || return 1
+    [[ -e "$EXTRA_RUNNERS_FILE" ]] || return 0
+    update_extra_runners "$1" "$2"
+}
+
+# Forgets every extra runner.
+forget_all_extra_runners() {
+    [[ -e "$EXTRA_RUNNERS_FILE" ]] || return 0
+    update_extra_runners "" ""
+}
+
 # Prints the kind clone_runner recorded in VM config text $1 (slot or
 # extra). Prints nothing for VMs cloned before it was recorded.
 runner_vm_kind() {
@@ -269,15 +369,18 @@ destroy_runner_vm() {
 # Clone the replacement for runner $1 of org $2 once its VM is destroyed. The
 # caller holds the slot lock (fd 200) and shared pool activity (fd 202), $3
 # prefixes the log lines and $4 is the old VM's kind (runner_vm_kind). Nothing
-# is cloned for a retired name (runner_slot_retired). The slot stays empty
-# while the backoff holds it, when the name is taken again, when the pool
-# started draining or while TEMPLATE_ID is not a finished template; the
-# watcher fills it later. Returns 1 only when clone_runner failed. Needs
-# template_is_converted from bake.sh.
+# is cloned for a retired name (runner_slot_retired), and the watcher no
+# longer fills it as an extra runner. The slot stays empty while the backoff
+# holds it, when the name is taken again, when the pool started draining or
+# while TEMPLATE_ID is not a finished template; the watcher fills it, or the
+# extra runner of that name, later. Returns 1 only when clone_runner failed.
+# Needs template_is_converted from bake.sh.
 refill_runner_slot() {
     local name="$1" org="$2" tag="$3" kind="${4:-}"
     if runner_slot_retired "$name" "$org" "$kind"; then
         log_info "$tag not re-cloning $name: $RETIRE_REASON"
+        forget_extra_runners "$name" "$org" \
+            || log_warn "$tag could not remove $name from $EXTRA_RUNNERS_FILE; the watcher may clone it again"
         return 0
     fi
     if slot_is_held "$name"; then

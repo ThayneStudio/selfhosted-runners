@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # clone_runner must configure a clone so the pool can always recycle it:
 # a guest reboot has to exit QEMU (post-stop, then reclone) instead of
-# resetting in place with no runner, and the clone must name its org from
-# the very first config write, before --cicustom exists.
+# resetting in place with no runner, and the clone must name its org and
+# VMID from the very first config write, before --cicustom exists.
 set -euo pipefail
 
 if [[ "${BASH_VERSINFO[0]}" -lt 4 ]]; then
@@ -54,7 +54,7 @@ vmid=$(clone_runner runner-1 acme) || fail "clone_runner failed"
 reboot_line=$(grep -n '^set 9001 --reboot 0$' "$calls" | cut -d: -f1) || fail "reboot was not disabled on the clone"
 start_line=$(grep -n '^start 9001$' "$calls" | cut -d: -f1) || fail "the clone was not started"
 (( reboot_line < start_line )) || fail "reboot was disabled only after the clone started"
-grep -qx 'clone 9000 9001 --name runner-1 --description selfhosted-runners org=acme' "$calls" \
+grep -qx 'clone 9000 9001 --name runner-1 --description selfhosted-runners org=acme vmid=9001' "$calls" \
     || fail "qm clone did not write the ownership marker with the name: $(grep '^clone' "$calls")"
 
 # The marker also records whether the VM is one of the org's slots, so the
@@ -66,12 +66,12 @@ kind_of_clone() {
 }
 RUNNER_PREFIX=runner
 RUNNER_COUNT=2
-[[ "$(kind_of_clone runner-2)" == "selfhosted-runners org=acme kind=slot" ]] || fail "a configured slot was not marked as a slot"
-[[ "$(kind_of_clone runner-3)" == "selfhosted-runners org=acme kind=extra" ]] || fail "a name past RUNNER_COUNT was marked as a slot"
-[[ "$(kind_of_clone runner-01)" == "selfhosted-runners org=acme kind=extra" ]] || fail "runner-01 was marked as slot runner-1"
-[[ "$(kind_of_clone build-box)" == "selfhosted-runners org=acme kind=extra" ]] || fail "a manual runner was marked as a slot"
+[[ "$(kind_of_clone runner-2)" == "selfhosted-runners org=acme kind=slot vmid=9001" ]] || fail "a configured slot was not marked as a slot"
+[[ "$(kind_of_clone runner-3)" == "selfhosted-runners org=acme kind=extra vmid=9001" ]] || fail "a name past RUNNER_COUNT was marked as a slot"
+[[ "$(kind_of_clone runner-01)" == "selfhosted-runners org=acme kind=extra vmid=9001" ]] || fail "runner-01 was marked as slot runner-1"
+[[ "$(kind_of_clone build-box)" == "selfhosted-runners org=acme kind=extra vmid=9001" ]] || fail "a manual runner was marked as a slot"
 RUNNER_COUNT=garbled
-[[ "$(kind_of_clone runner-1)" == "selfhosted-runners org=acme" ]] || fail "a kind was guessed without a readable RUNNER_COUNT"
+[[ "$(kind_of_clone runner-1)" == "selfhosted-runners org=acme vmid=9001" ]] || fail "a kind was guessed without a readable RUNNER_COUNT"
 unset RUNNER_PREFIX RUNNER_COUNT
 
 # CLONE_MINT_CONFLICT tells the backoff whether the previous runner of the
@@ -108,9 +108,9 @@ org_of() {
     vm_config="$1"
     get_vm_org 9001
 }
-[[ "$(org_of $'name: runner-1\ndescription: selfhosted-runners org=acme\nscsi0: local-zfs:base-9000-disk-0/vm-9001-disk-0')" == acme ]] \
+[[ "$(org_of $'name: runner-1\ndescription: selfhosted-runners org=acme vmid=9001\nscsi0: local-zfs:base-9000-disk-0/vm-9001-disk-0')" == acme ]] \
     || fail "a clone with only the marker is not managed"
-[[ "$(org_of $'name: runner-1\ndescription: selfhosted-runners org=acme%0Aoperator note')" == acme ]] \
+[[ "$(org_of $'name: runner-1\ndescription: selfhosted-runners org=acme vmid=9001%0Aoperator note')" == acme ]] \
     || fail "an edited description lost the marker"
 [[ "$(org_of $'cicustom: user=local:snippets/runner-9001-user-beta.yaml,meta=local:snippets/runner-9001-meta.yaml\ndescription: selfhosted-runners org=acme')" == beta ]] \
     || fail "the marker overrode the cicustom snippet"

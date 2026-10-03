@@ -40,9 +40,10 @@ wait_for_watch_slot() {
     done
 }
 
-# Worker: clone missing slot $1 for org $2. Runs in its own subshell.
+# Worker: clone missing slot $1 for org $2. $3 is "extra" for an extra runner
+# from `runner create`. Runs in its own subshell.
 fill_runner_slot() {
-    local slot="$1" org="$2"
+    local slot="$1" org="$2" kind="${3:-}"
     # Per-runner lock prevents races with reclone.sh on the same slot
     exec 200>"$(slot_lock_file "$slot")"
     flock -n 200 || return 0
@@ -52,6 +53,10 @@ fill_runner_slot() {
         return 0
     fi
     if slot_is_held "$slot"; then
+        return 0
+    fi
+    # `runner destroy` may have ended this extra runner since the scan.
+    if [[ "$kind" == "extra" ]] && ! extra_runner_recorded "$slot" "$org"; then
         return 0
     fi
     if ! load_org_config "$org" 2>/dev/null; then
@@ -68,15 +73,26 @@ fill_runner_slot() {
     fi
 }
 
+# 0 when VM $1, with config text $2, has what only clone_runner gives a VM:
+# its own meta snippet as a cicustom property, or the ownership marker with
+# its VMID, which is all a clone cut off before --cicustom has.
+cloned_as_runner() {
+    local vmid="$1" config="$2" meta_re
+    meta_re='^cicustom: (.*,)?meta=local:snippets/runner-'"$vmid"'-meta\.yaml(,|$)'
+    [[ "$(grep -m1 '^cicustom:' <<< "$config")" =~ $meta_re ]] && return 0
+    runner_marker_org "$vmid" "$config" > /dev/null
+}
+
 # Worker: recycle runner VM $1 named $2, which the scan found dead for reason
 # $3 (stopped, overdue or restarted). $4 is 1 when the name is a slot name of
-# a configured org. $5 is when the scan first saw a stopped VM stopped. Runs
-# in its own subshell. Everything is checked again under the slot lock, so a
-# reclone, `runner destroy` or clone that holds the slot wins, and only a VM
-# that carries this tool's snippet or clone-time marker is touched.
+# a configured org or a recorded extra runner. $5 is when the scan first saw a
+# stopped VM stopped. Runs in its own subshell. Everything is checked again
+# under the slot lock, so a reclone, `runner destroy` or clone that holds the
+# slot wins, and only a VM that carries this tool's snippet or clone-time
+# marker for its own VMID is touched.
 reclaim_runner_vm() {
     local vmid="$1" name="$2" reason="$3" slot_named="${4:-0}" stopped_since="${5:-}"
-    local config org status_out status uptime age lifetime=""
+    local config org status_out status uptime age lifetime="" snippet removed=0
     exec 200>"$(slot_lock_file "$name")"
     flock -n 200 || return 0
     if pool_is_draining; then
@@ -89,18 +105,29 @@ reclaim_runner_vm() {
         return 0
     fi
     org=$(get_vm_org "$vmid" "$config")
+    # Nobody confirms what the watcher stops and destroys, so a snippet name
+    # alone is not enough here: the legacy per-org one names no VMID.
+    if [[ "$org" != "unknown" ]] && ! cloned_as_runner "$vmid" "$config"; then
+        org=unknown
+    fi
     if [[ "$org" == "unknown" ]]; then
         # Worth reporting only when it holds a slot: otherwise this is a VM
         # that reused the VMID of a runner whose snippets were left behind.
         if [[ "$slot_named" == 1 ]]; then
             log_warn "[watch] $name (VMID $vmid) is $reason but carries no selfhosted-runners snippet or marker; leaving it. If it is a leftover clone, remove it with: qm destroy $vmid"
         else
-            # A plain `qm destroy` of a runner leaves its snippets. This VM's
-            # config names none of them, and while they exist every scan
-            # queues it again. A clone at this VMID writes its own.
-            rm -f "${SNIPPETS_DIR}/runner-${vmid}-meta.yaml" "${SNIPPETS_DIR}/runner-${vmid}-user-"*.yaml \
-                "${SNIPPETS_DIR}/runner-${vmid}-vendor.yaml"
-            log_info "[watch] VMID $vmid is now $name, not a runner VM; removed the runner snippets left behind for it"
+            # A plain `qm destroy` of a runner leaves its snippets, and while
+            # they exist every scan queues this VM again. One that this VM's
+            # own config names stays. A clone at this VMID writes its own.
+            for snippet in "${SNIPPETS_DIR}/runner-${vmid}-meta.yaml" "${SNIPPETS_DIR}/runner-${vmid}-user-"*.yaml \
+                "${SNIPPETS_DIR}/runner-${vmid}-vendor.yaml"; do
+                [[ -e "$snippet" ]] || continue
+                grep -qF "local:snippets/${snippet##*/}" <<< "$config" && continue
+                rm -f "$snippet" && removed=1
+            done
+            if [[ "$removed" == 1 ]]; then
+                log_info "[watch] VMID $vmid is now $name, not a runner VM; removed the runner snippets left behind for it"
+            fi
         fi
         return 0
     fi
@@ -168,9 +195,9 @@ reclaim_runner_vm() {
 
 watch_main() {
     local vm_table now vmid name status uptime lock template age since mtime key prefix slot entry reason n org
-    local stopped_state tmp slot_named
+    local stopped_state tmp slot_named extras kind
     local -a orgs=() prefixes=() slots=() missing=() reclaim=() stopped_now=()
-    local -A vm_names=() stopped_since=()
+    local -A vm_names=() stopped_since=() slot_names=()
 
     require_root "watch"
 
@@ -208,8 +235,21 @@ watch_main() {
         fi
         for n in $(seq 1 "$ORG_SLOT_COUNT"); do
             slots+=("${ORG_SLOT_PREFIX}-${n} $org")
+            slot_names["${ORG_SLOT_PREFIX}-${n}"]=1
         done
     done
+    # Extra runners from `runner create` are filled like slots, so one that a
+    # hold, the template gate or a failed clone left empty comes back. A slot
+    # of the same name wins, and an org that is gone fills nothing.
+    if ! extras=$(list_extra_runners); then
+        log_warn "[watch] Could not read $EXTRA_RUNNERS_FILE; filling slots only"
+        extras=""
+    fi
+    while read -r name org; do
+        [[ -n "$name" && -z "${slot_names[$name]:-}" && -f "$ORG_CONFIG_DIR/${org}.conf" ]] || continue
+        slots+=("$name $org extra")
+        slot_names["$name"]=1
+    done <<< "$extras"
 
     # When each stopped runner VM was first seen stopped, from earlier ticks.
     stopped_state="$SLOT_STATE_DIR/watch-stopped"
@@ -232,6 +272,8 @@ watch_main() {
                 break
             fi
         done
+        # A recorded extra runner's name is held like a slot's.
+        [[ -z "${slot_names[$name]:-}" ]] || slot_named=1
         # Runner VMs have the meta snippet clone_runner writes before
         # --cicustom. A clone cut off before that has only its slot name.
         if [[ ! -e "$SNIPPETS_DIR/runner-${vmid}-meta.yaml" ]]; then
@@ -313,9 +355,8 @@ watch_main() {
     done
     for entry in "${missing[@]}"; do
         wait_for_watch_slot
-        slot="${entry%% *}"
-        org="${entry##* }"
-        ( fill_runner_slot "$slot" "$org" ) &
+        read -r slot org kind <<< "$entry"
+        ( fill_runner_slot "$slot" "$org" "$kind" ) &
     done
 
     # Wait for all background jobs

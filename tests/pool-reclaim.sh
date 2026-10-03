@@ -96,8 +96,8 @@ qm() {
             gone "$id" && return 2
             printf 'name: %s\n' "$(field "$id" name)"
             [[ -z "$(field "$id" marker)" ]] || printf 'description: %s\n' "$(field "$id" marker)"
-            [[ -z "$(field "$id" org)" ]] \
-                || printf 'cicustom: user=local:snippets/runner-%s-user-%s.yaml\n' "$id" "$(field "$id" org)"
+            [[ -z "$(field "$id" org)" ]] || printf 'cicustom: user=local:snippets/runner-%s-user-%s.yaml,meta=local:snippets/runner-%s-meta.yaml\n' \
+                "$id" "$(field "$id" org)" "$id"
             [[ -z "$(field "$id" lock)" ]] || printf 'lock: %s\n' "$(field "$id" lock)"
             [[ -z "$(field "$id" template)" ]] || printf 'template: 1\n'
             ;;
@@ -225,10 +225,10 @@ tick
 did "destroy 9001" || fail "the VM was not reclaimed once its lock was gone"
 
 # R2-4: a clone killed between qm clone and --cicustom has only its name and
-# the clone-time marker.
+# the clone-time marker, which names its VMID.
 reset_vms
 healthy 9002 runner-2
-vm 9001 runner-1 stopped marker='selfhosted-runners org=acme kind=slot'
+vm 9001 runner-1 stopped marker='selfhosted-runners org=acme kind=slot vmid=9001'
 tick
 clock=$((clock + 61))
 tick
