@@ -233,6 +233,17 @@ vm_confirmed_absent() {
         'type == "array" and all(.[]; (.vmid | type) == "number" and .vmid != $id)' >/dev/null 2>&1
 }
 
+# 0 only when a readable cluster inventory lists this VMID as a guest that is
+# not a QEMU VM (a container). A rebake VM is always QEMU, so a pending record
+# for that VMID is stale: its bake VM is gone, or `qm create` never made it.
+vmid_is_non_qemu_guest() {
+    local id="$1" inventory
+    inventory=$(pvesh get /cluster/resources --type vm --output-format json \
+        199>&- 200>&- 201>&- 202>&- 203>&- 204>&- 2>/dev/null) || return 1
+    printf '%s\n' "$inventory" | jq -e --argjson id "$id" \
+        'type == "array" and any(.[]; .vmid == $id and (.type | type) == "string" and .type != "qemu")' >/dev/null 2>&1
+}
+
 retire_retired_templates() {
     local id name kept_file tmp
     [[ -f "$RETIRED_TEMPLATES_FILE" ]] || return 0
@@ -330,6 +341,9 @@ cleanup_rebake() {
         else
             if vm_confirmed_absent "$BAKE_VMID"; then
                 rm -f "$PENDING_BAKE_FILE" "$PENDING_VERSION_FILE"
+            elif vmid_is_non_qemu_guest "$BAKE_VMID"; then
+                log_warn "VMID $BAKE_VMID belongs to a container, not the rebake VM; dropping the pending record"
+                rm -f "$PENDING_BAKE_FILE" "$PENDING_VERSION_FILE"
             else
                 log_error "Could not confirm rebake VM $BAKE_VMID is absent; retaining the pending record"
                 [[ "$rc" -ne 0 ]] || rc=1
@@ -350,6 +364,12 @@ recover_pending_bake() {
     fi
     if ! qm_host status "$id" &>/dev/null; then
         if vm_confirmed_absent "$id"; then
+            rm -f "$PENDING_BAKE_FILE" "$PENDING_VERSION_FILE"
+            return 0
+        fi
+        # Kept, this record would fail every later run before the release check.
+        if vmid_is_non_qemu_guest "$id"; then
+            log_warn "Pending bake id $id belongs to a container, not a rebake VM; dropping the stale pending record"
             rm -f "$PENDING_BAKE_FILE" "$PENDING_VERSION_FILE"
             return 0
         fi
