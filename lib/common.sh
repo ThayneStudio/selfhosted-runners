@@ -173,31 +173,50 @@ slot_number() {
     printf '%s\n' "$n"
 }
 
+# Prints the org in the ownership marker that clone_runner writes into the
+# description of VM $1, read from config text $2. The marker names the VMID
+# it was written for and counts only on that VM: a full clone of a runner
+# copies the description too.
+runner_marker_org() {
+    local vmid="$1" description
+    local marker_re='^description: selfhosted-runners org=([a-zA-Z0-9-]+)( kind=(slot|extra))? vmid=([0-9]+)([ %]|$)'
+    description=$(grep -m1 '^description:' <<< "$2") || return 1
+    [[ "$description" =~ $marker_re && "${BASH_REMATCH[4]}" == "$vmid" ]] || return 1
+    printf '%s\n' "${BASH_REMATCH[1]}"
+}
+
 # Prints the org of runner VM $1, or "unknown". $2, when given, is the VM's
-# config as the caller already read it.
+# config as the caller already read it. A snippet counts only as a whole
+# cicustom property on this tool's snippet volume, so an operator's snippet
+# with a similar name does not, and the per-VM snippet and the marker count
+# only for VM $1 itself: a full clone of a runner copies both.
 get_vm_org() {
-    local config cicustom description
-    local marker_re='^description: selfhosted-runners org=([a-zA-Z0-9-]+)'
+    local vmid="$1" config cicustom org own_re legacy_re
+    if [[ ! "$vmid" =~ ^[0-9]+$ ]]; then
+        echo "unknown"
+        return 0
+    fi
     if (( $# > 1 )); then
         config="$2"
     else
-        config=$(qm config "$1" 2>/dev/null) || true
+        config=$(qm config "$vmid" 2>/dev/null) || true
     fi
     cicustom=$(grep -m1 '^cicustom:' <<< "$config") || true
-    description=$(grep -m1 '^description:' <<< "$config") || true
-    # New per-VM snippet: runner-<vmid>-user-<org>.yaml (org has no dots).
+    # Each snippet must be a whole cicustom property on this tool's snippet
+    # volume. New per-VM snippet: runner-<this VMID>-user-<org>.yaml.
     # Legacy per-org snippet: runner-user-data-<org>.yaml (kept as a fallback so
     # VMs created before the token refactor stay identifiable/destroyable).
-    # The two are mutually exclusive: legacy names have no digits after "runner-".
     # Last, the marker clone_runner passes to qm clone: a clone cut off before
     # --cicustom carries only that, and would otherwise hold its slot name
     # with no runner command able to see or remove it.
-    if [[ "$cicustom" =~ runner-[0-9]+-user-([a-zA-Z0-9-]+)\.yaml ]]; then
-        echo "${BASH_REMATCH[1]}"
-    elif [[ "$cicustom" =~ runner-user-data-([^.]+)\.yaml ]]; then
-        echo "${BASH_REMATCH[1]}"
-    elif [[ "$description" =~ $marker_re ]]; then
-        echo "${BASH_REMATCH[1]}"
+    own_re='(^cicustom: |,)user=local:snippets/runner-'"$vmid"'-user-([a-zA-Z0-9-]+)\.yaml(,|$)'
+    legacy_re='(^cicustom: |,)user=local:snippets/runner-user-data-([a-zA-Z0-9-]+)\.yaml(,|$)'
+    if [[ "$cicustom" =~ $own_re ]]; then
+        echo "${BASH_REMATCH[2]}"
+    elif [[ "$cicustom" =~ $legacy_re ]]; then
+        echo "${BASH_REMATCH[2]}"
+    elif org=$(runner_marker_org "$vmid" "$config"); then
+        echo "$org"
     else
         echo "unknown"
     fi
@@ -900,8 +919,10 @@ clone_runner() {
     # The description is the ownership marker get_vm_org falls back to, with
     # the kind. qm clone writes it in the same config write as the name, so a
     # clone that is killed before --cicustom below is still recognisably ours.
+    # It names the VMID, reserved above, because a full clone of this VM
+    # would copy it.
     local clone_err; clone_err=$(mktemp)
-    if ! qm clone "$TEMPLATE_ID" "$vmid" --name "$name" --description "selfhosted-runners org=$org${kind:+ kind=$kind}" \
+    if ! qm clone "$TEMPLATE_ID" "$vmid" --name "$name" --description "selfhosted-runners org=$org${kind:+ kind=$kind} vmid=$vmid" \
         200>&- 201>&- 202>&- 203>&- 204>&- 2>"$clone_err"; then
         while IFS= read -r line; do
             [[ -n "$line" ]] && log_error "qm clone $vmid: $line"

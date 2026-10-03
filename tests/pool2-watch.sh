@@ -98,8 +98,8 @@ qm() {
             fi
             printf 'name: %s\n' "$(field "$id" name)"
             [[ -z "$(field "$id" marker)" ]] || printf 'description: %s\n' "$(field "$id" marker)"
-            [[ -z "$(field "$id" org)" ]] \
-                || printf 'cicustom: user=local:snippets/runner-%s-user-%s.yaml\n' "$id" "$(field "$id" org)"
+            [[ -z "$(field "$id" org)" ]] || printf 'cicustom: user=local:snippets/runner-%s-user-%s.yaml,meta=local:snippets/runner-%s-meta.yaml\n' \
+                "$id" "$(field "$id" org)" "$id"
             ;;
         status)
             gone "$id" && return 2
