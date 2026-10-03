@@ -124,8 +124,11 @@ fi
 
 read -rp "Runner name prefix [${EXISTING_PREFIX:-runner}]: " RUNNER_PREFIX
 RUNNER_PREFIX=${RUNNER_PREFIX:-${EXISTING_PREFIX:-runner}}
-if [[ ! "$RUNNER_PREFIX" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]*$ ]]; then
-    log_error "Invalid prefix. Use only letters, numbers, dots, hyphens, underscores."
+# Slot names "${prefix}-${n}" become VM names, which qm clone checks as DNS
+# names. Checking "-1" covers every n: the digits never change the verdict.
+if ! validate_runner_name "${RUNNER_PREFIX}-1"; then
+    log_error "Invalid prefix '$RUNNER_PREFIX'. Use letters, numbers and hyphens, starting with a letter or number."
+    log_error "Runner names become Proxmox VM names, which must be DNS names (no underscores)."
     exit 1
 fi
 
@@ -176,7 +179,14 @@ fi
 mkdir -p "$ORG_CONFIG_DIR"
 chmod 700 "$ORG_CONFIG_DIR"
 CONF_TMP=$(mktemp "$ORG_CONFIG_DIR/.${GITHUB_ORG}.XXXXXX")
-printf 'GITHUB_ORG="%s"\nGITHUB_PAT="%s"\nRUNNER_PREFIX="%s"\nRUNNER_COUNT="%s"\nRUNNER_GROUP_ID="%s"\n' "$GITHUB_ORG" "$GITHUB_PAT" "$RUNNER_PREFIX" "$RUNNER_COUNT" "$RUNNER_GROUP_ID" > "$CONF_TMP"
+# Updating an org keeps every line that doesn't set a prompted key (a hand-set
+# RUNNER_LABELS, comments). The prompted keys go last so their new values win
+# when the file is sourced, and each is set exactly once for the grep readers.
+if [[ -f "$ORG_CONFIG_DIR/${GITHUB_ORG}.conf" ]]; then
+    awk '!/^(GITHUB_ORG|GITHUB_PAT|RUNNER_PREFIX|RUNNER_COUNT|RUNNER_GROUP_ID)=/' \
+        "$ORG_CONFIG_DIR/${GITHUB_ORG}.conf" > "$CONF_TMP"
+fi
+printf 'GITHUB_ORG="%s"\nGITHUB_PAT="%s"\nRUNNER_PREFIX="%s"\nRUNNER_COUNT="%s"\nRUNNER_GROUP_ID="%s"\n' "$GITHUB_ORG" "$GITHUB_PAT" "$RUNNER_PREFIX" "$RUNNER_COUNT" "$RUNNER_GROUP_ID" >> "$CONF_TMP"
 chmod 600 "$CONF_TMP"
 mv "$CONF_TMP" "$ORG_CONFIG_DIR/${GITHUB_ORG}.conf"
 CONF_TMP=""
