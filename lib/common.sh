@@ -747,17 +747,9 @@ clone_runner() {
         return 1
     fi
 
-    # Keep maintenance locks in this shell only. Proxmox helper children can
-    # spawn long-lived kvm processes; those must not inherit runner lock fds.
-    # Capture stderr so the actual ZFS/Proxmox error surfaces under
-    # `journalctl -t github-runner` instead of being buried under the service
-    # unit log (which the operator does not look at first).
-    # The description is the ownership marker get_vm_org falls back to. qm
-    # clone writes it in the same config write as the name, so a clone that is
-    # killed before --cicustom below is still recognisably ours. kind records
-    # whether this is one of the org's RUNNER_COUNT slots, which the pool
-    # retires once the count or prefix no longer covers it, or an extra
-    # runner from `runner create`, which recycles until `runner destroy`.
+    # Whether this is one of the org's RUNNER_COUNT slots, which the pool
+    # retires once the count or prefix no longer covers it, or an extra runner
+    # from `runner create`, which recycles until `runner destroy`.
     local kind="" slot_n
     if [[ "${RUNNER_COUNT:-}" =~ ^[0-9]{1,9}$ ]]; then
         kind=extra
@@ -765,6 +757,15 @@ clone_runner() {
             kind=slot
         fi
     fi
+
+    # Keep maintenance locks in this shell only. Proxmox helper children can
+    # spawn long-lived kvm processes; those must not inherit runner lock fds.
+    # Capture stderr so the actual ZFS/Proxmox error surfaces under
+    # `journalctl -t github-runner` instead of being buried under the service
+    # unit log (which the operator does not look at first).
+    # The description is the ownership marker get_vm_org falls back to, with
+    # the kind. qm clone writes it in the same config write as the name, so a
+    # clone that is killed before --cicustom below is still recognisably ours.
     local clone_err; clone_err=$(mktemp)
     if ! qm clone "$TEMPLATE_ID" "$vmid" --name "$name" --description "selfhosted-runners org=$org${kind:+ kind=$kind}" \
         200>&- 201>&- 202>&- 203>&- 204>&- 2>"$clone_err"; then
