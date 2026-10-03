@@ -126,9 +126,11 @@ sleep() { :; }
 logger() { printf '%s\n' "$*" >> "$state/logger"; }
 require_root() { :; }
 cleanup_runner_orphan_volumes() { :; }
+clone_rc=0
 clone_runner() {
     printf 'clone %s %s\n' "$1" "$2" >> "$actions"
     CLONE_MINT_CONFLICT=1
+    return "$clone_rc"
 }
 
 tick() {
@@ -180,5 +182,39 @@ did_nothing "a stopped VM was reclaimed inside its grace period"
 clock=$((clock + 31))
 tick
 did "destroy 9001" || fail "a stopped VM was not reclaimed after its grace period"
+
+# N14: after a host reboot every runner VM is stopped. The first tick records
+# them, then chrony steps the clock back two hours (an RTC kept in local
+# time). They are reclaimed a grace period after the step, not once the
+# clock has caught up. The meta snippet, written before the step, is now in
+# the future and must not restart the grace on every tick either.
+reset
+runner_vm 9001 runner-1 100
+tick
+clock=$((clock - 7200))
+tick
+did_nothing "a stopped VM was reclaimed at once after the clock was stepped back"
+clock=$((clock + 61))
+tick
+did "destroy 9001" || fail "a clock stepped back stalled the reclaim of a stopped VM"
+
+# A failure hold set before the step must not keep the slot empty for the
+# size of the step on top of the hold.
+reset
+clone_rc=1
+tick
+did "clone runner-1 acme" || fail "the missing slot was not filled"
+clone_rc=0
+clock=$((clock - 7200))
+retried=0
+for _ in $(seq 0 "$((SLOT_BACKOFF_MAX / 30))"); do
+    tick
+    if did "clone runner-1 acme"; then
+        retried=1
+        break
+    fi
+    clock=$((clock + 30))
+done
+(( retried )) || fail "a hold set before the clock was stepped back kept the slot empty for 30 minutes"
 
 printf 'pool2-watch: ok\n'

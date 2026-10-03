@@ -216,6 +216,10 @@ watch_main() {
         if [[ "$status" == "stopped" ]]; then
             key="$vmid $name"
             since=${stopped_since[$key]:-$now}
+            # A sighting after now was recorded before the clock was stepped
+            # back (an RTC corrected once NTP answers after boot). Start the
+            # grace again instead of waiting for the clock to catch up.
+            (( since <= now )) || since=$now
             # Each clone writes its meta snippet just before it starts the
             # VM, and a re-clone usually gets the same VMID and name. A
             # snippet written after that sighting belongs to a new VM, whose

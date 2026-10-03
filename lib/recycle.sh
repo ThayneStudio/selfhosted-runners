@@ -93,13 +93,15 @@ slot_backoff_seconds() {
 }
 
 # 0 while slot $1 is held by the backoff, with the seconds left in
-# SLOT_HOLD_LEFT.
+# SLOT_HOLD_LEFT. No hold is set for longer than SLOT_BACKOFF_MAX, so one
+# that ends later was set before the clock was stepped back: it is over,
+# instead of lasting the size of the step on top.
 slot_is_held() {
     local now
     SLOT_HOLD_LEFT=0
     slot_state_load "$1"
     now=$(date +%s)
-    (( SLOT_HOLD_UNTIL > now )) || return 1
+    (( SLOT_HOLD_UNTIL > now && SLOT_HOLD_UNTIL - now <= SLOT_BACKOFF_MAX )) || return 1
     SLOT_HOLD_LEFT=$((SLOT_HOLD_UNTIL - now))
 }
 
