@@ -56,7 +56,7 @@ fill_runner_slot() {
         return 0
     fi
     if clone_runner "$slot" "$org" >/dev/null; then
-        slot_note_clone_success "$slot"
+        slot_note_clone_success "$slot" "${CLONE_MINT_CONFLICT:-1}"
         log_info "[watch] Created $slot"
     else
         # A drain refuses the clone on purpose; that is not the slot failing.

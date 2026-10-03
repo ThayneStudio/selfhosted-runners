@@ -593,10 +593,14 @@ generate_mac() {
 
 # Clone template, configure cloud-init, set hookscript, start VM.
 # Returns VMID on stdout. Returns 1 on failure (cleans up partial clone).
+# Sets CLONE_MINT_CONFLICT to 1 when a runner of this name was still
+# registered on GitHub. An ephemeral runner is removed once it finishes a
+# job, so that means the previous runner of this name never finished one.
 clone_runner() {
     local name="$1" org="$2" vmid="${3:-}"
     local RESERVED_VMID=""
     local pool_lock_owned=0
+    CLONE_MINT_CONFLICT=0
 
     # GITHUB_PAT/GITHUB_ORG must be in scope (caller ran load_org_config).
     if [[ -z "${GITHUB_PAT:-}" || -z "${GITHUB_ORG:-}" ]]; then
@@ -675,6 +679,9 @@ clone_runner() {
     jit_config=$(fetch_jit_config "$name") && mint_rc=0 || mint_rc=$?
     if [[ $mint_rc -eq 2 ]]; then
         # Duplicate name: deregister the stale GitHub-side runner and mint once more.
+        # Read by the callers' failure backoff (recycle.sh).
+        # shellcheck disable=SC2034
+        CLONE_MINT_CONFLICT=1
         deregister_runner "$org" "$name" || true
         jit_config=$(fetch_jit_config "$name") && mint_rc=0 || mint_rc=$?
         if [[ $mint_rc -ne 0 ]]; then

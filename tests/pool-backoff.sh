@@ -102,8 +102,12 @@ logger() { printf '%s\n' "$*" >> "$state/logger"; }
 require_root() { :; }
 cleanup_runner_orphan_volumes() { :; }
 clone_rc=0
+# 1: the mint found the previous runner of this name still registered (it
+# never finished a job). 0: GitHub had already removed it after its job.
+mint_conflict=1
 clone_runner() {
     printf 'clone %s\n' "$1" >> "$actions"
+    CLONE_MINT_CONFLICT=$mint_conflict
     return "$clone_rc"
 }
 
@@ -194,6 +198,17 @@ make_vm 9001 runner-1
 rm -f "$SNIPPETS_DIR/runner-9001-meta.yaml"
 run reclone_main 9001
 [[ "$(clones)" -eq 1 ]] || fail "a VM with an unknown lifetime was held"
+
+# A short job also ends its VM within 120 s of the clone. That runner
+# finished a job, so GitHub no longer lists it and the next mint has no
+# conflict: a stream of short jobs must never hold the slot.
+rm -rf "$SLOT_STATE_DIR"
+mint_conflict=0
+for _ in 1 2 3 4 5; do
+    die_fast
+    [[ "$(clones)" -eq 1 ]] || fail "a stream of short jobs held the slot"
+done
+mint_conflict=1
 
 # A template whose disks were never converted (an interrupted `qm template`)
 # fails every clone after the JIT mint. The watcher must not even try.

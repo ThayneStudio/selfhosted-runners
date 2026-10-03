@@ -5,10 +5,13 @@
 # Per-slot failure backoff, kept in /run so a reboot starts every slot fresh:
 # - A failed clone_runner holds the slot for 30 s, doubling with each failure
 #   in a row up to 30 min. A successful clone clears it.
-# - reclone.sh counts VMs that die within RAPID_DEATH_SECS of their clone,
-#   which ran no job (GitHub rejected the runner, the guest failed to start
-#   it). Every RAPID_DEATH_LIMIT of those in a row leave the slot empty and
-#   hold it, again doubling up to 30 min. A VM that lives longer clears it.
+# - reclone.sh counts VMs that die within RAPID_DEATH_SECS of their clone.
+#   Every RAPID_DEATH_LIMIT of those in a row leave the slot empty and hold
+#   it, again doubling up to 30 min. A VM that lives longer clears the count,
+#   and so does a clone whose JIT mint finds no runner of that name still on
+#   GitHub: GitHub removes an ephemeral runner once it finishes a job, so the
+#   fast death was a short job. A runner that never ran one (GitHub rejected
+#   its version, the guest failed to start it) stays registered.
 # - Neither the watcher nor reclone.sh clones a held slot, so a slot that
 #   fails every time stops minting a JIT runner on every tick.
 set -euo pipefail
@@ -106,10 +109,17 @@ slot_note_clone_failure() {
     log_warn "Holding $name for ${hold}s after $SLOT_FAILURES failed clone(s) in a row"
 }
 
+# Record a successful clone_runner for slot $1. $2 is clone_runner's
+# CLONE_MINT_CONFLICT. Without a conflict the previous runner of this name
+# finished a job, so a fast death before this clone was a short job, not a
+# failure, and the fast-death count starts over.
 slot_note_clone_success() {
-    local name="$1"
+    local name="$1" mint_conflict="${2:-1}"
     slot_state_load "$name"
-    (( SLOT_FAILURES > 0 || SLOT_HOLD_UNTIL > 0 )) || return 0
+    if [[ "$mint_conflict" == 0 ]]; then
+        SLOT_RAPID=0
+        SLOT_DEFERRALS=0
+    fi
     SLOT_FAILURES=0
     SLOT_HOLD_UNTIL=0
     slot_state_save "$name" || log_warn "Could not clear the backoff for $name in $SLOT_STATE_DIR"
@@ -268,7 +278,7 @@ refill_runner_slot() {
     fi
     load_org_config "$org"
     if clone_runner "$name" "$org" >/dev/null; then
-        slot_note_clone_success "$name"
+        slot_note_clone_success "$name" "${CLONE_MINT_CONFLICT:-1}"
         log_info "$tag re-cloned $name for org $org"
         return 0
     fi

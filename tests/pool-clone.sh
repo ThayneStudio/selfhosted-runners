@@ -74,6 +74,22 @@ RUNNER_COUNT=garbled
 [[ "$(kind_of_clone runner-1)" == "selfhosted-runners org=acme" ]] || fail "a kind was guessed without a readable RUNNER_COUNT"
 unset RUNNER_PREFIX RUNNER_COUNT
 
+# CLONE_MINT_CONFLICT tells the backoff whether the previous runner of the
+# name was still registered (it never finished a job).
+deregister_runner() { :; }
+fetch_jit_config() {
+    if [[ -e "$state/stale-runner" ]]; then
+        rm -f "$state/stale-runner"
+        return 2
+    fi
+    printf 'Zm9v\n'
+}
+conflict=$(clone_runner runner-1 acme > /dev/null; printf '%s' "$CLONE_MINT_CONFLICT")
+[[ "$conflict" == 0 ]] || fail "a clean mint reported a conflict"
+: > "$state/stale-runner"
+conflict=$(clone_runner runner-1 acme > /dev/null; printf '%s' "$CLONE_MINT_CONFLICT")
+[[ "$conflict" == 1 ]] || fail "a mint that found the name still registered reported no conflict"
+
 [[ "$(slot_number runner-12 runner)" == 12 ]] || fail "slot_number missed runner-12"
 [[ "$(slot_number my.pool-3 my.pool)" == 3 ]] || fail "slot_number missed a prefix with a dot"
 for name in runner-0 runner-01 runner-x runner- runner ci-runner-1 myxpool-3; do
