@@ -59,6 +59,10 @@ write_files:
       # /etc/docker/certs.d, never /etc/containerd/certs.d; that routes
       # public.ecr.aws through the mirror. HTTP mirrors use overlay2, which
       # reads no hosts.toml. A failed Docker restart refuses to register.
+      # Docker verifies an HTTPS mirror's certificate against the system
+      # roots. Only a mirror addressed by IP literal (IPv4, or IPv6 in
+      # brackets), which usually has a self-signed or internal certificate,
+      # skips that check. The bake applies the same rule.
       if [[ -n "${DOCKER_MIRROR_URL:-}" ]]; then
         log "Configuring Docker mirror for public.ecr.aws: $DOCKER_MIRROR_URL"
         mkdir -p /etc/docker/certs.d/public.ecr.aws
@@ -66,6 +70,10 @@ write_files:
         SUPABASE_IMAGE_REGISTRY="${SUPABASE_IMAGE_REGISTRY#https://}"
         MIRROR_REGISTRY="${SUPABASE_IMAGE_REGISTRY%%/*}"
         mkdir -p "/etc/docker/certs.d/$MIRROR_REGISTRY"
+        MIRROR_TLS=""
+        if [[ "$MIRROR_REGISTRY" == \[* || "${MIRROR_REGISTRY%%:*}" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
+          [[ "$DOCKER_MIRROR_URL" != https://* ]] || MIRROR_TLS=$'\n  skip_verify = true'
+        fi
         if [[ "$DOCKER_MIRROR_URL" == http://* ]]; then
           cat > /etc/docker/daemon.json <<DOCKEREOF
       {
@@ -86,15 +94,13 @@ write_files:
       server = "https://public.ecr.aws"
 
       [host."$DOCKER_MIRROR_URL"]
-        capabilities = ["pull", "resolve"]
-        skip_verify = true
+        capabilities = ["pull", "resolve"]$MIRROR_TLS
       TOMLEOF
         cat > "/etc/docker/certs.d/$MIRROR_REGISTRY/hosts.toml" <<TOMLEOF
       server = "$DOCKER_MIRROR_URL"
 
       [host."$DOCKER_MIRROR_URL"]
-        capabilities = ["pull", "resolve"]
-        skip_verify = true
+        capabilities = ["pull", "resolve"]$MIRROR_TLS
       TOMLEOF
         if systemctl restart docker; then
           log "Docker mirror configured"
