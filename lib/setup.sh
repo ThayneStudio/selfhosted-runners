@@ -138,6 +138,7 @@ record_setup_bake() {
     if [[ "$id" =~ ^[0-9]+$ && "$id" != "$TEMPLATE_ID" ]] && ! vm_confirmed_absent "$id"; then
         log_error "VM $id from an earlier bake is still recorded in $PENDING_BAKE_FILE"
         log_error "Run 'runner rebake' to finish or remove it, then run setup again"
+        log_error "If 'qm config $id' on this node shows no VM named ubuntu-cloud-template, the record is stale; remove it instead: rm $PENDING_BAKE_FILE"
         return 1
     fi
     # A version left by an earlier record does not describe this bake.
@@ -159,7 +160,9 @@ forget_setup_bake() {
 # template. `template: 1` alone is written before qm template converts the
 # disk, and nothing can be cloned from an unconverted one. A signal after the
 # conversion must not destroy the template. A VM left in place keeps its
-# pending-bake record, if it has one, for the next rebake.
+# pending-bake record, if it has one, for the next rebake. A bake that
+# create_bake_vm refused before `qm create` has no VM, and once the cluster
+# inventory confirms that, its record goes, as cleanup_rebake drops its own.
 # After an SSH drop every log write fails (EIO on the hung-up tty, or SIGPIPE
 # through a pipe). Neither errexit nor a second SIGHUP may stop the destroy.
 cleanup_bake() {
@@ -167,6 +170,10 @@ cleanup_bake() {
     set +e
     trap '' HUP PIPE
     if ! cfg=$(qm_host config "$TEMPLATE_ID" 2>/dev/null); then
+        if vm_confirmed_absent "$TEMPLATE_ID"; then
+            forget_setup_bake
+            return 0
+        fi
         log_error "Could not read config for VM $TEMPLATE_ID; leaving it"
         return 0
     fi
@@ -214,9 +221,11 @@ bake_setup_template() {
     if [[ -n "$LIVE_TEMPLATE_ID" ]] && ! record_setup_bake; then
         return 1
     fi
+    # Armed before create_bake_vm, whose checks can refuse before `qm create`,
+    # so that cleanup_bake also drops the record of a VM that never existed.
+    trap cleanup_bake EXIT
     log_info "Creating VM template..."
     create_bake_vm "$TEMPLATE_ID"
-    trap cleanup_bake EXIT
 
     bake_and_publish_vm "$TEMPLATE_ID"
     # qm template exits 0 even when it did not convert the disk.

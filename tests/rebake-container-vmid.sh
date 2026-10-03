@@ -70,11 +70,14 @@ BAKE_VMID=9002
 if (cleanup_rebake 1); then fail "cleanup_rebake reported success after a failed bake"; fi
 assert_dropped "cleanup_rebake"
 
-# Anything short of a readable inventory that names a container keeps it.
-for condition in qemu_elsewhere no_type unreadable malformed; do
+# Anything short of a readable inventory that names a container keeps it. A
+# QEMU VM listed on this node proves nothing either. (recover_pending_bake
+# drops a VMID listed on another node: records-pending-bake.sh.)
+uname() { printf 'pve1\n'; }
+for condition in qemu_here no_type unreadable malformed; do
     inventory_fails=0
     case "$condition" in
-        qemu_elsewhere) mock_inventory='[{"vmid":9002,"type":"qemu","node":"pve2"}]' ;;
+        qemu_here) mock_inventory='[{"vmid":9002,"type":"qemu","node":"pve1"}]' ;;
         no_type) mock_inventory='[{"vmid":9002}]' ;;
         unreadable) inventory_fails=1 ;;
         malformed) mock_inventory='not JSON' ;;
