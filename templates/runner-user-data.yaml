@@ -21,6 +21,17 @@ write_files:
       DOCKER_MIRROR_URL="{{DOCKER_MIRROR_URL}}"
       DNS_SERVERS="{{DNS_SERVERS}}"
 
+  # ACTIONS_RUNNER_HOOK_JOB_STARTED, set by register-runner.sh. The runcmd
+  # shutdown counts from boot, so a job that lands on a long-idle runner would
+  # get only what is left of it. Restart the 6 hours from the job's start.
+  # The runner runs this with bash -e, and a failing hook fails the job.
+  - path: /opt/runner-job-started.sh
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      sudo -n shutdown -c || true
+      sudo -n shutdown -h +360 "Safety timeout: max job runtime reached" || true
+
   - path: /opt/register-runner.sh
     permissions: '0755'
     content: |
@@ -205,7 +216,11 @@ write_files:
       # sudo resets the environment, so run.sh's settings go through env. With
       # ACTIONS_RUNNER_RETURN_VERSION_DEPRECATED_EXIT_CODE=1 (runner 2.333.0+),
       # a runner version GitHub refuses exits 7 instead of looking like success.
-      RUNNER_ENV=(ACTIONS_RUNNER_RETURN_VERSION_DEPRECATED_EXIT_CODE=1)
+      # The job-started hook restarts the safety shutdown when a job starts.
+      RUNNER_ENV=(
+        ACTIONS_RUNNER_RETURN_VERSION_DEPRECATED_EXIT_CODE=1
+        ACTIONS_RUNNER_HOOK_JOB_STARTED=/opt/runner-job-started.sh
+      )
       RUN_STATUS=0
       if [[ -n "${SUPABASE_IMAGE_REGISTRY:-}" ]]; then
         sudo -u $RUNNER_USER env "${RUNNER_ENV[@]}" SUPABASE_INTERNAL_IMAGE_REGISTRY="$SUPABASE_IMAGE_REGISTRY" INTERNAL_IMAGE_REGISTRY="$SUPABASE_IMAGE_REGISTRY" ./run.sh --jitconfig "$JIT" --disableupdate || RUN_STATUS=$?
@@ -220,7 +235,8 @@ write_files:
       # EXIT trap handles shutdown
 
 runcmd:
-  # Hard ceiling: shut down after 6 hours even if run.sh hangs.
+  # Hard ceiling: shut down after 6 hours even if run.sh hangs. This counts
+  # from boot; /opt/runner-job-started.sh restarts it when a job starts.
   # Single-quoted so YAML doesn't parse the colon in "Safety timeout:" as a mapping.
   - 'shutdown -h +360 "Safety timeout: max VM lifetime reached" &'
   - /opt/register-runner.sh 2>&1 | tee /var/log/runner-setup.log

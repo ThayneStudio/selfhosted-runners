@@ -278,4 +278,29 @@ in_run_env ACTIONS_RUNNER_RETURN_VERSION_DEPRECATED_EXIT_CODE=1 \
 in_run_env SUPABASE_INTERNAL_IMAGE_REGISTRY=10.20.1.19:5000 || fail "the Supabase registry override did not reach run.sh"
 DOCKER_MIRROR_URL=""
 
+# Job ceiling. The runcmd shutdown counts from boot, and the job-started hook
+# restarts it when a job starts. run.sh must see the hook through sudo, and
+# every clone must have the file: the runner fails the job if it is missing.
+boot job-started-hook
+assert_ran "job-started hook"
+hook=$(sed -n 's/^ACTIONS_RUNNER_HOOK_JOB_STARTED=//p' "$state/run-env")
+[[ -n "$hook" ]] || fail "run.sh did not see ACTIONS_RUNNER_HOOK_JOB_STARTED"
+[[ "$hook" == "$guest"/* && -f "$hook" ]] || fail "the job-started hook $hook is not on the clone"
+write_file_paths "$user_data" | grep -qxF "${hook#"$guest"}" || fail "the job-started hook is not written by user-data"
+# The runner runs a .sh hook with bash -e, so the hook itself must not fail.
+: > "$state/calls"
+GUEST_STATE=$state PATH="$bin:$PATH" "$BASH" -e -o pipefail "$hook" > "$state/hook-out" 2>&1 \
+    || fail "the job-started hook failed: $(cat "$state/hook-out")"
+called "shutdown -c" || fail "the job-started hook did not cancel the boot-time shutdown"
+[[ "$(grep '^shutdown ' "$state/calls" | tail -1)" == "shutdown -h +360 Safety timeout: max job runtime reached" ]] \
+    || fail "the job-started hook did not restart the 6-hour shutdown: $(cat "$state/calls")"
+mkdir -p "$work/bin-sudo-fails"
+printf '#!/bin/bash\nexit 1\n' > "$work/bin-sudo-fails/sudo"
+chmod +x "$work/bin-sudo-fails/sudo"
+GUEST_STATE=$state PATH="$work/bin-sudo-fails:$bin:$PATH" "$BASH" -e -o pipefail "$hook" >/dev/null 2>&1 \
+    || fail "the job-started hook fails the job when sudo fails"
+# The boot-time shutdown stays: it is the ceiling for an idle runner.
+awk '/^runcmd:/ { r = 1; next } r && /^  - / && /shutdown -h \+360 / { found = 1 } END { exit !found }' "$user_data" \
+    || fail "runcmd no longer schedules the boot-time shutdown"
+
 printf 'guest-register-runner: ok\n'
