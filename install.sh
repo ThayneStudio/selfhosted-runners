@@ -54,18 +54,18 @@ if [[ -f /etc/github-runners.conf ]]; then
     echo "Do not install or enable it while a template bake is still running."
     # Prune obsolete per-org snippets. These embedded the org PAT; the PAT now
     # stays on the host and a single-use JIT config is rendered per-VM at clone time.
-    pruned_pat_snippets=0
     if compgen -G "/var/lib/vz/snippets/runner-user-data-*.yaml" > /dev/null; then
         rm -f /var/lib/vz/snippets/runner-user-data-*.yaml
         echo "  Removed obsolete per-org PAT snippets"
-        pruned_pat_snippets=1
     fi
     echo "Done. No need to re-run setup."
-    # Only VMs cloned from those snippets hold the PAT. Without them, the pool
-    # was cloned with JIT configs, or an earlier run removed them and warned.
-    if [[ "$pruned_pat_snippets" == 1 ]]; then
+    # VMs cloned from those snippets keep the PAT until they are destroyed.
+    # Look for the VMs, not the snippets: an earlier run may have removed the
+    # snippets, and clones made with JIT configs never held the PAT.
+    pat_vms=$(grep -ls '^cicustom:.*user=local:snippets/runner-user-data-' /etc/pve/nodes/*/qemu-server/*.conf | wc -l) || pat_vms=0
+    if (( pat_vms > 0 )); then
         echo ""
-        echo "WARNING: runner VMs cloned from the removed snippets still have the org PAT"
+        echo "WARNING: $((pat_vms)) runner VM(s) cloned from the old per-org snippets still have the org PAT"
         echo "on their cloud-init drive, where any job they run can read it, until they are"
         echo "destroyed. Recycle the pool to destroy them, now or once the first rebake has"
         echo "published a new template:"

@@ -127,22 +127,22 @@ write_infra_config() {
 
 # Prune obsolete per-org snippets that embedded the org PAT. Cloud-init is now
 # rendered per-VM at clone time with a single-use JIT config; the PAT stays
-# on the host. VMs cloned from those snippets still hold the PAT, so
-# PAT_SNIPPETS_PRUNED records for warn_pat_snippet_vms whether this run
-# removed any.
+# on the host.
 prune_pat_snippets() {
-    PAT_SNIPPETS_PRUNED=0
     compgen -G "$SNIPPETS_DIR/runner-user-data-*.yaml" > /dev/null || return 0
     rm -f "$SNIPPETS_DIR"/runner-user-data-*.yaml
     log_info "Removed obsolete per-org PAT snippets"
-    PAT_SNIPPETS_PRUNED=1
 }
 
-# Without those snippets, the pool was cloned with JIT configs, or an earlier
-# run removed them and warned.
+# VMs cloned from those snippets keep the PAT on their cloud-init drive until
+# they are destroyed. Look for the VMs, not the snippets: a run that removed
+# the snippets can fail before it warns, and clones made with JIT configs
+# never held the PAT.
 warn_pat_snippet_vms() {
-    [[ "${PAT_SNIPPETS_PRUNED:-0}" == 1 ]] || return 0
-    log_warn "Runner VMs cloned from the removed snippets still have the org PAT on their cloud-init drive, where any job they run can read it."
+    local count
+    count=$(grep -ls '^cicustom:.*user=local:snippets/runner-user-data-' "$PVE_NODES_DIR"/*/qemu-server/*.conf | wc -l) || count=0
+    (( count > 0 )) || return 0
+    log_warn "$((count)) runner VM(s) cloned from the old per-org snippets still have the org PAT on their cloud-init drive, where any job they run can read it."
     log_warn "Recycle the pool to destroy them: runner stop && runner start"
     echo ""
 }
