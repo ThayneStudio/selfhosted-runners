@@ -87,7 +87,9 @@ pool_is_draining() {
 }
 
 enable_pool_drain() {
-    install -d -m 755 "$(dirname "$POOL_DRAIN_FILE")"
+    # /run/lock is 1777 on Debian. mkdir -p leaves an existing directory's
+    # mode alone; install -d -m 755 would chmod it and lock out non-root users.
+    mkdir -p "$(dirname "$POOL_DRAIN_FILE")"
     : > "$POOL_DRAIN_FILE"
 }
 
