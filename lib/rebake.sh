@@ -23,6 +23,11 @@ PENDING_VERSION_FILE="$STATE_DIR/pending-version"
 REBAKE_LOCK_FILE="/run/lock/github-runner-rebake.lock"
 REBAKE_UNIT_FILE="/etc/systemd/system/github-runner-rebake.service"
 REBAKE_LOG_FILE="/var/log/github-runner-rebake.log"
+# An hour past the guest-poll limit. The download, qm importdisk and qm
+# template sit outside BAKE_TIMEOUT; without a finite start timeout a hang
+# there holds the rebake lock and the daily timer never runs again.
+REBAKE_START_HEADROOM=3600
+REBAKE_DROPIN_FILE="/etc/systemd/system/github-runner-rebake.service.d/timeout.conf"
 
 REBAKE_PUBLISHED=0
 BAKE_VMID=""
@@ -661,6 +666,60 @@ perform_bake() {
     log_info "TEMPLATE_ID is now $new_vmid. Running clones stay on $old_template until their next reclone."
 }
 
+# Poll limit this run will use, from the conf rather than a one-run
+# environment value. The service does not see that environment. Empty or
+# invalid means the script default.
+conf_bake_timeout_seconds() {
+    local seconds=5400
+    if [[ -f "$CONFIG_FILE" ]]; then
+        seconds=$(
+            unset BAKE_TIMEOUT
+            # shellcheck disable=SC1090
+            source "$CONFIG_FILE"
+            printf '%s\n' "${BAKE_TIMEOUT:-5400}"
+        ) || seconds=5400
+    fi
+    [[ "$seconds" =~ ^[1-9][0-9]*$ ]] || seconds=5400
+    printf '%s\n' "$seconds"
+}
+
+# TimeoutStartSec for the rebake oneshot: the conf's BAKE_TIMEOUT plus an
+# hour. The unit file carries the default (5400+3600) for a host whose
+# drop-in has not been written yet.
+write_rebake_timeout_dropin() {
+    local seconds dropin dir tmp
+    dropin=${REBAKE_DROPIN_FILE:-/etc/systemd/system/github-runner-rebake.service.d/timeout.conf}
+    # Tests and hosts without systemd leave the unit file's own cap in place.
+    if [[ -z "${REBAKE_DROPIN_FILE+x}" || "$REBAKE_DROPIN_FILE" == /etc/systemd/system/github-runner-rebake.service.d/timeout.conf ]] \
+        && [[ ! -d /etc/systemd/system ]]; then
+        return 0
+    fi
+    # Called as `write_rebake_timeout_dropin || log_warn ...`, which turns
+    # errexit off for this function, so each step has to report its own failure.
+    seconds=$(conf_bake_timeout_seconds) || return 1
+    seconds=$(( seconds + REBAKE_START_HEADROOM ))
+    dir=$(dirname "$dropin")
+    if ! mkdir -p "$dir"; then
+        log_error "Could not create $dir for the rebake start timeout"
+        return 1
+    fi
+    tmp=$(mktemp "$dir/timeout.conf.XXXXXX") || return 1
+    {
+        printf '%s\n' '[Service]'
+        printf '%s\n' '# An hour past BAKE_TIMEOUT. The poll does not cover the image download,'
+        printf '%s\n' '# qm importdisk or qm template. This ends a hang so the rebake lock drops.'
+        printf 'TimeoutStartSec=%s\n' "$seconds"
+    } > "$tmp" || { rm -f "$tmp"; return 1; }
+    chmod 644 "$tmp" || { rm -f "$tmp"; return 1; }
+    if ! mv "$tmp" "$dropin"; then
+        rm -f "$tmp"
+        return 1
+    fi
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl daemon-reload || log_warn "Could not reload systemd; $dropin applies on the next daemon-reload"
+    fi
+}
+
 detach_rebake_from_ssh() {
     if [[ "${REBAKE_FOREGROUND:-}" == 1 || -n "${INVOCATION_ID:-}" || "${REBAKE_DETACHED:-}" == 1 ]]; then
         return 0
@@ -725,6 +784,8 @@ rebake_main() {
     # Refuse a bad override here, where the caller sees it.
     check_bake_timeout || exit 1
     check_bake_min_free_gib || exit 1
+    # Reload the start timeout before systemd latches it for this job.
+    write_rebake_timeout_dropin || log_warn "The rebake start timeout was not updated"
     detach_rebake_from_ssh
     trap '' HUP PIPE
     if ! command -v qm >/dev/null 2>&1; then

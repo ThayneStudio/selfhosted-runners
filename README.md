@@ -564,12 +564,17 @@ the bake. Follow it with `journalctl -u github-runner-rebake.service -f`, or
 `/var/log/github-runner-rebake.log` when it detached with `setsid`.
 `runner rebake` with `BAKE_TIMEOUT` or `BAKE_MIN_FREE_GIB` set in the
 environment always detaches with `setsid`, because `systemctl start` cannot
-pass that environment into the unit. The unit's `TimeoutStartSec` is
-`infinity`. The bake script's own `BAKE_TIMEOUT` stops a long bake, including
-one the timer started from the conf, and a fixed start timeout would kill a
-bake that was still inside a larger configured value. `TimeoutStopSec=180`
-and `KillMode=mixed` still apply when the service is stopped, so the script's
-trap can destroy a partial VM. It checks an environment override before it
+pass that environment into the unit. The unit's `TimeoutStartSec` is 9000
+by default: the 5400-second poll limit plus an hour for the cloud-image
+download, `qm importdisk` and `qm template`, which `BAKE_TIMEOUT` does not
+cover. When `BAKE_TIMEOUT` is set in the conf, `runner setup`, `install.sh`
+and `runner rebake` write
+`/etc/systemd/system/github-runner-rebake.service.d/timeout.conf` with
+`TimeoutStartSec` set to that many seconds plus 3600, and reload systemd,
+before the service starts. A one-run environment value does not change the
+drop-in. `TimeoutStopSec=180` and `KillMode=mixed` still apply when the
+service is stopped, so the script's trap can destroy a partial VM before
+leftover `qm` children are killed. It checks an environment override before it
 detaches, so a bad one fails in the terminal with exit status 1. A bad value
 in the conf fails with the same message once the rebake has read the file,
 before it creates a VM. `runner rebake --foreground` stays attached; run that

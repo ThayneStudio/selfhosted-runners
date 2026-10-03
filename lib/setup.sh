@@ -615,6 +615,7 @@ cp "$INSTALL_DIR/templates/github-runner-watch.service" /etc/systemd/system/
 cp "$INSTALL_DIR/templates/github-runner-watch.timer" /etc/systemd/system/
 cp "$INSTALL_DIR/templates/github-runner-rebake.service" /etc/systemd/system/
 cp "$INSTALL_DIR/templates/github-runner-rebake.timer" /etc/systemd/system/
+write_rebake_timeout_dropin || log_warn "The rebake start timeout was not updated"
 systemctl daemon-reload
 systemctl enable --now github-runner-watch.timer 2>/dev/null || true
 systemctl enable --now github-runner-rebake.timer 2>/dev/null || true

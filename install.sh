@@ -102,6 +102,9 @@ if [[ -f /etc/github-runners.conf ]]; then
     fi
     cp "$INSTALL_DIR/templates/github-runner-rebake.service" /etc/systemd/system/
     cp "$INSTALL_DIR/templates/github-runner-rebake.timer" /etc/systemd/system/
+    # shellcheck source=lib/rebake.sh
+    source "$INSTALL_DIR/lib/rebake.sh"
+    write_rebake_timeout_dropin || log_warn "The rebake start timeout was not updated"
     systemctl daemon-reload
     systemctl enable --now github-runner-rebake.timer 2>/dev/null || true
     echo "Template rebake timer enabled (daily, separate from the pool watcher)."

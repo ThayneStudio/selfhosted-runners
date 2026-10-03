@@ -297,8 +297,8 @@ write_limits 120 0
 load_limits 180
 poll_for 3
 
-grep -qx 'TimeoutStartSec=infinity' "$root/templates/github-runner-rebake.service" \
-    || fail "the rebake unit still caps the bake with a fixed TimeoutStartSec"
+grep -qx 'TimeoutStartSec=9000' "$root/templates/github-runner-rebake.service" \
+    || fail "the rebake unit's default cap is not the default poll limit plus an hour"
 grep -qx 'TimeoutStopSec=180' "$root/templates/github-runner-rebake.service" \
     || fail "TimeoutStopSec no longer gives cleanup time to destroy a partial VM"
 grep -qx 'KillMode=mixed' "$root/templates/github-runner-rebake.service" \
