@@ -266,7 +266,9 @@ retire_retired_templates() {
             continue
         fi
         log_info "No linked clones depend on template $id; destroying it"
-        if ! qm_host destroy "$id" --purge; then
+        # No --purge: it also deletes the VMID from backup-job include and
+        # exclude lists, and that VMID is handed out again.
+        if ! qm_host destroy "$id"; then
             log_warn "Failed to destroy template $id; leaving it in place"
             printf '%s\n' "$id" >> "$kept_file"
         fi
@@ -318,7 +320,7 @@ cleanup_rebake() {
                     # template writes the flag first, and no clone can use it.
                     log_warn "Rebake failed; destroying partial VM $BAKE_VMID and leaving template ${TEMPLATE_ID} unchanged"
                     qm_host stop "$BAKE_VMID" --timeout 30 2>/dev/null || true
-                    if qm_host destroy "$BAKE_VMID" --purge; then
+                    if qm_host destroy "$BAKE_VMID"; then
                         rm -f "$PENDING_BAKE_FILE" "$PENDING_VERSION_FILE"
                     else
                         log_error "Could not destroy partial VM $BAKE_VMID; it stays recorded in $PENDING_BAKE_FILE"
@@ -390,7 +392,7 @@ recover_pending_bake() {
     # This includes `template: 1` over disks that were never converted.
     log_warn "Destroying incomplete rebake VM $id"
     qm_host stop "$id" --timeout 30 2>/dev/null || true
-    if qm_host destroy "$id" --purge; then
+    if qm_host destroy "$id"; then
         rm -f "$PENDING_BAKE_FILE" "$PENDING_VERSION_FILE"
         return 0
     fi
