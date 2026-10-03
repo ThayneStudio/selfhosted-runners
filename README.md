@@ -508,15 +508,16 @@ It refuses to start unless `pvesm status` shows the storage active with at
 least 30 GiB available, the size of the bake disk, because a storage that fills
 up pauses every VM on it. On thick-provisioned ZFS the floor is 60 GiB (see
 [Resource Planning](#resource-planning)). `BAKE_MIN_FREE_GIB=<GiB>`, a whole
-number, replaces that floor, and `0` turns the check off. For one run, put it
-on the command line of `runner setup` or `runner rebake`, as the refusal
-suggests; `runner rebake` then detaches with `setsid` (below). Runs through
-`github-runner-rebake.service` (the timer, and `runner rebake` without
-`--foreground`, `BAKE_TIMEOUT` or `BAKE_MIN_FREE_GIB`) take it from a drop-in:
-run `systemctl edit github-runner-rebake.service` and add
-`Environment=BAKE_MIN_FREE_GIB=<GiB>` under `[Service]`. Setting it in
-`/etc/github-runners.conf` also works for the rebake, until `runner setup`
-rewrites that file with only its eight keys.
+number, replaces that floor, and `0` turns the check off. Set it, and
+`BAKE_TIMEOUT`, in `/etc/github-runners.conf`. The daily rebake and `runner
+setup` both use them, and `runner setup` keeps the lines when it rewrites that
+file. For one run, put either value on the command line of `runner setup` or
+`runner rebake`, as the refusal suggests. That value wins over the conf, and
+`runner rebake` then detaches with `setsid` (below). Leave both out of a
+systemd drop-in. `timeout.conf` is applied after `override.conf`, so a
+`TimeoutStartSec` in the operator's drop-in cannot raise the cap, and an
+`Environment=BAKE_TIMEOUT=` there would let the guest poll run for longer than
+that cap allows.
 
 The host picks the `actions/runner` release for each bake: the rebake uses the
 release it just compared, and setup looks up the latest release once when its
@@ -563,11 +564,26 @@ afterward, so `qm guest exec` cannot read it later.
 unit is installed, otherwise `setsid`) so a dropped connection does not kill
 the bake. Follow it with `journalctl -u github-runner-rebake.service -f`, or
 `/var/log/github-runner-rebake.log` when it detached with `setsid`.
-`runner rebake` with `BAKE_TIMEOUT` or `BAKE_MIN_FREE_GIB` set always detaches
-with `setsid`, because the service cannot see those variables, and the
-service's 2-hour `TimeoutStartSec` does not apply to it. It checks both values
-before it detaches, so a bad one fails in the terminal with exit status 1.
-`runner rebake --foreground` stays attached; run that form inside tmux.
+`runner rebake` with `BAKE_TIMEOUT` or `BAKE_MIN_FREE_GIB` set in the
+environment always detaches with `setsid`, because `systemctl start` cannot
+pass that environment into the unit. The unit's `TimeoutStartSec` is 9000
+by default: the 5400-second poll limit plus an hour for the cloud-image
+download, `qm importdisk` and `qm template`, which `BAKE_TIMEOUT` does not
+cover. When `BAKE_TIMEOUT` is set in the conf, `runner setup`, `install.sh`
+and `runner rebake` write
+`/etc/systemd/system/github-runner-rebake.service.d/timeout.conf` with
+`TimeoutStartSec` set to that many seconds plus 3600, and reload systemd,
+before the service starts. A one-run environment value does not change the
+drop-in, because the service does not see it. When this process is the
+service, the drop-in uses the greater of the conf value and the service's
+`BAKE_TIMEOUT`, plus 3600, so a limit the unit already carries is covered.
+systemd keeps the cap it latched when the job started, so that write applies
+to the next start. `TimeoutStopSec=180` and `KillMode=mixed` still apply when the
+service is stopped, so the script's trap can destroy a partial VM before
+leftover `qm` children are killed. It checks an environment override, and
+the conf, before it detaches, so a bad value fails in the terminal with
+exit status 1 rather than only in the journal. `runner rebake --foreground`
+stays attached; run that form inside tmux.
 
 A healthy bake is 30–45 minutes. The guest writes
 `/opt/.template-setup-complete` last and does not power itself off. The host
@@ -579,9 +595,11 @@ fails the bake. A setup that fails before the guest agent runs (network, DNS or
 apt in the first steps) powers the VM off, and the host reports
 `Template VM stopped before setup completion was confirmed (status: stopped)`.
 That leaves the timeout for a guest that hangs: the bake aborts after 90
-minutes (`BAKE_TIMEOUT`, default 5400). `BAKE_TIMEOUT` must be a positive
-whole number of seconds, such as `7200`. A value such as `2h`, `90m`, `0` or
-`0900` is refused with
+minutes (`BAKE_TIMEOUT`, default 5400). Set `BAKE_TIMEOUT` to a positive
+whole number of seconds in `/etc/github-runners.conf`, such as `7200`, to
+change it for the daily rebake and for setup. An environment value on one
+run wins over the conf. A value such as `2h`, `90m`, `0` or `0900` is refused
+with
 `BAKE_TIMEOUT must be a whole number of seconds, such as 7200, not '<value>'`
 before a bake VM is created. Stopping the bake VM before the completion marker
 is confirmed destroys the partial VM and does not publish it.
@@ -678,10 +696,14 @@ mirror inputs disable those options; an empty DNS input selects
 [Network Requirements](#network-requirements)), and the summary shows
 `DNS Servers: DHCP only`. A saved `DNS_SERVERS` that is empty or missing is
 prefilled as `dhcp`, so Enter keeps it. With no saved config, or with piped
-input, an empty line selects the standard default. Setup rewrites
-`/etc/github-runners.conf` with its eight keys only, so anything else added
-there is dropped. Org configs and PATs are not touched; `add-org` runs only
-when no orgs exist yet. Run `runner setup` under tmux. It is interactive, and
+input, an empty line selects the standard default. Setup replaces a line
+only when it is exactly one assignment of one of the eight keys it prompts
+for, and keeps every other line, so `BAKE_TIMEOUT`, `BAKE_MIN_FREE_GIB`, a
+second command on the same line and a value continued on the next line stay.
+The new assignment is appended, so it wins when the file is sourced. If that
+result is not valid shell, or sourcing it still does not set one of those keys
+to the new value, the old file is left unchanged. Org configs and
+PATs are not touched; `add-org` runs only when no orgs exist yet. Run `runner setup` under tmux. It is interactive, and
 a dropped SSH session fires the cleanup trap and throws away an in-progress
 setup bake.
 
@@ -761,7 +783,12 @@ stops partway, run `install.sh` again at once.
    curl -fsSL https://raw.githubusercontent.com/ThayneStudio/selfhosted-runners/master/install.sh | bash
    ```
    It refreshes the hookscript and the systemd units and enables
-   `github-runner-rebake.timer`. On a host that still has the per-org snippets
+   `github-runner-rebake.timer`. When `/etc/github-runners.conf` exists, it
+   then checks that `TEMPLATE_ID` is a finished template. If it is, it says
+   there is no need to re-run setup. If it is not, it says so and tells you
+   to run `runner setup`. If `qm` is unavailable, pmxcfs is not serving
+   `/etc/pve`, or the check cannot be made, it says it could not check. On a
+   host that still has the per-org snippets
    of a version before single-use JIT configs
    (`/var/lib/vz/snippets/runner-user-data-<org>.yaml`, which held the org PAT),
    it also removes them. While any VM's cicustom still names one of those

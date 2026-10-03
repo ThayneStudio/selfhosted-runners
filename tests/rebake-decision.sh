@@ -144,7 +144,7 @@ fi
 [[ -z "$LATEST_RUNNER_PUBLISHED_AT" ]] || fail "null published_at was not cleared: ${LATEST_RUNNER_PUBLISHED_AT}"
 unset -f curl
 
-# awk failing must not replace the config or retire the live template.
+# A rejected rewrite must not replace the config or retire the live template.
 # switch_template_id is invoked under `||`, which is what used to hide the
 # failure and still update TEMPLATE_ID.
 switch_conf=$(mktemp)
@@ -157,11 +157,11 @@ CONFIG_FILE=$switch_conf
 TEMPLATE_ID=9000
 STATE_DIR=$switch_state
 RETIRED_TEMPLATES_FILE=$switch_state/retired-templates
-awk() { return 1; }
+bash() { return 1; }
 status=0
 switch_template_id 9100 || status=$?
-unset -f awk
-[[ "$status" -ne 0 ]] || fail "switch_template_id returned 0 after awk failed"
+unset -f bash
+[[ "$status" -ne 0 ]] || fail "switch_template_id returned 0 after the rewrite was rejected"
 [[ "$TEMPLATE_ID" == "9000" ]] || fail "shell TEMPLATE_ID changed after a failed switch: ${TEMPLATE_ID}"
 cmp -s "$switch_conf" "$switch_conf.orig" || fail "config file changed after a failed TEMPLATE_ID update"
 [[ ! -e "$RETIRED_TEMPLATES_FILE" ]] || fail "retired template list was written after a failed switch"

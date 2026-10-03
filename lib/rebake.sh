@@ -23,6 +23,11 @@ PENDING_VERSION_FILE="$STATE_DIR/pending-version"
 REBAKE_LOCK_FILE="/run/lock/github-runner-rebake.lock"
 REBAKE_UNIT_FILE="/etc/systemd/system/github-runner-rebake.service"
 REBAKE_LOG_FILE="/var/log/github-runner-rebake.log"
+# An hour past the guest-poll limit. The download, qm importdisk and qm
+# template sit outside BAKE_TIMEOUT; without a finite start timeout a hang
+# there holds the rebake lock and the daily timer never runs again.
+REBAKE_START_HEADROOM=3600
+REBAKE_DROPIN_FILE="/etc/systemd/system/github-runner-rebake.service.d/timeout.conf"
 
 REBAKE_PUBLISHED=0
 BAKE_VMID=""
@@ -107,31 +112,178 @@ unquote_shell_literal() {
     printf '%s' "$value"
 }
 
+# 0 when $1 is one shell word, or empty, with only trailing whitespace.
+# printf %q output is one word (quotes or backslash escapes). A second word,
+# an unclosed quote, or ; & | and the other command separators are not.
+conf_value_is_one_word() {
+    local s="$1" i=0 n c closed
+    n=${#s}
+    while (( i < n )); do
+        c=${s:i:1}
+        if [[ "$c" =~ [[:space:]] ]]; then
+            [[ "${s:i}" =~ ^[[:space:]]*$ ]]
+            return
+        fi
+        case "$c" in
+            "'")
+                i=$((i + 1))
+                [[ "${s:i}" == *"'"* ]] || return 1
+                while (( i < n )) && [[ ${s:i:1} != "'" ]]; do
+                    i=$((i + 1))
+                done
+                (( i < n )) || return 1
+                i=$((i + 1))
+                ;;
+            '"')
+                i=$((i + 1))
+                closed=0
+                while (( i < n )); do
+                    c=${s:i:1}
+                    if [[ $c == \\ ]]; then
+                        i=$((i + 2))
+                        continue
+                    fi
+                    if [[ $c == '"' ]]; then
+                        i=$((i + 1))
+                        closed=1
+                        break
+                    fi
+                    i=$((i + 1))
+                done
+                (( closed == 1 )) || return 1
+                ;;
+            '$')
+                # $'...' is one word. $var and $(...) are left in place: the
+                # appended assignment then wins, and a half-parsed substitution
+                # cannot swallow the rest of the file.
+                [[ ${s:i:2} == "$'" ]] || return 1
+                i=$((i + 2))
+                closed=0
+                while (( i < n )); do
+                    c=${s:i:1}
+                    if [[ $c == \\ ]]; then
+                        i=$((i + 2))
+                        continue
+                    fi
+                    if [[ $c == "'" ]]; then
+                        i=$((i + 1))
+                        closed=1
+                        break
+                    fi
+                    i=$((i + 1))
+                done
+                (( closed == 1 )) || return 1
+                ;;
+            \\)
+                (( i + 1 < n )) || return 1
+                i=$((i + 2))
+                ;;
+            ';'|'&'|'|'|'<'|'>'|'('|')'|'`'|'#')
+                return 1
+                ;;
+            *)
+                i=$((i + 1))
+                ;;
+        esac
+    done
+}
+
+# Print the key when $1 is exactly one assignment of a key setup prompts for.
+conf_exact_assignment_key() {
+    local line="$1" key value
+    [[ "$line" =~ ^[[:space:]]*(export[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]] || return 1
+    key=${BASH_REMATCH[2]}
+    value=${BASH_REMATCH[3]}
+    case "$key" in
+        NETWORK_BRIDGE|VLAN_TAG|VM_STORAGE|TEMPLATE_ID|MIN_VMID|BALLOON|DNS_SERVERS|DOCKER_MIRROR_URL) ;;
+        *) return 1 ;;
+    esac
+    conf_value_is_one_word "$value" || return 1
+    printf '%s\n' "$key"
+}
+
+# 0 when sourcing $1 in a clean shell leaves $2 set to $3.
+# The probe exits 42 after printing the value. set -e is on, and a sourced
+# exit skips the print: that must not look like an empty value. $2 is passed
+# as a parameter so the name is not interpolated into the script.
+conf_file_sets() {
+    local file="$1" key="$2" value="$3" got status
+    [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 1
+    # shellcheck disable=SC2016 # $1 and ${!2-} expand in the clean shell, not here
+    if got=$(env -i bash -c 'set -e; . "$1"; printf %s "${!2-}"; exit 42' bash "$file" "$key"); then
+        status=0
+    else
+        status=$?
+    fi
+    [[ "$status" -eq 42 ]] || return 1
+    [[ "$got" == "$value" ]]
+}
+
+# 0 when $1 sources to $2=$3. When it does not, append one exact assignment
+# and check again. 1 when the sourced value is still wrong. 2 when that
+# append could not be written. Callers leave the previous file in place.
+confirm_conf_assignment() {
+    local file="$1" key="$2" value="$3"
+    if conf_file_sets "$file" "$key" "$value"; then
+        return 0
+    fi
+    printf '%s=%q\n' "$key" "$value" >> "$file" || return 2
+    conf_file_sets "$file" "$key" "$value"
+}
+
 set_conf_assignment() {
-    local file="$1" key="$2" value="$3" tmp quoted
-    printf -v quoted '%q' "$value"
-    tmp=$(mktemp "${file}.XXXXXX")
+    local file="$1" key="$2" value="$3" tmp line found=0 syntax status
     # Callers invoke this under `||`, which disables errexit for the whole
-    # function. A failed awk must not chmod and mv a truncated file into place.
-    CONF_KEY="$key" CONF_VALUE="$quoted" awk '
-        index($0, ENVIRON["CONF_KEY"] "=") == 1 {
-            print ENVIRON["CONF_KEY"] "=" ENVIRON["CONF_VALUE"]
-            found = 1
-            next
-        }
-        { print }
-        END {
-            if (!found) {
-                print ENVIRON["CONF_KEY"] "=" ENVIRON["CONF_VALUE"]
-            }
-        }
-    ' "$file" > "$tmp" || {
+    # function, so each step reports its own failure. A line is replaced only
+    # when it is exactly one assignment of this key. Anything else stays,
+    # including a second command on the line. bash -n runs before the mv.
+    # The temp file is then sourced in a clean shell. If the key is still not
+    # the new value, an exact assignment is appended and the file is sourced
+    # again. A result that is not valid shell, or that still does not set the
+    # key, leaves the old file.
+    tmp=$(mktemp "${file}.XXXXXX") || {
+        log_error "Failed to update $key in $file"
+        return 1
+    }
+    {
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            if [[ "$(conf_exact_assignment_key "$line" || true)" == "$key" ]]; then
+                printf '%s=%q\n' "$key" "$value"
+                found=1
+            else
+                printf '%s\n' "$line"
+            fi
+        done < "$file"
+        if [[ "$found" == 0 ]]; then
+            printf '%s=%q\n' "$key" "$value"
+        fi
+    } > "$tmp" || {
         rm -f "$tmp"
         log_error "Failed to update $key in $file"
         return 1
     }
-    chmod 600 "$tmp"
-    mv -f "$tmp" "$file"
+    if ! syntax=$(bash -n "$tmp" 2>&1); then
+        log_error "Not replacing $file: the rewritten file is not valid shell, so the old one is unchanged"
+        [[ -z "$syntax" ]] || log_error "$syntax"
+        rm -f "$tmp"
+        return 1
+    fi
+    status=0
+    confirm_conf_assignment "$tmp" "$key" "$value" || status=$?
+    if [[ "$status" -ne 0 ]]; then
+        rm -f "$tmp"
+        if [[ "$status" -eq 2 ]]; then
+            log_error "Failed to update $key in $file"
+        else
+            log_error "Not replacing $file: sourcing it does not set $key to the new value, so the old one is unchanged"
+        fi
+        return 1
+    fi
+    if ! chmod 600 "$tmp" || ! mv -f "$tmp" "$file"; then
+        rm -f "$tmp"
+        log_error "Failed to update $key in $file"
+        return 1
+    fi
 }
 
 write_baked_record() {
@@ -661,15 +813,94 @@ perform_bake() {
     log_info "TEMPLATE_ID is now $new_vmid. Running clones stay on $old_template until their next reclone."
 }
 
+# Seconds the start timeout has to clear. The conf value, or the script
+# default. While this process is the systemd unit, also the unit's own
+# BAKE_TIMEOUT: that environment is a limit the run will use, and the cap
+# has to sit above it. A one-run value in an ordinary shell is not, because
+# the unit does not receive it. Empty or invalid means the script default.
+conf_bake_timeout_seconds() {
+    local from_conf=5400
+    if [[ -f "$CONFIG_FILE" ]]; then
+        from_conf=$(
+            unset BAKE_TIMEOUT
+            # shellcheck disable=SC1090
+            source "$CONFIG_FILE"
+            printf '%s\n' "${BAKE_TIMEOUT:-5400}"
+        ) || from_conf=5400
+    fi
+    [[ "$from_conf" =~ ^[1-9][0-9]*$ ]] || from_conf=5400
+    if [[ -n "${INVOCATION_ID:-}" && "${BAKE_TIMEOUT:-}" =~ ^[1-9][0-9]*$ ]] \
+        && (( BAKE_TIMEOUT > from_conf )); then
+        printf '%s\n' "$BAKE_TIMEOUT"
+        return 0
+    fi
+    printf '%s\n' "$from_conf"
+}
+
+# TimeoutStartSec for the rebake oneshot: an hour past the limit that run
+# can use. The unit file carries the default (5400+3600) for a host whose
+# drop-in has not been written yet.
+write_rebake_timeout_dropin() {
+    local seconds dropin dir tmp
+    dropin=${REBAKE_DROPIN_FILE:-/etc/systemd/system/github-runner-rebake.service.d/timeout.conf}
+    # Tests and hosts without systemd leave the unit file's own cap in place.
+    if [[ -z "${REBAKE_DROPIN_FILE+x}" || "$REBAKE_DROPIN_FILE" == /etc/systemd/system/github-runner-rebake.service.d/timeout.conf ]] \
+        && [[ ! -d /etc/systemd/system ]]; then
+        return 0
+    fi
+    # Called as `write_rebake_timeout_dropin || log_warn ...`, which turns
+    # errexit off for this function, so each step has to report its own failure.
+    seconds=$(conf_bake_timeout_seconds) || return 1
+    seconds=$(( seconds + REBAKE_START_HEADROOM ))
+    dir=$(dirname "$dropin")
+    if ! mkdir -p "$dir"; then
+        log_error "Could not create $dir for the rebake start timeout"
+        return 1
+    fi
+    tmp=$(mktemp "$dir/timeout.conf.XXXXXX") || return 1
+    {
+        printf '%s\n' '[Service]'
+        printf '%s\n' '# An hour past the bake limit this unit can run with. The poll does not'
+        printf '%s\n' '# cover the image download, qm importdisk or qm template. This ends a hang'
+        printf '%s\n' '# so the rebake lock drops.'
+        printf 'TimeoutStartSec=%s\n' "$seconds"
+    } > "$tmp" || { rm -f "$tmp"; return 1; }
+    chmod 644 "$tmp" || { rm -f "$tmp"; return 1; }
+    if ! mv "$tmp" "$dropin"; then
+        rm -f "$tmp"
+        return 1
+    fi
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl daemon-reload || log_warn "Could not reload systemd; $dropin applies on the next daemon-reload"
+    fi
+}
+
+# The values a detached rebake will actually run with. systemd does not see
+# this shell's environment, so an empty override is ignored and the conf is
+# checked instead. A bad conf value then fails here, not only in the journal.
+check_conf_bake_limits() {
+    # No conf yet: setup has not been run. Nothing to validate, and the
+    # existing missing-config error still reports that after detach.
+    [[ -f "$CONFIG_FILE" ]] || return 0
+    (
+        if [[ -z "${BAKE_TIMEOUT:-}" && -z "${BAKE_MIN_FREE_GIB:-}" ]]; then
+            unset BAKE_TIMEOUT BAKE_MIN_FREE_GIB
+        fi
+        # errexit is off here: rebake_main runs this as `|| exit 1`. The &&
+        # is what makes a bad conf value the subshell's status.
+        load_infra_config
+        check_bake_timeout && check_bake_min_free_gib
+    )
+}
+
 detach_rebake_from_ssh() {
     if [[ "${REBAKE_FOREGROUND:-}" == 1 || -n "${INVOCATION_ID:-}" || "${REBAKE_DETACHED:-}" == 1 ]]; then
         return 0
     fi
     log_info "Starting the rebake outside this shell so an SSH drop cannot kill it"
-    # systemctl start cannot pass this shell's environment to the unit, which
-    # would drop a BAKE_TIMEOUT or BAKE_MIN_FREE_GIB override (and its
-    # TimeoutStartSec caps the run). setsid keeps the environment, so an
-    # override goes that way.
+    # systemctl start cannot pass this shell's environment to the unit, so a
+    # one-run BAKE_TIMEOUT or BAKE_MIN_FREE_GIB would be dropped and the conf
+    # value (or the default) would be used instead. setsid keeps the environment.
     if [[ -z "${BAKE_TIMEOUT:-}" && -z "${BAKE_MIN_FREE_GIB:-}" && -f "$REBAKE_UNIT_FILE" ]] \
         && command -v systemctl >/dev/null 2>&1; then
         systemctl start --no-block github-runner-rebake.service
@@ -726,6 +957,10 @@ rebake_main() {
     # Refuse a bad override here, where the caller sees it.
     check_bake_timeout || exit 1
     check_bake_min_free_gib || exit 1
+    # Before the handoff to systemd. A bad limit in the conf must fail in
+    # this terminal, and the unit's start timeout has to be reloaded first.
+    check_conf_bake_limits || exit 1
+    write_rebake_timeout_dropin || log_warn "The rebake start timeout was not updated"
     detach_rebake_from_ssh
     trap '' HUP PIPE
     if ! command -v qm >/dev/null 2>&1; then
@@ -743,6 +978,10 @@ rebake_main() {
         exit 0
     fi
     load_infra_config
+    # The check before detach saw only the environment. A bad value in the
+    # conf arrives with the source above and must fail before any VM exists.
+    check_bake_timeout || exit 1
+    check_bake_min_free_gib || exit 1
     validate_saved_infra
     require_live_template
 

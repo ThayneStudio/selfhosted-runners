@@ -106,21 +106,75 @@ warn_template_storage() {
 
 # While a new template is baked beside the live one, the saved TEMPLATE_ID
 # keeps naming the live one. bake_setup_template moves it afterwards.
+# A line is replaced only when it is exactly one assignment of a key this
+# wizard prompts for. Anything else stays, including BAKE_TIMEOUT,
+# BAKE_MIN_FREE_GIB, a second command on the same line, and a quoted value
+# that continues on the next line. The new assignment is then appended so
+# it wins. After bash -n, the temp file is sourced in a clean shell. A key
+# that is still wrong gets one more exact assignment. The old file is left
+# in place when the result is not valid shell, or when sourcing it still
+# does not set one of these keys to the new value.
 write_infra_config() {
-    local conf_tmp
+    local conf_tmp line key syntax status
+    local -A new_value=()
+    local -A written=()
+    local -A dirty=()
+    local managed_re='^[[:space:]]*(export[[:space:]]+)?(NETWORK_BRIDGE|VLAN_TAG|VM_STORAGE|TEMPLATE_ID|MIN_VMID|BALLOON|DNS_SERVERS|DOCKER_MIRROR_URL)='
     mkdir -p "$ORG_CONFIG_DIR"
     chmod 700 "$ORG_CONFIG_DIR"
+    new_value[NETWORK_BRIDGE]="$NETWORK_BRIDGE"
+    new_value[VLAN_TAG]="${VLAN_TAG}"
+    new_value[VM_STORAGE]="$VM_STORAGE"
+    new_value[TEMPLATE_ID]="${LIVE_TEMPLATE_ID:-$TEMPLATE_ID}"
+    new_value[MIN_VMID]="$MIN_VMID"
+    new_value[BALLOON]="$BALLOON"
+    new_value[DNS_SERVERS]="$DNS_SERVERS"
+    new_value[DOCKER_MIRROR_URL]="${DOCKER_MIRROR_URL:-}"
     conf_tmp=$(mktemp "${CONFIG_FILE}.XXXXXX")
     {
-        printf 'NETWORK_BRIDGE=%q\n' "$NETWORK_BRIDGE"
-        printf 'VLAN_TAG=%q\n' "${VLAN_TAG}"
-        printf 'VM_STORAGE=%q\n' "$VM_STORAGE"
-        printf 'TEMPLATE_ID=%q\n' "${LIVE_TEMPLATE_ID:-$TEMPLATE_ID}"
-        printf 'MIN_VMID=%q\n' "$MIN_VMID"
-        printf 'BALLOON=%q\n' "$BALLOON"
-        printf 'DNS_SERVERS=%q\n' "$DNS_SERVERS"
-        printf 'DOCKER_MIRROR_URL=%q\n' "${DOCKER_MIRROR_URL:-}"
+        if [[ -f "$CONFIG_FILE" ]]; then
+            # "|| [[ -n $line ]]" also reads a last line that has no newline.
+            while IFS= read -r line || [[ -n "$line" ]]; do
+                if key=$(conf_exact_assignment_key "$line"); then
+                    if [[ -z "${dirty[$key]:-}" ]]; then
+                        written[$key]=1
+                    fi
+                    printf '%s=%q\n' "$key" "${new_value[$key]}"
+                else
+                    # A later exact assignment must not hide this line. Append
+                    # so the value setup just collected is the one that wins.
+                    if [[ "$line" =~ $managed_re ]]; then
+                        key=${BASH_REMATCH[2]}
+                        dirty[$key]=1
+                        unset "written[$key]"
+                    fi
+                    printf '%s\n' "$line"
+                fi
+            done < "$CONFIG_FILE"
+        fi
+        for key in NETWORK_BRIDGE VLAN_TAG VM_STORAGE TEMPLATE_ID MIN_VMID BALLOON DNS_SERVERS DOCKER_MIRROR_URL; do
+            [[ -n "${written[$key]:-}" ]] || printf '%s=%q\n' "$key" "${new_value[$key]}"
+        done
     } > "$conf_tmp"
+    if ! syntax=$(bash -n "$conf_tmp" 2>&1); then
+        log_error "Not replacing $CONFIG_FILE: the rewritten file is not valid shell, so the old one is unchanged"
+        [[ -z "$syntax" ]] || log_error "$syntax"
+        rm -f "$conf_tmp"
+        return 1
+    fi
+    for key in NETWORK_BRIDGE VLAN_TAG VM_STORAGE TEMPLATE_ID MIN_VMID BALLOON DNS_SERVERS DOCKER_MIRROR_URL; do
+        status=0
+        confirm_conf_assignment "$conf_tmp" "$key" "${new_value[$key]}" || status=$?
+        if [[ "$status" -ne 0 ]]; then
+            rm -f "$conf_tmp"
+            if [[ "$status" -eq 2 ]]; then
+                log_error "Failed to update $key in $CONFIG_FILE"
+            else
+                log_error "Not replacing $CONFIG_FILE: sourcing it does not set $key to the new value, so the old one is unchanged"
+            fi
+            return 1
+        fi
+    done
     chmod 600 "$conf_tmp"
     mv "$conf_tmp" "$CONFIG_FILE"
 }
@@ -487,6 +541,7 @@ cp "$INSTALL_DIR/templates/github-runner-watch.service" /etc/systemd/system/
 cp "$INSTALL_DIR/templates/github-runner-watch.timer" /etc/systemd/system/
 cp "$INSTALL_DIR/templates/github-runner-rebake.service" /etc/systemd/system/
 cp "$INSTALL_DIR/templates/github-runner-rebake.timer" /etc/systemd/system/
+write_rebake_timeout_dropin || log_warn "The rebake start timeout was not updated"
 systemctl daemon-reload
 systemctl enable --now github-runner-watch.timer 2>/dev/null || true
 systemctl enable --now github-runner-rebake.timer 2>/dev/null || true
