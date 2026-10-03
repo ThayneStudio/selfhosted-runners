@@ -683,7 +683,13 @@ names another VM that may still exist, setup refuses to bake beside the live
 template and asks you to run `runner rebake` first. Its message also says that
 the record is stale when `qm config <id>` on this node shows no VM named
 `ubuntu-cloud-template`, and that you can then remove it instead with
-`rm /var/lib/github-runners/pending-bake`. Choose an ID below `MIN_VMID`. Setup
+`rm /var/lib/github-runners/pending-bake`. When that VM is already gone, setup
+frees a leftover `base-<vmid>-disk-N` or `vm-<vmid>-disk-N` of its VMID before
+replacing the record, and only when that bake created the VM. If the listing
+of `VM_STORAGE` cannot be read, setup refuses and leaves the record so
+`runner rebake` can try again. A volume `pvesm free` cannot remove is logged,
+recorded in `/var/lib/github-runners/bake-leftover-volumes`, and setup still
+replaces the record. Choose an ID below `MIN_VMID`. Setup
 does not reserve the ID while it downloads the cloud image, so a runner clone
 can take an ID in the runner range first. The bake then fails, and setup logs
 `Refusing to destroy VM <id> (<name>); it is not the template bake VM` after

@@ -480,5 +480,103 @@ assert_gone local-zfs:base-9201-disk-0 "retry after an unreadable list"
 if record_kept; then fail "the record stayed after the leftover volume was freed"; fi
 [[ ! -e "${PENDING_BAKE_FILE}.created" ]] || fail "the created marker stayed after the leftover volume was freed"
 
+# A side setup replaces a pending record whose VM is already gone. The
+# leftover base volume has to be freed while the old marker still exists.
+# An unreadable listing keeps that record. A volume pvesm free cannot
+# remove is quarantined, and the new bake still takes the record.
+reset_case
+TEMPLATE_ID=9100
+LIVE_TEMPLATE_ID=9000
+# shellcheck disable=SC2034 # record_setup_bake clears it; the old marker must still count
+BAKE_RUN_TOKEN=this-run
+set_volumes <<'EOF'
+local-zfs:base-9001-disk-0
+local-zfs:base-9000-disk-0
+local-zfs:vm-9001-cloudinit
+EOF
+pending 9001
+printf '9001 tok\n' > "${PENDING_BAKE_FILE}.created"
+record_rc=0
+record_setup_bake 2>"$state/log" || record_rc=$?
+[[ "$record_rc" == 0 ]] || fail "setup refused to replace a record whose VM is gone: $(cat "$state/log")"
+[[ "$(tr -d '[:space:]' < "$PENDING_BAKE_FILE")" == 9100 ]] \
+    || fail "the side bake did not take the pending record"
+[[ ! -e "${PENDING_BAKE_FILE}.created" ]] || fail "the old created marker survived the new record"
+assert_gone local-zfs:base-9001-disk-0 "side setup replaced an unsettled record"
+assert_kept local-zfs:base-9000-disk-0 "side setup replaced an unsettled record"
+assert_kept local-zfs:vm-9001-cloudinit "side setup replaced an unsettled record"
+assert_not_freed local-zfs:base-9000-disk-0 "side setup replaced an unsettled record"
+assert_not_freed local-zfs:vm-9001-cloudinit "side setup replaced an unsettled record"
+
+# No marker: the volume was not this bake's disk, so replacing the record leaves it.
+reset_case
+TEMPLATE_ID=9100
+LIVE_TEMPLATE_ID=9000
+unset BAKE_VM_CREATED BAKE_RUN_TOKEN
+set_volumes <<'EOF'
+local-zfs:base-9001-disk-0
+EOF
+pending 9001
+record_rc=0
+record_setup_bake 2>"$state/log" || record_rc=$?
+[[ "$record_rc" == 0 ]] || fail "a record with no created marker blocked setup: $(cat "$state/log")"
+[[ "$(tr -d '[:space:]' < "$PENDING_BAKE_FILE")" == 9100 ]] \
+    || fail "a record with no created marker was not replaced"
+assert_kept local-zfs:base-9001-disk-0 "no created marker"
+assert_not_freed local-zfs:base-9001-disk-0 "no created marker"
+
+# The listing still cannot be read: keep the old record and the marker.
+reset_case
+TEMPLATE_ID=9100
+LIVE_TEMPLATE_ID=9000
+unset BAKE_VM_CREATED BAKE_RUN_TOKEN
+set_volumes <<'EOF'
+local-zfs:base-9001-disk-0
+EOF
+pending 9001
+printf '9001 tok\n' > "${PENDING_BAKE_FILE}.created"
+mock_list_fails=1
+record_rc=0
+record_setup_bake 2>"$state/log" || record_rc=$?
+[[ "$record_rc" != 0 ]] || fail "an unreadable volume list let setup replace the record"
+[[ "$(tr -d '[:space:]' < "$PENDING_BAKE_FILE")" == 9001 ]] \
+    || fail "an unreadable volume list replaced the pending record"
+[[ "$(cat "${PENDING_BAKE_FILE}.created")" == "9001 tok" ]] \
+    || fail "an unreadable volume list removed the created marker: $(cat "${PENDING_BAKE_FILE}.created" 2>/dev/null)"
+assert_kept local-zfs:base-9001-disk-0 "unlistable during setup"
+assert_not_freed local-zfs:base-9001-disk-0 "unlistable during setup"
+grep -qF 'could not be checked' "$state/log" \
+    || fail "the unreadable list was not reported: $(cat "$state/log")"
+grep -qF 'runner rebake' "$state/log" \
+    || fail "the refusal did not say to run rebake: $(cat "$state/log")"
+if [[ -f "$STATE_DIR/bake-leftover-volumes" ]] \
+    && grep -q 'base-9001-disk-0' "$STATE_DIR/bake-leftover-volumes"; then
+    fail "an unreadable volume list was quarantined: $(cat "$STATE_DIR/bake-leftover-volumes")"
+fi
+
+# pvesm free left the volume. It is quarantined, and the side bake proceeds.
+reset_case
+TEMPLATE_ID=9100
+LIVE_TEMPLATE_ID=9000
+unset BAKE_VM_CREATED BAKE_RUN_TOKEN
+set_volumes <<'EOF'
+local-zfs:base-9001-disk-0
+EOF
+printf 'local-zfs:base-9001-disk-0\n' > "$mock_busy"
+pending 9001
+printf '9001 tok\n' > "${PENDING_BAKE_FILE}.created"
+record_rc=0
+record_setup_bake 2>"$state/log" || record_rc=$?
+[[ "$record_rc" == 0 ]] || fail "a volume pvesm free could not remove blocked setup: $(cat "$state/log")"
+[[ "$(tr -d '[:space:]' < "$PENDING_BAKE_FILE")" == 9100 ]] \
+    || fail "a stuck volume kept the old pending record"
+[[ ! -e "${PENDING_BAKE_FILE}.created" ]] || fail "the old marker stayed after the stuck volume was quarantined"
+assert_kept local-zfs:base-9001-disk-0 "stuck volume during setup"
+grep -qF "pvesm free 'local-zfs:base-9001-disk-0'" "$state/log" \
+    || fail "the stuck volume was not named: $(cat "$state/log")"
+grep -qxF 'vmid=9001 volid=local-zfs:base-9001-disk-0' "$STATE_DIR/bake-leftover-volumes" \
+    || fail "the stuck volume was not quarantined: $(cat "$STATE_DIR/bake-leftover-volumes" 2>/dev/null)"
+: > "$mock_busy"
+
 printf 'bake-preexisting-volume: ok\n'
 

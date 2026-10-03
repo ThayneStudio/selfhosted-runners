@@ -151,9 +151,12 @@ warn_pat_snippet_vms() {
 # retired list names. Record it as the rebake records its own bake, so the next
 # rebake finishes or removes it when setup dies first (SIGKILL, power loss) or
 # cleanup_bake cannot destroy it. There is one record. Replacing one whose VM
-# may still exist would leave that VM to nobody, so refuse instead.
+# may still exist would leave that VM to nobody, so refuse instead. Replacing
+# one whose VM is already gone has to settle that VMID's leftover disks first:
+# the marker is what says the bake created them, and removing it first would
+# leave a base volume nobody retries.
 record_setup_bake() {
-    local id=""
+    local id="" settle_rc=0
     if [[ -f "$PENDING_BAKE_FILE" ]]; then
         id=$(tr -d '[:space:]' < "$PENDING_BAKE_FILE") || return 1
     fi
@@ -162,6 +165,21 @@ record_setup_bake() {
         log_error "Run 'runner rebake' to finish or remove it, then run setup again"
         log_error "If 'qm config $id' on this node shows no VM named ubuntu-cloud-template, the record is stale; remove it instead: rm $PENDING_BAKE_FILE"
         return 1
+    fi
+    if [[ "$id" =~ ^[0-9]+$ && "$id" != "$TEMPLATE_ID" ]]; then
+        # This process did not create that VM. A token or flag left in the
+        # environment belongs to some other bake and must not hide the marker.
+        unset BAKE_RUN_TOKEN BAKE_VM_CREATED
+        settle_bake_leftovers "$id" "$TEMPLATE_ID" absent || settle_rc=$?
+        if [[ "$settle_rc" -eq 1 ]]; then
+            log_error "VM $id from an earlier bake is gone, but its volumes on $VM_STORAGE could not be checked"
+            log_error "Its record stays in $PENDING_BAKE_FILE. Run 'runner rebake' once storage can be listed, then run setup again"
+            return 1
+        fi
+        # 0: nothing of this bake remains. 2: a volume is still listed.
+        # free_bake_leftover_volumes has logged it and appended it to
+        # bake-leftover-volumes. Keeping the record would stop every later
+        # rebake, so this setup takes the pending file either way.
     fi
     # A version left by an earlier record does not describe this bake, and
     # neither does a created-marker for a VM this setup has not made yet.
