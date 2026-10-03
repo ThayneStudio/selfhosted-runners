@@ -238,6 +238,29 @@ vmid_in_use() {
     [[ -n "$(vm_config_path "$1")" ]]
 }
 
+# pmxcfs serves /etc/pve. While it restarts (every pve-cluster upgrade
+# restarts it) /etc/pve is an empty directory, and after a crash it cannot
+# be read, so vm_config_path finds no config for any guest. Every node has a
+# directory in nodes, and only a live pmxcfs can list them. A lookup proves
+# less: after a crash the kernel can answer one from its cache for up to a
+# second, such as one for /etc/pve/local, the link PVE's own
+# check_cfs_is_mounted tests.
+pve_cfs_serving() {
+    compgen -G "$PVE_NODES_DIR/*" > /dev/null
+}
+
+# vm_config_path for callers that free VMID $1's volumes when it prints
+# nothing. Finding no config proves nothing unless pmxcfs served /etc/pve
+# both before and after the lookup, so this fails otherwise, and the caller
+# stops freeing. vmid_in_use stays a plain lookup: reserve_vmid steps past
+# every VMID in use, and would never stop while pmxcfs is down if a lookup
+# that failed counted as in use.
+vm_config_path_checked() {
+    pve_cfs_serving || return 1
+    vm_config_path "$1" || true
+    pve_cfs_serving
+}
+
 vmid_reservation_lock_file() {
     printf '%s-%s.lock\n' "$VMID_RESERVATION_LOCK_PREFIX" "$1"
 }
@@ -518,7 +541,11 @@ cleanup_template_orphan_volumes() {
     for volid in "${child_volids[@]}"; do
         child_vmid=$(linked_clone_child_vmid "$volid")
         config_path=""
-        [[ -n "$child_vmid" ]] && config_path=$(vm_config_path "$child_vmid")
+        if [[ -n "$child_vmid" ]] && ! config_path=$(vm_config_path_checked "$child_vmid"); then
+            log_error "pmxcfs is not serving /etc/pve, so VM configs cannot be checked; not freeing $volid"
+            log_error "Check that pve-cluster is running, then run 'runner stop' again."
+            return 1
+        fi
 
         if [[ -n "$config_path" ]]; then
             log_warn "Template child volume still has a VM config: $volid ($config_path)"
@@ -558,7 +585,8 @@ cleanup_template_orphan_volumes() {
 # next free ones). There it frees only linked clones of the live or a retired
 # runner template; a runner disk left there would otherwise stay for good and
 # keep its template from being retired. qm clone writes the new VM's config
-# before it creates a disk, so a clone in progress is never config-less.
+# before it creates a disk, so a clone in progress is never config-less. The
+# sweep stops at a lookup pmxcfs did not serve (vm_config_path_checked).
 cleanup_runner_orphan_volumes() {
     local min_vmid="${MIN_VMID:-}"
     if [[ ! "$min_vmid" =~ ^[1-9][0-9]*$ ]]; then
@@ -571,7 +599,7 @@ cleanup_runner_orphan_volumes() {
         return 0
     fi
 
-    local volid vmid freed=0 template_bases_read=0
+    local volid vmid config_path freed=0 template_bases_read=0
     local -a template_bases=()
     while IFS= read -r volid; do
         [[ -n "$volid" ]] || continue
@@ -584,7 +612,11 @@ cleanup_runner_orphan_volumes() {
         # Below the floor only a volume listed under a base volume can be a
         # runner's. Template configs are read once, and only when needed.
         [[ "$vmid" -ge "$min_vmid" || "$volid" == */* ]] || continue
-        [[ -z "$(vm_config_path "$vmid")" ]] || continue
+        if ! config_path=$(vm_config_path_checked "$vmid"); then
+            log_warn "[orphan-sweep] pmxcfs is not serving /etc/pve, so guest configs cannot be checked; stopping the sweep"
+            break
+        fi
+        [[ -z "$config_path" ]] || continue
         if [[ "$vmid" -lt "$min_vmid" ]]; then
             if [[ "$template_bases_read" == 0 ]]; then
                 # </dev/null: its qm calls must not read this loop's listing.
@@ -776,7 +808,8 @@ clone_runner() {
     # It frees nothing while any guest config holds the VMID: a destroy that a
     # lock refused (vzdump, for example) leaves a config still using those
     # volumes, and once the config is gone a parallel clone can take the VMID,
-    # so the check runs again before each free. No --purge: it deletes the
+    # so the check runs again before each free. Nor while pmxcfs is not
+    # serving /etc/pve, when no config shows. No --purge: it deletes the
     # VMID from backup jobs, and the next clone reuses this VMID.
     _fail() {
         local owner
@@ -800,10 +833,14 @@ clone_runner() {
             rm -f "$destroy_err"
         fi
 
-        local volid
+        local volid config_path
         while read -r volid; do
             [[ -n "$volid" ]] || continue
-            if vmid_in_use "$vmid"; then
+            if ! config_path=$(vm_config_path_checked "$vmid"); then
+                log_warn "pmxcfs is not serving /etc/pve; not freeing the volumes of VMID $vmid"
+                break
+            fi
+            if [[ -n "$config_path" ]]; then
                 log_warn "VMID $vmid still has a guest config; not freeing its volumes"
                 break
             fi
