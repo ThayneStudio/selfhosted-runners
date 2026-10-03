@@ -2,6 +2,8 @@
 set -euo pipefail
 
 source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/common.sh"
+# shellcheck source=recycle.sh
+source "$LIB_DIR/recycle.sh"
 
 require_root "add-org"
 
@@ -190,6 +192,17 @@ printf 'GITHUB_ORG="%s"\nGITHUB_PAT="%s"\nRUNNER_PREFIX="%s"\nRUNNER_COUNT="%s"\
 chmod 600 "$CONF_TMP"
 mv "$CONF_TMP" "$ORG_CONFIG_DIR/${GITHUB_ORG}.conf"
 CONF_TMP=""
+
+# A slot whose clones kept failing is held for up to 30 minutes (recycle.sh).
+# The new config is the fix for what failed them, such as an expired PAT, so
+# the watcher retries the org's slots on its next tick. Only this org's exact
+# slot names, as the watcher reads them: a glob on the prefix would also clear
+# another org's ${prefix}-x-N holds.
+read_org_slots "$GITHUB_ORG"
+for ((n = 1; n <= ${ORG_SLOT_COUNT:-0}; n++)); do
+    rm -f "$(slot_state_file "${ORG_SLOT_PREFIX}-${n}")" ||
+        log_warn "Could not clear the failure hold of ${ORG_SLOT_PREFIX}-${n}; the watcher retries it when the hold ends"
+done
 
 echo ""
 log_info "Organization '$GITHUB_ORG' configured successfully"
