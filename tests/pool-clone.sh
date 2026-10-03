@@ -57,6 +57,33 @@ start_line=$(grep -n '^start 9001$' "$calls" | cut -d: -f1) || fail "the clone w
 grep -qx 'clone 9000 9001 --name runner-1 --description selfhosted-runners org=acme' "$calls" \
     || fail "qm clone did not write the ownership marker with the name: $(grep '^clone' "$calls")"
 
+# The marker also records whether the VM is one of the org's slots, so the
+# pool can retire it when RUNNER_COUNT or RUNNER_PREFIX change.
+kind_of_clone() {
+    : > "$calls"
+    clone_runner "$1" acme > /dev/null || fail "clone_runner $1 failed"
+    sed -n 's/^clone 9000 9001 --name [^ ]* --description //p' "$calls"
+}
+RUNNER_PREFIX=runner
+RUNNER_COUNT=2
+[[ "$(kind_of_clone runner-2)" == "selfhosted-runners org=acme kind=slot" ]] || fail "a configured slot was not marked as a slot"
+[[ "$(kind_of_clone runner-3)" == "selfhosted-runners org=acme kind=extra" ]] || fail "a name past RUNNER_COUNT was marked as a slot"
+[[ "$(kind_of_clone runner-01)" == "selfhosted-runners org=acme kind=extra" ]] || fail "runner-01 was marked as slot runner-1"
+[[ "$(kind_of_clone build-box)" == "selfhosted-runners org=acme kind=extra" ]] || fail "a manual runner was marked as a slot"
+RUNNER_COUNT=garbled
+[[ "$(kind_of_clone runner-1)" == "selfhosted-runners org=acme" ]] || fail "a kind was guessed without a readable RUNNER_COUNT"
+unset RUNNER_PREFIX RUNNER_COUNT
+
+[[ "$(slot_number runner-12 runner)" == 12 ]] || fail "slot_number missed runner-12"
+[[ "$(slot_number my.pool-3 my.pool)" == 3 ]] || fail "slot_number missed a prefix with a dot"
+for name in runner-0 runner-01 runner-x runner- runner ci-runner-1 myxpool-3; do
+    prefix=runner
+    [[ "$name" == myxpool-3 ]] && prefix=my.pool
+    if slot_number "$name" "$prefix" > /dev/null; then
+        fail "slot_number accepted $name for prefix $prefix"
+    fi
+done
+
 # get_vm_org: snippets first, then the clone-time marker. A clone killed
 # between qm clone and --cicustom has only the marker.
 vm_config=""

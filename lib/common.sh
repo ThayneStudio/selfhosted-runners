@@ -153,6 +153,16 @@ select_org() {
     done
 }
 
+# Prints N when $1 is slot <prefix $2>-N as the watcher names it (no leading
+# zeros); fails for any other name, such as a manual runner-01.
+slot_number() {
+    local name="$1" prefix="$2" n
+    [[ -n "$prefix" && "$name" == "${prefix}-"* ]] || return 1
+    n="${name#"${prefix}-"}"
+    [[ "$n" =~ ^[1-9][0-9]{0,8}$ ]] || return 1
+    printf '%s\n' "$n"
+}
+
 get_vm_org() {
     local config cicustom description
     local marker_re='^description: selfhosted-runners org=([a-zA-Z0-9-]+)'
@@ -744,9 +754,19 @@ clone_runner() {
     # unit log (which the operator does not look at first).
     # The description is the ownership marker get_vm_org falls back to. qm
     # clone writes it in the same config write as the name, so a clone that is
-    # killed before --cicustom below is still recognisably ours.
+    # killed before --cicustom below is still recognisably ours. kind records
+    # whether this is one of the org's RUNNER_COUNT slots, which the pool
+    # retires once the count or prefix no longer covers it, or an extra
+    # runner from `runner create`, which recycles until `runner destroy`.
+    local kind="" slot_n
+    if [[ "${RUNNER_COUNT:-}" =~ ^[0-9]{1,9}$ ]]; then
+        kind=extra
+        if slot_n=$(slot_number "$name" "${RUNNER_PREFIX:-runner}") && (( slot_n <= 10#$RUNNER_COUNT )); then
+            kind=slot
+        fi
+    fi
     local clone_err; clone_err=$(mktemp)
-    if ! qm clone "$TEMPLATE_ID" "$vmid" --name "$name" --description "selfhosted-runners org=$org" \
+    if ! qm clone "$TEMPLATE_ID" "$vmid" --name "$name" --description "selfhosted-runners org=$org${kind:+ kind=$kind}" \
         200>&- 201>&- 202>&- 203>&- 204>&- 2>"$clone_err"; then
         while IFS= read -r line; do
             [[ -n "$line" ]] && log_error "qm clone $vmid: $line"

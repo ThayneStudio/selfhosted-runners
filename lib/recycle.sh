@@ -149,6 +149,74 @@ runner_vm_age() {
     printf '%s\n' "$((now - mtime))"
 }
 
+# Sets ORG_SLOT_PREFIX and ORG_SLOT_COUNT for org $1, read the way the
+# watcher reads them. ORG_SLOT_COUNT is empty when RUNNER_COUNT is missing or
+# not a number.
+read_org_slots() {
+    local org_file="$ORG_CONFIG_DIR/$1.conf" count prefix
+    count=$(grep '^RUNNER_COUNT=' "$org_file" 2>/dev/null | head -1 | sed 's/^RUNNER_COUNT=//' | tr -d '"') || true
+    prefix=$(grep '^RUNNER_PREFIX=' "$org_file" 2>/dev/null | head -1 | sed 's/^RUNNER_PREFIX=//' | tr -d '"') || true
+    ORG_SLOT_PREFIX="${prefix:-runner}"
+    ORG_SLOT_COUNT=""
+    if [[ "$count" =~ ^[0-9]{1,9}$ ]]; then
+        ORG_SLOT_COUNT=$((10#$count))
+    fi
+}
+
+# Prints the kind clone_runner recorded in VM config text $1 (slot or
+# extra). Prints nothing for VMs cloned before it was recorded.
+runner_vm_kind() {
+    local line kind_re='^description: selfhosted-runners org=[a-zA-Z0-9-]+ kind=(slot|extra)'
+    line=$(grep -m1 '^description:' <<< "$1") || return 0
+    if [[ "$line" =~ $kind_re ]]; then
+        printf '%s\n' "${BASH_REMATCH[1]}"
+    fi
+}
+
+# 0 when runner $1 of org $2 must not be re-cloned, with the reason in
+# RETIRE_REASON. $3 is the kind clone_runner recorded for it. The pool shrinks
+# when the org was removed, when a VM cloned as one of the org's slots is no
+# longer one (RUNNER_COUNT lowered or RUNNER_PREFIX changed), and when another
+# org now uses the name as a slot. An extra runner from `runner create` keeps
+# being re-cloned until `runner destroy`.
+runner_slot_retired() {
+    local name="$1" org="$2" kind="$3" other n
+    RETIRE_REASON=""
+    if [[ ! -f "$ORG_CONFIG_DIR/${org}.conf" ]]; then
+        RETIRE_REASON="org $org is no longer configured"
+        return 0
+    fi
+    read_org_slots "$org"
+    # An unreadable RUNNER_COUNT must not look like "shrink to nothing".
+    if [[ -n "$ORG_SLOT_COUNT" ]]; then
+        n=$(slot_number "$name" "$ORG_SLOT_PREFIX") || n=""
+        if [[ -n "$n" ]] && (( n <= ORG_SLOT_COUNT )); then
+            return 1
+        fi
+        if [[ "$kind" == "slot" ]]; then
+            RETIRE_REASON="it is no longer one of $org's $ORG_SLOT_COUNT slots named ${ORG_SLOT_PREFIX}-N"
+            return 0
+        fi
+        # Cloned before the kind was recorded: a <prefix>-N past the count is
+        # a slot that the count no longer covers.
+        if [[ -z "$kind" && -n "$n" ]]; then
+            RETIRE_REASON="it is beyond $org's RUNNER_COUNT ($ORG_SLOT_COUNT)"
+            return 0
+        fi
+    fi
+    while IFS= read -r other; do
+        [[ -n "$other" && "$other" != "$org" ]] || continue
+        read_org_slots "$other"
+        [[ -n "$ORG_SLOT_COUNT" ]] || continue
+        n=$(slot_number "$name" "$ORG_SLOT_PREFIX") || continue
+        if (( n <= ORG_SLOT_COUNT )); then
+            RETIRE_REASON="org $other now uses $name as a slot"
+            return 0
+        fi
+    done < <(list_orgs)
+    return 1
+}
+
 # Destroy runner VM $1, retrying while Proxmox may still hold its config lock
 # from the stop, then remove its snippets. The snippets go only once the VM
 # is gone: anything that starts the VM again (vzdump restarting it after a
@@ -169,12 +237,18 @@ destroy_runner_vm() {
 }
 
 # Clone the replacement for runner $1 of org $2 once its VM is destroyed. The
-# caller holds the slot lock (fd 200) and shared pool activity (fd 202), and
-# $3 prefixes the log lines. The slot stays empty while the backoff holds it,
-# when the name is taken again or when the pool started draining; the watcher
-# fills it later. Returns 1 only when clone_runner failed.
+# caller holds the slot lock (fd 200) and shared pool activity (fd 202), $3
+# prefixes the log lines and $4 is the old VM's kind (runner_vm_kind). Nothing
+# is cloned for a retired name (runner_slot_retired). The slot stays empty
+# while the backoff holds it, when the name is taken again or when the pool
+# started draining; the watcher fills it later. Returns 1 only when
+# clone_runner failed.
 refill_runner_slot() {
-    local name="$1" org="$2" tag="$3"
+    local name="$1" org="$2" tag="$3" kind="${4:-}"
+    if runner_slot_retired "$name" "$org" "$kind"; then
+        log_info "$tag: not re-cloning $name: $RETIRE_REASON"
+        return 0
+    fi
     if slot_is_held "$name"; then
         logger -t github-runner "$tag: $name is held for ${SLOT_HOLD_LEFT}s after repeated failures; the watcher refills it after that"
         return 0
