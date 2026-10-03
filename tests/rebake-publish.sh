@@ -37,22 +37,34 @@ actions=$state/actions
 vms=$state/vms
 : > "$actions"
 
-# Each VM is a directory: name, scsi0 volume, template flag, power state.
-# `qm template` sets the flag and exits 0; it converts scsi0 only when
-# $state/convert says so, as when its worker fails after writing the flag.
+# Each VM is a directory: name, disk volume, template flag, power state, and
+# whether the disk is attached as scsi0 (an imported disk is unused0 until
+# `qm set --scsi0`). `qm template` sets the flag and exits 0; it converts the
+# disk only when $state/convert says so, as when its worker fails after
+# writing the flag.
 add_vm() {
     mkdir -p "$vms/$1"
     printf '%s' "$2" > "$vms/$1/name"
     printf '%s' "$3" > "$vms/$1/disk"
     printf '%s' "$4" > "$vms/$1/template"
     printf stopped > "$vms/$1/power"
+    if [[ "${5:-attached}" == attached ]]; then
+        : > "$vms/$1/attached"
+    fi
 }
 qm() {
     local cmd="$1" id="${2:-}"
     printf '%s\n' "$*" >> "$actions"
     case "$cmd" in
-        importdisk) printf "Successfully imported disk as 'unused0:local-zfs:vm-%s-disk-0'\n" "$id" ;;
-        set|resize) [[ -d "$vms/$id" ]] ;;
+        # qemu-server >= 8.2.7 wording.
+        importdisk) printf "unused0: successfully imported disk '%s'\n" "$(cat "$vms/$id/disk")" ;;
+        set)
+            [[ -d "$vms/$id" ]] || return 2
+            if [[ " $* " == *" --scsi0 "* ]]; then
+                : > "$vms/$id/attached"
+            fi
+            ;;
+        resize) [[ -d "$vms/$id" ]] ;;
         start) printf running > "$vms/$id/power" ;;
         shutdown|stop) [[ ! -d "$vms/$id" ]] || printf stopped > "$vms/$id/power" ;;
         status)
@@ -63,7 +75,11 @@ qm() {
             [[ -d "$vms/$id" ]] || return 2
             printf 'name: %s\n' "$(cat "$vms/$id/name")"
             printf 'ide2: local-zfs:vm-%s-cloudinit,media=cdrom\n' "$id"
-            printf 'scsi0: %s,size=30G\n' "$(cat "$vms/$id/disk")"
+            if [[ -e "$vms/$id/attached" ]]; then
+                printf 'scsi0: %s,size=30G\n' "$(cat "$vms/$id/disk")"
+            else
+                printf 'unused0: %s\n' "$(cat "$vms/$id/disk")"
+            fi
             if [[ "$(cat "$vms/$id/template")" == 1 ]]; then
                 printf 'template: 1\n'
             fi
@@ -87,8 +103,15 @@ qm() {
         *) return 1 ;;
     esac
 }
-inventory='[]'
-pvesh() { printf '%s\n' "$inventory"; }
+mock_inventory='[]'
+pvesh() { printf '%s\n' "$mock_inventory"; }
+# No volumes are left over on the storage.
+pvesm() {
+    case "$1" in
+        list) printf 'Volid Format Type Size VMID\n' ;;
+        *) return 1 ;;
+    esac
+}
 curl() { return 22; }
 sleep() { :; }
 release_vmid_reservation() { :; }
@@ -105,7 +128,7 @@ destroyed() { grep -Eq "^destroy $1( |$)" "$actions"; }
 
 # The bake: qm template exits 0 but leaves scsi0 a vm- volume.
 reset_host
-add_vm 9001 ubuntu-cloud-template local-zfs:vm-9001-disk-0 0
+add_vm 9001 ubuntu-cloud-template local-zfs:vm-9001-disk-0 0 imported
 printf 0 > "$state/convert"
 if bake_and_publish_vm 9001; then
     fail "bake_and_publish_vm accepted a template whose disk was not converted"
@@ -115,7 +138,7 @@ grep -q '^template 9001' "$actions" || fail "the bake never reached qm template"
 
 # The same bake with a real conversion publishes.
 reset_host
-add_vm 9001 ubuntu-cloud-template local-zfs:vm-9001-disk-0 0
+add_vm 9001 ubuntu-cloud-template local-zfs:vm-9001-disk-0 0 imported
 printf 1 > "$state/convert"
 bake_and_publish_vm 9001 || fail "bake_and_publish_vm rejected a converted template"
 [[ "$REBAKE_PUBLISHED" == 1 ]] || fail "a converted template was not marked published"
