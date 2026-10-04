@@ -3,9 +3,9 @@
 # conf, still inside the quiesce, once the new tree is in place. The other
 # install check stubs tar without lib/rebake.sh, so that branch never runs.
 # BAKE_TIMEOUT in the conf becomes TimeoutStartSec plus an hour. With none
-# set, the drop-in keeps the unit default of 9000. A drop-in directory that
-# cannot be written is a warning: install still exits 0, releases the
-# quiesce, and starts the watcher again.
+# set, the drop-in keeps the unit default of 9000. When the drop-in
+# directory cannot be created, install warns and still exits 0, releases
+# the quiesce, and starts the watcher again.
 set -euo pipefail
 
 if [[ "${BASH_VERSINFO[0]}" -lt 4 ]]; then
@@ -21,7 +21,7 @@ root=$(cd "$(dirname "$0")/.." && pwd)
 source "$root/install.sh"
 fail() { printf 'install-dropin: %s\n' "$1" >&2; exit 1; }
 state=$(mktemp -d)
-trap 'chmod -R u+w "$state" 2>/dev/null || true; rm -rf "$state"' EXIT
+trap 'rm -rf "$state"' EXIT
 
 unset BAKE_TIMEOUT BAKE_MIN_FREE_GIB BAKE_FREE_FLOOR_GIB INVOCATION_ID TEMPLATE_ID
 
@@ -67,7 +67,6 @@ line_of() {
 }
 
 fresh() {
-    chmod -R u+w "$state" 2>/dev/null || true
     : > "$log"
     rm -rf "$INSTALL_DIR" "$SYSTEMD_DIR" "$SNIPPETS_DIR" "${state:?}/old" "${state:?}/bin" \
         "${state:?}/run" "${state:?}/legacy" "$CONFIG_FILE"
@@ -125,22 +124,24 @@ if grep -qF 'The rebake start timeout was not updated' "$state/err"; then
 fi
 released || fail "an upgrade with no BAKE_TIMEOUT did not release the quiesce: $(cat "$log")"
 
-# The directory is there and not writable. mkdir -p succeeds, the write
-# fails, and the upgrade still finishes.
+# A regular file sits where the drop-in directory should be. mkdir -p
+# fails for any uid; root ignores a directory's write bit. The write
+# returns 1, and the upgrade still finishes.
 fresh
 cat > "$CONFIG_FILE" <<'EOF'
 DOCKER_MIRROR_URL=
 BAKE_TIMEOUT=7200
 EOF
-mkdir -p "$SYSTEMD_DIR/github-runner-rebake.service.d"
-chmod a-w "$SYSTEMD_DIR/github-runner-rebake.service.d"
+: > "$SYSTEMD_DIR/github-runner-rebake.service.d"
 upgrade
-[[ "$upgrade_rc" == 0 ]] || fail "an unwritable drop-in directory failed the install: $(cat "$state/err")"
+[[ "$upgrade_rc" == 0 ]] || fail "a drop-in path that is not a directory failed the install: $(cat "$state/err")"
 grep -qF 'The rebake start timeout was not updated' "$state/err" \
-    || fail "an unwritable drop-in directory did not warn: $(cat "$state/err")"
-[[ ! -e "$dropin" ]] || fail "an unwritable drop-in directory still wrote timeout.conf: $(cat "$dropin")"
-released || fail "an unwritable drop-in directory did not release the quiesce: $(cat "$log")"
-grep -q 'Template rebake timer enabled' "$state/out" \
-    || fail "an unwritable drop-in directory stopped before the rebake timer was enabled: $(cat "$state/out")"
+    || fail "a drop-in path that is not a directory did not warn: $(cat "$state/err")"
+[[ -f "$SYSTEMD_DIR/github-runner-rebake.service.d" ]] \
+    || fail "install replaced the blocking file with a drop-in directory"
+[[ ! -e "$dropin" ]] || fail "a blocked drop-in path still wrote timeout.conf: $(cat "$dropin")"
+released || fail "a blocked drop-in path did not release the quiesce: $(cat "$log")"
+grep -qF 'Template rebake timer enabled' "$state/out" \
+    || fail "a blocked drop-in path stopped before the rebake timer was enabled: $(cat "$state/out")"
 
 printf 'install-dropin: ok\n'
