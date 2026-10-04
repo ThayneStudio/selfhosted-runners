@@ -3,6 +3,7 @@ set -euo pipefail
 # Stop the watcher and optionally destroy managed runner VMs.
 
 source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/common.sh"
+source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/recycle.sh"
 
 require_root "stop"
 load_infra_config
@@ -125,7 +126,7 @@ enable_pool_drain
 systemctl stop github-runner-watch.timer 2>/dev/null || true
 
 log_info "Waiting for in-flight clone activity to drain..."
-exec 202>"$POOL_ACTIVITY_LOCK_FILE"
+open_lock_fd 202 "$POOL_ACTIVITY_LOCK_FILE" || exit 1
 flock 202
 
 log_info "Stopping runner watcher service..."
@@ -140,6 +141,16 @@ if [[ "$WATCH_ONLY" == true ]]; then
     echo ""
     exec 202>&-
     exit 0
+fi
+
+# A full stop ends every extra runner from `runner create`, also one that has
+# no VM right now (held after repeated failures): `runner start` refills only
+# the slots. A ranged stop ends only the extras it destroys (destroy.sh).
+if [[ -z "$VMID_MIN" ]] && ! forget_all_extra_runners; then
+    log_error "Could not clear the extra runners recorded in $EXTRA_RUNNERS_FILE"
+    log_warn "Watcher remains stopped and pool drain remains active. Resolve this before resuming."
+    exec 202>&-
+    exit 1
 fi
 
 FAILURES=()

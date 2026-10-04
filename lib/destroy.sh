@@ -3,6 +3,7 @@ set -euo pipefail
 # Manually destroy a runner VM.
 
 source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/common.sh"
+source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/recycle.sh"
 
 require_root "destroy"
 
@@ -49,6 +50,23 @@ else
     fi
 
     mapfile -t MATCHING_VMIDS < <(qm list 200>&- 201>&- 202>&- | awk -v n="$RUNNER_NAME" '$2==n {print $1}')
+    # An extra runner that a failure hold, a template rebuild or a failed
+    # clone left empty has only its record: drop that, so the watcher does
+    # not create it again. Under the slot lock, and only once a listing that
+    # worked shows no VM of that name.
+    if [[ ${#MATCHING_VMIDS[@]} -eq 0 ]] && EXTRA_ORG=$(extra_runner_org "$RUNNER_NAME"); then
+        open_lock_fd 200 "$(slot_lock_file "$RUNNER_NAME")" || exit 1
+        flock -n 200 || { log_error "'$RUNNER_NAME' is being managed by another process (reclone/watch); try again in a moment"; exit 1; }
+        VM_LIST=$(qm list 200>&- 201>&- 202>&-) || { log_error "Could not list VMs"; exit 1; }
+        if awk -v n="$RUNNER_NAME" 'NR>1 && $2==n {found=1} END {exit !found}' <<< "$VM_LIST"; then
+            log_error "'$RUNNER_NAME' was just created again; run 'runner destroy $RUNNER_NAME' once more"
+            exit 1
+        fi
+        forget_extra_runners "$RUNNER_NAME" "" \
+            || { log_error "Could not remove '$RUNNER_NAME' from $EXTRA_RUNNERS_FILE"; exit 1; }
+        log_info "Extra runner $RUNNER_NAME of org $EXTRA_ORG had no VM; the watcher will not create it again."
+        exit 0
+    fi
     [[ ${#MATCHING_VMIDS[@]} -gt 0 ]] || { log_error "'$RUNNER_NAME' not found"; exit 1; }
 
     MANAGED_VMIDS=()
@@ -71,7 +89,7 @@ else
 fi
 
 # Take the per-slot lock so we don't race watch/reclone on this slot.
-exec 200>"/run/lock/runner-${RUNNER_NAME}.lock"
+open_lock_fd 200 "$(slot_lock_file "$RUNNER_NAME")" || exit 1
 flock -n 200 || { log_error "'$RUNNER_NAME' is being managed by another process (reclone/watch); try again in a moment"; exit 1; }
 
 VM_ORG=$(get_vm_org "$VMID")
@@ -95,13 +113,28 @@ fi
 
 # Destroy
 log_info "Destroying $RUNNER_NAME (VMID $VMID)..."
-qm destroy "$VMID" --purge 200>&- 201>&- 202>&- || { log_error "Failed to destroy $VMID"; exit 1; }
+qm destroy "$VMID" 200>&- 201>&- 202>&- || { log_error "Failed to destroy $VMID"; exit 1; }
 
 # Clean up per-VM snippets
 rm -f "${SNIPPETS_DIR}/runner-${VMID}-meta.yaml" "${SNIPPETS_DIR}/runner-${VMID}-user-"*.yaml "${SNIPPETS_DIR}/runner-${VMID}-vendor.yaml"
 
+# An extra runner from `runner create` ends here. Dropped once its VM is
+# gone: a failed destroy above leaves both, and the slot lock keeps the
+# watcher from filling the name in between.
+EXTRA=0
+if extra_runner_recorded "$RUNNER_NAME" "$VM_ORG"; then
+    EXTRA=1
+    if ! forget_extra_runners "$RUNNER_NAME" "$VM_ORG"; then
+        log_error "Destroyed $RUNNER_NAME, but could not remove it from $EXTRA_RUNNERS_FILE, so the watcher creates it again."
+        log_error "Run 'runner destroy $RUNNER_NAME' again."
+        exit 1
+    fi
+fi
+
 log_info "$RUNNER_NAME destroyed."
-if systemctl is-active --quiet github-runner-watch.timer 2>/dev/null; then
+if [[ "$EXTRA" == 1 ]]; then
+    echo "Extra runner removed; the watcher will not recreate it."
+elif systemctl is-active --quiet github-runner-watch.timer 2>/dev/null; then
     echo "Watcher will recreate on next tick."
 else
     echo "Watcher is stopped."
