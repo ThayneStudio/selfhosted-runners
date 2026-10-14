@@ -239,6 +239,10 @@ reserve_vmid
 release_vmid_reservation 9201
 reserve_bake_vmid 2>"$state/log"
 [[ "$RESERVED_VMID" == 9202 ]] || fail "reserve_bake_vmid took VMID $RESERVED_VMID, which has a volume or skipped a free one"
+# A skip is routine for a rebake. It warns once and logs no refusal errors.
+if grep -qF '[ERROR]' "$state/log"; then fail "a skipped VMID logged errors: $(cat "$state/log")"; fi
+grep -qF 'VMID 9201 already has disk volumes on local-zfs (local-zfs:vm-9201-disk-0); choosing another' "$state/log" \
+    || fail "the skipped VMID was not reported: $(cat "$state/log")"
 release_vmid_reservation "$RESERVED_VMID"
 # A longer VMID is not this one. A cloud-init drive and a linked clone are.
 set_volumes <<'EOF'

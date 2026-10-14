@@ -636,8 +636,10 @@ bake_vmid_storage_clear() {
 # already has a volume, which runner clones do not: those VMIDs are at or
 # above MIN_VMID, where the orphan sweep reaps a config-less vm- disk.
 # Setup cannot walk; it refuses the chosen Template VM ID instead.
+# The volume check is vmid_image_volids, not bake_vmid_storage_clear: a
+# skipped VMID is routine here and must not log setup's refusal as errors.
 reserve_bake_vmid() {
-    local vmid="" next="" clear_rc=0 skips=0
+    local vmid="" next="" vols="" skips=0
     while true; do
         if [[ -n "$next" ]]; then
             reserve_vmid "$next" || return 1
@@ -645,20 +647,20 @@ reserve_bake_vmid() {
             reserve_vmid || return 1
         fi
         vmid=$RESERVED_VMID
-        clear_rc=0
-        bake_vmid_storage_clear "$vmid" || clear_rc=$?
-        if [[ "$clear_rc" == 0 ]]; then
-            return 0
-        fi
-        release_vmid_reservation "$vmid"
         # A listing that cannot be read would skip every VMID.
-        [[ "$clear_rc" == 1 ]] || return 1
+        if ! vols=$(vmid_image_volids "$vmid"); then
+            release_vmid_reservation "$vmid"
+            log_error "Could not list volumes on $VM_STORAGE; not baking on VMID $vmid"
+            return 1
+        fi
+        [[ -n "$vols" ]] || return 0
+        release_vmid_reservation "$vmid"
         skips=$((skips + 1))
         if (( skips >= 1000 )); then
             log_error "No VMID without disk volumes on $VM_STORAGE in 1000 tries"
             return 1
         fi
-        log_warn "VMID $vmid already has disk volumes on $VM_STORAGE; choosing another"
+        log_warn "VMID $vmid already has disk volumes on $VM_STORAGE (${vols//$'\n'/ }); choosing another"
         next=$((vmid + 1))
     done
 }
