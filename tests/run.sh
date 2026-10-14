@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Run the repo's shell checks. There is no other test suite.
+# Every other tests/*.sh is one check; adding a file adds a check.
 set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)
-bash "$root/tests/cloud-image.sh"
-bash "$root/tests/disableupdate.sh"
-bash "$root/tests/rebake-decision.sh"
-bash "$root/tests/rebake-safety.sh"
-bash "$root/tests/setup-prompts.sh"
+for check in "$root"/tests/*.sh; do
+    [[ "$check" == "$root/tests/run.sh" ]] && continue
+    bash "$check"
+done

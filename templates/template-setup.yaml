@@ -13,6 +13,24 @@ write_files:
       #!/bin/bash
       set -euo pipefail
 
+      # Any failure writes /opt/.template-setup-failed. The host polls for it
+      # beside the completion marker and fails the bake at once instead of
+      # waiting for BAKE_TIMEOUT. It reads both through qemu-guest-agent, which
+      # step 2 installs, so a failure before the agent runs powers the VM off:
+      # the host also fails a bake whose VM stops before completion.
+      on_setup_exit() {
+        local rc=$?
+        set +e
+        [[ $rc -eq 0 ]] && return 0
+        log_error "Template setup failed with exit code $rc (last command: $BASH_COMMAND)"
+        printf 'rc=%s\n' "$rc" > /opt/.template-setup-failed
+        if ! systemctl is-active --quiet qemu-guest-agent; then
+          log_error "qemu-guest-agent is not running; powering off so the host sees the failure"
+          systemctl --no-block poweroff
+        fi
+      }
+      trap on_setup_exit EXIT
+
       # Logging with timestamps
       log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"; }
       log_error() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: $1" >&2; }
@@ -76,6 +94,20 @@ write_files:
       done
 
       log "[2/12] Updating system packages and installing base prerequisites..."
+      # apt-daily-upgrade is not ordered after cloud-final, so unattended-upgrades
+      # can hold the dpkg lock during this bake, and during a job on any clone,
+      # and apt-get fails at once on a held lock. The template is rebaked
+      # instead, so turn the periodic jobs off for good, and let apt-get wait
+      # for a run that had already started.
+      systemctl disable --now apt-daily.timer apt-daily-upgrade.timer \
+        || log "Could not disable the apt-daily timers; continuing"
+      systemctl mask apt-daily.service apt-daily-upgrade.service \
+        || log "Could not mask the apt-daily services; continuing"
+      cat > /etc/apt/apt.conf.d/99runner-template <<'APTEOF'
+      APT::Periodic::Update-Package-Lists "0";
+      APT::Periodic::Unattended-Upgrade "0";
+      DPkg::Lock::Timeout "300";
+      APTEOF
       retry "apt-get update"
       retry "apt-get install -y ca-certificates curl gnupg jq unzip zstd build-essential git wget apt-transport-https software-properties-common qemu-guest-agent"
       systemctl enable --now qemu-guest-agent
@@ -111,13 +143,24 @@ write_files:
       usermod -aG docker runner
       log "Docker installed and running"
 
+      # Docker's containerd image store (HTTPS mirrors) reads per-registry
+      # hosts.toml from /etc/docker/certs.d, never /etc/containerd/certs.d.
+      # HTTP mirrors use overlay2 and rely on the Supabase registry override.
+      # Docker verifies an HTTPS mirror's certificate against the system
+      # roots. Only a mirror addressed by IP literal (IPv4, or IPv6 in
+      # brackets), which usually has a self-signed or internal certificate,
+      # skips that check. Clones apply the same rule.
       if [[ -n "${DOCKER_MIRROR_URL:-}" ]]; then
         log "Configuring Docker mirror for public.ecr.aws: $DOCKER_MIRROR_URL"
-        mkdir -p /etc/docker /etc/containerd/certs.d/public.ecr.aws
+        mkdir -p /etc/docker/certs.d/public.ecr.aws
         SUPABASE_IMAGE_REGISTRY="${DOCKER_MIRROR_URL#http://}"
         SUPABASE_IMAGE_REGISTRY="${SUPABASE_IMAGE_REGISTRY#https://}"
         MIRROR_REGISTRY="${SUPABASE_IMAGE_REGISTRY%%/*}"
-        mkdir -p "/etc/containerd/certs.d/$MIRROR_REGISTRY"
+        mkdir -p "/etc/docker/certs.d/$MIRROR_REGISTRY"
+        MIRROR_TLS=""
+        if [[ "$MIRROR_REGISTRY" == \[* || "${MIRROR_REGISTRY%%:*}" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
+          [[ "$DOCKER_MIRROR_URL" != https://* ]] || MIRROR_TLS=$'\n  skip_verify = true'
+        fi
         if [[ "$DOCKER_MIRROR_URL" == http://* ]]; then
           cat > /etc/docker/daemon.json <<DOCKEREOF
       {
@@ -134,19 +177,17 @@ write_files:
       }
       DOCKEREOF
         fi
-        cat > /etc/containerd/certs.d/public.ecr.aws/hosts.toml <<TOMLEOF
+        cat > /etc/docker/certs.d/public.ecr.aws/hosts.toml <<TOMLEOF
       server = "https://public.ecr.aws"
 
       [host."$DOCKER_MIRROR_URL"]
-        capabilities = ["pull", "resolve"]
-        skip_verify = true
+        capabilities = ["pull", "resolve"]$MIRROR_TLS
       TOMLEOF
-        cat > "/etc/containerd/certs.d/$MIRROR_REGISTRY/hosts.toml" <<TOMLEOF
+        cat > "/etc/docker/certs.d/$MIRROR_REGISTRY/hosts.toml" <<TOMLEOF
       server = "$DOCKER_MIRROR_URL"
 
       [host."$DOCKER_MIRROR_URL"]
-        capabilities = ["pull", "resolve"]
-        skip_verify = true
+        capabilities = ["pull", "resolve"]$MIRROR_TLS
       TOMLEOF
         systemctl restart docker
         log "Docker mirror configured for template bake"
@@ -286,10 +327,12 @@ write_files:
       chown $RUNNER_USER:$RUNNER_USER $RUNNER_HOME
       cd $RUNNER_HOME
 
-      # Get latest runner version with validation
-      RUNNER_VERSION=$(curl -sf --retry 3 https://api.github.com/repos/actions/runner/releases/latest | jq -r .tag_name | sed 's/v//')
-      if [[ -z "$RUNNER_VERSION" || "$RUNNER_VERSION" == "null" ]]; then
-        log_error "Failed to get runner version from GitHub API"
+      # The host picks the release and renders it here. The guest makes no
+      # GitHub API call: unauthenticated calls share a limit of 60 an hour
+      # with every job behind this address, and a 403 would fail the bake.
+      RUNNER_VERSION="{{RUNNER_VERSION}}"
+      if [[ ! "$RUNNER_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        log_error "Runner version from the host is not X.Y.Z: ${RUNNER_VERSION:-empty}"
         exit 1
       fi
       log "Latest runner version: $RUNNER_VERSION"
@@ -329,6 +372,20 @@ write_files:
       log "Runner.Listener version ${LISTENER_VERSION}"
 
       log "[12/12] Cleaning up for template conversion..."
+      # A slot keeps its MAC across recycles, but each clone gets a new
+      # machine-id, so networkd's default DUID client-id would take a new DHCP
+      # lease every time. netplan merges this file into the config cloud-init
+      # generates before networkd starts, so it applies from a clone's first
+      # DHCP request. Written from user-data, it would land after DHCP started.
+      cat > /etc/netplan/99-dhcp-mac.yaml <<'NETPLANEOF'
+      network:
+        version: 2
+        ethernets:
+          eth0:
+            dhcp4: true
+            dhcp-identifier: mac
+      NETPLANEOF
+      chmod 600 /etc/netplan/99-dhcp-mac.yaml
       apt-get clean
       rm -rf /tmp/* /var/tmp/*
       truncate -s 0 /var/log/*.log 2>/dev/null || true

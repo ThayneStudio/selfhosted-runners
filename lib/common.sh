@@ -21,20 +21,29 @@ CONFIG_FILE="/etc/github-runners.conf"
 ORG_CONFIG_DIR="/etc/github-runners.d"
 SNIPPETS_DIR="/var/lib/vz/snippets"
 INSTALL_DIR="/opt/selfhosted-runners"
-POOL_DRAIN_FILE="/run/lock/github-runner-drain"
+# Drain flag, pool locks and per-slot state (SLOT_STATE_DIR in recycle.sh).
+# /run is root-owned 0755, so another account cannot create this directory,
+# and mode 0700 keeps one from opening or unlinking the files. /run/lock is
+# 1777, which is why none of these live there.
+RUN_DIR="/run/github-runners"
+POOL_DRAIN_FILE="$RUN_DIR/github-runner-drain"
+# The hookscript copied by the previous install reads this path and does not
+# source these libs. install.sh replaces /opt before it copies the new
+# hookscript, so a VM can stop in between.
+LEGACY_POOL_DRAIN_FILE="/run/lock/github-runner-drain"
 # Shared/exclusive lock coordinating maintenance mode with in-flight clones.
 # clone_runner holds a shared lock for its full lifecycle; runner stop takes an
 # exclusive lock so it can wait until all clone activity is quiesced.
-POOL_ACTIVITY_LOCK_FILE="/run/lock/github-runner-pool.lock"
+POOL_ACTIVITY_LOCK_FILE="$RUN_DIR/github-runner-pool.lock"
 # Global lock serializing VMID allocation across reclone.sh/watch.sh/create.sh.
 # Scope is narrow: "pick free VMID -> reserve it". A per-VMID reservation
 # stays held until qm clone returns, so clone tasks can run with bounded
 # parallelism without racing on the same VMID.
 # pvesh get /cluster/nextid is not atomic and does not reserve, so without
 # this lock two parallel clones reliably pick the same VMID.
-VMID_LOCK_FILE="/run/lock/runner-vmid.lock"
-VMID_RESERVATION_LOCK_PREFIX="/run/lock/runner-vmid-reserve"
-CLONE_SLOT_LOCK_PREFIX="/run/lock/runner-clone-slot"
+VMID_LOCK_FILE="$RUN_DIR/runner-vmid.lock"
+VMID_RESERVATION_LOCK_PREFIX="$RUN_DIR/runner-vmid-reserve"
+CLONE_SLOT_LOCK_PREFIX="$RUN_DIR/runner-clone-slot"
 DEFAULT_CLONE_MAX_PARALLEL=2
 
 require_root() {
@@ -49,12 +58,38 @@ validate_org_name() {
     [[ "$1" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?$ ]]
 }
 
+# A VM name `qm clone --name` accepts (Proxmox's dns-name format): dot-separated
+# labels of letters, digits and hyphens, each starting and ending with a letter
+# or digit. Check a runner name before minting a JIT config for it — the mint
+# registers the runner on GitHub, and a name qm rejects can never be cloned.
+validate_runner_name() {
+    [[ "$1" =~ ^([a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?\.)*[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?$ ]]
+}
+
 load_infra_config() {
     if [[ ! -f "$CONFIG_FILE" ]]; then
         log_error "Configuration not found at $CONFIG_FILE"
         log_error "Run 'runner setup' first."
         exit 1
     fi
+    # A BAKE_TIMEOUT, BAKE_MIN_FREE_GIB or BAKE_FREE_FLOOR_GIB set for this
+    # run wins over the conf. local hides that value from the source, then
+    # drops on return. A name the environment left unset keeps the value the
+    # file assigned, which is how the daily rebake honours a limit written
+    # in the conf.
+    if [[ -v BAKE_TIMEOUT ]]; then
+        # shellcheck disable=SC2034 # shadows the caller's value across source
+        local BAKE_TIMEOUT="$BAKE_TIMEOUT"
+    fi
+    if [[ -v BAKE_MIN_FREE_GIB ]]; then
+        # shellcheck disable=SC2034
+        local BAKE_MIN_FREE_GIB="$BAKE_MIN_FREE_GIB"
+    fi
+    if [[ -v BAKE_FREE_FLOOR_GIB ]]; then
+        # shellcheck disable=SC2034
+        local BAKE_FREE_FLOOR_GIB="$BAKE_FREE_FLOOR_GIB"
+    fi
+    # shellcheck disable=SC1090
     source "$CONFIG_FILE"
     for var in NETWORK_BRIDGE VM_STORAGE TEMPLATE_ID; do
         if [[ -z "${!var:-}" ]]; then
@@ -82,17 +117,163 @@ load_org_config() {
     fi
 }
 
+# uid of $1. GNU stat, then BSD, so the check is the same under the tests.
+file_owner() {
+    local owner
+    if owner=$(stat -c '%u' "$1" 2>/dev/null); then
+        printf '%s\n' "$owner"
+        return 0
+    fi
+    stat -f '%u' "$1"
+}
+
+# Permission bits of $1 as octal without the file type (700, 1777).
+file_mode() {
+    local mode
+    if ! mode=$(stat -c '%a' "$1" 2>/dev/null); then
+        mode=$(stat -f '%OLp' "$1") || return 1
+    fi
+    [[ "$mode" =~ ^[0-7]+$ ]] || return 1
+    printf '%o\n' "$((8#$mode))"
+}
+
+# Make $1 mode 0700 and owned by this process before a lock or the drain
+# flag is opened in it. Creates it if it is missing. An existing directory
+# with another owner, or with any group or other permission, is tightened;
+# if that cannot be done the caller must not open a file there. A symlink
+# is refused: chmod would follow it and change the target.
+ensure_private_dir() {
+    local dir="$1" owner mode
+    [[ -n "$dir" && "$dir" != "/" && "$dir" != "." ]] || {
+        log_error "refusing to store locks in ${dir:-<empty>}"
+        return 1
+    }
+    if [[ -L "$dir" ]]; then
+        log_error "$dir is a symlink; refusing to store locks there"
+        return 1
+    fi
+    if [[ -e "$dir" && ! -d "$dir" ]]; then
+        log_error "$dir exists and is not a directory"
+        return 1
+    fi
+    if [[ ! -d "$dir" ]]; then
+        # install -d -m applies to this directory, including one that already
+        # exists, and not to its parents. Two callers creating it both end at
+        # 0700. 0700 has no group or other bits for umask to leave set.
+        install -d -m 700 "$dir" || return 1
+    fi
+    owner=$(file_owner "$dir") || {
+        log_error "could not stat $dir"
+        return 1
+    }
+    if [[ "$owner" != "$EUID" ]]; then
+        if ! chown "$EUID:$(id -g)" "$dir" 2>/dev/null; then
+            log_error "$dir is owned by uid $owner, not $EUID; refusing to store locks there"
+            return 1
+        fi
+    fi
+    chmod 700 "$dir" || {
+        log_error "could not make $dir mode 0700; refusing to store locks there"
+        return 1
+    }
+    owner=$(file_owner "$dir") || return 1
+    mode=$(file_mode "$dir") || return 1
+    if [[ "$owner" != "$EUID" || "$mode" != "700" ]]; then
+        log_error "$dir is not private (owner $owner mode $mode); refusing to store locks there"
+        return 1
+    fi
+}
+
+# Drop a symlink or another account's file at $1 after its directory is
+# private. flock follows a symlink, and a lock file someone else created is
+# one they can already hold. Neither can be recreated once the directory is
+# mode 0700 and owned by this process.
+prepare_lock_file() {
+    local file="$1" owner dir
+    dir=$(dirname -- "$file")
+    ensure_private_dir "$dir" || return 1
+    if [[ -L "$file" ]]; then
+        rm -f -- "$file" || return 1
+    elif [[ -d "$file" ]]; then
+        log_error "$file is a directory; refusing to use it as a lock"
+        return 1
+    elif [[ -e "$file" ]]; then
+        owner=$(file_owner "$file") || return 1
+        if [[ "$owner" != "$EUID" ]]; then
+            rm -f -- "$file" || return 1
+        fi
+    fi
+}
+
+# Open $2 on file descriptor $1 for a later flock. The fd numbers are fixed:
+# workers close 200-204 around qm so a long-lived qemu does not inherit them.
+open_lock_fd() {
+    local fd="$1" file="$2"
+    prepare_lock_file "$file" || return 1
+    case "$fd" in
+        199) exec 199>"$file" ;;
+        200) exec 200>"$file" ;;
+        201) exec 201>"$file" ;;
+        202) exec 202>"$file" ;;
+        203) exec 203>"$file" ;;
+        204) exec 204>"$file" ;;
+        *)
+            log_error "internal: no lock fd $fd"
+            return 1
+            ;;
+    esac
+}
+
+# 0 when the previous install left a root-owned drain flag at the old path.
+# /run/lock is 1777, so a file another account created there does not count,
+# and neither does a symlink (stat would report the target's owner).
+legacy_drain_active() {
+    local owner
+    [[ -n "${LEGACY_POOL_DRAIN_FILE:-}" && "$LEGACY_POOL_DRAIN_FILE" != "$POOL_DRAIN_FILE" ]] || return 1
+    [[ -f "$LEGACY_POOL_DRAIN_FILE" && ! -L "$LEGACY_POOL_DRAIN_FILE" ]] || return 1
+    owner=$(file_owner "$LEGACY_POOL_DRAIN_FILE") || return 1
+    [[ "$owner" == "0" ]]
+}
+
+# The old hookscript only tests that this path exists. Replace whatever is
+# there with a file this process owns: mv uses rename, which replaces a
+# symlink instead of writing through it. /run/lock is sticky, so another
+# account cannot unlink the result. A directory we cannot write is skipped;
+# reclone.sh still checks the new flag.
+sync_legacy_drain() {
+    local dir tmp
+    [[ -n "${LEGACY_POOL_DRAIN_FILE:-}" && "$LEGACY_POOL_DRAIN_FILE" != "$POOL_DRAIN_FILE" ]] || return 0
+    dir=$(dirname -- "$LEGACY_POOL_DRAIN_FILE")
+    [[ -d "$dir" && -w "$dir" ]] || return 0
+    tmp=$(mktemp "$dir/.github-runner-drain.XXXXXX") || return 0
+    if ! mv -f "$tmp" "$LEGACY_POOL_DRAIN_FILE"; then
+        rm -f -- "$tmp"
+        return 0
+    fi
+}
+
 pool_is_draining() {
-    [[ -e "$POOL_DRAIN_FILE" ]]
+    if [[ -f "$POOL_DRAIN_FILE" && ! -L "$POOL_DRAIN_FILE" ]]; then
+        return 0
+    fi
+    legacy_drain_active || return 1
+    # Copy it forward so a new hookscript and the next check agree. The
+    # legacy flag still counts when the copy fails.
+    enable_pool_drain || true
+    return 0
 }
 
 enable_pool_drain() {
-    install -d -m 755 "$(dirname "$POOL_DRAIN_FILE")"
-    : > "$POOL_DRAIN_FILE"
+    prepare_lock_file "$POOL_DRAIN_FILE" || return 1
+    : > "$POOL_DRAIN_FILE" || return 1
+    sync_legacy_drain || true
 }
 
 disable_pool_drain() {
-    rm -f "$POOL_DRAIN_FILE"
+    rm -f -- "$POOL_DRAIN_FILE"
+    if [[ -n "${LEGACY_POOL_DRAIN_FILE:-}" && "$LEGACY_POOL_DRAIN_FILE" != "$POOL_DRAIN_FILE" ]]; then
+        rm -f -- "$LEGACY_POOL_DRAIN_FILE"
+    fi
 }
 
 list_orgs() {
@@ -153,29 +334,102 @@ select_org() {
     done
 }
 
+# Prints N when $1 is slot <prefix $2>-N as the watcher names it (no leading
+# zeros); fails for any other name, such as a manual runner-01.
+slot_number() {
+    local name="$1" prefix="$2" n
+    [[ -n "$prefix" && "$name" == "${prefix}-"* ]] || return 1
+    n="${name#"${prefix}-"}"
+    [[ "$n" =~ ^[1-9][0-9]{0,8}$ ]] || return 1
+    printf '%s\n' "$n"
+}
+
+# Prints the org in the ownership marker that clone_runner writes into the
+# description of VM $1, read from config text $2. The marker names the VMID
+# it was written for and counts only on that VM: a full clone of a runner
+# copies the description too.
+runner_marker_org() {
+    local vmid="$1" description
+    local marker_re='^description: selfhosted-runners org=([a-zA-Z0-9-]+)( kind=(slot|extra))? vmid=([0-9]+)([ %]|$)'
+    description=$(grep -m1 '^description:' <<< "$2") || return 1
+    [[ "$description" =~ $marker_re && "${BASH_REMATCH[4]}" == "$vmid" ]] || return 1
+    printf '%s\n' "${BASH_REMATCH[1]}"
+}
+
+# Prints the org of runner VM $1, or "unknown". $2, when given, is the VM's
+# config as the caller already read it. A snippet counts only as a whole
+# cicustom property on this tool's snippet volume, so an operator's snippet
+# with a similar name does not, and the per-VM snippet and the marker count
+# only for VM $1 itself: a full clone of a runner copies both.
 get_vm_org() {
-    local cicustom
-    cicustom=$(qm config "$1" 2>/dev/null | grep "^cicustom:" || true)
-    # New per-VM snippet: runner-<vmid>-user-<org>.yaml (org has no dots).
+    local vmid="$1" config cicustom org own_re legacy_re
+    if [[ ! "$vmid" =~ ^[0-9]+$ ]]; then
+        echo "unknown"
+        return 0
+    fi
+    if (( $# > 1 )); then
+        config="$2"
+    else
+        config=$(qm config "$vmid" 2>/dev/null) || true
+    fi
+    cicustom=$(grep -m1 '^cicustom:' <<< "$config") || true
+    # Each snippet must be a whole cicustom property on this tool's snippet
+    # volume. New per-VM snippet: runner-<this VMID>-user-<org>.yaml.
     # Legacy per-org snippet: runner-user-data-<org>.yaml (kept as a fallback so
     # VMs created before the token refactor stay identifiable/destroyable).
-    # The two are mutually exclusive: legacy names have no digits after "runner-".
-    if [[ "$cicustom" =~ runner-[0-9]+-user-([a-zA-Z0-9-]+)\.yaml ]]; then
-        echo "${BASH_REMATCH[1]}"
-    elif [[ "$cicustom" =~ runner-user-data-([^.]+)\.yaml ]]; then
-        echo "${BASH_REMATCH[1]}"
+    # Last, the marker clone_runner passes to qm clone: a clone cut off before
+    # --cicustom carries only that, and would otherwise hold its slot name
+    # with no runner command able to see or remove it.
+    own_re='(^cicustom: |,)user=local:snippets/runner-'"$vmid"'-user-([a-zA-Z0-9-]+)\.yaml(,|$)'
+    legacy_re='(^cicustom: |,)user=local:snippets/runner-user-data-([a-zA-Z0-9-]+)\.yaml(,|$)'
+    if [[ "$cicustom" =~ $own_re ]]; then
+        echo "${BASH_REMATCH[2]}"
+    elif [[ "$cicustom" =~ $legacy_re ]]; then
+        echo "${BASH_REMATCH[2]}"
+    elif org=$(runner_marker_org "$vmid" "$config"); then
+        echo "$org"
     else
         echo "unknown"
     fi
 }
 
+# Guest configs of every cluster node.
+PVE_NODES_DIR="/etc/pve/nodes"
+
+# VMIDs are cluster-wide and shared by VMs and containers. A container's
+# LVM-thin, LVM and RBD volumes are named vm-<ctid>-disk-N like a VM's, so a
+# VMID counts as taken when either guest type has a config for it on any node.
 vm_config_path() {
     local vmid="$1"
-    compgen -G "/etc/pve/nodes/*/qemu-server/${vmid}.conf" | head -n 1
+    compgen -G "$PVE_NODES_DIR/*/qemu-server/${vmid}.conf" | head -n 1 ||
+        compgen -G "$PVE_NODES_DIR/*/lxc/${vmid}.conf" | head -n 1
 }
 
 vmid_in_use() {
     [[ -n "$(vm_config_path "$1")" ]]
+}
+
+# pmxcfs serves /etc/pve. While it restarts (every pve-cluster upgrade
+# restarts it) /etc/pve is an empty directory, and after a crash it cannot
+# be read, so vm_config_path finds no config for any guest. Every node has a
+# directory in nodes, and only a live pmxcfs can list them. A lookup proves
+# less: after a crash the kernel can answer one from its cache for up to a
+# second, such as one for /etc/pve/local, the link PVE's own
+# check_cfs_is_mounted tests.
+pve_cfs_serving() {
+    compgen -G "$PVE_NODES_DIR/*" > /dev/null
+}
+
+# vm_config_path for callers that free VMID $1's volumes when it prints
+# nothing. Finding no config proves nothing unless pmxcfs served /etc/pve
+# both before and after the lookup, so this fails otherwise, and the caller
+# stops freeing. vmid_in_use stays a plain lookup: reserve_vmid steps past
+# every VMID in use, and would never stop while pmxcfs is down if a lookup
+# that failed counted as in use.
+vm_config_path_checked() {
+    pve_cfs_serving || return 1
+    vm_config_path "$1" || true
+    pve_cfs_serving
 }
 
 vmid_reservation_lock_file() {
@@ -201,7 +455,7 @@ reserve_vmid() {
         fi
 
         lock_file=$(vmid_reservation_lock_file "$vmid")
-        exec 203>"$lock_file"
+        open_lock_fd 203 "$lock_file" || return 1
         if flock -n 203; then
             if vmid_in_use "$vmid"; then
                 exec 203>&-
@@ -218,7 +472,10 @@ reserve_vmid() {
 
 release_vmid_reservation() {
     local vmid="${1:-${RESERVED_VMID:-}}"
-    exec 203>&- 2>/dev/null || true
+    # Closing an fd that is not open is silent and returns 0. A redirection
+    # on a bare exec applies to this shell for good: 2>/dev/null here would
+    # hide every later log line.
+    exec 203>&-
     [[ -n "$vmid" ]] && rm -f "$(vmid_reservation_lock_file "$vmid")" 2>/dev/null || true
 }
 
@@ -237,7 +494,7 @@ acquire_clone_slot() {
     while true; do
         pool_is_draining && return 1
         for ((slot = 1; slot <= max; slot++)); do
-            exec 204>"${CLONE_SLOT_LOCK_PREFIX}-${slot}.lock"
+            open_lock_fd 204 "${CLONE_SLOT_LOCK_PREFIX}-${slot}.lock" || return 1
             if flock -n 204; then
                 return 0
             fi
@@ -248,12 +505,18 @@ acquire_clone_slot() {
 }
 
 release_clone_slot() {
-    exec 204>&- 2>/dev/null || true
+    # No 2>/dev/null: see release_vmid_reservation.
+    exec 204>&-
 }
 
 list_template_base_volids() {
     local template_id="${1:-$TEMPLATE_ID}"
-    qm config "$template_id" 199>&- 200>&- 201>&- 202>&- 203>&- 204>&- 2>/dev/null | awk -F': ' -v storage="$VM_STORAGE:" '
+    qm config "$template_id" 199>&- 200>&- 201>&- 202>&- 203>&- 204>&- 2>/dev/null | base_volids_in_config
+}
+
+# Base volumes on $VM_STORAGE among the disks of the VM config on stdin.
+base_volids_in_config() {
+    awk -F': ' -v storage="$VM_STORAGE:" '
         $1 ~ /^(ide|sata|scsi|virtio)[0-9]+$/ {
             split($2, parts, ",")
             volume = substr(parts[1], length(storage) + 1)
@@ -262,6 +525,37 @@ list_template_base_volids() {
             }
         }
     '
+}
+
+# Base volumes of the runner templates: TEMPLATE_ID, and each template the
+# rebake retired but has not destroyed yet (lib/rebake.sh). The rebake also
+# keeps ids that are no longer runner templates on that list, so a retired id
+# counts only while it is a template named ubuntu-cloud-template, the check
+# retire_retired_templates makes before it destroys one.
+runner_template_base_volids() {
+    local retired_file="${RETIRED_TEMPLATES_FILE:-/var/lib/github-runners/retired-templates}"
+    local id config
+    list_template_base_volids "$TEMPLATE_ID" || true
+    [[ -f "$retired_file" ]] || return 0
+    while IFS= read -r id || [[ -n "$id" ]]; do
+        [[ "$id" =~ ^[0-9]+$ && "$id" != "$TEMPLATE_ID" ]] || continue
+        config=$(qm config "$id" 199>&- 200>&- 201>&- 202>&- 203>&- 204>&- 2>/dev/null) || continue
+        grep -q '^template: 1[[:space:]]*$' <<< "$config" || continue
+        grep -q '^name: ubuntu-cloud-template[[:space:]]*$' <<< "$config" || continue
+        base_volids_in_config <<< "$config"
+    done < "$retired_file" || true
+}
+
+# 0 when the storage listing shows volume $1 as a linked clone of one of the
+# base volumes that follow. Proxmox lists a ZFS, RBD or directory linked clone
+# under its base; LVM-thin lists it on its own, so it never matches.
+volume_is_linked_clone_of() {
+    local volid="$1" base
+    shift
+    for base in "$@"; do
+        [[ "$volid" == "$base/"* ]] && return 0
+    done
+    return 1
 }
 
 linked_clone_child_vmid() {
@@ -273,17 +567,34 @@ linked_clone_child_vmid() {
     fi
 }
 
+# Prints the ZFS dataset behind zvol volume $1. Like pvesm path, it does not
+# check that the dataset exists.
 zfs_dataset_from_volid() {
     local volid="$1"
-    local path dataset
+    local path
 
     command -v zfs >/dev/null 2>&1 || return 1
     path=$(pvesm path "$volid" 199>&- 200>&- 201>&- 202>&- 203>&- 204>&- 2>/dev/null) || return 1
     [[ "$path" == /dev/zvol/* ]] || return 1
 
-    dataset="${path#/dev/zvol/}"
-    zfs list -H -o name "$dataset" >/dev/null 2>&1 || return 1
-    printf '%s\n' "$dataset"
+    printf '%s\n' "${path#/dev/zvol/}"
+}
+
+# 0 only when a listing of the volume's storage succeeds and no longer shows
+# it. A failed listing is not proof that the volume is gone.
+volume_confirmed_absent() {
+    local volid="$1" listing
+    listing=$(pvesm list "${volid%%:*}" 199>&- 200>&- 201>&- 202>&- 203>&- 204>&- 2>/dev/null) || return 1
+    awk -v v="$volid" '$1 == v { found = 1 } END { exit found }' <<< "$listing"
+}
+
+# `pvesm free` exits 0 even when its deletion task fails (a busy zvol, an open
+# LV): the error only reaches stderr and the task log. A free counts only once
+# the volume is gone from its storage listing.
+free_volume() {
+    local volid="$1"
+    pvesm free "$volid" 199>&- 200>&- 201>&- 202>&- 203>&- 204>&- || return 1
+    volume_confirmed_absent "$volid"
 }
 
 list_template_linked_clone_volids() {
@@ -330,9 +641,9 @@ list_template_linked_clone_volids() {
 
     # ZFS linked clones are sibling zvols, not nested volids. They point at
     # the template base volume snapshot via the ZFS origin property. A failed
-    # path or origin lookup must fail this function: an empty result is
-    # permission to destroy the template. A path that is not a zvol is dir
-    # or LVM storage, already handled above.
+    # path or origin lookup must fail this function, unless the volume is
+    # gone (below): an empty result is permission to destroy the template. A
+    # path that is not a zvol is dir or LVM storage, already handled above.
     while read -r base_volid; do
         [[ -n "$base_volid" ]] || continue
         if ! zfs_path=$(pvesm path "$base_volid" 199>&- 200>&- 201>&- 202>&- 203>&- 204>&- 2>/dev/null); then
@@ -357,8 +668,19 @@ list_template_linked_clone_volids() {
                 log_error "Failed to resolve ZFS dataset for $volid"
                 return 1
             fi
-            if ! origin=$(zfs get -H -o value origin "$dataset" 2>/dev/null); then
+            # Runners are destroyed and recloned while this scan runs. A
+            # volume that is gone depends on nothing, so this lookup's own
+            # "dataset does not exist" (what Proxmox's ZFS plugin also takes
+            # as gone) skips it. A second lookup would not do: by then a new
+            # volume can have the same name. Any other failure fails closed.
+            if ! origin=$(LC_ALL=C zfs get -H -o value origin "$dataset" 2>&1); then
+                [[ "$origin" == *"dataset does not exist"* ]] && continue
                 log_error "Failed to read ZFS origin for $dataset"
+                return 1
+            fi
+            # stderr is captured too, so anything but one word fails closed.
+            if [[ -z "$origin" || "$origin" == *[[:space:]]* ]]; then
+                log_error "Unexpected ZFS origin for $dataset: $origin"
                 return 1
             fi
             # "-" is a real origin value meaning "not a clone".
@@ -390,7 +712,11 @@ cleanup_template_orphan_volumes() {
     for volid in "${child_volids[@]}"; do
         child_vmid=$(linked_clone_child_vmid "$volid")
         config_path=""
-        [[ -n "$child_vmid" ]] && config_path=$(vm_config_path "$child_vmid")
+        if [[ -n "$child_vmid" ]] && ! config_path=$(vm_config_path_checked "$child_vmid"); then
+            log_error "pmxcfs is not serving /etc/pve, so VM configs cannot be checked; not freeing $volid"
+            log_error "Check that pve-cluster is running, then run 'runner stop' again."
+            return 1
+        fi
 
         if [[ -n "$config_path" ]]; then
             log_warn "Template child volume still has a VM config: $volid ($config_path)"
@@ -399,7 +725,7 @@ cleanup_template_orphan_volumes() {
         fi
 
         log_info "Freeing orphaned template child volume: $volid"
-        if ! pvesm free "$volid"; then
+        if ! free_volume "$volid"; then
             log_error "Failed to free orphaned template child volume: $volid"
             return 1
         fi
@@ -419,21 +745,33 @@ cleanup_template_orphan_volumes() {
     return 0
 }
 
-# Sweep zvols on $VM_STORAGE whose VMID has no /etc/pve config — leftovers from
-# clones that failed before writing config (or whose _fail cleanup couldn't
-# fully reap). Holds the pool activity lock exclusive non-blocking so it can
-# never race a clone in progress. Scoped to vmid >= MIN_VMID and != TEMPLATE_ID
-# so non-runner VMs on the same storage are never touched.
+# Sweep VM image volumes on $VM_STORAGE whose VMID has no VM or container
+# config on any node — leftovers from clones that failed before writing config
+# (or whose _fail cleanup couldn't fully reap). Holds the pool activity lock
+# exclusive non-blocking so it can never race a clone in progress. Scoped to
+# VMIDs runners can get: vmid >= MIN_VMID and != TEMPLATE_ID. MIN_VMID=0
+# ("auto") sets no lower bound, so the floor is then TEMPLATE_ID + 1. Listing
+# only images content also leaves out every container's rootdir volumes.
+# Runners get VMIDs below that floor too (MIN_VMID=0 hands out the cluster's
+# next free ones). There it frees only linked clones of the live or a retired
+# runner template; a runner disk left there would otherwise stay for good and
+# keep its template from being retired. qm clone writes the new VM's config
+# before it creates a disk, so a clone in progress is never config-less. The
+# sweep stops at a lookup pmxcfs did not serve (vm_config_path_checked).
 cleanup_runner_orphan_volumes() {
-    local min_vmid="${MIN_VMID:-$((TEMPLATE_ID + 1))}"
+    local min_vmid="${MIN_VMID:-}"
+    if [[ ! "$min_vmid" =~ ^[1-9][0-9]*$ ]]; then
+        min_vmid=$((TEMPLATE_ID + 1))
+    fi
 
-    exec 202>"$POOL_ACTIVITY_LOCK_FILE"
+    open_lock_fd 202 "$POOL_ACTIVITY_LOCK_FILE" || return 1
     if ! flock -n -x 202; then
         exec 202>&-
         return 0
     fi
 
-    local volid vmid freed=0
+    local volid vmid config_path freed=0 template_bases_read=0
+    local -a template_bases=()
     while IFS= read -r volid; do
         [[ -n "$volid" ]] || continue
         if [[ "$volid" =~ (:|/)vm-([0-9]+)-(disk-[0-9]+|cloudinit)$ ]]; then
@@ -441,15 +779,30 @@ cleanup_runner_orphan_volumes() {
         else
             continue
         fi
-        [[ "$vmid" -ge "$min_vmid" && "$vmid" -ne "$TEMPLATE_ID" ]] || continue
-        [[ -z "$(vm_config_path "$vmid")" ]] || continue
+        [[ "$vmid" -ne "$TEMPLATE_ID" ]] || continue
+        # Below the floor only a volume listed under a base volume can be a
+        # runner's. Template configs are read once, and only when needed.
+        [[ "$vmid" -ge "$min_vmid" || "$volid" == */* ]] || continue
+        if ! config_path=$(vm_config_path_checked "$vmid"); then
+            log_warn "[orphan-sweep] pmxcfs is not serving /etc/pve, so guest configs cannot be checked; stopping the sweep"
+            break
+        fi
+        [[ -z "$config_path" ]] || continue
+        if [[ "$vmid" -lt "$min_vmid" ]]; then
+            if [[ "$template_bases_read" == 0 ]]; then
+                # </dev/null: its qm calls must not read this loop's listing.
+                mapfile -t template_bases < <(runner_template_base_volids </dev/null)
+                template_bases_read=1
+            fi
+            volume_is_linked_clone_of "$volid" "${template_bases[@]}" || continue
+        fi
         log_info "[orphan-sweep] freeing $volid (vmid $vmid has no config)"
-        if pvesm free "$volid" 2>/dev/null; then
+        if free_volume "$volid" 2>/dev/null; then
             freed=$((freed + 1))
         else
             log_warn "[orphan-sweep] pvesm free $volid failed"
         fi
-    done < <(pvesm list "$VM_STORAGE" 2>/dev/null | awk 'NR>1 {print $1}')
+    done < <(pvesm list "$VM_STORAGE" --content images 2>/dev/null | awk 'NR>1 {print $1}')
 
     [[ "$freed" -gt 0 ]] && log_info "[orphan-sweep] reaped $freed orphan volume(s)"
     exec 202>&-
@@ -548,7 +901,7 @@ render_user_snippet() {
     local tmp
     tmp=$(mktemp "$SNIPPETS_DIR/.runner-${vmid}-user.XXXXXX") || return 1
     chmod 600 "$tmp"
-    JIT_CONFIG="$jit_config" GITHUB_ORG="$GITHUB_ORG" DOCKER_MIRROR_URL="${DOCKER_MIRROR_URL:-}" awk '
+    JIT_CONFIG="$jit_config" GITHUB_ORG="$GITHUB_ORG" DOCKER_MIRROR_URL="${DOCKER_MIRROR_URL:-}" DNS_SERVERS="${DNS_SERVERS:-}" awk '
     # Literal string replace (avoids gsub special chars: & and \)
     function lreplace(str, old, new,    i, result) {
         result = ""
@@ -562,6 +915,7 @@ render_user_snippet() {
         $0 = lreplace($0, "{{JIT_CONFIG}}", ENVIRON["JIT_CONFIG"])
         $0 = lreplace($0, "{{GITHUB_ORG}}", ENVIRON["GITHUB_ORG"])
         $0 = lreplace($0, "{{DOCKER_MIRROR_URL}}", ENVIRON["DOCKER_MIRROR_URL"])
+        $0 = lreplace($0, "{{DNS_SERVERS}}", ENVIRON["DNS_SERVERS"])
         print
     }' "$INSTALL_DIR/templates/runner-user-data.yaml" > "$tmp" || { rm -f "$tmp"; return 1; }
     mv "$tmp" "$SNIPPETS_DIR/runner-${vmid}-user-${org}.yaml" || { rm -f "$tmp"; return 1; }
@@ -575,10 +929,14 @@ generate_mac() {
 
 # Clone template, configure cloud-init, set hookscript, start VM.
 # Returns VMID on stdout. Returns 1 on failure (cleans up partial clone).
+# Sets CLONE_MINT_CONFLICT to 1 when a runner of this name was still
+# registered on GitHub. An ephemeral runner is removed once it finishes a
+# job, so that means the previous runner of this name never finished one.
 clone_runner() {
     local name="$1" org="$2" vmid="${3:-}"
     local RESERVED_VMID=""
     local pool_lock_owned=0
+    CLONE_MINT_CONFLICT=0
 
     # GITHUB_PAT/GITHUB_ORG must be in scope (caller ran load_org_config).
     if [[ -z "${GITHUB_PAT:-}" || -z "${GITHUB_ORG:-}" ]]; then
@@ -593,7 +951,7 @@ clone_runner() {
         if [[ "${POOL_ACTIVITY_LOCK_HELD:-0}" == "1" ]]; then
             return 0
         fi
-        exec 202>"$POOL_ACTIVITY_LOCK_FILE"
+        open_lock_fd 202 "$POOL_ACTIVITY_LOCK_FILE" || return 1
         flock -s 202
         pool_lock_owned=1
     }
@@ -604,7 +962,7 @@ clone_runner() {
         fi
     }
 
-    _pool_lock_acquire
+    _pool_lock_acquire || return 1
 
     if pool_is_draining; then
         log_warn "clone_runner: pool drain active, refusing to create $name"
@@ -613,11 +971,17 @@ clone_runner() {
     fi
 
     # Cleanup helper: destroy VM (only if it belongs to us), remove snippet, and
-    # sweep orphan zvols at this VMID. The ownership check prevents touching
-    # another process's VM on VMID collision. Orphan sweep runs unconditionally
-    # for our-VMID and no-owner cases because qm destroy --purge can silently
-    # leave residue (busy ZFS dataset, etc.) and a clone that fails before
-    # writing config leaves zvols with no VM to attach to.
+    # sweep orphan volumes at this VMID. The ownership check prevents touching
+    # another process's VM on VMID collision. An empty owner is not a free
+    # VMID: qm config cannot read a container, a VM on another node or a VM
+    # with no name. The sweep covers our VM's residue (qm destroy can leave a
+    # busy ZFS dataset, etc.) and a clone that failed before writing config.
+    # It frees nothing while any guest config holds the VMID: a destroy that a
+    # lock refused (vzdump, for example) leaves a config still using those
+    # volumes, and once the config is gone a parallel clone can take the VMID,
+    # so the check runs again before each free. Nor while pmxcfs is not
+    # serving /etc/pve, when no config shows. No --purge: it deletes the
+    # VMID from backup jobs, and the next clone reuses this VMID.
     _fail() {
         local owner
         owner=$(qm config "$vmid" 200>&- 201>&- 202>&- 203>&- 204>&- 2>/dev/null | awk '/^name:/{print $2}') || true
@@ -625,23 +989,45 @@ clone_runner() {
         if [[ -n "$owner" && "$owner" != "$name" ]]; then
             return 0
         fi
+        # An empty owner proves the VMID free only while pmxcfs serves
+        # /etc/pve: otherwise a live runner's config, and so its owner, is
+        # just as invisible, and its snippets are the ones removed below.
+        if [[ -z "$owner" ]]; then
+            local owner_config
+            if ! owner_config=$(vm_config_path_checked "$vmid"); then
+                log_warn "pmxcfs is not serving /etc/pve; leaving VMID $vmid's snippets and volumes"
+                return 0
+            fi
+            if [[ -n "$owner_config" ]]; then
+                log_warn "VMID $vmid belongs to another guest; leaving it and its volumes"
+                return 0
+            fi
+        fi
 
         rm -f "${SNIPPETS_DIR}/runner-${vmid}-meta.yaml" "${SNIPPETS_DIR}/runner-${vmid}-user-"*.yaml "${SNIPPETS_DIR}/runner-${vmid}-vendor.yaml"
 
         if [[ "$owner" == "$name" ]]; then
             local destroy_err; destroy_err=$(mktemp)
-            if ! qm destroy "$vmid" --purge 200>&- 201>&- 202>&- 203>&- 204>&- 2>"$destroy_err"; then
+            if ! qm destroy "$vmid" 200>&- 201>&- 202>&- 203>&- 204>&- 2>"$destroy_err"; then
                 log_warn "qm destroy $vmid failed: $(tr '\n' ' ' < "$destroy_err")"
             fi
             rm -f "$destroy_err"
         fi
 
-        local volid
+        local volid config_path
         while read -r volid; do
             [[ -n "$volid" ]] || continue
-            pvesm free "$volid" 2>/dev/null || log_warn "Failed to free orphan volume $volid"
+            if ! config_path=$(vm_config_path_checked "$vmid"); then
+                log_warn "pmxcfs is not serving /etc/pve; not freeing the volumes of VMID $vmid"
+                break
+            fi
+            if [[ -n "$config_path" ]]; then
+                log_warn "VMID $vmid still has a guest config; not freeing its volumes"
+                break
+            fi
+            free_volume "$volid" 2>/dev/null || log_warn "Failed to free orphan volume $volid"
         done < <(
-            pvesm list "$VM_STORAGE" 2>/dev/null |
+            pvesm list "$VM_STORAGE" --content images 2>/dev/null |
                 awk -v v="$vmid" 'NR>1 && $1 ~ ("(^|:|/)vm-" v "-(disk-[0-9]+|cloudinit)$") {print $1}'
         )
     }
@@ -657,6 +1043,9 @@ clone_runner() {
     jit_config=$(fetch_jit_config "$name") && mint_rc=0 || mint_rc=$?
     if [[ $mint_rc -eq 2 ]]; then
         # Duplicate name: deregister the stale GitHub-side runner and mint once more.
+        # Read by the callers' failure backoff (recycle.sh).
+        # shellcheck disable=SC2034
+        CLONE_MINT_CONFLICT=1
         deregister_runner "$org" "$name" || true
         jit_config=$(fetch_jit_config "$name") && mint_rc=0 || mint_rc=$?
         if [[ $mint_rc -ne 0 ]]; then
@@ -676,7 +1065,7 @@ clone_runner() {
     # workers behind the same allocation lock.
     # Callers (reclone.sh/watch.sh) must acquire their per-slot fd 200 lock
     # before entering clone_runner to avoid deadlock on lock order inversion.
-    exec 201>"$VMID_LOCK_FILE"
+    open_lock_fd 201 "$VMID_LOCK_FILE" || return 1
     if ! flock -w 300 201; then
         log_error "clone_runner: timed out acquiring VMID lock for $name"
         exec 201>&-
@@ -729,13 +1118,30 @@ clone_runner() {
         return 1
     fi
 
+    # Whether this is one of the org's RUNNER_COUNT slots, which the pool
+    # retires once the count or prefix no longer covers it, or an extra runner
+    # from `runner create`, which recycles until `runner destroy`.
+    local kind="" slot_n
+    if [[ "${RUNNER_COUNT:-}" =~ ^[0-9]{1,9}$ ]]; then
+        kind=extra
+        if slot_n=$(slot_number "$name" "${RUNNER_PREFIX:-runner}") && (( slot_n <= 10#$RUNNER_COUNT )); then
+            kind=slot
+        fi
+    fi
+
     # Keep maintenance locks in this shell only. Proxmox helper children can
     # spawn long-lived kvm processes; those must not inherit runner lock fds.
     # Capture stderr so the actual ZFS/Proxmox error surfaces under
     # `journalctl -t github-runner` instead of being buried under the service
     # unit log (which the operator does not look at first).
+    # The description is the ownership marker get_vm_org falls back to, with
+    # the kind. qm clone writes it in the same config write as the name, so a
+    # clone that is killed before --cicustom below is still recognisably ours.
+    # It names the VMID, reserved above, because a full clone of this VM
+    # would copy it.
     local clone_err; clone_err=$(mktemp)
-    if ! qm clone "$TEMPLATE_ID" "$vmid" --name "$name" 200>&- 201>&- 202>&- 203>&- 204>&- 2>"$clone_err"; then
+    if ! qm clone "$TEMPLATE_ID" "$vmid" --name "$name" --description "selfhosted-runners org=$org${kind:+ kind=$kind} vmid=$vmid" \
+        200>&- 201>&- 202>&- 203>&- 204>&- 2>"$clone_err"; then
         while IFS= read -r line; do
             [[ -n "$line" ]] && log_error "qm clone $vmid: $line"
         done < "$clone_err"
@@ -809,6 +1215,16 @@ clone_runner() {
         203>&- \
         204>&- \
         || { _fail; _pool_lock_release; return 1; }
+    # A guest reboot must end the VM like a shutdown. By default QEMU resets
+    # in place: no post-stop, no reclone, and cloud-init does not start the
+    # one-shot runner again, so the VM idles in its slot.
+    qm set "$vmid" --reboot 0 \
+        200>&- \
+        201>&- \
+        202>&- \
+        203>&- \
+        204>&- \
+        || { _fail; _pool_lock_release; return 1; }
 
     # Hookscript for auto-destroy on shutdown
     if [[ -f "$SNIPPETS_DIR/runner-hookscript.sh" ]]; then
@@ -819,6 +1235,8 @@ clone_runner() {
             203>&- \
             204>&- \
             || log_warn "Failed to set hookscript on $vmid — VM will not auto-recycle"
+    else
+        log_warn "$SNIPPETS_DIR/runner-hookscript.sh is missing, so $name (VMID $vmid) will not auto-recycle; the watcher reclaims it after it stops. Restore it with: install -m 755 $INSTALL_DIR/templates/runner-hookscript.sh $SNIPPETS_DIR/runner-hookscript.sh"
     fi
 
     if pool_is_draining; then
