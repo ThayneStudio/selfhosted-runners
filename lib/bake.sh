@@ -366,7 +366,9 @@ bake_and_publish_vm() {
     log_info "  (Monitor progress: qm guest exec $vmid -- cat /var/log/template-setup.log)"
 
     while true; do
-        sleep "$bake_interval"
+        # A sleep that outlives a SIGKILLed setup or rebake must not keep
+        # holding the rebake lock (199) or the VMID reservation (203).
+        sleep "$bake_interval" 199>&- 200>&- 201>&- 202>&- 203>&- 204>&-
         bake_elapsed=$((bake_elapsed + bake_interval))
 
         if [[ $bake_elapsed -ge $bake_timeout ]]; then
@@ -473,7 +475,7 @@ bake_and_publish_vm() {
     for ((i = 1; i <= 60; i++)); do
         vm_status=$(qm_host status "$vmid" 2>/dev/null | awk '{print $2}') || true
         [[ "$vm_status" == "stopped" ]] && break
-        sleep 2
+        sleep 2 199>&- 200>&- 201>&- 202>&- 203>&- 204>&-
     done
     if [[ "$vm_status" != "stopped" ]]; then
         log_error "Template VM did not reach stopped state; refusing to convert to template"

@@ -31,7 +31,14 @@ mkdir -p "$SNIPPETS_DIR"
 guest=$state/guest
 calls=$state/calls
 
-sleep() { :; }
+# A sleep still running when setup or rebake is SIGKILLed must not hold the
+# rebake lock. Record each sleep that would inherit fd 199.
+sleep() {
+    if { true >&199; } 2>/dev/null; then
+        printf 'sleep held 199\n' >> "$calls"
+    fi
+}
+exec 199>"$state/rebake.lock"
 mock_stderr=""
 mock_stopped=0
 mock_converted=0
@@ -98,6 +105,7 @@ touch "$guest/opt/.template-setup-complete"
 run_bake
 [[ "$bake_rc" == 0 ]] || fail "a finished bake failed: $(tail -n 3 "$state/log")"
 grep -q '^template 9001$' "$calls" || fail "a finished bake was not converted"
+if grep -q '^sleep held 199$' "$calls"; then fail "a bake poll sleep inherited the rebake lock"; fi
 
 # The same guest, with a locale warning on every qm call's stderr.
 mock_stderr=$'perl: warning: Setting locale failed.\nperl: warning: Please check that your locale settings:\n\tLC_ALL = (unset),\n\tLC_CTYPE = "UTF-8",\n\tLANG = "en_US.UTF-8"\n    are supported and installed on your system.\nperl: warning: Falling back to the standard locale ("C").'
